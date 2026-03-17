@@ -1,0 +1,11 @@
+main-navigation:
+  label: Main sidebar
+  dashboard: Dash
+  jobs: Jobs
+  jobschedules: Job schedules
+  pools: Pools
+  packages: Packages
+  certificates: Certificates
+  data: Data
+  home: Home
+  profile: Profile

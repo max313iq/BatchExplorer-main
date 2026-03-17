@@ -1,0 +1,11 @@
+<bl-browse-layout #layout>
+    <div blBrowseLayoutTitle>
+        Application packages
+    </div>
+    <bl-inline-quota blBrowseLayoutQuotas include="applications"></bl-inline-quota>
+    <div blBrowseLayoutButtons>
+        <bl-button type="plain" icon="fa fa-plus spin-hover" color="light" title="Add an application" [action]="addApplication" permission="write">
+        </bl-button>
+    </div>
+    <bl-application-list blBrowseLayoutList></bl-application-list>
+</bl-browse-layout>

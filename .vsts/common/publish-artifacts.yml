@@ -1,0 +1,10 @@
+parameters:
+  folder: ''
+
+steps:
+  - task: PublishBuildArtifacts@1
+    displayName: Publish application artifacts
+    inputs:
+      pathtoPublish: ./desktop/release
+      artifactName: ${{ parameters.folder }}
+      artifactType: Container

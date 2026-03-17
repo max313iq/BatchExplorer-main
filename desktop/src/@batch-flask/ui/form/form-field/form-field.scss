@@ -1,0 +1,71 @@
+@import "app/styles/variables";
+bl-form-field {
+    display: inline-block;
+    width: 100%;
+    .label-container {
+        display: block;
+        color: $primary-text;
+        sup.required {
+            line-height: 1em;
+            .fa-asterisk {
+                color: $danger-color;
+                font-size: 8px;
+            }
+        }
+    }
+
+    .input-container {
+        width: 100%;
+        display: flex;
+
+
+        > .input-prefix, > .input-suffix {
+            background: $secondary-background;
+            border: 1px solid $input-border-color;
+            height: 26px;
+            padding: 0 5px;
+            line-height: 26px;
+            vertical-align: middle;
+            color: $primary-text;
+        }
+
+        > .input-prefix {
+            border-right: none;
+        }
+
+        > .input-suffix {
+            border-left: none;
+        }
+    }
+    .bl-form-field-label {}
+
+    &.bl-disabled {
+        // Having this opacity make contrast ratio too loos
+        // opacity: 0.5;
+    }
+}
+
+bl-form-field {
+    input[blInput] {
+        display: inline-block;
+        width: 100%;
+        flex: 1;
+        min-width: 0;
+        border: 1px solid $input-border-color;
+
+        &::placeholder {
+            color: transparent;
+            // Remove the transition to prevent the placeholder
+            // from overlapping when the label comes back down.
+            transition: none;
+        }
+    }
+
+    textarea[blInput] {
+        width: 100%;
+    }
+
+    bl-select {
+        width: 100%;
+    }
+}

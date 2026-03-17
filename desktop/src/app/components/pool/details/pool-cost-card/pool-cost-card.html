@@ -1,0 +1,10 @@
+<ng-container *ngIf="isArmBatchAccount && !unsupportedSubscription">
+    <div class="graph">
+        <canvas blChart
+            [datasets]="datasets"
+            [options]="options"
+            [chartType]="chartType"
+            [attr.aria-label]="label">
+        </canvas>
+    </div>
+</ng-container>

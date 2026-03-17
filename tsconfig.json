@@ -1,0 +1,11 @@
+{
+  "files": [],
+  "references": [
+    { "path": "./packages/bonito-core" },
+    { "path": "./packages/bonito-ui" },
+    { "path": "./packages/playground" },
+    { "path": "./packages/react" },
+    { "path": "./packages/service" },
+    { "path": "./web" }
+  ]
+}

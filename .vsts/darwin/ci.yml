@@ -1,0 +1,9 @@
+steps:
+  - template: ./darwin-dependencies.yml
+  - script: |
+      set -e
+      npm run build:package
+    displayName: Build and pack
+  - template: ../common/publish-artifacts.yml
+    parameters:
+      folder: darwin

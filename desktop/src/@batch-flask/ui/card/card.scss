@@ -1,0 +1,11 @@
+@import "app/styles/variables";
+
+bl-card {
+    display: block;
+    position: relative;
+    background-color: $card-background;
+}
+
+.batch-explorer.high-contrast bl-card {
+    border-bottom: 1px solid $border-color;
+}

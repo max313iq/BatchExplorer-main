@@ -1,0 +1,37 @@
+<bl-loading [status]="data.newDataStatus | async">
+    <div *ngIf="pool && node" class="fit-details-container">
+        <bl-summary-card>
+            <div summaryTitle>{{node.id}}</div>
+            <div summarySubtitle>State: {{node.state}}</div>
+            <div summaryDetails>Pool: {{poolId}}</div>
+            <bl-button-group summaryActions>
+                <bl-refresh-btn [refresh]="refresh"></bl-refresh-btn>
+                <bl-commands-list [commands]="commands" [entity]="node"></bl-commands-list>
+                <bl-button color="light" [action]="uploadNodeLogs" title="Upload batch logs" [disabled]="pool.cloudServiceConfiguration">
+                    <span class="upload-node-logs fa-stacked" aria-hidden="true">
+                        <i class="fa fa-upload fa-stack-1x"></i>
+                        <i class="fa fa-bug fa-stack-1x"></i>
+                    </span>
+                </bl-button>
+            </bl-button-group>
+        </bl-summary-card>
+        <bl-start-task-error-display [pool]="pool" [nodeId]="nodeId" [startTaskInfo]="node?.startTaskInfo"></bl-start-task-error-display>
+        <bl-node-error-display [node]="node"></bl-node-error-display>
+        <bl-card class="details">
+            <bl-tab-group>
+                <bl-tab key="files">
+                    <bl-tab-label>Files</bl-tab-label>
+                    <bl-node-file-browse [poolId]="poolId" [node]="node" [nodeId]="nodeId"></bl-node-file-browse>
+                </bl-tab>
+                <bl-tab key="configuration">
+                    <bl-tab-label>Configuration</bl-tab-label>
+                    <bl-node-configuration [pool]="pool" [node]="node"></bl-node-configuration>
+                </bl-tab>
+                <bl-tab key="monitoring">
+                    <bl-tab-label>Monitoring</bl-tab-label>
+                    <bl-pool-graphs [pool]="pool" [node]="node"></bl-pool-graphs>
+                </bl-tab>
+            </bl-tab-group>
+        </bl-card>
+    </div>
+</bl-loading>

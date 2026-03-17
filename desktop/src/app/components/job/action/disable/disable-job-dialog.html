@@ -1,0 +1,11 @@
+<bl-simple-form [submit]="ok" [containerRef]="dialogRef" [multiUse]="false" [stickyFooter]="false" actionName="Disable" [title]="title">
+    <div class="options">
+        <p>Specifies what to do with active tasks associated with the job:</p>
+        <mat-radio-group [(ngModel)]="taskAction" [ngModelOptions]="{standalone: true}">
+            <mat-radio-button value="requeue" checked="true">Requeue</mat-radio-button>
+            <mat-radio-button value="terminate">Terminate</mat-radio-button>
+            <mat-radio-button value="wait">Wait</mat-radio-button>
+        </mat-radio-group>
+        <bl-info-box [message]="actionDescription"></bl-info-box>
+    </div>
+</bl-simple-form>

@@ -1,0 +1,42 @@
+@import "app/styles/variables";
+
+bl-activity-monitor {
+    display: block;
+    height: $contentview-height;
+
+    $activity-monitor-header-height: 60px;
+    $activity-monitor-content-height: calc(#{$contentview-height} - #{$activity-monitor-header-height});
+    $activity-monitor-label-height: 24px;
+
+    .activity-monitor-header {
+        height: $activity-monitor-header-height;
+        padding: 10px 20px;
+        display: flex;
+
+        > h1 {
+            flex: 1;
+        }
+
+        .actions i {
+            color: $primary-contrast-color;
+        }
+    }
+
+    .main-content {
+        display: flex;
+        flex-direction: column;
+        width: 100%;
+        height: $activity-monitor-content-height;
+
+        > .running-activities, > .completed-activities {
+            margin: 0 10px;
+            width: calc(100% - 20px);
+            height: 50%;
+
+            .activity-list {
+                height: 100%;
+            }
+        }
+    }
+}
+

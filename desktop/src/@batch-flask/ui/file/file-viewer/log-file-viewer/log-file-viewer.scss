@@ -1,0 +1,47 @@
+@import "app/styles/variables";
+
+
+bl-log-file-viewer {
+    display: block;
+    position: relative;
+    height: 100%;
+
+    bl-loading {
+        height: 100%;
+
+        .loading-content {
+            height: 100%;
+        }
+    }
+
+    .log-console {
+        position: relative;
+        height: 100%;
+
+        .log-container {
+            height: 100%;
+        }
+
+        .follow-log-btn {
+            position: absolute;
+            z-index: 100;
+            cursor: pointer;
+            right: 20px;
+            top: 40px;
+            background: $secondary-background;
+            color: $primary-text;
+            border-radius: 3px;
+            padding: 2px 4px;
+
+            &.bottom {
+                top: auto;
+                bottom: 0;
+            }
+
+            &.following {
+                background: $success-color;
+                color: $success-contrast-color;
+            }
+        }
+    }
+}

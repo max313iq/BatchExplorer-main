@@ -1,0 +1,42 @@
+@import "app/styles/variables";
+
+bl-toggle-filter-button {
+    position: relative;
+
+    > bl-clickable {
+        display: block;
+        cursor: pointer;
+        border-style: solid;
+        border-width: 1px 1px 1px 0;
+        border-color: $border-color;
+        font-size: 16px;
+        background: $button-basic-bg-color;
+        color: $button-basic-text-color;
+        height: 26px;
+        width: 26px;
+        position: relative;
+        padding-left: 6px;
+        padding-top: 3px;
+
+        &:hover {
+            background: $button-basic-hover-bg-color;
+        }
+
+        &.focus-outline.focus-visible {
+            outline-color: $primary-color;
+        }
+
+        > .filtering {
+            position: absolute;
+            top: 3px;
+            left: 12px;
+            background-color: $primary-color;
+            color: $primary-contrast-color;
+            border-radius: 99%;
+            width: 12px;
+            height: 12px;
+            vertical-align: middle;
+            text-align: center;
+        }
+    }
+}

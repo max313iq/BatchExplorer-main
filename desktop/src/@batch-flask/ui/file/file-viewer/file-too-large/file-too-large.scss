@@ -1,0 +1,31 @@
+@import "app/styles/variables";
+
+bl-file-too-large {
+    display: block;
+    text-align: center;
+    margin-top: 20px;
+
+    h2 {
+        margin-bottom: 20px;
+    }
+
+    bl-button {
+        padding: 10px;
+        cursor: pointer;
+        margin-right: 10px;
+        width: 100px; // both same size looks better
+
+        &:hover {
+            background: $primary-color;
+        }
+
+        &[disabled] {
+            cursor: not-allowed;
+        }
+    }
+
+    .downloading {
+        margin-top: 20px;
+        color: $secondary-text;
+    }
+}

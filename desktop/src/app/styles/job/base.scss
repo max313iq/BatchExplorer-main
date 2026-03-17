@@ -1,0 +1,14 @@
+
+bl-application-preview, bl-task-preview, bl-task-runtime {
+    i {
+        margin-top: 5px;
+    }
+
+    .success {
+        color: map-get($success, 500);
+    }
+
+    .failure {
+        color: $danger-color;
+    }
+}

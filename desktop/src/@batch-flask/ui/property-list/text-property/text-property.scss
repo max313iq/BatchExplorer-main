@@ -1,0 +1,18 @@
+@import "app/styles/variables";
+
+bl-text-property {
+    .clipboard {
+        font-size: 16px;
+        color: $secondary-text;
+        cursor: pointer;
+        margin-left: 5px;
+
+        &:hover {
+            color: $hover-bg-color;
+        }
+
+        &:active {
+            color: $primary-color-light;
+        }
+    }
+}

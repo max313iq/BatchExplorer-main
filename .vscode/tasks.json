@@ -1,0 +1,94 @@
+{
+  // See https://go.microsoft.com/fwlink/?LinkId=733558
+  // for the documentation about the tasks.json format
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "Build all",
+      "type": "npm",
+      "script": "build",
+      "group": {
+        "kind": "build",
+        "isDefault": true
+      },
+      "problemMatcher": [
+        "$tsc"
+      ]
+    },
+    {
+      "label": "Build desktop client",
+      "type": "npm",
+      "script": "build:desktop:client",
+      "problemMatcher": [
+        "$tsc"
+      ],
+      "group": "build"
+    },
+    {
+      "label": "Lint all",
+      "type": "npm",
+      "script": "lint",
+      "problemMatcher": [
+        "$eslint-stylish"
+      ]
+    },
+    {
+      "label": "Start web dev server",
+      "type": "npm",
+      "script": "start:web",
+      "promptOnClose": true,
+      "isBackground": true,
+      "problemMatcher": [
+        {
+          "owner": "typescript",
+          "base": "$tsc-watch",
+          "background": {
+            "activeOnStart": true,
+            "beginsPattern": {
+              "regexp": "Starting compilation.*?"
+            },
+            "endsPattern": {
+              "regexp": "Compiled.*?"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "label": "Start desktop dev server",
+      "type": "npm",
+      "script": "start:desktop",
+      "promptOnClose": true,
+      "isBackground": true,
+      "problemMatcher": [
+        {
+          "owner": "typescript",
+          "base": "$tsc-watch",
+          "background": {
+            "activeOnStart": true,
+            "beginsPattern": {
+              "regexp": "Starting compilation.*?"
+            },
+            "endsPattern": {
+              "regexp": "Compiled.*?"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "label": "Terminate all tasks",
+      "command": "echo ${input:terminate}",
+      "type": "shell",
+      "problemMatcher": []
+    }
+  ],
+  "inputs": [
+    {
+      "id": "terminate",
+      "type": "command",
+      "command": "workbench.action.tasks.terminate",
+      "args": "terminateAll"
+    }
+  ]
+}

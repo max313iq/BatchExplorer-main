@@ -1,0 +1,26 @@
+@import "app/styles/variables";
+
+bl-pool-configuration {
+    // static colors for deprecation warnings
+    .certificate-deprecation-warning {
+        > .warning {
+            background-color: var(--color-warn-50);
+            color: #201f1e;
+
+            > .summary-container {
+
+                &.standard {
+                    height: unset;
+                }
+
+                > .message {
+                    white-space: normal;
+                }
+            }
+        }
+    }
+
+    .certificate-warning-alternative-link {
+        color: var(--color-primary-600);
+    }
+}

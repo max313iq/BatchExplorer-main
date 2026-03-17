@@ -1,0 +1,14 @@
+<div *ngIf="showJson" class="editor-container">
+    <bl-editor [value]="jsonValue" [config]="editorConfig"></bl-editor>
+</div>
+<div *ngIf="!showJson">
+    <ng-content></ng-content>
+</div>
+<div class="toggle-mode" *ngIf="enableJsonView">
+    <bl-button role="tab" type="square" [disabled]="!showJson" (do)="toggleShowJson(false)" [title]="'entity-configuration.viewClassic' | i18n">
+        <i class="fa fa-list-ul" aria-hidden="true"></i>
+    </bl-button>
+    <bl-button role="tab" type="square" [disabled]="showJson" (do)="toggleShowJson(true)" [title]="'entity-configuration.viewAsJSON' | i18n">
+        <i class="fa fa-code" aria-hidden="true"></i>
+    </bl-button>
+</div>

@@ -1,0 +1,83 @@
+<!DOCTYPE html>
+<html>
+
+<head>
+    <link href="./manual-proxy-configuration-window.css" rel="stylesheet" type="text/css">
+</head>
+<script>
+    const { ipcRenderer } = require("electron");
+
+    if (document.readyState === "loading") {
+        document.addEventListener("DOMContentLoaded", loadValues);
+    } else {
+        loadValues();
+    }
+
+    function loadValues() {
+        window.urlEl = document.getElementById("url");
+        window.portEl = document.getElementById("port");
+        window.usernameEl = document.getElementById("username");
+        window.passwordEl = document.getElementById("password");
+
+        ipcRenderer.invoke("proxy-configuration-requested").then((settings) => {
+            if (settings) {
+                window.urlEl.value = settings.url || "";
+                window.portEl.value = settings.port || "";
+                window.usernameEl.value = settings.username || "";
+                window.passwordEl.value = settings.password || "";
+            }
+        }).finally(() => {
+            window.urlEl.disabled = false;
+            window.portEl.disabled = false;
+            window.usernameEl.disabled = false;
+            window.passwordEl.disabled = false;
+            document.getElementById("clear").disabled = false;
+            document.getElementById("save").disabled = false;
+        });
+    }
+
+    function clearConfig() {
+        urlEl.value = "";
+        portEl.value = "";
+        usernameEl.value = "";
+        passwordEl.value = "";
+    }
+
+    function submit() {
+        ipcRenderer.send("proxy-configuration-submitted", {
+            url: window.urlEl.value,
+            port: window.portEl.value,
+            username: window.usernameEl.value,
+            password: window.passwordEl.value,
+        });
+    }
+</script>
+
+<body>
+    <h1>Enter proxy configuration for BatchExplorer</h1>
+    <div class="subtitle">
+        Leave blank for no proxy configuration
+        <button type="reset" class="clear" id="clear" onclick="clearConfig()"
+            autofocus disabled>Clear</button>
+    </div>
+    <div class="form-element">
+        <label for="url">Url</label>
+        <input id="url" placeholder="ex: https://proxy.contoso.com" disabled>
+    </div>
+    <div class="form-element">
+        <label for="port">Port</label>
+        <input id="port" placeholder="ex: 80" disabled>
+    </div>
+    <div class="form-element">
+        <label for="username">Username</label>
+        <input id="username" placeholder="ex: sample_username" disabled>
+    </div>
+    <div class="form-element">
+        <label for="password">Password</label>
+        <input id="password" type="password" placeholder="ex: samplepassword" disabled>
+    </div>
+    <br>
+    <button class="save-button" id="save" onclick="submit()" disabled>Save</button>
+</body>
+
+</html>

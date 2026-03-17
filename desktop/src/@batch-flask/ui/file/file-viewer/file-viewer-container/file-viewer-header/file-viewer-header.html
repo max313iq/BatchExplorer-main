@@ -1,0 +1,31 @@
+<div class="filename" [title]="filename">{{filename}}</div>
+<div class="content-length">
+    <div class="label">File size</div>
+    <div class="value"> {{contentSize}}</div>
+</div>
+<div class="last-modified" [title]="file?.properties?.lastModified">
+    <div class="label">Last modified</div>
+    <div class="value">
+        <bl-date [date]="lastModified"></bl-date>
+    </div>
+</div>
+<div class="actions">
+    <bl-refresh-btn [refresh]="refresh" tooltipPosition="above"></bl-refresh-btn>
+    <bl-download-button *ngIf="config?.downloadEnabled && !actionDisabled" [action]="downloadFile" tooltipPosition="above">
+    </bl-download-button>
+    <bl-button class="open-in-default-app" color="light" [action]="openDefaultEditor" *ngIf="!actionDisabled"
+        title="Open in default application" tooltipPosition="above">
+        <i class="fa fa-external-link" aria-hidden="true"></i>
+    </bl-button>
+    <bl-button class="save" color="light" [action]="save" title="Save" tooltipPosition="above" *ngIf="canSave"
+        [disabled]="actionDisabled">
+        <i class="fa fa-save" aria-hidden="true"></i>
+        <span class="modified-icon" *ngIf="fileViewer?.modified | async">*</span>
+    </bl-button>
+    <ng-container *ngIf="fileViewer?.commands && !actionDisabled">
+        <bl-button *ngFor="let command of fileViewer?.commands;trackBy: trackCommand" [color]="command.color"  [disabled]="actionDisabled"
+            [action]="command.execute" [title]="command.label">
+            <i class="{{command.icon}}" aria-hidden="true"></i>
+        </bl-button>
+    </ng-container>
+</div>

@@ -1,0 +1,27 @@
+@import "app/styles/variables";
+
+bl-activity-monitor-tree-view {
+    $tree-view-header-height: 24px;
+    $tree-view-content-height: calc(100% - 24px);
+    position: relative;
+    display: flex;
+    flex-direction: column;
+    height: 100%;
+
+    .tree-view-content {
+        position: relative;
+        height: $tree-view-content-height;
+    }
+
+    .tree-rows-container {
+        height: 100%;
+
+        bl-virtual-scroll {
+            height: 100%;
+        }
+    }
+
+    .tree-view-error {
+        white-space: pre-line;
+    }
+}

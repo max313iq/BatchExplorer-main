@@ -1,0 +1,19 @@
+<div class="back-nav">
+    <button class="back" (click)="goBack()" title="Back">
+        <i class="fa fa-angle-left" aria-hidden="true"></i>
+    </button>
+    <button class="forward" (click)="goForward()" title="Forward">
+        <i class="fa fa-angle-right" aria-hidden="true"></i>
+    </button>
+</div>
+<a class="menu-item logo" href="#" [routerLink]="['']" title="Batch Explorer - Home">
+    <i class="fa fa-flask" aria-hidden="true"></i>Batch Explorer
+</a>
+<bl-breadcrumb-group>
+</bl-breadcrumb-group>
+<div class="menu-item">
+    <bl-pinned-dropdown></bl-pinned-dropdown>
+</div>
+<div class="menu-item">
+    <bl-sidebar-bookmarks></bl-sidebar-bookmarks>
+</div>

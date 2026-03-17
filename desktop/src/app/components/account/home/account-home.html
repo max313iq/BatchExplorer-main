@@ -1,0 +1,18 @@
+<bl-browse-layout #layout [config]="layoutConfig">
+    <div blBrowseLayoutTitle>
+        Batch Accounts
+    </div>
+    <div blBrowseLayoutButtons>
+        <bl-button icon="fa fa-plus spin-hover" title="Add a batch account" [action]="addBatchAccount" type="plain" color="light" (contextmenu)="addContextMenu()">
+        </bl-button>
+    </div>
+    <div pre-quicksearch>
+        <bl-select placeholder="Subscriptions" [multiple]="true" [formControl]="subscriptionIds" [filterable]="true">
+            <bl-option *ngFor="let subscription of subscriptionService.subscriptions | async;trackBy: trackByFn;let index = index"
+                [value]="subscription.subscriptionId"
+                label="{{subscription.displayName}} ({{subscription.tenant?.displayName}})">
+            </bl-option>
+        </bl-select>
+    </div>
+    <bl-account-list blBrowseLayoutList></bl-account-list>
+</bl-browse-layout>

@@ -1,0 +1,23 @@
+bl-loading-button {
+    button {
+        height: 36px;
+        .fa {
+            font-size: 20px;
+        }
+    }
+}
+
+@keyframes spin-left-then-right {
+    0% {
+        transform: rotate(0);
+    }
+    25% {
+        transform: rotate(-60deg);
+    }
+    75% {
+        transform: rotate(60deg);
+    }
+    100% {
+        transform: rotate(0);
+    }
+}

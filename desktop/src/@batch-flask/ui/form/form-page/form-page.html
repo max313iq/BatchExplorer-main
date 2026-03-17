@@ -1,0 +1,18 @@
+<ng-template>
+    <div class="form-section" *ngFor="let section of sections;trackBy: trackByFn let i = index">
+        <div class="section-title" *ngIf="section.title">
+            <span class="step-index">{{i + 1}}</span>
+            <div class="step-header">
+                <h2>{{section.title}}</h2>
+                <div class="subtitle">{{section.subtitle}}</div>
+            </div>
+        </div>
+        <div class="section-wrapper">
+            <div class="section-bar" *ngIf="section.title">
+            </div>
+            <div class="section-content">
+                <ng-template [ngTemplateOutlet]="section.content"></ng-template>
+            </div>
+        </div>
+    </div>
+</ng-template>

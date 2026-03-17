@@ -1,0 +1,36 @@
+<bl-toolbar>
+    <div toolbarLabel>{{name}}</div>
+    <bl-clickable toolbarAction class="clear-all" [title]="xButtonTitle" (do)="xButtonClicked()">
+        <i class="fa fa-times" aria-hidden="true"></i>
+    </bl-clickable>
+</bl-toolbar>
+<bl-focus-section *ngIf="activities.length > 0"
+    class="tree-view-content"
+    (focus)="setFocus(true)"
+    (blur)="setFocus(false)"
+    (keypress)="handleKeyboardNavigation($event)"
+    (contextmenu)="showContextMenu($event)"
+    tabindex="0">
+
+    <div *ngIf="error" class="tree-view-error">{{error.message}}</div>
+    <div class="tree-rows-container">
+        <bl-virtual-scroll [items]="treeRows" [childHeight]="40" (change)="onViewScroll($event)">
+            <bl-activity-monitor-item *blVirtualRow="let row; let i = index; trackBy: treeRowTrackBy"
+                [activity]="row.activity"
+                [focused]="isFocused && focusedIndex === i + viewPortStart"
+                [flash]="flashIndex === i + viewPortStart"
+                [hovered]="hoveredIndex === i + viewPortStart"
+                [indent]="row.indent"
+                [expanded]="isExpanded(row.id)"
+                [(focusedAction)]="focusedAction"
+                (click)="focusRow(row)"
+                (mouseover)="hoverRow(row)"
+                (mouseleave)="clearHover()"
+                (toggleRowExpand)="toggleRowExpand(row)">
+            </bl-activity-monitor-item>
+        </bl-virtual-scroll>
+    </div>
+</bl-focus-section>
+<div *ngIf="activities.length === 0">
+    No activities to show
+</div>

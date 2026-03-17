@@ -1,0 +1,172 @@
+@import "app/styles/variables";
+
+bl-browse-layout {
+    .layout-list-header {
+        display: flex;
+        margin-top: 5px;
+        padding: 0 13px;
+        align-items: center;
+
+        > .title {
+            text-transform: uppercase;
+            font-size: 14px;
+            color: $headings-color;
+            font-weight: 500;
+        }
+
+        > .actions {
+            font-size: 16px;
+
+            bl-button {
+                height: 24px;
+                width: 24px;
+                line-height: 24px;
+            }
+        }
+    }
+
+    .quick-filter-content {
+        border-bottom: 1px solid $border-color;
+        padding-bottom: 10px;
+    }
+
+    .quicksearch {
+        margin: 0 10px;
+    }
+
+    .context-button-bar {
+        &.left {
+            float: left;
+        }
+    }
+
+    [blBrowseLayoutButtons] {
+        display: inline;
+    }
+    > .layout-container {
+        display: flex;
+        height: $contentview-height;
+
+        .list-view {
+            transition:width 100ms;
+            width: 100%;
+            height: 100%;
+            background-color: $card-background;
+            z-index: 1;
+
+            > .left-pane {
+                display: flex;
+                flex-direction: column;
+                width: 100%;
+                height: 100%;
+
+                .bl-list-content {
+                    flex: 1;
+                    min-height: 100px;
+                    overflow-y: auto;
+                    position: relative;
+                }
+            }
+
+            .header {
+                height: $listview-header-height;
+                padding: 15px 15px 0;
+            }
+
+            .scrollable {
+                height: 100%;
+                overflow-y: hidden;
+
+                &:hover {
+                    overflow-y: auto;
+                }
+            }
+
+            [blbrowselayoutlist] {
+                display: flex;
+                flex-direction: column;
+                height: 100%;
+
+                > .list {
+                    flex: 1 1 auto;
+                    min-height: 100px;
+                    overflow-y: hidden;
+                    height: 100%;
+                }
+            }
+        }
+
+        .content-view {
+            width: 100%;
+            height: 100%;
+            overflow-y: auto;
+            background-color: $main-background;
+
+            position: relative;
+
+            .content-wrapper {
+                padding-left: 5px;
+                padding-top: 0;
+                position: relative;
+            }
+        }
+
+        .quotas {
+            border-top: 1px solid $border-color;
+        }
+    }
+
+    .advanced-filter-content {
+        width: 100%;
+        min-height: 100%;
+        z-index: 100;
+        background: $card-background;
+        padding: 10px;
+    }
+
+}
+
+.batch-explorer.high-contrast bl-browse-layout {
+    .list-view {
+        border-right: 1px solid $border-color;
+    }
+}
+
+.load-more-btn {
+    display: flex;
+    justify-content: center;
+    padding: 5px 0;
+}
+
+.quicksearch {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+
+    > [pre-quicksearch] {
+        min-width: 80px;
+        flex: 1;
+        margin-right: 5px;
+    }
+
+    .bl-form-field-infix {
+        width: auto;
+    }
+
+    > input {
+        flex: 1;
+        padding: 5px;
+        font-size: 1.1em;
+        height: 26px;
+        min-width: 80px;
+
+        &:focus {
+            outline: none;
+        }
+    }
+
+    bl-select {
+        min-width: 50px;
+    }
+}
+

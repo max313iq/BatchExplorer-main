@@ -1,0 +1,67 @@
+@import "app/styles/variables";
+
+bl-monitor-chart {
+    $header-height: 40px;
+    height: 100%;
+    width: 100%;
+
+    display: flex;
+    position: relative;
+    flex-direction: column;
+
+    > .header {
+        padding: 5px 10px;
+        flex-basis: $header-height;
+        display: flex;
+        align-items: center;
+
+        h2 {
+            flex: 1;
+        }
+
+        .aggregation {
+            color: $primary-color;
+            background: $secondary-background;
+            padding: 2px 4px;
+        }
+    }
+
+    > .chart-container {
+        flex: 1;
+        min-height: 10px;
+        padding: 10px 10px 2px;
+    }
+
+    > .legend {
+        flex-shrink: 0;
+        display: flex;
+        justify-content: space-around;
+
+        > .legend-item {
+            text-align: center;
+            flex: 1;
+
+            > .value {
+                color: $secondary-text;
+                font-size: 18px;
+            }
+
+            > .label {
+                color: $secondary-text;
+                font-size: 14px;
+            }
+        }
+    }
+
+    > .interval-label {
+        color: $secondary-text;
+        text-align: center;
+        font-size: 9px;
+    }
+
+    > .monitor-chart-preview {
+        height: 100%;
+        width: 100%;
+        pointer-events: none;
+    }
+}

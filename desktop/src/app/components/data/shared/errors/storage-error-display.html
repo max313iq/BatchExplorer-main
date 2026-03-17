@@ -1,0 +1,4 @@
+<bl-banner *ngIf="hasError" fixMessage="Setup linked storage account" [fix]="setupLinkedStorage" type="warning">
+    <div message *ngIf="!isClassic">{{'storage-error-display.noAutoStorage' | i18n}}</div>
+    <div message *ngIf="isClassic">{{'storage-error-display.isClassic' | i18n}}</div>
+</bl-banner>

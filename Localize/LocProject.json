@@ -1,0 +1,30 @@
+{
+  "Projects": [
+    {
+      "LanguageSet": "Azure_LanguagesExt",
+      "LocItems": [
+        {
+          "SourceFile": "packages\\bonito-core\\i18n\\resources.resjson"
+        },
+        {
+          "SourceFile": "packages\\bonito-ui\\i18n\\resources.resjson"
+        },
+        {
+          "SourceFile": "packages\\playground\\i18n\\resources.resjson"
+        },
+        {
+          "SourceFile": "packages\\react\\i18n\\resources.resjson"
+        },
+        {
+          "SourceFile": "packages\\service\\i18n\\resources.resjson"
+        },
+        {
+          "SourceFile": "desktop\\i18n\\resources.resjson"
+        },
+        {
+          "SourceFile": "web\\i18n\\resources.resjson"
+        }
+      ]
+    }
+  ]
+}

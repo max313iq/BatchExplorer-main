@@ -1,0 +1,12 @@
+{
+  "endOfLine": "auto",
+  "trailingComma": "es5",
+  "overrides": [
+    {
+      "files": ["*.jsonc", "tsconfig.json"],
+      "options": {
+        "trailingComma": "none"
+      }
+    }
+  ]
+}

@@ -1,0 +1,206 @@
+{
+  "version": "0.2.0",
+  "resolveSourceMapLocations": [
+    "${workspaceFolder}/**",
+    "!**/node_modules/**"
+  ],
+  "configurations": [
+    {
+      "name": "Web: Launch",
+      "type": "chrome",
+      "request": "launch",
+      "preLaunchTask": "Start web dev server",
+      "url": "http://127.0.0.1:9000",
+      "webRoot": "${workspaceFolder}/web",
+      "sourceMaps": true,
+      "trace": true,
+      "outFiles": [
+        "${workspaceRoot}/web/lib/**/*.js"
+      ],
+      "postDebugTask": "Terminate all tasks",
+      "presentation": {
+        "group": "Web",
+        "order": 10
+      }
+    },
+    {
+      "name": "Web: Test Watch",
+      "type": "node",
+      "request": "launch",
+      "runtimeArgs": [
+        "--inspect-brk",
+        "./node_modules/.bin/jest",
+        "--runInBand",
+        "--testTimeout=3600000",
+        "--watch"
+      ],
+      "cwd": "${workspaceRoot}/web",
+      "console": "integratedTerminal",
+      "internalConsoleOptions": "neverOpen",
+      "presentation": {
+        "group": "Web",
+        "order": 20
+      }
+    },
+    {
+      "name": "Bonito Core: Test Watch",
+      "type": "node",
+      "request": "launch",
+      "runtimeArgs": [
+        "--inspect-brk",
+        "./node_modules/.bin/jest",
+        "--runInBand",
+        "--testTimeout=3600000",
+        "--watch"
+      ],
+      "cwd": "${workspaceRoot}/packages/bonito-core",
+      "console": "integratedTerminal",
+      "internalConsoleOptions": "neverOpen",
+      "presentation": {
+        "group": "Packages",
+        "order": 10
+      }
+    },
+    {
+      "name": "Bonito UI: Test Watch",
+      "type": "node",
+      "request": "launch",
+      "runtimeArgs": [
+        "--inspect-brk",
+        "./node_modules/.bin/jest",
+        "--runInBand",
+        "--testTimeout=3600000",
+        "--watch"
+      ],
+      "cwd": "${workspaceRoot}/packages/bonito-ui",
+      "console": "integratedTerminal",
+      "internalConsoleOptions": "neverOpen",
+      "presentation": {
+        "group": "Packages",
+        "order": 20
+      }
+    },
+    {
+      "name": "React: Test Watch",
+      "type": "node",
+      "request": "launch",
+      "runtimeArgs": [
+        "--inspect-brk",
+        "./node_modules/.bin/jest",
+        "--runInBand",
+        "--testTimeout=3600000",
+        "--watch"
+      ],
+      "cwd": "${workspaceRoot}/packages/react",
+      "console": "integratedTerminal",
+      "internalConsoleOptions": "neverOpen",
+      "presentation": {
+        "group": "Packages",
+        "order": 20
+      }
+    },
+    {
+      "name": "Service: Test Watch",
+      "type": "node",
+      "request": "launch",
+      "runtimeArgs": [
+        "--inspect-brk",
+        "./node_modules/.bin/jest",
+        "--runInBand",
+        "--testTimeout=3600000",
+        "--watch"
+      ],
+      "cwd": "${workspaceRoot}/packages/service",
+      "console": "integratedTerminal",
+      "internalConsoleOptions": "neverOpen",
+      "presentation": {
+        "group": "Packages",
+        "order": 20
+      }
+    },
+    {
+      "name": "Desktop: Debug Client",
+      "type": "node",
+      "request": "launch",
+      "preLaunchTask": "Start desktop dev server",
+      "program": "${workspaceRoot}/desktop/src/client/main.ts",
+      "stopOnEntry": false,
+      "args": [
+        "--remote-debugging-port=9222",
+        "--nolazy"
+      ],
+      "cwd": "${workspaceRoot}/desktop",
+      "runtimeExecutable": "${workspaceRoot}/desktop/node_modules/.bin/electron",
+      "windows": {
+        "runtimeExecutable": "${workspaceRoot}/desktop/node_modules/.bin/electron.cmd"
+      },
+      "env": {
+        "NODE_ENV": "development",
+        "HOT": "1"
+      },
+      "console": "integratedTerminal",
+      "outputCapture": "std",
+      "sourceMaps": true,
+      "outFiles": [
+        "${workspaceRoot}/desktop/build/**/*.js"
+      ],
+      "postDebugTask": "Terminate all tasks",
+      "presentation": {
+        "group": "Desktop",
+        "order": 30
+      }
+    },
+    {
+      "name": "Desktop: Attach Debugger to Render Process",
+      "type": "chrome",
+      "request": "attach",
+      "port": 9222,
+      "sourceMaps": true,
+      "trace": true,
+      "url": "file://*",
+      "webRoot": "${workspaceRoot}/build",
+      "timeout": 300000,
+      "presentation": {
+        "group": "Desktop",
+        "order": 40
+      }
+    },
+    {
+      "name": "Desktop: Test Client",
+      "type": "node",
+      "request": "launch",
+      "program": "${workspaceRoot}/test/client/run-jasmine.js",
+      "cwd": "${workspaceRoot}",
+      "runtimeExecutable": "node",
+      "runtimeArgs": [
+        "--nolazy"
+      ],
+      "env": {
+        "NODE_ENV": "test"
+      },
+      "presentation": {
+        "group": "Desktop",
+        "order": 20
+      },
+      "skipFiles": [
+        "<node_internals>/**",
+        "${workspaceFolder}/node_modules/**"
+      ]
+    }
+  ],
+  "compounds": [
+    {
+      "name": "Desktop: Launch",
+      "configurations": [
+        "Desktop: Debug Client",
+        "Desktop: Attach Debugger to Render Process"
+      ],
+      "stopAll": true,
+      "presentation": {
+        "hidden": false,
+        "group": "Desktop",
+        "order": 10
+      }
+    }
+  ]
+}

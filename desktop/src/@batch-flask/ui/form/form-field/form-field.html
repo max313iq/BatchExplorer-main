@@ -1,0 +1,27 @@
+
+
+<div class="label-container">
+    <label class="bl-form-field-label"
+        [attr.for]="control.id"
+        [attr.aria-owns]="control.id">
+        {{control.placeholder}}
+        <sup class="required" *ngIf="control.required">
+            <i class="fa fa-asterisk" aria-hidden="true"></i>
+        </sup>
+    </label>
+</div>
+<div class="input-container">
+    <div class="input-prefix" *ngIf="prefix.length > 0">
+        <ng-content select="[blFormFieldPrefix]"></ng-content>
+    </div>
+    <ng-content></ng-content>
+    <div class="input-suffix"  *ngIf="suffix.length > 0">
+        <ng-content select="[blFormFieldSuffix]"></ng-content>
+    </div>
+</div>
+<div class="hints-container" aria-live="polite">
+    <ng-content select="bl-hint"></ng-content>
+</div>
+<div class="errors-container" aria-live="assertive">
+    <ng-content select="bl-error"></ng-content>
+</div>

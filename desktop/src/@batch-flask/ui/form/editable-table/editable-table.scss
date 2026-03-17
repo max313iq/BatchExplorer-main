@@ -1,0 +1,122 @@
+@import "app/styles/variables";
+
+bl-editable-table, .editable-table {
+    table {
+        margin-bottom: 15px;
+        border-collapse: collapse;
+        width: 100%;
+        table-layout: fixed;
+
+        thead {
+            text-align: left;
+            color: $primary-text;
+            font-size: 12px;
+            font-weight: 200;
+
+            th {
+                padding: 0 5px;
+            }
+        }
+
+        tr:last-child > td {
+            background: $input-disabled-background-color;
+            filter: opacity(0.9);
+
+            bl-select .select-button-container {
+                background: $input-disabled-background-color;
+            }
+        }
+
+        td {
+            background: $input-background-color;
+            border: 1px solid $border-color;
+            padding: 0;
+            margin: 0;
+            height: 20px;
+            font-size: 12px;
+            line-height: 0;
+        }
+
+        td.action-column, th.action-column {
+            width: 26px;
+        }
+
+        input, .bl-form-field {
+            width: 100%;
+            border: none;
+            outline: none;
+            color: $input-text-color;
+            border-bottom: 2px solid transparent;
+            background: transparent;
+
+            &:focus {
+                background: $input-background-color;
+                -color-input-background: $input-background-color;
+
+                border-bottom: 2px solid $primary-color;
+            }
+        }
+
+        .bl-form-field > .mat-input-wrapper {
+            padding: 0;
+
+            .mat-input-infix {
+                border-top: 0;
+                padding: 0;
+            }
+
+            .mat-input-underline {
+                display: none;
+            }
+        }
+
+        input {
+            padding: 5px;
+            font-size: 12px;
+        }
+
+        bl-select {
+            .select-button-container .select-button:not(:focus) {
+                border: 1px solid transparent;
+            }
+        }
+
+        .delete-item-btn {
+            width: 26px;
+            height: 26px;
+            background: none;
+            text-align: center;
+            margin: 0;
+            padding: 0;
+            border: 0;
+            cursor: pointer;
+            display:  flex;
+            align-items: center;
+            justify-content: center;
+
+            > .fa {
+                color: $danger-color;
+            }
+
+            &:focus, &:hover {
+                outline: none;
+                background: $danger-color;
+                > .fa {
+                    color: $danger-contrast-color;
+                }
+            }
+
+            &:active {
+                background: $danger-color;
+                > .fa {
+                    color: $danger-contrast-color;
+                }
+            }
+        }
+    }
+
+    .add-item-btn {
+        display: block;
+        margin: 10px auto;
+    }
+}
