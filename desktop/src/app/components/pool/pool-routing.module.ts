@@ -1,9 +1,14 @@
 import { NgModule } from "@angular/core";
 import { RouterModule, Routes } from "@angular/router";
+import { PoolControlWorkbenchComponent } from "app/components/workbench";
 import { PoolDefaultComponent, PoolDetailsComponent } from "./details";
 import { PoolHomeComponent } from "./home/pool-home.component";
 
 const routes: Routes = [
+    {
+        path: "workbench",
+        component: PoolControlWorkbenchComponent,
+    },
     {
         path: "",
         component: PoolHomeComponent,

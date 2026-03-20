@@ -1,0 +1,64 @@
+{
+  "name": "batch-explorer-full-auto",
+  "version": "1.0.0",
+  "productName": "BatchExplorer Full Auto",
+  "description": "Batch Explorer Full Auto - Bulk pool and node creation for Azure Batch",
+  "main": "main.js",
+  "author": "BatchExplorer",
+  "license": "MIT",
+  "scripts": {
+    "start": "electron .",
+    "pack": "electron-builder --dir",
+    "dist": "electron-builder",
+    "dist:win": "electron-builder --win",
+    "dist:linux": "electron-builder --linux",
+    "dist:all": "electron-builder --win --linux"
+  },
+  "build": {
+    "appId": "com.batchexplorer.fullauto",
+    "productName": "BatchExplorer Full Auto",
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "main.js",
+      "preload.js",
+      "app/**/*",
+      "resources/**/*"
+    ],
+    "win": {
+      "icon": "resources/icon.png",
+      "target": [
+        {
+          "target": "portable",
+          "arch": ["x64"]
+        },
+        {
+          "target": "nsis",
+          "arch": ["x64"]
+        }
+      ]
+    },
+    "nsis": {
+      "oneClick": true,
+      "perMachine": false,
+      "allowToChangeInstallationDirectory": false,
+      "installerIcon": "resources/icon.png"
+    },
+    "portable": {
+      "artifactName": "BatchExplorer-FullAuto-${version}-portable.exe"
+    },
+    "linux": {
+      "category": "Development",
+      "icon": "resources/icon.png",
+      "target": [
+        "AppImage",
+        "deb"
+      ]
+    }
+  },
+  "devDependencies": {
+    "electron": "^29.3.1",
+    "electron-builder": "^24.13.3"
+  }
+}

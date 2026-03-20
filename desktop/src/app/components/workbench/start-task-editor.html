@@ -1,0 +1,55 @@
+<div class="start-task-editor" [formGroup]="form">
+    <h3>Start task editor</h3>
+
+    <div class="editor-grid">
+        <label for="scope">Apply scope</label>
+        <select id="scope" formControlName="scope">
+            <option value="current">Current pool</option>
+            <option value="selected">Selected pools</option>
+            <option value="all">All pools</option>
+        </select>
+
+        <label for="command-line">Command line</label>
+        <textarea id="command-line"
+            formControlName="commandLine"
+            rows="3"
+            placeholder="cmd /c echo hello">
+        </textarea>
+        <div class="validation" *ngIf="commandLineInvalid">Start task command line is required.</div>
+
+        <label for="wait-for-success">Wait for success</label>
+        <input id="wait-for-success" type="checkbox" formControlName="waitForSuccess" />
+
+        <label for="max-retry">Max task retry count</label>
+        <input id="max-retry" type="number" formControlName="maxTaskRetryCount" />
+
+        <label for="resource-files-json">Resource files (JSON array)</label>
+        <textarea id="resource-files-json"
+            formControlName="resourceFilesJson"
+            rows="4"
+            placeholder="[{ &quot;autoStorageContainerName&quot;: &quot;mycontainer&quot;, &quot;filePath&quot;: &quot;setup.ps1&quot; }]"
+        >
+        </textarea>
+        <div class="validation" *ngIf="parsingError">{{ parsingError }}</div>
+    </div>
+
+    <div class="scope-summary">
+        Affected pools: {{ affectedPoolCount }}
+    </div>
+
+    <div class="actions">
+        <button type="button" (click)="preview()">Preview</button>
+        <button type="button" (click)="beginApply()" [disabled]="affectedPoolCount === 0">Apply</button>
+    </div>
+
+    <div class="confirm-box" *ngIf="confirmationPending">
+        <p>
+            You are applying this start task to {{ affectedPoolCount }} pool(s).
+            This may trigger node restarts depending on operational policy.
+        </p>
+        <div class="confirm-actions">
+            <button type="button" (click)="confirmApply()">Confirm</button>
+            <button type="button" (click)="cancelApply()">Cancel</button>
+        </div>
+    </div>
+</div>

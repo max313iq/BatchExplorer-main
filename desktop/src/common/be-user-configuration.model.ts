@@ -8,6 +8,10 @@ export interface BEUserConfiguration extends BatchFlaskUserConfiguration {
 
     externalBrowserAuth: boolean;
 
+    features: {
+        poolControlWorkbench: boolean,
+    };
+
     subscriptions: {
         ignore: string[],
     };
@@ -36,7 +40,28 @@ export interface BEUserConfiguration extends BatchFlaskUserConfiguration {
 
     tenants: {
         [tenantId: string]: "active" | "inactive"
-    }
+    };
+
+    poolControlWorkbench: {
+        discovery: {
+            includeNodeCountsInMasterTable: boolean,
+            maxPoolsPerAccountPerPage: number,
+        },
+        refresh: {
+            autoRefreshEnabled: boolean,
+            autoRefreshIntervalSeconds: number,
+        },
+        throttling: {
+            concurrency: number,
+            delayMsBetweenRequests: number,
+            retryAttempts: number,
+            retryBackoffSeconds: number[],
+        },
+        safety: {
+            requireConfirmationsForDestructiveActions: boolean,
+            maxNodeRemoveBatchSize: number,
+        },
+    };
 }
 
 export const DEFAULT_BE_USER_CONFIGURATION: BEUserConfiguration = {
@@ -45,6 +70,9 @@ export const DEFAULT_BE_USER_CONFIGURATION: BEUserConfiguration = {
     },
     subscriptions: {
         ignore: [],
+    },
+    features: {
+        poolControlWorkbench: false,
     },
     tenants: {},
     update: {
@@ -60,6 +88,26 @@ export const DEFAULT_BE_USER_CONFIGURATION: BEUserConfiguration = {
     githubData: {
         repo: "Azure/BatchExplorer-data",
         branch: "master",
+    },
+    poolControlWorkbench: {
+        discovery: {
+            includeNodeCountsInMasterTable: true,
+            maxPoolsPerAccountPerPage: 1000,
+        },
+        refresh: {
+            autoRefreshEnabled: false,
+            autoRefreshIntervalSeconds: 30,
+        },
+        throttling: {
+            concurrency: 1,
+            delayMsBetweenRequests: 250,
+            retryAttempts: 5,
+            retryBackoffSeconds: [2, 4, 8, 16, 32],
+        },
+        safety: {
+            requireConfirmationsForDestructiveActions: true,
+            maxNodeRemoveBatchSize: 100,
+        },
     },
     theme: "classic",
     externalBrowserAuth: true

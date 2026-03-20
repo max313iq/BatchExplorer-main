@@ -8,7 +8,7 @@ import {
     IDropdownStyles,
 } from "@fluentui/react/lib/Dropdown";
 import * as React from "react";
-import { BrowserRouter, Route, Routes } from "react-router-dom";
+import { HashRouter, Route, Routes } from "react-router-dom";
 import { AppRoot } from "./layout/app-root";
 import { Footer } from "./layout/footer";
 import { Header } from "./layout/header";
@@ -17,6 +17,7 @@ import { Stack, IStackTokens } from "@fluentui/react/lib/Stack";
 import { PrimaryButton } from "@fluentui/react/lib/Button";
 import { translate } from "@azure/bonito-core";
 import { ThemeName } from "@azure/bonito-ui/lib/theme";
+import { AutoDashboard } from "./auto-ops";
 
 //DefaultButton
 const dropdownStyles: Partial<IDropdownStyles> = {
@@ -50,20 +51,54 @@ export const Application: React.FC = () => {
 
     return (
         <AppRoot theme={theme}>
-            <BrowserRouter>
+            <HashRouter>
                 <Header>
                     <Stack horizontal tokens={stackTokens}>
                         <PrimaryButton
                             text={translate("application.buttons.home")}
-                            href="/"
+                            href="#/"
                         ></PrimaryButton>
                         <PrimaryButton
                             text={translate("application.buttons.editor")}
-                            href="/editor"
+                            href="#/editor"
                         ></PrimaryButton>
                         <PrimaryButton
                             text={translate("application.buttons.playground")}
-                            href="/playground"
+                            href="#/playground"
+                        ></PrimaryButton>
+                        <PrimaryButton
+                            text="Full Auto"
+                            href="#/auto"
+                            iconProps={{ iconName: "Rocket" }}
+                            styles={{
+                                root: {
+                                    background:
+                                        "linear-gradient(90deg, #0078d4, #6b2fa0)",
+                                    border: "none",
+                                },
+                                rootHovered: {
+                                    background:
+                                        "linear-gradient(90deg, #005a9e, #5a2690)",
+                                    border: "none",
+                                },
+                            }}
+                        ></PrimaryButton>
+                        <PrimaryButton
+                            text="Full Auto"
+                            href="/auto"
+                            iconProps={{ iconName: "Rocket" }}
+                            styles={{
+                                root: {
+                                    background:
+                                        "linear-gradient(90deg, #0078d4, #6b2fa0)",
+                                    border: "none",
+                                },
+                                rootHovered: {
+                                    background:
+                                        "linear-gradient(90deg, #005a9e, #5a2690)",
+                                    border: "none",
+                                },
+                            }}
                         ></PrimaryButton>
 
                         <Dropdown
@@ -106,11 +141,15 @@ export const Application: React.FC = () => {
                                 />
                             }
                         />
+                        <Route
+                            path="/auto"
+                            element={<AutoDashboard />}
+                        />
                         <Route path="/" element={<CertificatePage />} />
                     </Routes>
                 </Main>
                 <Footer />
-            </BrowserRouter>
+            </HashRouter>
         </AppRoot>
     );
 };
