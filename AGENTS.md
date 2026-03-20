@@ -1,265 +1,657 @@
-# AGENTS.md — BatchExplorer Advanced Control Workbench
+# AGENTS.md
 
-## 🎯 Project Goal
+## Mission
 
-Upgrade Azure BatchExplorer into a full operational control panel supporting:
+Upgrade **BatchExplorer** into a production-grade **Pool Control Workbench**.
 
-* All subscriptions
-* All batch accounts
-* All regions
+Target scope:
 
-The system must behave like a professional dashboard (similar to Azure Portal), not a simple tool.
+- all subscriptions
+- all existing Azure Batch accounts
+- all regions represented by those Batch accounts
 
----
-
-## 🧠 Core Engineering Rules (CRITICAL)
-
-### 1. Change Discipline
-
-* Modify ONLY one logical feature per task
-* Do NOT refactor unrelated code
-* Do NOT change architecture unless explicitly requested
+Do not auto-create Batch accounts.  
+Do not break existing flows.  
+Reuse existing repo patterns for UI, services, config, auth, and testing.
 
 ---
 
-### 2. Full File Rule
+## Execution Mode
 
-* ALWAYS return FULL FILES
-* NEVER return partial snippets
-* Output must be copy-paste ready
-
----
-
-### 3. Backward Compatibility (MANDATORY)
-
-* Do NOT break existing BatchExplorer features
-* Extend, do NOT replace existing logic
-* Preserve:
-
-  * existing services
-  * existing UI flows
-  * existing APIs
+- Work on **exactly one phase** per run: `P0` to `P9`
+- Do **not** continue to the next phase automatically
+- Do **not** widen scope beyond the current phase
+- Stop immediately on build failure or test failure
+- Preserve backward compatibility at every phase
 
 ---
 
-### 4. Anti-429 Discipline (VERY IMPORTANT)
+## Response Contract
 
-Azure APIs are sensitive to rate limits.
+For every phase, return output in this exact order:
 
-You MUST:
+1. **Executive Summary**
+   - 3 to 5 sentences
+   - first person
+   - explain what I checked or changed and why
 
-* Avoid burst requests
-* Default to sequential execution
-* Use bounded concurrency (max 2 unless specified)
-* Implement:
+2. **Changed Files**
+   - repo-relative paths only
+   - if no changes: `None`
 
-  * retry logic
-  * exponential backoff
-* Never spam:
+3. **Full Files**
+   - output only full contents of new or modified files
+   - never output partial snippets
+   - if no changes: `None`
 
-  * resize
-  * removeNodes
-  * pool creation
+4. **Validation**
+   - for code-changing phases, run:
+     - `npm run build:desktop`
+     - `npm run test:desktop`
+   - report results
+   - stop
 
----
+### P0 exception
 
-### 5. State Machine Design
+For `P0`, output only:
 
-All workflows must follow:
+- Executive Summary
+- Changed Files: `None`
+- Full Files: `None`
+- plan, service-boundary validation, extension points, compatibility notes, and risks
 
-* ensure → act → wait → verify → fix → repeat
-
-No random or uncontrolled execution.
-
----
-
-### 6. Error Handling
-
-Every operation must:
-
-* catch errors
-* classify errors:
-
-  * quota
-  * transient
-  * fatal
-* decide:
-
-  * retry
-  * stop
-  * skip
+`P0` makes **no code changes**.
 
 ---
 
-### 7. Loop Safety
+## Non-Negotiable Rules
 
-* Every loop must have:
-
-  * timeout OR max attempts
-* No infinite loops
-* Polling must be controlled
-
----
-
-### 8. Performance Safety
-
-* No global parallel execution across all accounts
-* Per-account operations must be sequential
-* Global concurrency must be limited
+- Change **one logical area** per phase
+- Extend behavior; do not replace working behavior
+- Keep existing flows working
+- Use repo-native patterns before adding new patterns
+- No uncontrolled loops
+- No uncontrolled fan-out
+- No burst traffic across subscriptions, accounts, or regions
+- Do not eagerly load node lists during discovery
+- Lazy-load nodes only when needed by the UI
 
 ---
 
-### 9. Clean Code Standards
+## Anti-429 Rules
 
-* Clear naming
-* Small reusable functions
-* No duplicated logic
-* Readable structure
+All new multi-account and multi-region logic must follow these rules:
 
----
+- default execution is sequential
+- concurrency must be bounded and config-driven
+- apply pacing delay between scheduled requests
+- honor `Retry-After` when present
+- otherwise use exponential backoff
+- add jitter to backoff
+- retry only throttling/transient failures selectively
+- never use uncontrolled `Promise.all` across discovered accounts
+- never do burst discovery or burst mutations
 
-## 🧩 System Architecture (HIGH LEVEL)
+Baseline execution policy:
 
-### UI Layer
-
-* Master Table (all pools)
-* Detail Panel
-* Start Task Editor
-* Bulk Actions
-* Monitoring Panel
-
-### Service Layer
-
-* MultiAccountDiscoveryService
-* PoolDeploymentService
-* NodeManagementService
-* StartTaskService
-* RetryManager
-* ThrottlingController
+```yaml
+execution:
+  concurrency: 1
+  retryAttempts: 5
+  retryBackoffSeconds: [2, 4, 8, 16, 32]
+```
 
 ---
 
-## 🤖 Multi-Agent System (10 Agents)
+## Azure Batch Constraints
 
-### Agent 1 — Master Table UI
+Enforce these in code and docs:
 
-* Build global pool table
-* Add filtering system
-* Add alert indicators
+1. Resize only when pool `allocationState === "steady"`
+   - otherwise expect `409`
 
-### Agent 2 — Pool Actions
+2. `remove-nodes` accepts at most **100 node IDs per request**
+   - large removals must be chunked
 
-* Implement row actions:
-  resize, delete, clone, recreate, export
+3. Quotas vary by region and subscription
+   - quota may be `0`
+   - quota failure must stop the relevant action and be summarized
 
-### Agent 3 — Node Management
-
-* Node list
-* Node actions:
-  remove, reboot, reimage, scheduling
-
-### Agent 4 — Bulk Operations
-
-* Multi-select actions
-* Apply actions across pools
-
-### Agent 5 — Start Task System
-
-* Global Start Task editor
-* Apply to:
-  single / selected / all pools
-
-### Agent 6 — Deployment Engine
-
-* Cross-account execution
-* Zero-node → incremental scaling
-
-### Agent 7 — Anti-429 Controller
-
-* Retry + backoff
-* Concurrency control
-
-### Agent 8 — Monitoring System
-
-* Live progress
-* Current operation tracking
-
-### Agent 9 — Summary System
-
-* Final results table
-* Stop reasons + metrics
-
-### Agent 10 — Testing & Stability
-
-* Unit tests
-* Integration tests
-* Failure scenarios
+4. All polling must have:
+   - timeout
+   - max attempts
 
 ---
 
-## 🚦 Deployment Rules
+## Decision Log Baseline
 
-* Always start pools with target = 0
-* Increase gradually: 1 → 2 → ...
-* Stop on:
+Use this baseline unless the current phase explicitly changes it.
 
-  * quota error
-  * fatal error
-* Record last successful target
+```yaml
+features:
+  multiRegionPoolBootstrap: false
 
----
+scope:
+  includeExistingBatchAccountsOnly: true
+  autoCreateBatchAccountsPerRegion: false
 
-## 🧠 Node Policy
+pool:
+  idPattern: "bootstrap-{location}-{yyyyMMdd-HHmm}-{rand4}"
+  nodeType: dedicated
+  vmSize: Standard_D2s_v3
+  image: UbuntuLTS
+  maxTargetPerAccount: 20
 
-* idle → OK
-* creating/starting → wait
-* startTaskFailed/unusable → remove
-* running → wait 3 cycles → manual review
+execution:
+  concurrency: 1
+  provisioningTimeoutMinutes: 20
+  waitForIdleTimeoutMinutes: 10
+  retryAttempts: 5
+  retryBackoffSeconds: [2, 4, 8, 16, 32]
 
----
-
-## 📊 UI Requirements
-
-* Must look like Azure Portal-level dashboard
-* Must show:
-
-  * all node states
-  * all actions
-  * all errors
-* No hidden operations
-
----
-
-## ⚠️ Forbidden Actions
-
-* Do NOT:
-
-  * rewrite entire project
-  * break existing features
-  * introduce unsafe parallelism
-  * ignore Azure limits
+policy:
+  runningNodeAction: manual-review-after-3-polls
+  cleanupAfterRun: false
+```
 
 ---
 
-## 🧾 Output Rules
+## Authoritative Repo Files
 
-Every response MUST:
+Use these files as the primary extension points.
 
-* Return FULL FILES
-* No explanations unless requested
-* No partial patches
+### Configuration
+
+- `desktop/src/common/be-user-configuration.model.ts`
+- `desktop/src/client/core/user-configuration/main-configuration-store.ts`
+
+### Azure Batch HTTP
+
+- `desktop/src/app/services/azure-batch/core/batch-http.service.ts`
+
+### ARM account discovery
+
+- `desktop/src/app/services/batch-account/arm-batch-account.service.ts`
+
+### Existing pool and node services
+
+- `desktop/src/app/services/azure-batch/pool/pool.service.ts`
+- `desktop/src/app/services/azure-batch/node/node.service.ts`
+
+### Supported images pattern
+
+- `desktop/src/app/services/azure-batch/pool-os/pool-os.service.ts`
+
+### Models and DTOs
+
+- `desktop/src/app/models/azure-batch/node/node.ts`
+- `desktop/src/app/models/azure-batch/pool/pool.ts`
+- `desktop/src/app/models/dtos/pool-create/pool-create.dto.ts`
+
+### Entry point and UI hook
+
+- `desktop/src/app/components/pool/home/pool-home.component.ts`
+- `desktop/src/app/components/pool/home/pool-home.component.html`
+
+### Test harness
+
+- `desktop/karma.conf.js`
 
 ---
 
-## 🧠 Decision Priority
+## Required Configuration Shape
 
-Always choose:
+Add these configuration fields without breaking existing config consumers.
 
-* SAFE over FAST
-* STABLE over AGGRESSIVE
-* SIMPLE over COMPLEX
+```ts
+features: {
+  poolControlWorkbench: boolean
+  multiRegionPoolBootstrap: boolean
+}
+
+poolControlWorkbench: {
+  throttling: {
+    concurrency: number
+    delayMs: number
+    retryAttempts: number
+    retryBackoffSeconds: number[]
+    jitterPct: number
+  }
+  refresh: {
+    autoRefreshEnabled: boolean
+    autoRefreshIntervalSeconds: number
+  }
+}
+```
 
 ---
 
-You are acting as a senior Azure engineer working on a production system.
-Follow these rules strictly.
+## Required Service Behavior
+
+### Batch HTTP
+
+Add account-aware data-plane requests in:
+
+- `desktop/src/app/services/azure-batch/core/batch-http.service.ts`
+
+Required method:
+
+```ts
+public requestForAccount(account: BatchAccount, method: any, uri?: any, options?: any): Observable<any>
+```
+
+Rules:
+
+- keep existing `request()` unchanged
+- use existing auth patterns
+- support existing account types
+- preserve current callers
+
+Reference shape:
+
+```ts
+public requestForAccount(account: BatchAccount, method: any, uri?: any, options?: any): Observable<any> {
+  options = this._addApiVersion(uri, options)
+  const url = this._computeUrl(uri, account)
+  const auth$ = account instanceof ArmBatchAccount
+    ? this._setupRequestForArm(account, options)
+    : this._setupRequestForSharedKey(account as any, method, url, options)
+
+  return auth$.pipe(
+    mergeMap(opts => super.request(method, url, opts).pipe(retryWhen(a => this.retryWhen(a)))),
+    shareReplay(1)
+  )
+}
+```
+
+### Scheduler
+
+All multi-account and bulk work must go through a scheduler service.
+
+Rules:
+
+- default concurrency `1`
+- pacing delay
+- exponential backoff
+- honor `Retry-After`
+- bounded retries
+- no unbounded queue growth
+- produce stable, testable behavior
+
+### Discovery
+
+Discovery must:
+
+- enumerate existing Batch accounts across subscriptions
+- aggregate pool-level counts
+- not fetch nodes for every pool
+- lazy-load nodes only when a user opens details or selects a row
+
+### Workbench UI
+
+Workbench must:
+
+- be behind a feature flag
+- add a navigation entry from pool home
+- keep the existing button and flow
+- provide master table, filters, selection, detail panel, and progress/summary views
+
+---
+
+## Required Helper Patterns
+
+### Bootstrap pool create DTO
+
+```ts
+function buildBootstrapPoolCreateDto(
+  poolId: string,
+  vmSize: string,
+  nodeAgentSKUId: string,
+  imageRef: any
+): PoolCreateDto {
+  return new PoolCreateDto({
+    id: poolId,
+    vmSize,
+    targetDedicatedNodes: 0,
+    enableAutoScale: false,
+    virtualMachineConfiguration: {
+      nodeAgentSKUId,
+      imageReference: imageRef
+    },
+    startTask: {
+      commandLine: '/bin/bash -c "echo bootstrap-ok"',
+      waitForSuccess: true
+    }
+  } as any)
+}
+```
+
+### Remove-nodes chunking
+
+```ts
+const chunk = (xs, n = 100) =>
+  Array.from({ length: Math.ceil(xs.length / n) }, (_, i) => xs.slice(i * n, i * n + n))
+
+async function removeNodesChunked(account, poolId, nodeIds) {
+  for (const part of chunk(nodeIds, 100)) {
+    await post(`/pools/${poolId}/removenodes`, { nodeList: part })
+  }
+}
+```
+
+### Resize and poll discipline
+
+```ts
+for target = 1..maxTarget:
+  await waitUntil(pool.allocationState === "steady", provisioningTimeout)
+  await retryBackoff(() => resizePool(target))
+  await pollUntil(
+    () => poolSteady && currentDedicatedNodes == target && allNodesIdle,
+    waitForIdleTimeout
+  )
+  if quota/resize failure:
+    stopReason = "quota-or-resize-failure"
+    break
+```
+
+---
+
+## Required Summary Model
+
+Use a per-account summary model for orchestrated actions.
+
+```ts
+export interface PerAccountSummary {
+  subscriptionId: string
+  accountId: string
+  location: string
+  poolId?: string
+  lastSuccessfulTarget: number
+  stopReason?: string
+  retries: number
+  startedAt: string
+  finishedAt?: string
+  errors: any[]
+}
+```
+
+---
+
+## Phase Plan
+
+Run these phases in order.  
+Complete **only the requested phase**.
+
+### P0 — Scan and validate only
+
+Inspect:
+
+- `desktop/src/common/be-user-configuration.model.ts`
+- `desktop/src/client/core/user-configuration/main-configuration-store.ts`
+- `desktop/src/app/services/azure-batch/core/batch-http.service.ts`
+- `desktop/src/app/services/batch-account/arm-batch-account.service.ts`
+- `desktop/src/app/services/azure-batch/pool/pool.service.ts`
+- `desktop/src/app/services/azure-batch/node/node.service.ts`
+- `desktop/src/app/services/azure-batch/pool-os/pool-os.service.ts`
+- `desktop/src/app/models/azure-batch/node/node.ts`
+- `desktop/src/app/models/azure-batch/pool/pool.ts`
+- `desktop/src/app/models/dtos/pool-create/pool-create.dto.ts`
+- `desktop/src/app/components/pool/home/pool-home.component.ts`
+- `desktop/src/app/components/pool/home/pool-home.component.html`
+- `desktop/karma.conf.js`
+
+Output:
+
+- service boundaries
+- extension points
+- compatibility notes
+- risks
+- phase-by-phase implementation plan
+
+Do **not** change code in `P0`.
+
+### P1 — Feature flags and config defaults
+
+Primary target:
+
+- `desktop/src/common/be-user-configuration.model.ts`
+
+Validate merge behavior in:
+
+- `desktop/src/client/core/user-configuration/main-configuration-store.ts`
+
+### P2 — Account-aware Batch HTTP and scheduler
+
+Primary targets:
+
+- `desktop/src/app/services/azure-batch/core/batch-http.service.ts`
+- new scheduler service files under `desktop/src/app/services/workbench/`
+
+### P3 — Discovery service
+
+Create:
+
+- `workbench-discovery.service.ts`
+
+Requirements:
+
+- aggregate accounts and pools
+- anti-429 safe
+- no eager node enumeration
+
+### P4 — Workbench route and main component
+
+Create:
+
+- workbench route
+- main workbench component
+
+Update:
+
+- `desktop/src/app/components/pool/home/pool-home.component.ts`
+- `desktop/src/app/components/pool/home/pool-home.component.html`
+
+Requirements:
+
+- feature-flagged navigation
+- keep current button
+- table, filters, selection
+
+### P5 — Detail panel and node actions
+
+Add:
+
+- lazy node list
+- node actions service or extensions
+
+Requirements:
+
+- fetch nodes only when needed
+- preserve current node flows
+
+### P6 — Pool actions, row actions, bulk actions, export
+
+Add:
+
+- pool action service or extensions
+- row actions
+- bulk actions
+- export JSON
+
+Requirements:
+
+- enforce steady-state resize rules
+- summarize per-account outcomes
+
+### P7 — Start Task editor and apply service
+
+Add:
+
+- Start Task editor
+- apply-to-current
+- apply-to-selected
+- apply-to-all
+
+### P8 — Multi-region bootstrap orchestrator
+
+Add:
+
+- orchestrator service
+- stepwise bootstrap flow
+- remediation and summary
+
+Requirements:
+
+- existing accounts only
+- no account auto-create
+- 0-node create
+- step resize
+- idle verification
+- stop on quota or resize failure
+
+### P9 — Tests, docs, and workflow
+
+Add tests, docs, diagrams, and GitHub Actions workflow.
+
+---
+
+## Required Tests
+
+Add these by `P9`:
+
+- `desktop/src/app/services/workbench/request-scheduler.spec.ts`
+- `desktop/src/app/services/workbench/chunking.spec.ts`
+- `desktop/src/app/services/workbench/discovery.spec.ts`
+- `desktop/src/app/services/workbench/actions.spec.ts`
+- `desktop/src/app/components/workbench/pool-control-workbench.component.spec.ts`
+
+Test intent:
+
+- scheduler concurrency, pacing, backoff, `Retry-After`
+- remove-nodes chunk size max 100
+- discovery aggregates and lazy node loading
+- correct endpoint construction
+- steady-state resize handling
+- table render, filters, multiselect, action enable/disable
+
+---
+
+## Documentation Requirements
+
+Document these in `P9`:
+
+### Permissions
+
+- minimum RBAC: **Azure Batch Data Contributor** or higher on each Batch account
+- account discovery permissions vary by org policy
+
+### Data-plane APIs used
+
+- `/supportedimages`
+- `/pools`
+- `/pools/{id}/resize`
+- `/pools/{id}/stopresize`
+- `/pools/{id}/nodes`
+- `/pools/{id}/removenodes`
+- node ops:
+  - reboot
+  - reimage
+  - enable scheduling
+  - disable scheduling
+
+### Constraints
+
+- resize only when allocation state is steady
+- remove-nodes max 100 IDs per request
+- quotas vary and may be 0
+- throttling requires backoff and `Retry-After`
+
+### Mermaid diagrams
+
+```mermaid
+flowchart LR
+ UI[Workbench UI] --> DISC[DiscoverySvc] --> SCHED[RequestScheduler] --> HTTP[AzureBatchHttpService.requestForAccount] --> BATCH[Batch Data Plane]
+ UI --> ACTS[Pool/Node/StartTask Actions] --> SCHED
+ DISC --> ARM[ArmBatchAccountService] --> ARMAPI[Azure RM]
+```
+
+```mermaid
+flowchart TB
+ LOAD[Discover accounts+pools] --> TABLE[Master table+filters]
+ TABLE --> DETAIL[Detail panel (lazy nodes)]
+ TABLE --> ROWA[Row actions] --> EXEC[Scheduler+action services]
+ TABLE --> BULK[Bulk actions] --> EXEC
+ EXEC --> MON[Live progress] --> SUM[Final summary]
+```
+
+---
+
+## Required Workflow for P9
+
+Create the GitHub Actions workflow with this behavior:
+
+- manual dispatch
+- install dependencies
+- install Codex CLI
+- run `P0` through `P9` sequentially
+- run desktop build and desktop tests after each phase
+- stop on failure
+
+Reference workflow:
+
+```yaml
+name: codex-workbench
+
+on:
+  workflow_dispatch: {}
+
+jobs:
+  codex:
+    runs-on: ubuntu-latest
+    env:
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      AZURE_CREDENTIALS: ${{ secrets.AZURE_CREDENTIALS }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - run: npm ci
+      - run: npm i -g @openai/codex
+
+      - name: Run P0..P9
+        run: |
+          for p in P0 P1 P2 P3 P4 P5 P6 P7 P8 P9; do
+            codex exec --full-auto --ask-for-approval never --sandbox workspace-write "$(cat prompts/$p.txt)"
+            npm run build:desktop
+            npm run test:desktop
+          done
+```
+
+---
+
+## Final Discipline
+
+- Never output partial code for changed files
+- Never skip validation after code changes
+- Never continue past the current phase
+- Never replace working flows when extension is sufficient
+- Never ignore throttling constraints
+- Never leave polling unbounded
+- Never exceed Azure Batch remove-nodes request limits
+- Never resize a pool unless allocation state is steady
+
+---
+
+## First Task
+
+Start with **P0** only.
+
+- scan the exact files listed in `P0`
+- confirm service boundaries
+- identify extension points
+- provide plan and validation only
+- make no code changes
