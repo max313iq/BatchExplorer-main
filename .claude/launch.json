@@ -1,0 +1,23 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "desktop-dev-server",
+      "runtimeExecutable": "npm.cmd",
+      "runtimeArgs": ["run", "dev-server"],
+      "port": 3178
+    },
+    {
+      "name": "web-dev-server",
+      "runtimeExecutable": "npm.cmd",
+      "runtimeArgs": ["run", "start:dev"],
+      "port": 9000
+    },
+    {
+      "name": "karma-test-runner",
+      "runtimeExecutable": "npm.cmd",
+      "runtimeArgs": ["run", "test-app"],
+      "port": 9876
+    }
+  ]
+}
