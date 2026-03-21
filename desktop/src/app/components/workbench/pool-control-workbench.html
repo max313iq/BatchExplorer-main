@@ -50,6 +50,14 @@
                 </select>
             </label>
 
+            <label>
+                Status
+                <select [(ngModel)]="statusFilter" (ngModelChange)="applyFilters()">
+                    <option value="">All</option>
+                    <option *ngFor="let status of statusOptions" [value]="status">{{status}}</option>
+                </select>
+            </label>
+
             <label class="search">
                 Search
                 <input type="text" [(ngModel)]="searchFilter" (ngModelChange)="applyFilters()" placeholder="pool id, account, region">
@@ -68,6 +76,12 @@
             </button>
             <button mat-stroked-button type="button" (click)="bulkResizeSelected()" [disabled]="selectedCount === 0">
                 Resize selected
+            </button>
+            <button mat-stroked-button type="button" (click)="bulkApplyStartTaskSelected()" [disabled]="selectedCount === 0">
+                Apply start task
+            </button>
+            <button mat-stroked-button type="button" (click)="bulkRestartNodesSelected()" [disabled]="selectedCount === 0">
+                Restart nodes
             </button>
             <button mat-stroked-button type="button" (click)="cleanupBootstrapPools()" [disabled]="displayedRows.length === 0">
                 Cleanup bootstrap pools
@@ -99,29 +113,45 @@
             </bl-column>
 
             <bl-column name="poolId">
-                <div *blHeadCellDef>Pool</div>
+                <div *blHeadCellDef>Pool ID</div>
                 <div *blCellDef="let row">{{row.poolId}}</div>
             </bl-column>
 
             <bl-column name="allocationState">
-                <div *blHeadCellDef>Allocation</div>
+                <div *blHeadCellDef>Allocation state</div>
                 <div *blCellDef="let row">{{row.allocationState}}</div>
             </bl-column>
 
             <bl-column name="nodeCounts">
-                <div *blHeadCellDef>Node counts</div>
+                <div *blHeadCellDef>Node counts (total/by state)</div>
                 <div *blCellDef="let row">
-                    Idle: {{row.nodeCountsByState.idle}}
-                    Running: {{row.nodeCountsByState.running}}
-                    Starting: {{row.nodeCountsByState.starting}}
-                    StartTaskFailed: {{row.nodeCountsByState.startTaskFailed}}
-                    Unusable: {{row.nodeCountsByState.unusable}}
+                    <div class="node-counts-cell">
+                        <strong>Total: {{row.nodeCountsByState.total}}</strong>
+                        <span>Idle: {{row.nodeCountsByState.idle}}</span>
+                        <span>Running: {{row.nodeCountsByState.running}}</span>
+                        <span>Starting: {{row.nodeCountsByState.starting}}</span>
+                        <span>StartTaskFailed: {{row.nodeCountsByState.startTaskFailed}}</span>
+                        <span>Unusable: {{row.nodeCountsByState.unusable}}</span>
+                    </div>
+                </div>
+            </bl-column>
+
+            <bl-column name="quotaStatus">
+                <div *blHeadCellDef>Quota status</div>
+                <div *blCellDef="let row">
+                    <span class="quota-pill" [ngClass]="quotaStatusClass(row)">
+                        {{quotaStatusLabel(row)}}
+                    </span>
                 </div>
             </bl-column>
 
             <bl-column name="alerts">
-                <div *blHeadCellDef>Alerts</div>
-                <div *blCellDef="let row">{{row.alerts.length > 0 ? row.alerts.join(', ') : 'None'}}</div>
+                <div *blHeadCellDef>Alert indicators</div>
+                <div *blCellDef="let row">
+                    <span class="alert-indicator" [ngClass]="{ 'has-alerts': row.alerts.length > 0 }" [title]="row.alerts.join(', ')">
+                        {{alertIndicatorLabel(row)}}
+                    </span>
+                </div>
             </bl-column>
 
             <bl-column name="actions">
@@ -129,8 +159,11 @@
                 <div *blCellDef="let row">
                     <button mat-button type="button" (click)="resizeRow(row)" [disabled]="isRowBusy(row)">Resize</button>
                     <button mat-button type="button" (click)="stopResizeRow(row)" [disabled]="isRowBusy(row)">Stop</button>
+                    <button mat-button type="button" (click)="cloneRow(row)" [disabled]="isRowBusy(row)">Clone</button>
+                    <button mat-button type="button" (click)="recreateRow(row)" [disabled]="isRowBusy(row)">Recreate</button>
+                    <button mat-button type="button" (click)="applyStartTaskRow(row)" [disabled]="isRowBusy(row)">Apply start task</button>
                     <button mat-button type="button" (click)="deleteRow(row)" [disabled]="isRowBusy(row)">Delete</button>
-                    <button mat-button type="button" (click)="exportRow(row)" [disabled]="isRowBusy(row)">Export</button>
+                    <button mat-button type="button" (click)="exportRow(row)" [disabled]="isRowBusy(row)">Export config JSON</button>
                 </div>
             </bl-column>
         </bl-table>
@@ -145,11 +178,17 @@
             <pre>{{exportedJson}}</pre>
         </div>
 
+        <div class="export-json" *ngIf="perAccountOutcomes.length > 0">
+            <h3>Per-account outcomes</h3>
+            <pre>{{perAccountOutcomes | json}}</pre>
+        </div>
+
         <div class="start-task-section">
             <h3>Start task rollout</h3>
             <bl-start-task-editor
                 [currentTarget]="currentTarget"
                 [selectedTargets]="selectedTargets"
+                [displayedTargets]="displayedTargets"
                 [allTargets]="allTargets"
                 (previewRequested)="handleStartTaskPreview($event)"
                 (applyRequested)="handleStartTaskApply($event)">

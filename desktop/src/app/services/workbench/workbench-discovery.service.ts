@@ -1,14 +1,15 @@
 import { HttpParams } from "@angular/common/http";
-import { Injectable } from "@angular/core";
+import { Injectable, Optional } from "@angular/core";
 import { HttpCode } from "@batch-flask/core";
 import { log } from "@batch-flask/utils";
 import { ArmBatchAccount, BatchAccount, PoolAllocationState } from "app/models";
 import { AzureBatchHttpService, BatchListResponse } from "app/services/azure-batch/core";
 import { ArmBatchAccountService, BatchAccountService, LocalBatchAccountService } from "app/services/batch-account";
 import { SubscriptionService } from "app/services/subscription";
-import { from, Observable, of } from "rxjs";
+import { EMPTY, from, Observable, of } from "rxjs";
 import { catchError, concatMap, expand, map, reduce, switchMap, take } from "rxjs/operators";
-import { WorkbenchAccountRef, WorkbenchPoolRow } from "./workbench-types";
+import { RequestScheduler } from "./request-scheduler";
+import { WorkbenchAccountRef, WorkbenchPoolRow, WorkbenchQuotaStatus } from "./workbench-types";
 
 export type WorkbenchErrorClass = "quota" | "transient" | "fatal";
 
@@ -47,20 +48,19 @@ interface BatchPoolNodeCounts {
     lowPriority: WorkbenchNodeCountsByState;
 }
 
-interface QuotaStatus {
-    used: number;
-    quota: number;
-}
-
 @Injectable({ providedIn: "root" })
 export class WorkbenchDiscoveryService {
+    private scheduler: RequestScheduler;
+
     constructor(
         private subscriptionService: SubscriptionService,
         private batchAccountService: BatchAccountService,
         private armBatchAccountService: ArmBatchAccountService,
         private localBatchAccountService: LocalBatchAccountService,
         private batchHttp: AzureBatchHttpService,
+        @Optional() scheduler?: RequestScheduler,
     ) {
+        this.scheduler = scheduler || new RequestScheduler();
     }
 
     public listAccounts(): Observable<WorkbenchAccountRef[]> {
@@ -123,28 +123,25 @@ export class WorkbenchDiscoveryService {
         return this._listPoolSummaries(account).pipe(
             switchMap((poolSummaries) => {
                 return this._getAllPoolNodeCounts(account).pipe(
-                    switchMap((countsByPool) => {
-                        return this._getQuotaStatus(account).pipe(
-                            map((quota) => {
-                                return poolSummaries.map((pool) => {
-                                    const nodeCounts = countsByPool.get(pool.id) || this._emptyNodeCounts();
-                                    return {
-                                        subscriptionId: account instanceof ArmBatchAccount
-                                            ? account.subscriptionId || "unknown-subscription"
-                                            : "local",
-                                        accountId: account.id,
-                                        accountName: account.displayName || account.name,
-                                        location: account instanceof ArmBatchAccount
-                                            ? account.location || "unknown-region"
-                                            : "local",
-                                        poolId: pool.id,
-                                        allocationState: pool.allocationState || "unknown",
-                                        nodeCountsByState: nodeCounts,
-                                        alerts: this._buildAlerts(pool, nodeCounts, quota),
-                                    };
-                                });
-                            }),
-                        );
+                    map((countsByPool) => {
+                        return poolSummaries.map((pool) => {
+                            const nodeCounts = countsByPool.get(pool.id) || this._emptyNodeCounts();
+                            return {
+                                subscriptionId: account instanceof ArmBatchAccount
+                                    ? account.subscriptionId || "unknown-subscription"
+                                    : "local",
+                                accountId: account.id,
+                                accountName: account.displayName || account.name,
+                                location: account instanceof ArmBatchAccount
+                                    ? account.location || "unknown-region"
+                                    : "local",
+                                poolId: pool.id,
+                                allocationState: pool.allocationState || "unknown",
+                                nodeCountsByState: nodeCounts,
+                                quotaStatus: this._unknownQuotaStatus(),
+                                alerts: this._buildAlerts(pool, nodeCounts),
+                            };
+                        });
                     }),
                 );
             }),
@@ -156,7 +153,7 @@ export class WorkbenchDiscoveryService {
             .set("$select", "id,allocationState")
             .set("maxresults", "200");
 
-        return this.batchHttp.requestForAccount(
+        return this._requestForAccountScheduled<BatchListResponse<BatchPoolSummary>>(
             account,
             "GET",
             "/pools",
@@ -164,8 +161,8 @@ export class WorkbenchDiscoveryService {
         ).pipe(
             expand((response: BatchListResponse<BatchPoolSummary>) => {
                 return response && response["odata.nextLink"]
-                    ? this.batchHttp.requestForAccount(account, "GET", response["odata.nextLink"])
-                    : of(null);
+                    ? this._requestForAccountScheduled(account, "GET", response["odata.nextLink"])
+                    : EMPTY;
             }),
             reduce((allPools: BatchPoolSummary[], response: BatchListResponse<BatchPoolSummary>) => {
                 if (!response || !Array.isArray(response.value)) {
@@ -177,7 +174,7 @@ export class WorkbenchDiscoveryService {
     }
 
     private _getAllPoolNodeCounts(account: BatchAccount): Observable<Map<string, WorkbenchNodeCountsByState>> {
-        return this.batchHttp.requestForAccount(
+        return this._requestForAccountScheduled<BatchListResponse<BatchPoolNodeCounts>>(
             account,
             "GET",
             "/nodecounts",
@@ -185,8 +182,8 @@ export class WorkbenchDiscoveryService {
         ).pipe(
             expand((response) => {
                 return response && response["odata.nextLink"]
-                    ? this.batchHttp.requestForAccount(account, "GET", response["odata.nextLink"])
-                    : of(null);
+                    ? this._requestForAccountScheduled(account, "GET", response["odata.nextLink"])
+                    : EMPTY;
             }),
             reduce((allItems: BatchPoolNodeCounts[], response: BatchListResponse<BatchPoolNodeCounts>) => {
                 if (!response || !Array.isArray(response.value)) {
@@ -213,13 +210,11 @@ export class WorkbenchDiscoveryService {
     }
 
     private _loadAccounts(): Observable<BatchAccount[]> {
-        return this.subscriptionService.load().pipe(
-            switchMap(() => this.subscriptionService.subscriptions.pipe(take(1))),
-            switchMap((subscriptions) => {
-                return from(subscriptions.toArray()).pipe(
+        return this._loadSubscriptionsScheduled().pipe(
+            switchMap((subscriptions: any[]) => {
+                return from(subscriptions).pipe(
                     concatMap((subscription) => {
-                        return this.armBatchAccountService.list(subscription.subscriptionId).pipe(
-                            map((accounts) => accounts.toArray()),
+                        return this._listArmAccountsScheduled(subscription.subscriptionId).pipe(
                             catchError((error) => {
                                 const classified = this.classifyError(error);
                                 log.error(
@@ -236,10 +231,9 @@ export class WorkbenchDiscoveryService {
                 );
             }),
             switchMap((armAccounts) => {
-                return this.localBatchAccountService.load().pipe(
-                    switchMap(() => this.localBatchAccountService.accounts.pipe(take(1))),
+                return this._loadLocalAccountsScheduled().pipe(
                     map((localAccounts) => {
-                        return [...armAccounts, ...localAccounts.toArray()];
+                        return this._dedupeAccounts([...armAccounts, ...localAccounts]);
                     }),
                     catchError((error) => {
                         const classified = this.classifyError(error);
@@ -247,7 +241,7 @@ export class WorkbenchDiscoveryService {
                             `[WorkbenchDiscovery] loading local accounts failed: ${classified.category} - ${classified.message}`,
                             error,
                         );
-                        return of(armAccounts);
+                        return of(this._dedupeAccounts(armAccounts));
                     }),
                 );
             }),
@@ -263,34 +257,15 @@ export class WorkbenchDiscoveryService {
     }
 
     private _resolveAccount(accountRef: WorkbenchAccountRef): Observable<BatchAccount> {
-        return this.batchAccountService.get(accountRef.accountId).pipe(
+        return this._schedule(
+            `resolve-account:${accountRef.accountId}`,
+            () => this.batchAccountService.get(accountRef.accountId).toPromise(),
+        ).pipe(
             map((account) => {
                 if (!account) {
                     throw new Error(`Batch account ${accountRef.accountId} not found`);
                 }
                 return account;
-            }),
-        );
-    }
-
-    private _getQuotaStatus(account: BatchAccount): Observable<QuotaStatus | null> {
-        if (!(account instanceof ArmBatchAccount) || !account.subscription || !account.location) {
-            return of(null);
-        }
-        return this.armBatchAccountService.accountQuota(account.subscription, account.location).pipe(
-            map((quota) => {
-                if (!quota) {
-                    return null;
-                }
-                return {
-                    used: quota.used,
-                    quota: quota.quota,
-                };
-            }),
-            catchError((error) => {
-                const classified = this.classifyError(error);
-                log.warn(`[WorkbenchDiscovery] quota lookup failed for ${account.id}`, classified);
-                return of(null);
             }),
         );
     }
@@ -330,10 +305,7 @@ export class WorkbenchDiscoveryService {
         };
     }
 
-    private _buildAlerts(
-        pool: BatchPoolSummary,
-        nodeCounts: WorkbenchNodeCountsByState,
-        quota: QuotaStatus | null): string[] {
+    private _buildAlerts(pool: BatchPoolSummary, nodeCounts: WorkbenchNodeCountsByState): string[] {
         const alerts: string[] = [];
 
         if (pool.allocationState === PoolAllocationState.resizing || pool.allocationState === PoolAllocationState.stopping) {
@@ -345,10 +317,66 @@ export class WorkbenchDiscoveryService {
         if (nodeCounts.unusable > 0 || nodeCounts.unknown > 0) {
             alerts.push("Nodes with unusable or unknown state");
         }
-        if (quota && quota.quota >= 0 && quota.used >= quota.quota) {
-            alerts.push("Batch account quota reached");
-        }
         return alerts;
+    }
+
+    private _loadSubscriptionsScheduled(): Observable<any[]> {
+        return this._schedule("load-subscriptions", async () => {
+            await this.subscriptionService.load().toPromise();
+            const subscriptions = await this.subscriptionService.subscriptions.pipe(take(1)).toPromise();
+            return subscriptions ? subscriptions.toArray() : [];
+        });
+    }
+
+    private _loadLocalAccountsScheduled(): Observable<BatchAccount[]> {
+        return this._schedule("load-local-accounts", async () => {
+            await this.localBatchAccountService.load().toPromise();
+            const localAccounts = await this.localBatchAccountService.accounts.pipe(take(1)).toPromise();
+            return localAccounts ? localAccounts.toArray() : [];
+        });
+    }
+
+    private _listArmAccountsScheduled(subscriptionId: string): Observable<ArmBatchAccount[]> {
+        return this._schedule(
+            `list-arm-accounts:${subscriptionId}`,
+            async () => {
+                const accounts = await this.armBatchAccountService.list(subscriptionId).toPromise();
+                return accounts ? accounts.toArray() : [];
+            },
+        );
+    }
+
+    private _requestForAccountScheduled<T>(account: BatchAccount, method: any, uri?: any, options?: any): Observable<T> {
+        return this._schedule(
+            this._accountScheduleKey(account),
+            () => this.batchHttp.requestForAccount(account, method, uri, options).toPromise(),
+        );
+    }
+
+    private _dedupeAccounts(accounts: BatchAccount[]): BatchAccount[] {
+        const byId = new Map<string, BatchAccount>();
+        for (const account of accounts) {
+            const id = (account && account.id ? account.id : "").toLowerCase();
+            if (!id) {
+                continue;
+            }
+            if (!byId.has(id)) {
+                byId.set(id, account);
+            }
+        }
+        return [...byId.values()];
+    }
+
+    private _unknownQuotaStatus(): WorkbenchQuotaStatus {
+        return { state: "unknown" };
+    }
+
+    private _accountScheduleKey(account: BatchAccount): string {
+        return `account:${account && account.id ? account.id : (account && account.url ? account.url : "unknown-account")}`;
+    }
+
+    private _schedule<T>(key: string, fn: () => Promise<T>): Observable<T> {
+        return from(this.scheduler.run(key, fn));
     }
 
     private _emptyNodeCounts(): WorkbenchNodeCountsByState {

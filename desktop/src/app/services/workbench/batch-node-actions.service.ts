@@ -1,9 +1,10 @@
 import { HttpHeaders, HttpParams } from "@angular/common/http";
-import { Injectable } from "@angular/core";
+import { Injectable, Optional } from "@angular/core";
 import { HttpRequestOptions } from "@batch-flask/core";
 import { Node } from "app/models";
 import { AzureBatchHttpService } from "app/services/azure-batch/core";
 import { Observable, from } from "rxjs";
+import { RequestScheduler } from "./request-scheduler";
 
 export type NodeActionClassification = "quota" | "transient" | "fatal";
 
@@ -47,9 +48,38 @@ export interface BulkNodeActionResult {
     results: NodeActionResult[];
 }
 
+export interface PoolStartTaskSummary {
+    commandLine: string;
+    waitForSuccess: boolean;
+    maxTaskRetryCount: number;
+    environmentSettingsCount: number;
+    resourceFilesCount: number;
+    userIdentity: string;
+}
+
+export interface PoolConfigurationSummary {
+    id: string;
+    vmSize: string;
+    allocationState: string;
+    currentDedicatedNodes: number;
+    targetDedicatedNodes: number;
+    currentLowPriorityNodes: number;
+    targetLowPriorityNodes: number;
+    taskSlotsPerNode: number;
+    enableAutoScale: boolean;
+    nodeAgentSKUId: string;
+    imageReference: string;
+    startTask: PoolStartTaskSummary;
+}
+
 interface BatchListResponse<TEntity> {
     value: TEntity[];
     "odata.nextLink"?: string;
+}
+
+interface PoolStateResponse {
+    id?: string;
+    allocationState?: string;
 }
 
 @Injectable({ providedIn: "root" })
@@ -59,14 +89,29 @@ export class BatchNodeActionsService {
     private readonly _retryBackoffSeconds = [2, 4, 8, 16, 32];
     private readonly _retryJitterPercent = 0.2;
 
-    constructor(private http: AzureBatchHttpService) { }
+    private scheduler: RequestScheduler;
+
+    constructor(
+        private http: AzureBatchHttpService,
+        @Optional() scheduler?: RequestScheduler,
+    ) {
+        this.scheduler = scheduler || new RequestScheduler();
+    }
 
     public listNodes(account: unknown, poolId: string): Observable<Node[]> {
         return from(this._listNodes(account, poolId));
     }
 
+    public getPoolConfiguration(account: unknown, poolId: string): Observable<PoolConfigurationSummary> {
+        return from(this._getPoolConfiguration(account, poolId));
+    }
+
     public removeNodes(account: unknown, poolId: string, nodeIds: string[]): Observable<BulkNodeActionResult> {
         return from(this._removeNodes(account, poolId, nodeIds));
+    }
+
+    public restartPoolNodes(account: unknown, poolId: string): Observable<BulkNodeActionResult> {
+        return from(this._restartPoolNodes(account, poolId));
     }
 
     public rebootNode(account: unknown, poolId: string, nodeId: string): Observable<NodeActionResult> {
@@ -183,9 +228,50 @@ export class BatchNodeActionsService {
         return nodes;
     }
 
+    private async _getPoolConfiguration(account: unknown, poolId: string): Promise<PoolConfigurationSummary> {
+        const select = [
+            "id",
+            "vmSize",
+            "allocationState",
+            "currentDedicatedNodes",
+            "targetDedicatedNodes",
+            "currentLowPriorityNodes",
+            "targetLowPriorityNodes",
+            "taskSlotsPerNode",
+            "enableAutoScale",
+            "virtualMachineConfiguration",
+            "startTask",
+        ].join(",");
+
+        const params = new HttpParams().set("$select", select);
+        const responseResult = await this._requestWithRetry<any>(
+            () => this._requestForAccount<any>(account, "GET", `/pools/${poolId}`, { params }),
+            false,
+        );
+        const pool = responseResult.result || {};
+        const vmConfig = pool.virtualMachineConfiguration || {};
+        const imageReference = vmConfig.imageReference || {};
+
+        return {
+            id: `${pool.id || poolId}`,
+            vmSize: `${pool.vmSize || "-"}`,
+            allocationState: `${pool.allocationState || "unknown"}`,
+            currentDedicatedNodes: this._toNonNegativeNumber(pool.currentDedicatedNodes),
+            targetDedicatedNodes: this._toNonNegativeNumber(pool.targetDedicatedNodes),
+            currentLowPriorityNodes: this._toNonNegativeNumber(pool.currentLowPriorityNodes),
+            targetLowPriorityNodes: this._toNonNegativeNumber(pool.targetLowPriorityNodes),
+            taskSlotsPerNode: this._toNonNegativeNumber(pool.taskSlotsPerNode, 1),
+            enableAutoScale: Boolean(pool.enableAutoScale),
+            nodeAgentSKUId: `${vmConfig.nodeAgentSKUId || "-"}`,
+            imageReference: this._toImageReference(imageReference),
+            startTask: this._toStartTaskSummary(pool.startTask),
+        };
+    }
+
     private async _removeNodes(account: unknown, poolId: string, nodeIds: string[]): Promise<BulkNodeActionResult> {
         const startedAt = new Date().toISOString();
         const uniqueNodeIds = Array.from(new Set(nodeIds.filter((x) => Boolean(x))));
+        await this._ensurePoolSteady(account, poolId);
         const chunks = this._chunk(uniqueNodeIds, this._maxRemoveNodesPerRequest);
         const results: NodeActionResult[] = [];
 
@@ -226,6 +312,14 @@ export class BatchNodeActionsService {
         }
 
         return this._bulkResult("removeNodes", poolId, uniqueNodeIds.length, startedAt, results);
+    }
+
+    private async _restartPoolNodes(account: unknown, poolId: string): Promise<BulkNodeActionResult> {
+        const nodes = await this._listNodes(account, poolId);
+        const nodeIds = nodes.map((node) => node.id).filter((id) => Boolean(id));
+        return this._runNodeActionInSequence("rebootNodes", account, poolId, nodeIds, (nodeId) => {
+            return this.rebootNode(account, poolId, nodeId);
+        });
     }
 
     private async _nodeAction(
@@ -307,7 +401,9 @@ export class BatchNodeActionsService {
         if (typeof requestForAccount !== "function") {
             throw new Error("AzureBatchHttpService.requestForAccount is required for workbench multi-account operations.");
         }
-        return requestForAccount.call(this.http, account, method, uri, options).toPromise();
+        return this.scheduler.run(this._accountKey(account), async () => {
+            return requestForAccount.call(this.http, account, method, uri, options).toPromise();
+        });
     }
 
     private async _requestWithRetry<T>(
@@ -405,12 +501,75 @@ export class BatchNodeActionsService {
         return typeof error?.__attempt === "number" ? error.__attempt : 1;
     }
 
+    private _toImageReference(imageReference: any): string {
+        const publisher = imageReference?.publisher;
+        const offer = imageReference?.offer;
+        const sku = imageReference?.sku;
+        const version = imageReference?.version;
+
+        if (publisher || offer || sku || version) {
+            const values = [publisher, offer, sku, version].filter((x) => Boolean(x));
+            return values.join("/");
+        }
+
+        return imageReference?.virtualMachineImageId || "-";
+    }
+
+    private _toStartTaskSummary(startTask: any): PoolStartTaskSummary {
+        const userIdentity = startTask?.userIdentity || {};
+        const autoUser = userIdentity?.autoUser || {};
+        const userName = userIdentity?.userName || autoUser?.scope || autoUser?.elevationLevel || "-";
+
+        return {
+            commandLine: `${startTask?.commandLine || "-"}`,
+            waitForSuccess: startTask?.waitForSuccess !== false,
+            maxTaskRetryCount: this._toNonNegativeNumber(startTask?.maxTaskRetryCount, 0),
+            environmentSettingsCount: Array.isArray(startTask?.environmentSettings) ? startTask.environmentSettings.length : 0,
+            resourceFilesCount: Array.isArray(startTask?.resourceFiles) ? startTask.resourceFiles.length : 0,
+            userIdentity: `${userName}`,
+        };
+    }
+
+    private _toNonNegativeNumber(value: any, fallback = 0): number {
+        const parsed = Number(value);
+        return Number.isFinite(parsed) && parsed >= 0 ? parsed : fallback;
+    }
+
     private _chunk(values: string[], size: number): string[][] {
         const chunks: string[][] = [];
         for (let index = 0; index < values.length; index += size) {
             chunks.push(values.slice(index, index + size));
         }
         return chunks;
+    }
+
+    private async _ensurePoolSteady(account: unknown, poolId: string): Promise<void> {
+        const response = await this._requestForAccount<PoolStateResponse>(
+            account,
+            "GET",
+            `/pools/${encodeURIComponent(poolId)}`,
+            { params: { "$select": "id,allocationState" } },
+        );
+
+        const allocationState = String(response?.allocationState || "").toLowerCase();
+        if (allocationState !== "steady") {
+            const error: any = new Error(
+                `Pool '${poolId}' is not in steady allocation state (current: '${response?.allocationState || "unknown"}').`,
+            );
+            error.code = "PoolNotSteady";
+            error.status = 400;
+            throw error;
+        }
+    }
+
+    private _accountKey(account: any): string {
+        if (account?.id) {
+            return String(account.id);
+        }
+        if (account?.url) {
+            return String(account.url);
+        }
+        return "unknown-account";
     }
 
     private async _sleep(ms: number): Promise<void> {

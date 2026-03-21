@@ -65,6 +65,16 @@ export interface StartTaskApplyProgress {
     summary?: StartTaskApplySummary;
 }
 
+const START_TASK_TEMPLATE_TOKENS = [
+    "subscriptionId",
+    "accountId",
+    "accountName",
+    "location",
+    "poolId",
+] as const;
+
+type StartTaskTemplateToken = typeof START_TASK_TEMPLATE_TOKENS[number];
+
 @Injectable({ providedIn: "root" })
 export class StartTaskApplyService {
     private scheduler: RequestScheduler;
@@ -231,6 +241,8 @@ export class StartTaskApplyService {
         const commandLine = request.startTask && request.startTask.commandLine;
         if (typeof commandLine !== "string" || commandLine.trim().length === 0) {
             errors.push("Start task commandLine is required.");
+        } else {
+            errors.push(...this._validateCommandLineTemplate(commandLine));
         }
         if (!request.confirmationAccepted && !request.dryRun) {
             errors.push("Confirmation is required before applying start task changes.");
@@ -252,15 +264,92 @@ export class StartTaskApplyService {
             throw new Error("AzureBatchHttpService.requestForAccount is not available.");
         }
 
+        const renderedStartTask: Partial<StartTaskDto> = {
+            ...startTask,
+            commandLine: this._renderCommandLineTemplate(startTask.commandLine, target),
+        };
+
         await this.scheduler.run(target.accountId, async () => {
             await requestForAccount.call(
                 this.batchHttp,
                 account as BatchAccount,
                 "PATCH",
                 `/pools/${encodeURIComponent(target.poolId)}`,
-                { body: this._buildPatchBody(startTask) },
+                { body: this._buildPatchBody(renderedStartTask) },
             ).toPromise();
         });
+    }
+
+    private _validateCommandLineTemplate(commandLine: string): string[] {
+        const errors: string[] = [];
+        const allowedTokens = new Set<string>(START_TASK_TEMPLATE_TOKENS);
+        let cursor = 0;
+
+        while (cursor < commandLine.length) {
+            const openIndex = commandLine.indexOf("{{", cursor);
+            const closeIndex = commandLine.indexOf("}}", cursor);
+
+            if (closeIndex !== -1 && (openIndex === -1 || closeIndex < openIndex)) {
+                errors.push("Invalid commandLine template: unexpected '}}'.");
+                break;
+            }
+
+            if (openIndex === -1) {
+                break;
+            }
+
+            const endIndex = commandLine.indexOf("}}", openIndex + 2);
+            if (endIndex === -1) {
+                errors.push("Invalid commandLine template: missing closing '}}'.");
+                break;
+            }
+
+            const token = commandLine.slice(openIndex + 2, endIndex).trim();
+            if (!token) {
+                errors.push("Invalid commandLine template: token name is empty.");
+            } else if (!/^[a-zA-Z][\w]*$/.test(token)) {
+                errors.push(`Invalid commandLine template token '${token}'.`);
+            } else if (!allowedTokens.has(token)) {
+                errors.push(
+                    `Unsupported commandLine template token '${token}'. `
+                    + `Allowed tokens: ${START_TASK_TEMPLATE_TOKENS.join(", ")}.`,
+                );
+            }
+
+            cursor = endIndex + 2;
+        }
+
+        return errors;
+    }
+
+    private _renderCommandLineTemplate(
+        commandLine: string | undefined,
+        target: StartTaskApplyTarget): string | undefined {
+
+        if (typeof commandLine !== "string") {
+            return commandLine;
+        }
+
+        return commandLine.replace(/\{\{\s*([a-zA-Z][\w]*)\s*\}\}/g, (_match, token: string) => {
+            return this._resolveTemplateToken(token as StartTaskTemplateToken, target);
+        });
+    }
+
+    private _resolveTemplateToken(token: StartTaskTemplateToken, target: StartTaskApplyTarget): string {
+        switch (token) {
+            case "subscriptionId":
+                return target.subscriptionId || "";
+            case "accountId":
+                return target.accountId || "";
+            case "accountName":
+                return target.accountName || "";
+            case "location":
+                return target.location || "";
+            case "poolId":
+                return target.poolId || "";
+            default:
+                return "";
+        }
     }
 
     private _buildPatchBody(startTask: Partial<StartTaskDto>) {

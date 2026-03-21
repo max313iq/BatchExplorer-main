@@ -5,13 +5,16 @@ import { TableConfig } from "@batch-flask/ui";
 import { BatchAccount } from "app/models";
 import { BatchAccountService } from "app/services/batch-account";
 import {
+    BatchNodeActionsService,
     BatchPoolActionsService,
+    PerAccountSummary,
     StartTaskApplyProgress,
     StartTaskApplyRequest,
     StartTaskApplyService,
     StartTaskApplyTarget,
     WorkbenchDiscoveryService,
     WorkbenchPoolRow,
+    WorkbenchQuotaStatus,
 } from "app/services/workbench";
 import { BEUserConfiguration } from "common";
 import { Subject, Subscription, timer } from "rxjs";
@@ -53,6 +56,7 @@ export class PoolControlWorkbenchComponent implements OnInit, OnDestroy {
     public actionError: string | null = null;
     public bulkSummary: string | null = null;
     public exportedJson: string | null = null;
+    public perAccountOutcomes: PerAccountSummary[] = [];
 
     public selection = new ListSelection();
     public allRows: WorkbenchPoolTableRow[] = [];
@@ -62,12 +66,14 @@ export class PoolControlWorkbenchComponent implements OnInit, OnDestroy {
     public subscriptionFilter = "";
     public accountFilter = "";
     public regionFilter = "";
+    public statusFilter = "";
     public searchFilter = "";
     public onlyAlerts = false;
 
     public subscriptionOptions: string[] = [];
     public accountOptions: string[] = [];
     public regionOptions: string[] = [];
+    public statusOptions: string[] = [];
 
     public autoRefreshEnabled = false;
     public autoRefreshIntervalSeconds = 30;
@@ -89,6 +95,7 @@ export class PoolControlWorkbenchComponent implements OnInit, OnDestroy {
         private discoveryService: WorkbenchDiscoveryService,
         private batchAccountService: BatchAccountService,
         private poolActionsService: BatchPoolActionsService,
+        private nodeActionsService: BatchNodeActionsService,
         private startTaskApplyService: StartTaskApplyService,
         private changeDetector: ChangeDetectorRef,
     ) {
@@ -154,8 +161,12 @@ export class PoolControlWorkbenchComponent implements OnInit, OnDestroy {
         return this.selectedRows.map((row) => this._toApplyTarget(row));
     }
 
-    public get allTargets(): StartTaskApplyTarget[] {
+    public get displayedTargets(): StartTaskApplyTarget[] {
         return this.displayedRows.map((row) => this._toApplyTarget(row));
+    }
+
+    public get allTargets(): StartTaskApplyTarget[] {
+        return this.allRows.map((row) => this._toApplyTarget(row));
     }
 
     public get selectedSummary(): PoolDetailSummary | null {
@@ -194,6 +205,9 @@ export class PoolControlWorkbenchComponent implements OnInit, OnDestroy {
                 return false;
             }
             if (this.regionFilter && row.location !== this.regionFilter) {
+                return false;
+            }
+            if (this.statusFilter && row.allocationState !== this.statusFilter) {
                 return false;
             }
             if (this.onlyAlerts && row.alerts.length === 0) {
@@ -245,6 +259,10 @@ export class PoolControlWorkbenchComponent implements OnInit, OnDestroy {
     }
 
     public async resizeRow(row: WorkbenchPoolTableRow) {
+        if (!this._ensureSteadyForOperation(row, "resize")) {
+            return;
+        }
+
         const targetInput = window.prompt(`Target dedicated nodes for ${row.poolId}`, "0");
         if (targetInput == null) {
             return;
@@ -254,46 +272,140 @@ export class PoolControlWorkbenchComponent implements OnInit, OnDestroy {
             this.actionError = "Invalid target node count.";
             return;
         }
+
+        const startedAt = new Date();
         try {
             await this._runRowAction(row, `Resizing ${row.poolId}`, async (account) => {
                 await this.poolActionsService.resizePool(account, row.poolId, Math.floor(target)).toPromise();
             });
+            this._recordOutcome(row, startedAt, true, Math.floor(target), "none", [], 0);
         } catch {
+            this._recordOutcome(row, startedAt, false, row.nodeCountsByState.total, "resize-failed", [this.actionError], 0);
             return;
         }
     }
 
     public async stopResizeRow(row: WorkbenchPoolTableRow) {
+        const startedAt = new Date();
         try {
             await this._runRowAction(row, `Stopping resize for ${row.poolId}`, async (account) => {
                 await this.poolActionsService.stopResize(account, row.poolId).toPromise();
             });
+            this._recordOutcome(row, startedAt, true, row.nodeCountsByState.total, "none", [], 0);
         } catch {
+            this._recordOutcome(row, startedAt, false, row.nodeCountsByState.total, "stop-resize-failed", [this.actionError], 0);
             return;
         }
     }
 
     public async deleteRow(row: WorkbenchPoolTableRow) {
+        if (!this._ensureSteadyForOperation(row, "delete")) {
+            return;
+        }
         if (!window.confirm(`Delete pool ${row.poolId}? This action is destructive.`)) {
             return;
         }
+        const startedAt = new Date();
         try {
             await this._runRowAction(row, `Deleting ${row.poolId}`, async (account) => {
                 await this.poolActionsService.deletePool(account, row.poolId).toPromise();
             });
+            this._recordOutcome(row, startedAt, true, 0, "none", [], 0);
         } catch {
+            this._recordOutcome(row, startedAt, false, row.nodeCountsByState.total, "delete-failed", [this.actionError], 0);
             return;
         }
         await this.refresh();
     }
 
-    public async exportRow(row: WorkbenchPoolTableRow) {
+    public async cloneRow(row: WorkbenchPoolTableRow) {
+        const clonePoolId = window.prompt(`Clone pool ${row.poolId} to new pool ID`, `${row.poolId}-clone`);
+        if (!clonePoolId || clonePoolId.trim().length === 0) {
+            return;
+        }
+
+        const startedAt = new Date();
         try {
-            await this._runRowAction(row, `Exporting ${row.poolId}`, async (account) => {
-                const result = await this.poolActionsService.exportPoolJson(account, row.poolId).toPromise();
+            await this._runRowAction(row, `Cloning ${row.poolId}`, async (account) => {
+                await this.poolActionsService.clonePool(account, row.poolId, clonePoolId.trim()).toPromise();
+            });
+            this._recordOutcome(row, startedAt, true, row.nodeCountsByState.total, "none", [], 0, clonePoolId.trim());
+        } catch {
+            this._recordOutcome(row, startedAt, false, row.nodeCountsByState.total, "clone-failed", [this.actionError], 0);
+            return;
+        }
+        await this.refresh();
+    }
+
+    public async recreateRow(row: WorkbenchPoolTableRow) {
+        if (!this._ensureSteadyForOperation(row, "recreate")) {
+            return;
+        }
+
+        const newPoolIdInput = window.prompt(
+            `Recreate pool ${row.poolId}. Leave unchanged to recreate in-place, or specify a new pool ID.`,
+            row.poolId,
+        );
+        if (newPoolIdInput == null) {
+            return;
+        }
+        const newPoolId = newPoolIdInput.trim();
+        if (!newPoolId) {
+            this.actionError = "Pool ID cannot be empty.";
+            return;
+        }
+
+        if (!window.confirm(`Recreate pool ${row.poolId} as ${newPoolId}?`)) {
+            return;
+        }
+
+        const startedAt = new Date();
+        try {
+            await this._runRowAction(row, `Recreating ${row.poolId}`, async (account) => {
+                await this.poolActionsService.recreatePool(account, row.poolId, newPoolId).toPromise();
+            });
+            this._recordOutcome(row, startedAt, true, 0, "none", [], 0, newPoolId);
+        } catch {
+            this._recordOutcome(row, startedAt, false, row.nodeCountsByState.total, "recreate-failed", [this.actionError], 0);
+            return;
+        }
+        await this.refresh();
+    }
+
+    public async applyStartTaskRow(row: WorkbenchPoolTableRow) {
+        const commandLine = window.prompt(`Start task command line for ${row.poolId}`, "/bin/bash -c \"echo bootstrap-ok\"");
+        if (commandLine == null) {
+            return;
+        }
+        if (!commandLine.trim()) {
+            this.actionError = "Start task command line is required.";
+            return;
+        }
+
+        const startedAt = new Date();
+        try {
+            await this._runRowAction(row, `Applying start task for ${row.poolId}`, async (account) => {
+                await this.poolActionsService.applyStartTask(account, row.poolId, {
+                    commandLine: commandLine.trim(),
+                    waitForSuccess: true,
+                }).toPromise();
+            });
+            this._recordOutcome(row, startedAt, true, row.nodeCountsByState.total, "none", [], 0);
+        } catch {
+            this._recordOutcome(row, startedAt, false, row.nodeCountsByState.total, "apply-start-task-failed", [this.actionError], 0);
+        }
+    }
+
+    public async exportRow(row: WorkbenchPoolTableRow) {
+        const startedAt = new Date();
+        try {
+            await this._runRowAction(row, `Exporting config for ${row.poolId}`, async (account) => {
+                const result = await this.poolActionsService.exportPoolConfigJson(account, row.poolId).toPromise();
                 this.exportedJson = JSON.stringify(result, null, 2);
             });
+            this._recordOutcome(row, startedAt, true, row.nodeCountsByState.total, "none", [], 0);
         } catch {
+            this._recordOutcome(row, startedAt, false, row.nodeCountsByState.total, "export-config-failed", [this.actionError], 0);
             return;
         }
     }
@@ -315,12 +427,29 @@ export class PoolControlWorkbenchComponent implements OnInit, OnDestroy {
         let succeeded = 0;
         let failed = 0;
         for (const row of this.selectedRows) {
+            if (!this._isSteady(row)) {
+                this._recordOutcome(
+                    row,
+                    new Date(),
+                    false,
+                    row.nodeCountsByState.total,
+                    "pool-not-steady",
+                    [`Cannot resize ${row.poolId} because allocationState is '${row.allocationState}'.`],
+                    0,
+                );
+                failed++;
+                continue;
+            }
+
+            const startedAt = new Date();
             try {
                 await this._runRowAction(row, `Resizing ${row.poolId}`, async (account) => {
                     await this.poolActionsService.resizePool(account, row.poolId, Math.floor(target)).toPromise();
                 });
+                this._recordOutcome(row, startedAt, true, Math.floor(target), "none", [], 0);
                 succeeded++;
             } catch {
+                this._recordOutcome(row, startedAt, false, row.nodeCountsByState.total, "resize-failed", [this.actionError], 0);
                 failed++;
             }
         }
@@ -345,18 +474,105 @@ export class PoolControlWorkbenchComponent implements OnInit, OnDestroy {
         let succeeded = 0;
         let failed = 0;
         for (const row of targets) {
+            if (!this._isSteady(row)) {
+                this._recordOutcome(
+                    row,
+                    new Date(),
+                    false,
+                    row.nodeCountsByState.total,
+                    "pool-not-steady",
+                    [`Cannot delete ${row.poolId} because allocationState is '${row.allocationState}'.`],
+                    0,
+                );
+                failed++;
+                continue;
+            }
+
+            const startedAt = new Date();
             try {
                 await this._runRowAction(row, `Deleting ${row.poolId}`, async (account) => {
                     await this.poolActionsService.deletePool(account, row.poolId).toPromise();
                 });
+                this._recordOutcome(row, startedAt, true, 0, "none", [], 0);
                 succeeded++;
             } catch {
+                this._recordOutcome(row, startedAt, false, row.nodeCountsByState.total, "cleanup-failed", [this.actionError], 0);
                 failed++;
             }
         }
 
         this.bulkSummary = `Cleanup complete: ${succeeded} deleted, ${failed} failed.`;
         await this.refresh();
+    }
+
+    public async bulkApplyStartTaskSelected() {
+        if (this.selectedRows.length === 0) {
+            return;
+        }
+
+        const commandLine = window.prompt("Start task command line for selected pools", "/bin/bash -c \"echo bootstrap-ok\"");
+        if (commandLine == null) {
+            return;
+        }
+        if (!commandLine.trim()) {
+            this.actionError = "Start task command line is required.";
+            return;
+        }
+
+        if (!window.confirm(`Apply start task to ${this.selectedRows.length} selected pool(s)?`)) {
+            return;
+        }
+
+        let succeeded = 0;
+        let failed = 0;
+        for (const row of this.selectedRows) {
+            const startedAt = new Date();
+            try {
+                await this._runRowAction(row, `Applying start task for ${row.poolId}`, async (account) => {
+                    await this.poolActionsService.applyStartTask(account, row.poolId, {
+                        commandLine: commandLine.trim(),
+                        waitForSuccess: true,
+                    }).toPromise();
+                });
+                this._recordOutcome(row, startedAt, true, row.nodeCountsByState.total, "none", [], 0);
+                succeeded++;
+            } catch {
+                this._recordOutcome(row, startedAt, false, row.nodeCountsByState.total, "apply-start-task-failed", [this.actionError], 0);
+                failed++;
+            }
+        }
+
+        this.bulkSummary = `Bulk start task apply complete: ${succeeded} succeeded, ${failed} failed.`;
+        this.changeDetector.markForCheck();
+    }
+
+    public async bulkRestartNodesSelected() {
+        if (this.selectedRows.length === 0) {
+            return;
+        }
+
+        if (!window.confirm(`Restart all nodes across ${this.selectedRows.length} selected pool(s)?`)) {
+            return;
+        }
+
+        let succeeded = 0;
+        let failed = 0;
+        for (const row of this.selectedRows) {
+            const startedAt = new Date();
+            try {
+                await this._runRowAction(row, `Restarting nodes in ${row.poolId}`, async (account) => {
+                    await this.nodeActionsService.restartPoolNodes(account, row.poolId).toPromise();
+                });
+                this._recordOutcome(row, startedAt, true, row.nodeCountsByState.total, "none", [], 0);
+                succeeded++;
+            } catch {
+                this._recordOutcome(row, startedAt, false, row.nodeCountsByState.total, "restart-nodes-failed", [this.actionError], 0);
+                failed++;
+            }
+        }
+
+        this.bulkSummary = `Bulk restart nodes complete: ${succeeded} succeeded, ${failed} failed.`;
+        this.changeDetector.markForCheck();
     }
 
     public async exportSelectedAsJson() {
@@ -417,6 +633,7 @@ export class PoolControlWorkbenchComponent implements OnInit, OnDestroy {
             },
             complete: () => {
                 this.startTaskRunning = false;
+                this._recordStartTaskProgressSummary(this.startTaskProgress);
                 this.changeDetector.markForCheck();
             },
         });
@@ -448,6 +665,7 @@ export class PoolControlWorkbenchComponent implements OnInit, OnDestroy {
         this.subscriptionOptions = this._sortedUnique(this.allRows.map((x) => x.subscriptionId));
         this.accountOptions = this._sortedUnique(this.allRows.map((x) => x.accountName));
         this.regionOptions = this._sortedUnique(this.allRows.map((x) => x.location));
+        this.statusOptions = this._sortedUnique(this.allRows.map((x) => x.allocationState));
     }
 
     private _sortedUnique(values: string[]): string[] {
@@ -476,14 +694,60 @@ export class PoolControlWorkbenchComponent implements OnInit, OnDestroy {
                 starting: this._asNumber(row.nodeCountsByState && row.nodeCountsByState.starting),
                 startTaskFailed: this._asNumber(row.nodeCountsByState && row.nodeCountsByState.startTaskFailed),
                 unusable: this._asNumber(row.nodeCountsByState && row.nodeCountsByState.unusable),
+                total: this._asNumber(row.nodeCountsByState && row.nodeCountsByState.total),
             },
+            quotaStatus: this._normalizeQuotaStatus(row.quotaStatus),
             alerts: Array.isArray(row.alerts) ? row.alerts : [],
         };
+    }
+
+    public quotaStatusLabel(row: WorkbenchPoolTableRow): string {
+        const quota = row.quotaStatus;
+        if (!quota || quota.state === "unknown") {
+            return "Unknown";
+        }
+        if (quota.used === null || quota.used === undefined || quota.quota === null || quota.quota === undefined) {
+            return this._titleCaseQuotaState(quota.state);
+        }
+        return `${this._titleCaseQuotaState(quota.state)} (${quota.used}/${quota.quota})`;
+    }
+
+    public quotaStatusClass(row: WorkbenchPoolTableRow): string {
+        const state = row.quotaStatus && row.quotaStatus.state || "unknown";
+        return `quota-${state}`;
+    }
+
+    public alertIndicatorLabel(row: WorkbenchPoolTableRow): string {
+        if (!row.alerts || row.alerts.length === 0) {
+            return "None";
+        }
+        return row.alerts.length === 1 ? "1 alert" : `${row.alerts.length} alerts`;
     }
 
     private _asNumber(value: any): number {
         const parsed = Number(value);
         return Number.isFinite(parsed) && parsed >= 0 ? parsed : 0;
+    }
+
+    private _normalizeQuotaStatus(value: WorkbenchQuotaStatus | undefined): WorkbenchQuotaStatus {
+        if (!value || !value.state) {
+            return { state: "unknown" };
+        }
+        return {
+            state: value.state,
+            used: value.used,
+            quota: value.quota,
+        };
+    }
+
+    private _titleCaseQuotaState(state: string): string {
+        if (state === "at-limit") {
+            return "At limit";
+        }
+        if (!state) {
+            return "Unknown";
+        }
+        return `${state.charAt(0).toUpperCase()}${state.slice(1)}`;
     }
 
     private _toApplyTarget(row: WorkbenchPoolTableRow): StartTaskApplyTarget {
@@ -547,6 +811,87 @@ export class PoolControlWorkbenchComponent implements OnInit, OnDestroy {
         }
         this._accountCache.set(accountId, account);
         return account;
+    }
+
+    private _isSteady(row: WorkbenchPoolTableRow): boolean {
+        return String(row.allocationState || "").toLowerCase() === "steady";
+    }
+
+    private _ensureSteadyForOperation(row: WorkbenchPoolTableRow, operation: string): boolean {
+        if (this._isSteady(row)) {
+            return true;
+        }
+        this.actionError = `Cannot ${operation} pool '${row.poolId}' because allocationState is '${row.allocationState || "unknown"}'.`;
+        this.changeDetector.markForCheck();
+        this._recordOutcome(
+            row,
+            new Date(),
+            false,
+            row.nodeCountsByState.total,
+            "pool-not-steady",
+            [this.actionError],
+            0,
+        );
+        return false;
+    }
+
+    private _recordOutcome(
+        row: WorkbenchPoolTableRow,
+        startedAt: Date,
+        success: boolean,
+        lastSuccessfulTarget: number,
+        stopReason: string,
+        errors: any[],
+        retries: number,
+        poolId?: string,
+    ) {
+        const summary: PerAccountSummary = {
+            subscriptionId: row.subscriptionId,
+            accountId: row.accountId,
+            location: row.location,
+            poolId: poolId || row.poolId,
+            lastSuccessfulTarget: success ? lastSuccessfulTarget : 0,
+            stopReason: success ? undefined : stopReason,
+            retries,
+            startedAt: startedAt.toISOString(),
+            finishedAt: new Date().toISOString(),
+            errors: success ? [] : errors.filter((x) => Boolean(x)),
+        };
+
+        this.perAccountOutcomes = [summary, ...this.perAccountOutcomes].slice(0, 500);
+        this.changeDetector.markForCheck();
+    }
+
+    private _recordStartTaskProgressSummary(progress: StartTaskApplyProgress | null) {
+        const summary = progress && progress.summary;
+        if (!summary || !Array.isArray(summary.results)) {
+            return;
+        }
+
+        for (const result of summary.results) {
+            const target = result.target;
+            if (!target) {
+                continue;
+            }
+
+            const row = this.allRows.find((candidate) => {
+                return candidate.accountId === target.accountId && candidate.poolId === target.poolId;
+            });
+
+            if (!row) {
+                continue;
+            }
+
+            this._recordOutcome(
+                row,
+                result.startedAt,
+                result.status === "applied",
+                row.nodeCountsByState.total,
+                result.stopReason || (result.status === "failed" ? "apply-start-task-failed" : "none"),
+                result.status === "failed" ? [result.stopReason || "Apply start task failed"] : [],
+                result.retries || 0,
+            );
+        }
     }
 
     private _describeError(error: any): string {

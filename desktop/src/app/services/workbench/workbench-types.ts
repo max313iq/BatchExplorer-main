@@ -6,6 +6,14 @@ export interface WorkbenchAccountRef {
     endpoint: string;
 }
 
+export type WorkbenchQuotaState = "ok" | "warning" | "at-limit" | "unknown";
+
+export interface WorkbenchQuotaStatus {
+    state: WorkbenchQuotaState;
+    used?: number;
+    quota?: number;
+}
+
 export interface WorkbenchPoolRow {
     subscriptionId: string;
     accountId: string;
@@ -16,6 +24,7 @@ export interface WorkbenchPoolRow {
     nodeCountsByState: {
         [state: string]: number;
     };
+    quotaStatus?: WorkbenchQuotaStatus;
     alerts: string[];
 }
 
@@ -37,4 +46,17 @@ export interface ActionResult {
     startedAt: Date | string;
     finishedAt: Date | string;
     retries?: number;
+}
+
+export interface PerAccountSummary {
+    subscriptionId: string;
+    accountId: string;
+    location: string;
+    poolId?: string;
+    lastSuccessfulTarget: number;
+    stopReason?: string;
+    retries: number;
+    startedAt: string;
+    finishedAt?: string;
+    errors: any[];
 }

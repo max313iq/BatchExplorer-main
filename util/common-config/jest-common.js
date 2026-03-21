@@ -46,8 +46,9 @@ module.exports = {
             ],
             moduleDirectories: ["src", "node_modules"],
             moduleNameMapper: {
-                // batch RLC generates import has .js extension, so we need to remove it in test
-                "(.+)\\.js": "$1",
+                // batch RLC generates relative imports with .js extension; map only relative paths.
+                // Do not rewrite package subpath imports from node_modules.
+                "^(\\.{1,2}/.*)\\.js$": "$1",
             },
             reporters: [
                 "default",

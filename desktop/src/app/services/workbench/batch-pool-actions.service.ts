@@ -1,9 +1,10 @@
-import { Injectable } from "@angular/core";
+import { Injectable, Optional } from "@angular/core";
 import { HttpMethod, HttpRequestOptions } from "@batch-flask/core";
 import { BatchAccount } from "app/models";
 import { NodeDeallocationOption } from "app/models/dtos";
 import { AzureBatchHttpService } from "app/services/azure-batch/core";
 import { Observable, from } from "rxjs";
+import { RequestScheduler } from "./request-scheduler";
 
 export type PoolActionErrorKind = "quota" | "transient" | "fatal";
 
@@ -45,18 +46,40 @@ export class BatchPoolActionError extends Error {
     }
 }
 
-const DEFAULT_CONCURRENCY = 1;
-const DEFAULT_DELAY_BETWEEN_REQUESTS_MS = 250;
-const DEFAULT_MAX_ATTEMPTS = 5;
-const DEFAULT_BACKOFF_SECONDS = [2, 4, 8, 16, 32];
+interface PoolStartTaskPatch {
+    commandLine?: string;
+    waitForSuccess?: boolean;
+    maxTaskRetryCount?: number;
+    resourceFiles?: any[];
+    environmentSettings?: any[];
+    userIdentity?: any;
+    containerSettings?: any;
+}
+
+interface PoolSteadyStateResponse {
+    id?: string;
+    allocationState?: string;
+}
+
+class PoolSteadyStateError extends Error {
+    public status = 400;
+    public code = "PoolNotSteady";
+
+    constructor(public accountId: string, public poolId: string, public allocationState: string) {
+        super(`Pool '${poolId}' is not in steady allocation state (current: '${allocationState || "unknown"}').`);
+        this.name = "PoolSteadyStateError";
+    }
+}
 
 @Injectable({ providedIn: "root" })
 export class BatchPoolActionsService {
-    private _activeTasks = 0;
-    private _pendingSlots: Array<() => void> = [];
-    private _accountQueues = new Map<string, Promise<void>>();
+    private scheduler: RequestScheduler;
 
-    constructor(private batchHttp: AzureBatchHttpService) {
+    constructor(
+        private batchHttp: AzureBatchHttpService,
+        @Optional() scheduler?: RequestScheduler,
+    ) {
+        this.scheduler = scheduler || new RequestScheduler();
     }
 
     public resizePool(
@@ -69,44 +92,78 @@ export class BatchPoolActionsService {
             targetDedicatedNodes,
             nodeDeallocationOption: deallocationOption,
         };
-        return from(this._schedulePoolAction(account, "resizePool", poolId, true, () => {
-            return this._requestForAccount(account, HttpMethod.Post, `/pools/${poolId}/resize`, { body });
+        return from(this._schedulePoolAction(account, "resizePool", poolId, async () => {
+            await this._ensurePoolSteady(account, poolId);
+            return this._requestForAccount(account, HttpMethod.Post, `/pools/${encodeURIComponent(poolId)}/resize`, { body });
         }));
     }
 
     public stopResize(account: BatchAccount, poolId: string): Observable<any> {
-        return from(this._schedulePoolAction(account, "stopResize", poolId, true, () => {
-            return this._requestForAccount(account, HttpMethod.Post, `/pools/${poolId}/stopresize`, { body: null });
+        return from(this._schedulePoolAction(account, "stopResize", poolId, async () => {
+            return this._requestForAccount(account, HttpMethod.Post, `/pools/${encodeURIComponent(poolId)}/stopresize`, { body: null });
         }));
     }
 
     public deletePool(account: BatchAccount, poolId: string): Observable<any> {
-        return from(this._schedulePoolAction(account, "deletePool", poolId, false, () => {
-            return this._requestForAccount(account, HttpMethod.Delete, `/pools/${poolId}`);
+        return from(this._schedulePoolAction(account, "deletePool", poolId, async () => {
+            await this._ensurePoolSteady(account, poolId);
+            return this._requestForAccount(account, HttpMethod.Delete, `/pools/${encodeURIComponent(poolId)}`);
         }));
     }
 
     public exportPoolJson(account: BatchAccount, poolId: string): Observable<any> {
-        return from(this._schedulePoolAction(account, "exportPoolJson", poolId, false, () => {
-            return this._requestForAccount(account, HttpMethod.Get, `/pools/${poolId}`);
+        return this.exportPoolConfigJson(account, poolId);
+    }
+
+    public exportPoolConfigJson(account: BatchAccount, poolId: string): Observable<any> {
+        return from(this._schedulePoolAction(account, "exportPoolConfigJson", poolId, async () => {
+            return this._requestForAccount(account, HttpMethod.Get, `/pools/${encodeURIComponent(poolId)}`);
         }));
     }
 
     public clonePool(account: BatchAccount, sourcePoolId: string, newPoolId: string): Observable<any> {
-        return from(this._schedulePoolAction(account, "clonePool", sourcePoolId, false, async () => {
-            const sourcePool = await this._requestForAccount<any>(account, HttpMethod.Get, `/pools/${sourcePoolId}`);
+        return from(this._schedulePoolAction(account, "clonePool", sourcePoolId, async () => {
+            const sourcePool = await this._requestForAccount<any>(account, HttpMethod.Get, `/pools/${encodeURIComponent(sourcePoolId)}`);
             const body = this._buildPoolCreatePayload(sourcePool, newPoolId);
             return this._requestForAccount(account, HttpMethod.Post, "/pools", { body });
         }));
     }
 
     public recreatePool(account: BatchAccount, poolId: string, newPoolId?: string): Observable<any> {
-        return from(this._schedulePoolAction(account, "recreatePool", poolId, false, async () => {
-            const sourcePool = await this._requestForAccount<any>(account, HttpMethod.Get, `/pools/${poolId}`);
+        return from(this._schedulePoolAction(account, "recreatePool", poolId, async () => {
+            const sourcePool = await this._requestForAccount<any>(account, HttpMethod.Get, `/pools/${encodeURIComponent(poolId)}`);
             const targetPoolId = newPoolId || poolId;
             const body = this._buildPoolCreatePayload(sourcePool, targetPoolId);
-            await this._requestForAccount(account, HttpMethod.Delete, `/pools/${poolId}`);
+            await this._ensurePoolSteady(account, poolId);
+            await this._requestForAccount(account, HttpMethod.Delete, `/pools/${encodeURIComponent(poolId)}`);
             return this._requestForAccount(account, HttpMethod.Post, "/pools", { body });
+        }));
+    }
+
+    public applyStartTask(
+        account: BatchAccount,
+        poolId: string,
+        startTask: PoolStartTaskPatch): Observable<any> {
+
+        const body = {
+            startTask: {
+                commandLine: startTask.commandLine && startTask.commandLine.trim(),
+                waitForSuccess: startTask.waitForSuccess,
+                maxTaskRetryCount: startTask.maxTaskRetryCount,
+                resourceFiles: startTask.resourceFiles || [],
+                environmentSettings: startTask.environmentSettings || [],
+                userIdentity: startTask.userIdentity,
+                containerSettings: startTask.containerSettings,
+            },
+        };
+
+        return from(this._schedulePoolAction(account, "applyStartTask", poolId, async () => {
+            return this._requestForAccount(
+                account,
+                HttpMethod.Patch,
+                `/pools/${encodeURIComponent(poolId)}`,
+                { body },
+            );
         }));
     }
 
@@ -114,115 +171,21 @@ export class BatchPoolActionsService {
         account: BatchAccount,
         actionName: string,
         poolId: string | undefined,
-        retryOnConflict: boolean,
         operation: () => Promise<T>): Promise<T> {
-
-        const key = this._getAccountKey(account);
-        const previous = this._accountQueues.get(key) || Promise.resolve();
-        const task = previous
-            .catch(() => {
-                // Ensure one failed task does not block subsequent actions for the same account.
-            })
-            .then(() => this._withGlobalSlot(() => {
-                return this._runWithRetry(account, actionName, poolId, retryOnConflict, operation);
-            }));
-
-        this._accountQueues.set(key, task.then(() => undefined, () => undefined));
-        return task;
-    }
-
-    private async _withGlobalSlot<T>(task: () => Promise<T>): Promise<T> {
-        await this._acquireSlot();
-        try {
-            return await task();
-        } finally {
-            await this._delay(DEFAULT_DELAY_BETWEEN_REQUESTS_MS);
-            this._releaseSlot();
-        }
-    }
-
-    private _acquireSlot(): Promise<void> {
-        if (this._activeTasks < DEFAULT_CONCURRENCY) {
-            this._activeTasks += 1;
-            return Promise.resolve();
-        }
-
-        return new Promise((resolve) => {
-            this._pendingSlots.push(() => {
-                this._activeTasks += 1;
-                resolve();
-            });
-        });
-    }
-
-    private _releaseSlot() {
-        this._activeTasks = Math.max(0, this._activeTasks - 1);
-        const next = this._pendingSlots.shift();
-        if (next) {
-            next();
-        }
-    }
-
-    private async _runWithRetry<T>(
-        account: BatchAccount,
-        actionName: string,
-        poolId: string | undefined,
-        retryOnConflict: boolean,
-        operation: () => Promise<T>): Promise<T> {
-
-        for (let attempt = 1; attempt <= DEFAULT_MAX_ATTEMPTS; attempt++) {
+        const accountKey = this._getAccountKey(account);
+        return this.scheduler.run(accountKey, async () => {
             try {
                 return await operation();
             } catch (error) {
-                const status = this._readStatus(error);
-                const code = this._readCode(error);
-                const kind = this._classifyError(status, code, retryOnConflict);
-                const canRetry = this._canRetry(kind, status, attempt, retryOnConflict);
-
-                if (!canRetry) {
-                    throw this._toActionError(account, actionName, poolId, attempt, kind, error);
+                if (error instanceof BatchPoolActionError) {
+                    throw error;
                 }
-
-                const retryDelayMs = this._resolveRetryDelayMs(error, attempt);
-                await this._delay(retryDelayMs);
+                throw this._toActionError(account, actionName, poolId, this._readAttempt(error), error);
             }
-        }
-
-        throw this._toActionError(
-            account,
-            actionName,
-            poolId,
-            DEFAULT_MAX_ATTEMPTS,
-            "fatal",
-            new Error(`Action ${actionName} exceeded max attempts (${DEFAULT_MAX_ATTEMPTS})`),
-        );
+        });
     }
 
-    private _canRetry(
-        kind: PoolActionErrorKind,
-        status: number | undefined,
-        attempt: number,
-        retryOnConflict: boolean): boolean {
-
-        if (attempt >= DEFAULT_MAX_ATTEMPTS) {
-            return false;
-        }
-
-        if (kind !== "transient") {
-            return false;
-        }
-
-        if (status === 409) {
-            return retryOnConflict;
-        }
-
-        return true;
-    }
-
-    private _classifyError(
-        status: number | undefined,
-        code: string | undefined,
-        retryOnConflict: boolean): PoolActionErrorKind {
+    private _classifyError(status: number | undefined, code: string | undefined): PoolActionErrorKind {
 
         const normalizedCode = (code || "").toLowerCase();
 
@@ -231,7 +194,7 @@ export class BatchPoolActionsService {
         }
 
         if (status === 409) {
-            return retryOnConflict ? "transient" : "fatal";
+            return "transient";
         }
 
         if (status === 0 || status === 408 || status === 429 || status === 500 || status === 502 || status === 503 || status === 504) {
@@ -241,56 +204,23 @@ export class BatchPoolActionsService {
         return "fatal";
     }
 
-    private _resolveRetryDelayMs(error: any, attempt: number): number {
-        const retryAfter = this._readRetryAfterMs(error);
-        if (retryAfter !== null) {
-            return retryAfter;
-        }
-
-        const delaySeconds = DEFAULT_BACKOFF_SECONDS[Math.min(attempt - 1, DEFAULT_BACKOFF_SECONDS.length - 1)];
-        return Math.max(1000, delaySeconds * 1000);
-    }
-
-    private _readRetryAfterMs(error: any): number | null {
-        const headers = error && error.headers;
-        if (!headers || typeof headers.get !== "function") {
-            return null;
-        }
-
-        const retryAfter = headers.get("Retry-After") || headers.get("retry-after");
-        if (!retryAfter) {
-            return null;
-        }
-
-        const asNumber = Number(retryAfter);
-        if (!Number.isNaN(asNumber)) {
-            return Math.max(0, Math.floor(asNumber * 1000));
-        }
-
-        const asDate = Date.parse(retryAfter);
-        if (Number.isNaN(asDate)) {
-            return null;
-        }
-
-        return Math.max(0, asDate - Date.now());
-    }
-
     private _toActionError(
         account: BatchAccount,
         actionName: string,
         poolId: string | undefined,
         attempt: number,
-        kind: PoolActionErrorKind,
         error: any): BatchPoolActionError {
 
+        const status = this._readStatus(error);
+        const code = this._readCode(error);
         return new BatchPoolActionError({
             action: actionName,
-            kind,
+            kind: this._classifyError(status, code),
             accountId: this._getAccountKey(account),
             poolId,
             attempt,
-            status: this._readStatus(error),
-            code: this._readCode(error),
+            status,
+            code,
             details: this._readMessage(error),
             originalError: error,
         });
@@ -304,7 +234,7 @@ export class BatchPoolActionsService {
     }
 
     private _readCode(error: any): string | undefined {
-        return error && error.code ? `${error.code}` : undefined;
+        return error && (error.code || error.error?.code) ? `${error.code || error.error?.code}` : undefined;
     }
 
     private _readMessage(error: any): string | undefined {
@@ -321,6 +251,27 @@ export class BatchPoolActionsService {
             return error.statusText;
         }
         return undefined;
+    }
+
+    private _readAttempt(error: any): number {
+        const attempt = Number(error && (error.__attempt ?? error.attempt));
+        return Number.isFinite(attempt) && attempt > 0 ? attempt : 1;
+    }
+
+    private async _ensurePoolSteady(account: BatchAccount, poolId: string): Promise<void> {
+        const params = {
+            "$select": "id,allocationState",
+        };
+        const response = await this._requestForAccount<PoolSteadyStateResponse>(
+            account,
+            HttpMethod.Get,
+            `/pools/${encodeURIComponent(poolId)}`,
+            { params },
+        );
+        const allocationState = String(response && response.allocationState || "").toLowerCase();
+        if (allocationState !== "steady") {
+            throw new PoolSteadyStateError(this._getAccountKey(account), poolId, response && response.allocationState || "unknown");
+        }
     }
 
     private _buildPoolCreatePayload(sourcePool: any, newPoolId: string): any {
@@ -364,10 +315,6 @@ export class BatchPoolActionsService {
 
     private _getAccountKey(account: BatchAccount): string {
         return account && account.id ? account.id : `${account && account.url ? account.url : "unknown-account"}`;
-    }
-
-    private _delay(ms: number): Promise<void> {
-        return new Promise((resolve) => setTimeout(resolve, ms));
     }
 
     private _requestForAccount<T>(

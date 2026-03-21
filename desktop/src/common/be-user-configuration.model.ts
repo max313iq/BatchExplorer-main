@@ -10,6 +10,7 @@ export interface BEUserConfiguration extends BatchFlaskUserConfiguration {
 
     features: {
         poolControlWorkbench: boolean,
+        multiRegionPoolBootstrap: boolean,
     };
 
     subscriptions: {
@@ -53,9 +54,15 @@ export interface BEUserConfiguration extends BatchFlaskUserConfiguration {
         },
         throttling: {
             concurrency: number,
+            delayMs: number,
+            /**
+             * @deprecated Use delayMs.
+             * Kept for backward compatibility with persisted settings.
+             */
             delayMsBetweenRequests: number,
             retryAttempts: number,
             retryBackoffSeconds: number[],
+            jitterPct: number,
         },
         safety: {
             requireConfirmationsForDestructiveActions: boolean,
@@ -73,6 +80,7 @@ export const DEFAULT_BE_USER_CONFIGURATION: BEUserConfiguration = {
     },
     features: {
         poolControlWorkbench: false,
+        multiRegionPoolBootstrap: false,
     },
     tenants: {},
     update: {
@@ -100,9 +108,11 @@ export const DEFAULT_BE_USER_CONFIGURATION: BEUserConfiguration = {
         },
         throttling: {
             concurrency: 1,
+            delayMs: 250,
             delayMsBetweenRequests: 250,
             retryAttempts: 5,
             retryBackoffSeconds: [2, 4, 8, 16, 32],
+            jitterPct: 0.2,
         },
         safety: {
             requireConfirmationsForDestructiveActions: true,

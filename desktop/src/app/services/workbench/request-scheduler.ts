@@ -1,9 +1,23 @@
 export interface RequestSchedulerOptions {
     concurrency?: number;
     delayMs?: number;
+    /**
+     * @deprecated Use delayMs.
+     * Kept for persisted compatibility.
+     */
+    delayMsBetweenRequests?: number;
     retryAttempts?: number;
+    /**
+     * @deprecated Use retryBackoffSeconds.
+     * Kept for callers that already pass backoffSeconds.
+     */
     backoffSeconds?: number[];
+    retryBackoffSeconds?: number[];
     jitterPct?: number;
+    maxQueueSize?: number;
+    now?: () => number;
+    random?: () => number;
+    sleep?: (ms: number) => Promise<void>;
 }
 
 export interface RetryDecision {
@@ -13,6 +27,16 @@ export interface RetryDecision {
 }
 
 const DEFAULT_RETRY_BACKOFF_SECONDS = [2, 4, 8, 16, 32];
+const DEFAULT_MAX_QUEUE_SIZE = 1000;
+const DEFAULT_DELAY_MS = 250;
+const DEFAULT_JITTER_PCT = 0.2;
+
+export class RequestSchedulerQueueOverflowError extends Error {
+    constructor(maxQueueSize: number) {
+        super(`Request scheduler queue capacity reached (${maxQueueSize}).`);
+        this.name = "RequestSchedulerQueueOverflowError";
+    }
+}
 
 /**
  * Schedules requests with per-key serialization and bounded global concurrency.
@@ -24,8 +48,13 @@ export class RequestScheduler {
     private readonly _retryAttempts: number;
     private readonly _backoffSeconds: number[];
     private readonly _jitterPct: number;
+    private readonly _maxQueueSize: number;
+    private readonly _now: () => number;
+    private readonly _random: () => number;
+    private readonly _sleep: (ms: number) => Promise<void>;
 
     private _activeCount = 0;
+    private _inflightCount = 0;
     private _nextStartAt = 0;
     private _paceChain: Promise<void> = Promise.resolve();
     private _keyChains = new Map<string, Promise<unknown>>();
@@ -33,16 +62,33 @@ export class RequestScheduler {
 
     constructor(options: RequestSchedulerOptions = {}) {
         this._concurrency = Math.max(1, options.concurrency ?? 1);
-        this._delayMs = Math.max(0, options.delayMs ?? 250);
+        const delayMs = typeof options.delayMs === "number"
+            ? options.delayMs
+            : options.delayMsBetweenRequests;
+        this._delayMs = Math.max(0, delayMs ?? DEFAULT_DELAY_MS);
         this._retryAttempts = Math.max(0, options.retryAttempts ?? 5);
-        this._backoffSeconds = options.backoffSeconds && options.backoffSeconds.length > 0
-            ? options.backoffSeconds
+        const backoff = options.retryBackoffSeconds && options.retryBackoffSeconds.length > 0
+            ? options.retryBackoffSeconds
+            : options.backoffSeconds;
+        this._backoffSeconds = backoff && backoff.length > 0
+            ? backoff.map((value) => Math.max(0, value))
             : DEFAULT_RETRY_BACKOFF_SECONDS;
-        this._jitterPct = Math.min(Math.max(options.jitterPct ?? 0.1, 0), 0.5);
+        this._jitterPct = Math.min(Math.max(options.jitterPct ?? DEFAULT_JITTER_PCT, 0), 0.5);
+        this._maxQueueSize = Math.max(1, options.maxQueueSize ?? DEFAULT_MAX_QUEUE_SIZE);
+        this._now = options.now || (() => Date.now());
+        this._random = options.random || (() => Math.random());
+        this._sleep = options.sleep || ((ms) => {
+            return new Promise((resolve) => setTimeout(resolve, ms));
+        });
     }
 
     public run<T>(key: string, fn: () => Promise<T>): Promise<T> {
+        if (this._inflightCount >= this._maxQueueSize) {
+            return Promise.reject(new RequestSchedulerQueueOverflowError(this._maxQueueSize));
+        }
+
         const serializedKey = key || "default";
+        this._inflightCount++;
         const previous = this._keyChains.get(serializedKey) ?? Promise.resolve();
         const scheduled = previous
             .catch(() => undefined)
@@ -50,6 +96,7 @@ export class RequestScheduler {
 
         this._keyChains.set(serializedKey, scheduled);
         scheduled.finally(() => {
+            this._inflightCount = Math.max(0, this._inflightCount - 1);
             if (this._keyChains.get(serializedKey) === scheduled) {
                 this._keyChains.delete(serializedKey);
             }
@@ -133,17 +180,7 @@ export class RequestScheduler {
     }
 
     private _extractRetryAfterMs(error: any): number | null {
-        const headers = error?.headers;
-        if (!headers) {
-            return null;
-        }
-
-        let value: string | null = null;
-        if (typeof headers.get === "function") {
-            value = headers.get("Retry-After") ?? headers.get("retry-after");
-        } else {
-            value = headers["Retry-After"] ?? headers["retry-after"] ?? null;
-        }
+        const value = this._readHeaderValue(error, "retry-after");
 
         if (!value) {
             return null;
@@ -159,7 +196,53 @@ export class RequestScheduler {
             return null;
         }
 
-        return Math.max(0, asDate - Date.now());
+        return Math.max(0, asDate - this._now());
+    }
+
+    private _readHeaderValue(error: any, headerName: string): string | null {
+        const headers = [
+            error?.headers,
+            error?.error?.headers,
+            error?.response?.headers,
+        ];
+
+        for (const item of headers) {
+            const value = this._readHeaderFromSource(item, headerName);
+            if (value) {
+                return value;
+            }
+        }
+
+        return null;
+    }
+
+    private _readHeaderFromSource(headers: any, headerName: string): string | null {
+        if (!headers) {
+            return null;
+        }
+
+        if (typeof headers.get === "function") {
+            const direct = headers.get(headerName) || headers.get(headerName.toLowerCase()) || headers.get(headerName.toUpperCase());
+            return this._normalizeHeaderValue(direct);
+        }
+
+        const targetKey = headerName.toLowerCase();
+        const key = Object.keys(headers).find((candidate) => candidate.toLowerCase() === targetKey);
+        if (!key) {
+            return null;
+        }
+
+        return this._normalizeHeaderValue(headers[key]);
+    }
+
+    private _normalizeHeaderValue(value: any): string | null {
+        if (value == null) {
+            return null;
+        }
+        if (Array.isArray(value)) {
+            return this._normalizeHeaderValue(value[0]);
+        }
+        return String(value);
     }
 
     private _getBackoffDelayMs(retryCount: number): number {
@@ -170,7 +253,7 @@ export class RequestScheduler {
         }
 
         const spread = baseMs * this._jitterPct;
-        const jitter = (Math.random() * spread * 2) - spread;
+        const jitter = (this._random() * spread * 2) - spread;
         return Math.max(0, Math.floor(baseMs + jitter));
     }
 
@@ -198,12 +281,12 @@ export class RequestScheduler {
 
     private async _applyPacing(): Promise<void> {
         const nextPace = this._paceChain.then(async () => {
-            const now = Date.now();
+            const now = this._now();
             const waitMs = Math.max(0, this._nextStartAt - now);
             if (waitMs > 0) {
                 await this._delay(waitMs);
             }
-            this._nextStartAt = Date.now() + this._delayMs;
+            this._nextStartAt = this._now() + this._delayMs;
         });
 
         this._paceChain = nextPace.catch(() => undefined);
@@ -214,6 +297,6 @@ export class RequestScheduler {
         if (ms <= 0) {
             return Promise.resolve();
         }
-        return new Promise((resolve) => setTimeout(resolve, ms));
+        return this._sleep(ms);
     }
 }

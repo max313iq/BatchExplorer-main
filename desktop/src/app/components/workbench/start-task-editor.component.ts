@@ -8,8 +8,10 @@ import {
 } from "app/services/workbench/start-task-apply.service";
 import "./start-task-editor.scss";
 
+type StartTaskEditorScope = StartTaskApplyScope | "displayed";
+
 interface StartTaskEditorForm {
-    scope: StartTaskApplyScope;
+    scope: StartTaskEditorScope;
     commandLine: string;
     waitForSuccess: boolean;
     maxTaskRetryCount: number;
@@ -24,6 +26,7 @@ export class StartTaskEditorComponent {
     @Input() public currentTarget: StartTaskApplyTarget | null = null;
     @Input() public selectedTargets: StartTaskApplyTarget[] = [];
     @Input() public allTargets: StartTaskApplyTarget[] = [];
+    @Input() public displayedTargets: StartTaskApplyTarget[] = [];
     @Input() public requireConfirmation = true;
 
     @Output() public previewRequested = new EventEmitter<StartTaskApplyRequest>();
@@ -100,12 +103,16 @@ export class StartTaskEditorComponent {
         if (!startTask) {
             return null;
         }
+
+        const requestScope: StartTaskApplyScope = value.scope === "displayed" ? "all" : value.scope;
+        const allTargets = value.scope === "displayed" ? this.displayedTargets : this.allTargets;
+
         return {
-            scope: value.scope,
+            scope: requestScope,
             startTask,
             currentTarget: this.currentTarget || undefined,
             selectedTargets: this.selectedTargets,
-            allTargets: this.allTargets,
+            allTargets,
             dryRun,
             confirmationAccepted,
         };
@@ -137,12 +144,15 @@ export class StartTaskEditorComponent {
         return startTask;
     }
 
-    private _resolveTargets(scope: StartTaskApplyScope): StartTaskApplyTarget[] {
+    private _resolveTargets(scope: StartTaskEditorScope): StartTaskApplyTarget[] {
         if (scope === "current") {
             return this.currentTarget ? [this.currentTarget] : [];
         }
         if (scope === "selected") {
             return this.selectedTargets || [];
+        }
+        if (scope === "displayed") {
+            return this.displayedTargets || [];
         }
         return this.allTargets || [];
     }

@@ -6,16 +6,22 @@
         <select id="scope" formControlName="scope">
             <option value="current">Current pool</option>
             <option value="selected">Selected pools</option>
-            <option value="all">All pools</option>
+            <option value="displayed">All displayed pools (filtered regions/accounts)</option>
+            <option value="all">All discovered pools</option>
         </select>
 
         <label for="command-line">Command line</label>
         <textarea id="command-line"
             formControlName="commandLine"
             rows="3"
-            placeholder="cmd /c echo hello">
+            placeholder="cmd /c echo [poolId] [location]">
         </textarea>
         <div class="validation" *ngIf="commandLineInvalid">Start task command line is required.</div>
+        <div class="template-hint">
+            Template tokens: <code>subscriptionId</code>, <code>accountId</code>,
+            <code>accountName</code>, <code>location</code>,
+            <code>poolId</code> (use double-curly syntax in the command line).
+        </div>
 
         <label for="wait-for-success">Wait for success</label>
         <input id="wait-for-success" type="checkbox" formControlName="waitForSuccess" />

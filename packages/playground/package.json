@@ -37,6 +37,7 @@
     "workspace:watch:lib": "npm run watch",
     "workspace:build": "npm run build",
     "workspace:build:clean": "npm run build:clean",
+    "workspace:build:desktop": "npm run build",
     "workspace:build:web": "npm run build",
     "workspace:build:lib": "npm run build",
     "workspace:build:package": "npm run build:clean",

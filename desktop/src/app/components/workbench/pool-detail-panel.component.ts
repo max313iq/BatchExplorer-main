@@ -1,10 +1,20 @@
-import { ChangeDetectionStrategy, ChangeDetectorRef, Component, EventEmitter, Input, Output } from "@angular/core";
+import {
+    ChangeDetectionStrategy,
+    ChangeDetectorRef,
+    Component,
+    EventEmitter,
+    Input,
+    OnChanges,
+    Output,
+    SimpleChanges,
+} from "@angular/core";
 import { Node } from "app/models";
 import {
     BatchNodeActionsService,
     BulkNodeActionResult,
     DisableSchedulingOption,
     NodeActionResult,
+    PoolConfigurationSummary,
 } from "app/services/workbench/batch-node-actions.service";
 import "./pool-detail-panel.scss";
 
@@ -21,7 +31,7 @@ export interface PoolDetailSummary {
     templateUrl: "pool-detail-panel.html",
     changeDetection: ChangeDetectionStrategy.OnPush,
 })
-export class PoolDetailPanelComponent {
+export class PoolDetailPanelComponent implements OnChanges {
     @Input() public account: unknown;
     @Input() public poolId: string;
     @Input() public summary: PoolDetailSummary | null = null;
@@ -30,12 +40,15 @@ export class PoolDetailPanelComponent {
     @Output() public nodeActionCompleted = new EventEmitter<NodeActionResult>();
 
     public activeTabIndex = 0;
+    public loadingPoolConfig = false;
     public loadingNodes = false;
     public nodesLoaded = false;
     public actionInProgress = false;
     public nodes: Node[] = [];
+    public poolConfiguration: PoolConfigurationSummary | null = null;
     public actionMessage: string | null = null;
     public actionError: string | null = null;
+    public configError: string | null = null;
     public lastBulkResult: BulkNodeActionResult | null = null;
     public lastNodeAction: NodeActionResult | null = null;
 
@@ -64,10 +77,25 @@ export class PoolDetailPanelComponent {
         return Boolean(counts && Object.keys(counts).length > 0);
     }
 
+    public ngOnChanges(changes: SimpleChanges) {
+        if (changes.poolId || changes.account) {
+            this._resetSelectionContext();
+            void this._loadPoolConfiguration();
+
+            if (this.activeTabIndex === 1 && this.poolId && this.account) {
+                void this.loadNodes(false);
+            } else if (!this.poolId || !this.account) {
+                this.nodes = [];
+                this.nodesLoaded = false;
+            }
+            this.changeDetector.markForCheck();
+        }
+    }
+
     public onTabIndexChange(index: number) {
         this.activeTabIndex = index;
         if (index === 1) {
-            this.loadNodes(false);
+            void this.loadNodes(false);
         }
     }
 
@@ -103,6 +131,12 @@ export class PoolDetailPanelComponent {
         await this._executeBulk("Removing selected nodes", () => {
             return this.nodeActions.removeNodes(this.account, this.poolId, this._selectedIds()).toPromise();
         });
+    }
+
+    public async removeNode(node: Node) {
+        await this._executeBulk("Removing node", () => {
+            return this.nodeActions.removeNodes(this.account, this.poolId, [node.id]).toPromise();
+        }, false);
     }
 
     public async bulkRebootSelected() {
@@ -187,6 +221,42 @@ export class PoolDetailPanelComponent {
         }
     }
 
+    private async _loadPoolConfiguration() {
+        if (!this.account || !this.poolId) {
+            this.poolConfiguration = null;
+            this.configError = null;
+            this.loadingPoolConfig = false;
+            return;
+        }
+
+        this.loadingPoolConfig = true;
+        this.configError = null;
+        this.changeDetector.markForCheck();
+
+        try {
+            this.poolConfiguration = await this.nodeActions.getPoolConfiguration(this.account, this.poolId).toPromise();
+        } catch (error) {
+            this.poolConfiguration = null;
+            this.configError = error?.message || "Failed to load pool configuration.";
+        } finally {
+            this.loadingPoolConfig = false;
+            this.changeDetector.markForCheck();
+        }
+    }
+
+    private _resetSelectionContext() {
+        if (this._selectionPoolId === this.poolId) {
+            return;
+        }
+
+        this._selectionPoolId = this.poolId || null;
+        this._selectedNodeIds.clear();
+        this.nodes = [];
+        this.nodesLoaded = false;
+        this.lastBulkResult = null;
+        this.lastNodeAction = null;
+    }
+
     private _selectedIds(): string[] {
         return Array.from(this._selectedNodeIds.values());
     }
@@ -194,8 +264,12 @@ export class PoolDetailPanelComponent {
     private async _executeBulk(
         actionMessage: string,
         callback: () => Promise<BulkNodeActionResult>,
+        requireSelection = true,
     ) {
-        if (!this.account || !this.poolId || this._selectedNodeIds.size === 0 || this.actionInProgress) {
+        if (!this.account || !this.poolId || this.actionInProgress) {
+            return;
+        }
+        if (requireSelection && this._selectedNodeIds.size === 0) {
             return;
         }
 

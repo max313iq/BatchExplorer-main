@@ -16,7 +16,9 @@ export class MainConfigurationStore<T extends {}> implements UserConfigurationSt
         this.config = this._config.pipe(
             filter(isNotNullOrUndefined),
             map((userConfig) => {
-                return deepMerge(DEFAULT_BE_USER_CONFIGURATION, userConfig);
+                const mergedConfig = deepMerge(DEFAULT_BE_USER_CONFIGURATION, userConfig as any);
+                this._normalizePoolControlWorkbenchThrottling(mergedConfig as any, userConfig as any);
+                return mergedConfig;
             }),
         );
         this._load();
@@ -30,5 +32,27 @@ export class MainConfigurationStore<T extends {}> implements UserConfigurationSt
     private async _load() {
         const value = await this.storage.get<T>(MainConfigurationStore.KEY);
         this._config.next(value || {} as any);
+    }
+
+    private _normalizePoolControlWorkbenchThrottling(mergedConfig: any, userConfig: any): void {
+        const mergedThrottling = mergedConfig?.poolControlWorkbench?.throttling;
+        if (!mergedThrottling) {
+            return;
+        }
+
+        const userThrottling = userConfig?.poolControlWorkbench?.throttling;
+        const hasNewDelayMs = typeof userThrottling?.delayMs === "number";
+        const hasLegacyDelayMs = typeof userThrottling?.delayMsBetweenRequests === "number";
+
+        const effectiveDelayMs = hasNewDelayMs
+            ? userThrottling.delayMs
+            : hasLegacyDelayMs
+                ? userThrottling.delayMsBetweenRequests
+                : mergedThrottling.delayMs;
+
+        if (typeof effectiveDelayMs === "number") {
+            mergedThrottling.delayMs = effectiveDelayMs;
+            mergedThrottling.delayMsBetweenRequests = effectiveDelayMs;
+        }
     }
 }
