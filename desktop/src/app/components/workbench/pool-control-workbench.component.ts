@@ -26,6 +26,26 @@ interface WorkbenchPoolTableRow extends WorkbenchPoolRow {
     id: string;
 }
 
+const KNOWN_AZURE_REGIONS = [
+    "australiacentral", "australiacentral2", "australiaeast", "australiasoutheast",
+    "brazilsouth", "canadacentral", "canadaeast",
+    "centralindia", "centralus",
+    "eastasia", "eastus", "eastus2",
+    "francecentral", "francesouth",
+    "germanywestcentral",
+    "japaneast", "japanwest",
+    "koreacentral", "koreasouth",
+    "northcentralus", "northeurope",
+    "norwayeast",
+    "southafricanorth",
+    "southcentralus", "southeastasia", "southindia",
+    "swedencentral", "switzerlandnorth",
+    "uaenorth", "uksouth", "ukwest",
+    "westcentralus", "westeurope", "westindia", "westus", "westus2", "westus3",
+];
+
+const KNOWN_ALLOCATION_STATES = ["steady", "resizing", "stopping"];
+
 @Component({
     selector: "bl-pool-control-workbench",
     templateUrl: "pool-control-workbench.html",
@@ -233,10 +253,15 @@ export class PoolControlWorkbenchComponent implements OnInit, OnDestroy {
         this.isRefreshing = true;
         this.refreshError = null;
         this.statusMessage = "Refreshing pool inventory...";
+        this._rebuildFilterOptions();
         this.changeDetector.markForCheck();
 
         try {
-            const accounts = await this.discoveryService.listAccounts().toPromise();
+            const accounts = await this._withTimeout(
+                this.discoveryService.listAccounts().toPromise(),
+                90_000,
+                "Timed out loading accounts after 90 seconds.",
+            );
             if (!accounts || accounts.length === 0) {
                 this.allRows = [];
                 this._rebuildFilterOptions();
@@ -251,7 +276,11 @@ export class PoolControlWorkbenchComponent implements OnInit, OnDestroy {
             const errors: string[] = [];
             for (const account of accounts) {
                 try {
-                    const pools = await this.discoveryService.listPools(account).toPromise();
+                    const pools = await this._withTimeout(
+                        this.discoveryService.listPools(account).toPromise(),
+                        30_000,
+                        `Timed out loading pools for ${account.accountName}.`,
+                    );
                     for (const pool of pools || []) {
                         rows.push(this._normalizeRow(pool));
                     }
@@ -708,8 +737,14 @@ export class PoolControlWorkbenchComponent implements OnInit, OnDestroy {
     private _rebuildFilterOptions() {
         this.subscriptionOptions = this._sortedUnique(this.allRows.map((x) => x.subscriptionId));
         this.accountOptions = this._sortedUnique(this.allRows.map((x) => x.accountName));
-        this.regionOptions = this._sortedUnique(this.allRows.map((x) => x.location || "unknown-region"));
-        this.statusOptions = this._sortedUnique(this.allRows.map((x) => x.allocationState || "unknown"));
+        this.regionOptions = this._sortedUnique([
+            ...KNOWN_AZURE_REGIONS,
+            ...this.allRows.map((x) => x.location || "unknown-region"),
+        ]);
+        this.statusOptions = this._sortedUnique([
+            ...KNOWN_ALLOCATION_STATES,
+            ...this.allRows.map((x) => x.allocationState || "unknown"),
+        ]);
     }
 
     private _sortedUnique(values: string[]): string[] {
@@ -936,6 +971,15 @@ export class PoolControlWorkbenchComponent implements OnInit, OnDestroy {
                 result.retries || 0,
             );
         }
+    }
+
+    private _withTimeout<T>(promise: Promise<T>, ms: number, message: string): Promise<T> {
+        return Promise.race([
+            promise,
+            new Promise<never>((_, reject) =>
+                setTimeout(() => reject(new Error(message)), ms),
+            ),
+        ]);
     }
 
     private _describeError(error: any): string {
