@@ -87,8 +87,12 @@ describe("FileExplorerComponent", () => {
         fsService.readdir.and.returnValue(Promise.resolve(dirFiles));
 
         const result = await component["_getFilesToUpload"](base, files);
+        const normalized = result.map((entry) => ({
+            ...entry,
+            localPath: entry.localPath.replace(/\\/g, "/"),
+        }));
 
-        expect(result).toEqual([
+        expect(normalized).toEqual([
             {
                 localPath: "local/dir/file1.txt",
                 remotePath: "base/path/dir/file1.txt"

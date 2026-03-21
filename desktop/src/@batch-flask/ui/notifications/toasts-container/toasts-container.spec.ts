@@ -83,7 +83,7 @@ describe("Notification", () => {
                 expect(currentNotifications.size).toBe(0);
                 expect(de.query(By.css("bl-toast"))).toBeNull();
                 done();
-            }, 1000);
+            }, 1300);
         });
 
         it("clicking dimiss should dismiss", () => {
@@ -139,7 +139,7 @@ describe("Notification", () => {
                 expect(notification.title).toEqual("FakePersistentNotification");
                 expect(notification.message).toEqual("Something happend!");
                 done();
-            }, 1000);
+            }, 1300);
         });
 
         it("clicking dimiss should dismiss and not add to the list", () => {

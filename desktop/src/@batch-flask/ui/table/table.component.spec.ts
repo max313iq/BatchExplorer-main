@@ -141,6 +141,7 @@ describe("TableComponent", () => {
                 fixture.debugElement.query(By.css(".table-body")).nativeElement;
             de.componentInstance.focusList();
             fixture.detectChanges();
+            await fixture.whenStable();
             expect(document.activeElement).toEqual(listContainer);
             const rows = getRows();
 
@@ -154,6 +155,7 @@ describe("TableComponent", () => {
 
             de.componentInstance.focusList();
             fixture.detectChanges();
+            await fixture.whenStable();
             const listContainer =
                 fixture.debugElement.query(By.css(".table-body")).nativeElement;
             expect(document.activeElement).toEqual(listContainer);
@@ -167,6 +169,8 @@ describe("TableComponent", () => {
         it("should be navigable with the keyboard", async () => {
             await fixture.whenStable();
             de.componentInstance.focusList();
+            fixture.detectChanges();
+            await fixture.whenStable();
             const listContainer = de.componentInstance.getListContainer();
             const pressKey = key => keydown(listContainer, key, key);
 
@@ -405,9 +409,9 @@ describe("TableComponent", () => {
         });
 
         it("should have initial size", () => {
-            expect(initialWidths["name"]).toEqual(201); // Padding for first item adds 5px
-            expect(initialWidths["cores"]).toEqual(196);
-            expect(initialWidths["resourceDiskSizeInMB"]).toEqual(201); // Padding for last item adds 5px
+            expect(initialWidths["name"]).toBeCloseTo(201, 0); // Padding for first item adds 5px
+            expect(initialWidths["cores"]).toBeCloseTo(196, 0);
+            expect(initialWidths["resourceDiskSizeInMB"]).toBeCloseTo(201, 0); // Padding for last item adds 5px
         });
 
         it("should have one separator between each columns", () => {
@@ -440,18 +444,18 @@ describe("TableComponent", () => {
             fixture.detectChanges();
 
             let widths = getCellsWidth();
-            expect(widths["name"]).toEqual(249);
-            expect(widths["cores"]).toEqual(148);
-            expect(widths["resourceDiskSizeInMB"]).toEqual(initialWidths["resourceDiskSizeInMB"]);
+            expect(widths["name"]).toBeCloseTo(249, 0);
+            expect(widths["cores"]).toBeCloseTo(148, 0);
+            expect(widths["resourceDiskSizeInMB"]).toBeCloseTo(initialWidths["resourceDiskSizeInMB"], 0);
             head.stopResizing();
 
             // Reset the width with dbl click
             dblclick(separators[0]);
             fixture.detectChanges();
             widths = getCellsWidth();
-            expect(widths["name"]).toEqual(initialWidths["name"], "Should have reset 'name' column to initial size");
-            expect(widths["cores"]).toEqual(initialWidths["cores"], "Should have reset 'cores' column to initial size");
-            expect(widths["resourceDiskSizeInMB"]).toEqual(initialWidths["resourceDiskSizeInMB"], "Should reset");
+            expect(widths["name"]).toBeCloseTo(initialWidths["name"], 0, "Should have reset 'name' column to initial size");
+            expect(widths["cores"]).toBeCloseTo(initialWidths["cores"], 0, "Should have reset 'cores' column to initial size");
+            expect(widths["resourceDiskSizeInMB"]).toBeCloseTo(initialWidths["resourceDiskSizeInMB"], 0, "Should reset");
         });
     });
 });

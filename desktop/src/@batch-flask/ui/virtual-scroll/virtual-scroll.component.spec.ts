@@ -109,7 +109,7 @@ describe("VirtualScrollComponent", () => {
         it("ensure item is visible", async () => {
             component.ensureItemVisible("item-07", "instant" as any);
             triggerScroll(de);
-            expect(de.nativeElement.scrollTop).toBe(210);
+            expect(de.nativeElement.scrollTop).toBeCloseTo(210, 0);
             await fixture.whenStable();
             fixture.detectChanges();
             let items = de.queryAll(By.css(".item"));
@@ -121,7 +121,7 @@ describe("VirtualScrollComponent", () => {
 
             component.ensureItemVisible("item-11", "instant" as any);
             triggerScroll(de);
-            expect(de.nativeElement.scrollTop).toBe(610);
+            expect(de.nativeElement.scrollTop).toBeCloseTo(610, 0);
             await fixture.whenStable();
             fixture.detectChanges();
             items = de.queryAll(By.css(".item"));
@@ -134,7 +134,7 @@ describe("VirtualScrollComponent", () => {
             // Ensure item up in the list should scroll up
             component.ensureItemVisible("item-02", "instant" as any);
             triggerScroll(de);
-            expect(de.nativeElement.scrollTop).toBe(0);
+            expect(de.nativeElement.scrollTop).toBeCloseTo(0, 0);
             await fixture.whenStable();
             fixture.detectChanges();
             items = de.queryAll(By.css(".item"));

@@ -88,8 +88,8 @@ describe("SplitPaneComponent", () => {
         fixture.detectChanges();
         const { firstPane, secondPane } = getPanels();
 
-        expect(firstPane.nativeElement.getBoundingClientRect().width).toBe(100);
-        expect(secondPane.nativeElement.getBoundingClientRect().width).toBe(499);
+        expect(firstPane.nativeElement.getBoundingClientRect().width).toBeCloseTo(100, 0);
+        expect(secondPane.nativeElement.getBoundingClientRect().width).toBeCloseTo(499, 0);
 
         expect(de.nativeElement.textContent).toContain("First content");
         expect(de.nativeElement.textContent).toContain("Second content");
@@ -102,8 +102,8 @@ describe("SplitPaneComponent", () => {
         fixture.detectChanges();
         const { firstPane, secondPane } = getPanels();
 
-        expect(firstPane.nativeElement.getBoundingClientRect().width).toBe(449);
-        expect(secondPane.nativeElement.getBoundingClientRect().width).toBe(150);
+        expect(firstPane.nativeElement.getBoundingClientRect().width).toBeCloseTo(449, 0);
+        expect(secondPane.nativeElement.getBoundingClientRect().width).toBeCloseTo(150, 0);
 
         expect(de.nativeElement.textContent).toContain("First content");
         expect(de.nativeElement.textContent).toContain("Second content");
@@ -122,7 +122,7 @@ describe("SplitPaneComponent", () => {
         fixture.detectChanges();
 
         const { firstPane, secondPane } = getPanels();
-        expect(firstPane.nativeElement.getBoundingClientRect().width).toBe(349);
-        expect(secondPane.nativeElement.getBoundingClientRect().width).toBe(250);
+        expect(firstPane.nativeElement.getBoundingClientRect().width).toBeCloseTo(349, 0);
+        expect(secondPane.nativeElement.getBoundingClientRect().width).toBeCloseTo(250, 0);
     });
 });

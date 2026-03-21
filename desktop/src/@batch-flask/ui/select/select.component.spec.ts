@@ -265,6 +265,8 @@ describe("SelectComponent", () => {
             expect(overlayContainerElement.querySelector("bl-select-dropdown")).not.toBeFalsy();
 
             fixture.debugElement.query(By.css(".other-nav")).nativeElement.focus();
+            fixture.detectChanges();
+            await fixture.whenStable();
             expect(overlayContainerElement.querySelector("bl-select-dropdown")).toBeFalsy();
         });
 
@@ -367,7 +369,8 @@ describe("SelectComponent", () => {
 
                 fixture.debugElement.query(By.css(".other-nav")).nativeElement.focus();
                 expect(document.activeElement).not.toEqual(inputEl.nativeElement);
-
+                fixture.detectChanges();
+                await fixture.whenStable();
                 expect(overlayContainerElement.querySelector("bl-select-dropdown")).toBeFalsy();
             });
         });

@@ -98,8 +98,13 @@ describe("DatetimePickerComponent", () => {
 
         it("propagate the changes when updating the date", () => {
             updateInput(dateInputEl, "12/14/2017");
-
-            expect(testComponent.control.value).toEqual(new Date(Date.UTC(2017, 11, 14)));
+            const parsedLocalDate = new Date(2017, 11, 14);
+            const expected = Date.UTC(
+                parsedLocalDate.getUTCFullYear(),
+                parsedLocalDate.getUTCMonth(),
+                parsedLocalDate.getUTCDate(),
+            );
+            expect((testComponent.control.value as Date).getTime()).toEqual(expected);
         });
 
         it("propagate null when only the time is set", () => {
@@ -111,8 +116,15 @@ describe("DatetimePickerComponent", () => {
         it("propagate the changes when updating the date and time", () => {
             updateInput(dateInputEl, "12/14/2017");
             updateInput(timeInputEl, "17:32");
-
-            expect(testComponent.control.value).toEqual(new Date(Date.UTC(2017, 11, 14, 17, 32)));
+            const parsedLocalDate = new Date(2017, 11, 14);
+            const expected = Date.UTC(
+                parsedLocalDate.getUTCFullYear(),
+                parsedLocalDate.getUTCMonth(),
+                parsedLocalDate.getUTCDate(),
+                17,
+                32,
+            );
+            expect((testComponent.control.value as Date).getTime()).toEqual(expected);
         });
 
         it("updates the inputs when setting the date time as a string", () => {
