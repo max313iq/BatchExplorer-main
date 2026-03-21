@@ -401,7 +401,7 @@ export class BatchNodeActionsService {
             throw new Error("AzureBatchHttpService.requestForAccount is required for workbench multi-account operations.");
         }
         return this.scheduler.run(this._accountKey(account), async () => {
-            return this.http.requestForAccount(account, method, uri, options).toPromise();
+            return this.http.requestForAccount(account as any, method, uri, options).toPromise();
         });
     }
 
