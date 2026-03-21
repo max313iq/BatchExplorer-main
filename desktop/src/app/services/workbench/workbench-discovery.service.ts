@@ -77,11 +77,14 @@ export class WorkbenchDiscoveryService {
             switchMap((account) => this._listPoolsForAccount(account)),
             catchError((error) => {
                 const classified = this.classifyError(error);
-                log.error(
+                log.warn(
                     `[WorkbenchDiscovery] listPools failed for ${accountRef.accountId}: ${classified.category} - ${classified.message}`,
                     error,
                 );
-                return of([]);
+                if (classified.category === "fatal") {
+                    return of([]);
+                }
+                throw error;
             }),
         );
     }

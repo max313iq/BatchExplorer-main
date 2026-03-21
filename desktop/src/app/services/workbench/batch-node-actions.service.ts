@@ -397,12 +397,11 @@ export class BatchNodeActionsService {
         uri: string,
         options: HttpRequestOptions = {},
     ): Promise<T> {
-        const requestForAccount = (this.http as any).requestForAccount;
-        if (typeof requestForAccount !== "function") {
+        if (typeof this.http.requestForAccount !== "function") {
             throw new Error("AzureBatchHttpService.requestForAccount is required for workbench multi-account operations.");
         }
         return this.scheduler.run(this._accountKey(account), async () => {
-            return requestForAccount.call(this.http, account, method, uri, options).toPromise();
+            return this.http.requestForAccount(account, method, uri, options).toPromise();
         });
     }
 

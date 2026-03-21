@@ -107,7 +107,10 @@ export class PoolControlWorkbenchComponent implements OnInit, OnDestroy {
 
     public set activeItem(value: WorkbenchPoolTableRow | null) {
         this._activeItem = value;
-        void this._loadSelectedAccount();
+        this._loadSelectedAccount().catch((error) => {
+            this.actionError = this._describeError(error);
+            this.changeDetector.markForCheck();
+        });
     }
 
     public ngOnInit() {
@@ -234,18 +237,43 @@ export class PoolControlWorkbenchComponent implements OnInit, OnDestroy {
 
         try {
             const accounts = await this.discoveryService.listAccounts().toPromise();
+            if (!accounts || accounts.length === 0) {
+                this.allRows = [];
+                this._rebuildFilterOptions();
+                this.applyFilters();
+                this.statusMessage = "No batch accounts found. Check subscriptions and permissions.";
+                this.selection.clear();
+                this.changeDetector.markForCheck();
+                return;
+            }
+
             const rows: WorkbenchPoolTableRow[] = [];
-            for (const account of accounts || []) {
-                const pools = await this.discoveryService.listPools(account).toPromise();
-                for (const pool of pools || []) {
-                    rows.push(this._normalizeRow(pool));
+            const errors: string[] = [];
+            for (const account of accounts) {
+                try {
+                    const pools = await this.discoveryService.listPools(account).toPromise();
+                    for (const pool of pools || []) {
+                        rows.push(this._normalizeRow(pool));
+                    }
+                } catch (error) {
+                    errors.push(`${account.accountName}: ${this._describeError(error)}`);
                 }
             }
 
             this.allRows = rows;
             this._rebuildFilterOptions();
             this.applyFilters();
-            this.statusMessage = rows.length === 0 ? "No pools were discovered." : "";
+            if (rows.length === 0 && errors.length > 0) {
+                this.refreshError = `Failed to load pools from ${errors.length} account(s): ${errors.join("; ")}`;
+                this.statusMessage = "Refresh completed with errors.";
+            } else if (rows.length === 0) {
+                this.statusMessage = "No pools were discovered.";
+            } else if (errors.length > 0) {
+                this.refreshError = `Partial failure: ${errors.length} account(s) had errors.`;
+                this.statusMessage = "";
+            } else {
+                this.statusMessage = "";
+            }
             this.selection.clear();
             this.bulkSummary = null;
             this.exportedJson = null;
@@ -426,15 +454,18 @@ export class PoolControlWorkbenchComponent implements OnInit, OnDestroy {
 
         let succeeded = 0;
         let failed = 0;
+        const errors: string[] = [];
         for (const row of this.selectedRows) {
             if (!this._isSteady(row)) {
+                const msg = `Cannot resize ${row.poolId} because allocationState is '${row.allocationState}'.`;
+                errors.push(msg);
                 this._recordOutcome(
                     row,
                     new Date(),
                     false,
                     row.nodeCountsByState.total,
                     "pool-not-steady",
-                    [`Cannot resize ${row.poolId} because allocationState is '${row.allocationState}'.`],
+                    [msg],
                     0,
                 );
                 failed++;
@@ -449,11 +480,13 @@ export class PoolControlWorkbenchComponent implements OnInit, OnDestroy {
                 this._recordOutcome(row, startedAt, true, Math.floor(target), "none", [], 0);
                 succeeded++;
             } catch {
+                errors.push(`${row.poolId}: ${this.actionError || "Unknown error"}`);
                 this._recordOutcome(row, startedAt, false, row.nodeCountsByState.total, "resize-failed", [this.actionError], 0);
                 failed++;
             }
         }
         this.bulkSummary = `Bulk resize complete: ${succeeded} succeeded, ${failed} failed.`;
+        this.actionError = errors.length > 0 ? errors.join("; ") : null;
         this.changeDetector.markForCheck();
     }
 
@@ -473,15 +506,18 @@ export class PoolControlWorkbenchComponent implements OnInit, OnDestroy {
 
         let succeeded = 0;
         let failed = 0;
+        const errors: string[] = [];
         for (const row of targets) {
             if (!this._isSteady(row)) {
+                const msg = `Cannot delete ${row.poolId} because allocationState is '${row.allocationState}'.`;
+                errors.push(msg);
                 this._recordOutcome(
                     row,
                     new Date(),
                     false,
                     row.nodeCountsByState.total,
                     "pool-not-steady",
-                    [`Cannot delete ${row.poolId} because allocationState is '${row.allocationState}'.`],
+                    [msg],
                     0,
                 );
                 failed++;
@@ -496,12 +532,14 @@ export class PoolControlWorkbenchComponent implements OnInit, OnDestroy {
                 this._recordOutcome(row, startedAt, true, 0, "none", [], 0);
                 succeeded++;
             } catch {
+                errors.push(`${row.poolId}: ${this.actionError || "Unknown error"}`);
                 this._recordOutcome(row, startedAt, false, row.nodeCountsByState.total, "cleanup-failed", [this.actionError], 0);
                 failed++;
             }
         }
 
         this.bulkSummary = `Cleanup complete: ${succeeded} deleted, ${failed} failed.`;
+        this.actionError = errors.length > 0 ? errors.join("; ") : null;
         await this.refresh();
     }
 
@@ -525,6 +563,7 @@ export class PoolControlWorkbenchComponent implements OnInit, OnDestroy {
 
         let succeeded = 0;
         let failed = 0;
+        const errors: string[] = [];
         for (const row of this.selectedRows) {
             const startedAt = new Date();
             try {
@@ -537,12 +576,14 @@ export class PoolControlWorkbenchComponent implements OnInit, OnDestroy {
                 this._recordOutcome(row, startedAt, true, row.nodeCountsByState.total, "none", [], 0);
                 succeeded++;
             } catch {
+                errors.push(`${row.poolId}: ${this.actionError || "Unknown error"}`);
                 this._recordOutcome(row, startedAt, false, row.nodeCountsByState.total, "apply-start-task-failed", [this.actionError], 0);
                 failed++;
             }
         }
 
         this.bulkSummary = `Bulk start task apply complete: ${succeeded} succeeded, ${failed} failed.`;
+        this.actionError = errors.length > 0 ? errors.join("; ") : null;
         this.changeDetector.markForCheck();
     }
 
@@ -557,6 +598,7 @@ export class PoolControlWorkbenchComponent implements OnInit, OnDestroy {
 
         let succeeded = 0;
         let failed = 0;
+        const errors: string[] = [];
         for (const row of this.selectedRows) {
             const startedAt = new Date();
             try {
@@ -566,12 +608,14 @@ export class PoolControlWorkbenchComponent implements OnInit, OnDestroy {
                 this._recordOutcome(row, startedAt, true, row.nodeCountsByState.total, "none", [], 0);
                 succeeded++;
             } catch {
+                errors.push(`${row.poolId}: ${this.actionError || "Unknown error"}`);
                 this._recordOutcome(row, startedAt, false, row.nodeCountsByState.total, "restart-nodes-failed", [this.actionError], 0);
                 failed++;
             }
         }
 
         this.bulkSummary = `Bulk restart nodes complete: ${succeeded} succeeded, ${failed} failed.`;
+        this.actionError = errors.length > 0 ? errors.join("; ") : null;
         this.changeDetector.markForCheck();
     }
 
@@ -664,12 +708,12 @@ export class PoolControlWorkbenchComponent implements OnInit, OnDestroy {
     private _rebuildFilterOptions() {
         this.subscriptionOptions = this._sortedUnique(this.allRows.map((x) => x.subscriptionId));
         this.accountOptions = this._sortedUnique(this.allRows.map((x) => x.accountName));
-        this.regionOptions = this._sortedUnique(this.allRows.map((x) => x.location));
-        this.statusOptions = this._sortedUnique(this.allRows.map((x) => x.allocationState));
+        this.regionOptions = this._sortedUnique(this.allRows.map((x) => x.location || "unknown-region"));
+        this.statusOptions = this._sortedUnique(this.allRows.map((x) => x.allocationState || "unknown"));
     }
 
     private _sortedUnique(values: string[]): string[] {
-        return [...new Set(values.filter((x) => Boolean(x)))].sort((a, b) => a.localeCompare(b));
+        return [...new Set(values.filter((x) => x != null && x !== ""))].sort((a, b) => a.localeCompare(b));
     }
 
     private _normalizeRow(row: WorkbenchPoolRow): WorkbenchPoolTableRow {

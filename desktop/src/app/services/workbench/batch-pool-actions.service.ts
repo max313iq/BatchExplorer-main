@@ -323,8 +323,7 @@ export class BatchPoolActionsService {
         uri: string,
         options?: HttpRequestOptions): Promise<T> {
 
-        const accountAwareRequest = (this.batchHttp as any).requestForAccount;
-        if (typeof accountAwareRequest !== "function") {
+        if (typeof this.batchHttp.requestForAccount !== "function") {
             return Promise.reject(new BatchPoolActionError({
                 action: "requestForAccount",
                 kind: "fatal",
@@ -334,7 +333,7 @@ export class BatchPoolActionsService {
                 originalError: new Error("Missing requestForAccount"),
             }));
         }
-        return this._toPromise<T>(accountAwareRequest.call(this.batchHttp, account, method, uri, options));
+        return this._toPromise<T>(this.batchHttp.requestForAccount(account, method, uri, options));
     }
 
     private _toPromise<T>(obs: Observable<T>): Promise<T> {
