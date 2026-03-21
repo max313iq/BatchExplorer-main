@@ -9,6 +9,11 @@
         <base href="<%= htmlWebpackPlugin.options.metadata.baseUrl %>">
     <% } %>
 
+    <!-- Jam.dev: screen recording and event capture -->
+    <meta name="jam:team" content="7918f421-5777-4a00-b483-772a6e3c1395" />
+    <script type="module" src="https://js.jam.dev/recorder.js"></script>
+    <script type="module" src="https://js.jam.dev/capture.js"></script>
+
     <script>
         window.STARTUP_TIME = new Date().getTime();
     </script>

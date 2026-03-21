@@ -7,7 +7,7 @@ import { AzureBatchHttpService, BatchListResponse } from "app/services/azure-bat
 import { ArmBatchAccountService, BatchAccountService, LocalBatchAccountService } from "app/services/batch-account";
 import { SubscriptionService } from "app/services/subscription";
 import { EMPTY, from, Observable, of } from "rxjs";
-import { catchError, concatMap, expand, map, reduce, switchMap, take } from "rxjs/operators";
+import { catchError, concatMap, expand, map, reduce, switchMap, take, timeout } from "rxjs/operators";
 import { RequestScheduler } from "./request-scheduler";
 import { WorkbenchAccountRef, WorkbenchPoolRow, WorkbenchQuotaStatus } from "./workbench-types";
 
@@ -65,9 +65,19 @@ export class WorkbenchDiscoveryService {
 
     public listAccounts(): Observable<WorkbenchAccountRef[]> {
         return this._loadAccounts().pipe(
+            take(1),
+            timeout(60_000),
             map((accounts) => {
                 return accounts.map((account) => this._toAccountRef(account))
                     .sort((left, right) => left.accountName.localeCompare(right.accountName));
+            }),
+            catchError((error) => {
+                const classified = this.classifyError(error);
+                log.error(
+                    `[WorkbenchDiscovery] listAccounts failed: ${classified.category} - ${classified.message}`,
+                    error,
+                );
+                return of([]);
             }),
         );
     }
@@ -75,9 +85,11 @@ export class WorkbenchDiscoveryService {
     public listPools(accountRef: WorkbenchAccountRef): Observable<WorkbenchPoolRow[]> {
         return this._resolveAccount(accountRef).pipe(
             switchMap((account) => this._listPoolsForAccount(account)),
+            take(1),
+            timeout(30_000),
             catchError((error) => {
                 const classified = this.classifyError(error);
-                log.error(
+                log.warn(
                     `[WorkbenchDiscovery] listPools failed for ${accountRef.accountId}: ${classified.category} - ${classified.message}`,
                     error,
                 );
@@ -259,7 +271,7 @@ export class WorkbenchDiscoveryService {
     private _resolveAccount(accountRef: WorkbenchAccountRef): Observable<BatchAccount> {
         return this._schedule(
             `resolve-account:${accountRef.accountId}`,
-            () => this.batchAccountService.get(accountRef.accountId).toPromise(),
+            () => this.batchAccountService.get(accountRef.accountId).pipe(take(1)).toPromise(),
         ).pipe(
             map((account) => {
                 if (!account) {
@@ -322,7 +334,7 @@ export class WorkbenchDiscoveryService {
 
     private _loadSubscriptionsScheduled(): Observable<any[]> {
         return this._schedule("load-subscriptions", async () => {
-            await this.subscriptionService.load().toPromise();
+            await this.subscriptionService.load().pipe(take(1)).toPromise();
             const subscriptions = await this.subscriptionService.subscriptions.pipe(take(1)).toPromise();
             return subscriptions ? subscriptions.toArray() : [];
         });
@@ -330,7 +342,7 @@ export class WorkbenchDiscoveryService {
 
     private _loadLocalAccountsScheduled(): Observable<BatchAccount[]> {
         return this._schedule("load-local-accounts", async () => {
-            await this.localBatchAccountService.load().toPromise();
+            await this.localBatchAccountService.load().pipe(take(1)).toPromise();
             const localAccounts = await this.localBatchAccountService.accounts.pipe(take(1)).toPromise();
             return localAccounts ? localAccounts.toArray() : [];
         });
@@ -340,7 +352,9 @@ export class WorkbenchDiscoveryService {
         return this._schedule(
             `list-arm-accounts:${subscriptionId}`,
             async () => {
-                const accounts = await this.armBatchAccountService.list(subscriptionId).toPromise();
+                const accounts = await this.armBatchAccountService.list(subscriptionId)
+                    .pipe(take(1))
+                    .toPromise();
                 return accounts ? accounts.toArray() : [];
             },
         );
@@ -349,7 +363,7 @@ export class WorkbenchDiscoveryService {
     private _requestForAccountScheduled<T>(account: BatchAccount, method: any, uri?: any, options?: any): Observable<T> {
         return this._schedule(
             this._accountScheduleKey(account),
-            () => this.batchHttp.requestForAccount(account, method, uri, options).toPromise(),
+            () => this.batchHttp.requestForAccount(account, method, uri, options).pipe(take(1)).toPromise(),
         );
     }
 

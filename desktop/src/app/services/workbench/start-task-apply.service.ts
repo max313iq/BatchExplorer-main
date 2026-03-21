@@ -259,8 +259,7 @@ export class StartTaskApplyService {
             throw new Error(`Batch account ${target.accountId} not found.`);
         }
 
-        const requestForAccount = (this.batchHttp as any).requestForAccount;
-        if (typeof requestForAccount !== "function") {
+        if (typeof this.batchHttp.requestForAccount !== "function") {
             throw new Error("AzureBatchHttpService.requestForAccount is not available.");
         }
 
@@ -270,8 +269,7 @@ export class StartTaskApplyService {
         };
 
         await this.scheduler.run(target.accountId, async () => {
-            await requestForAccount.call(
-                this.batchHttp,
+            await this.batchHttp.requestForAccount(
                 account as BatchAccount,
                 "PATCH",
                 `/pools/${encodeURIComponent(target.poolId)}`,
