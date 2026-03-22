@@ -1,0 +1,41 @@
+@import "app/styles/variables";
+
+.account-dropdown {
+    $account-dropdown-width: 240px;
+
+    [bl-dropdown-btn] {
+        &.invalid {
+            color: $danger-color;
+        }
+
+        i {
+            margin: 0 5px;
+            font-weight: bold;
+        }
+    }
+
+    [bl-dropdown-content] {
+        min-width: $account-dropdown-width;
+
+        .url {
+            font-size: 10px;
+            text-overflow: ellipsis;
+        }
+
+        i.fa {
+            margin-right: 5px;
+        }
+
+        .fa-check {
+            margin-left: 5px;
+        }
+
+        .selected {
+            cursor: not-allowed;
+
+            .main {
+                opacity: 0.3;
+            }
+        }
+    }
+}

@@ -1,0 +1,58 @@
+@import "app/styles/variables";
+
+bl-file-tree-view {
+    $tree-view-header-height: 24px;
+    position: relative;
+    display: flex;
+    flex-direction: column;
+
+    .tree-view-header {
+        padding-left: 0;
+
+        .caret {
+            padding: 0 5px;
+            width: 20px;
+        }
+    }
+
+
+    .caret, .file-icon {
+        width: 16px;
+        font-size: 16px;
+        display: inline-block;
+        vertical-align: middle;
+    }
+
+    .caret {
+        color: $secondary-text;
+
+        &:hover {
+            color: $hover-bg-color;
+        }
+    }
+
+    .label {
+        margin-left: 3px;
+    }
+
+    .tree-view-content {
+        outline: none;
+        position: relative;
+        height: calc(100% - #{$tree-view-header-height});
+
+        &.no-rows:focus {
+            border: 1px solid $outline-color;
+        }
+    }
+
+    .tree-rows-container {
+        height: 100%;
+        &.drop-target {
+            background: $main-background;
+        }
+    }
+
+    .tree-view-error {
+        white-space: pre-line;
+    }
+}

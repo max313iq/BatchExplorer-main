@@ -1,0 +1,19 @@
+@import "app/styles/variables";
+
+bl-duration-picker {
+    .input-container {
+        display: flex;
+
+        > input {
+            border-right: none;
+        }
+
+        > .unit-picker {
+            width: 150px;
+        }
+    }
+
+    > .error-container > .error {
+        color: $danger-color;
+    }
+}

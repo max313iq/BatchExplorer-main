@@ -1,0 +1,219 @@
+<div class="pool-control-workbench">
+    <div class="header">
+        <div>
+            <h2>Pool Control Workbench</h2>
+            <p class="subtitle">Cross-account pool visibility with safe refresh controls.</p>
+        </div>
+        <div class="header-actions">
+            <button mat-stroked-button type="button"
+                [disabled]="isRefreshing || !isFeatureEnabled"
+                (click)="refresh()"
+                title="Refresh pools">
+                <i class="fa fa-refresh" aria-hidden="true"></i>
+                Refresh
+            </button>
+            <label class="auto-refresh-toggle">
+                <input type="checkbox" [(ngModel)]="autoRefreshEnabled" (change)="onAutoRefreshChanged()" [disabled]="!isFeatureEnabled">
+                Auto refresh
+            </label>
+            <span class="refresh-interval">Every {{autoRefreshIntervalSeconds}}s</span>
+        </div>
+    </div>
+
+    <div class="feature-off" *ngIf="!isFeatureEnabled">
+        Pool Control Workbench is disabled. Enable <code>features.poolControlWorkbench</code> in user settings.
+    </div>
+
+    <div *ngIf="isFeatureEnabled">
+        <div class="filters">
+            <label>
+                Subscription
+                <select [(ngModel)]="subscriptionFilter" (ngModelChange)="applyFilters()">
+                    <option value="">All</option>
+                    <option *ngFor="let subscription of subscriptionOptions" [value]="subscription">{{subscription}}</option>
+                </select>
+            </label>
+
+            <label>
+                Account
+                <select [(ngModel)]="accountFilter" (ngModelChange)="applyFilters()">
+                    <option value="">All</option>
+                    <option *ngFor="let account of accountOptions" [value]="account">{{account}}</option>
+                </select>
+            </label>
+
+            <label>
+                Region
+                <select [(ngModel)]="regionFilter" (ngModelChange)="applyFilters()">
+                    <option value="">All</option>
+                    <option *ngFor="let region of regionOptions" [value]="region">{{region}}</option>
+                </select>
+            </label>
+
+            <label>
+                Status
+                <select [(ngModel)]="statusFilter" (ngModelChange)="applyFilters()">
+                    <option value="">All</option>
+                    <option *ngFor="let status of statusOptions" [value]="status">{{status}}</option>
+                </select>
+            </label>
+
+            <label class="search">
+                Search
+                <input type="text" [(ngModel)]="searchFilter" (ngModelChange)="applyFilters()" placeholder="pool id, account, region">
+            </label>
+
+            <label class="alerts-only">
+                <input type="checkbox" [(ngModel)]="onlyAlerts" (change)="applyFilters()">
+                Alerts only
+            </label>
+        </div>
+
+        <div class="selection-bar">
+            <span>{{selectedCount}} selected</span>
+            <button mat-stroked-button type="button" [disabled]="selection.isEmpty()" (click)="clearSelection()">
+                Clear selection
+            </button>
+            <button mat-stroked-button type="button" (click)="bulkResizeSelected()" [disabled]="selectedCount === 0">
+                Resize selected
+            </button>
+            <button mat-stroked-button type="button" (click)="bulkApplyStartTaskSelected()" [disabled]="selectedCount === 0">
+                Apply start task
+            </button>
+            <button mat-stroked-button type="button" (click)="bulkRestartNodesSelected()" [disabled]="selectedCount === 0">
+                Restart nodes
+            </button>
+            <button mat-stroked-button type="button" (click)="cleanupBootstrapPools()" [disabled]="displayedRows.length === 0">
+                Cleanup bootstrap pools
+            </button>
+            <button mat-stroked-button type="button" (click)="exportSelectedAsJson()" [disabled]="selectedCount === 0">
+                Export selected JSON
+            </button>
+        </div>
+
+        <bl-table
+            [config]="tableConfig"
+            [data]="displayedRows"
+            [(activeItem)]="activeItem"
+            [(selection)]="selection">
+
+            <bl-column name="subscriptionId">
+                <div *blHeadCellDef>Subscription</div>
+                <div *blCellDef="let row">{{row.subscriptionId}}</div>
+            </bl-column>
+
+            <bl-column name="accountName">
+                <div *blHeadCellDef>Account</div>
+                <div *blCellDef="let row">{{row.accountName}}</div>
+            </bl-column>
+
+            <bl-column name="location">
+                <div *blHeadCellDef>Region</div>
+                <div *blCellDef="let row">{{row.location}}</div>
+            </bl-column>
+
+            <bl-column name="poolId">
+                <div *blHeadCellDef>Pool ID</div>
+                <div *blCellDef="let row">{{row.poolId}}</div>
+            </bl-column>
+
+            <bl-column name="allocationState">
+                <div *blHeadCellDef>Allocation state</div>
+                <div *blCellDef="let row">{{row.allocationState}}</div>
+            </bl-column>
+
+            <bl-column name="nodeCounts">
+                <div *blHeadCellDef>Node counts (total/by state)</div>
+                <div *blCellDef="let row">
+                    <div class="node-counts-cell">
+                        <strong>Total: {{row.nodeCountsByState.total}}</strong>
+                        <span>Idle: {{row.nodeCountsByState.idle}}</span>
+                        <span>Running: {{row.nodeCountsByState.running}}</span>
+                        <span>Starting: {{row.nodeCountsByState.starting}}</span>
+                        <span>StartTaskFailed: {{row.nodeCountsByState.startTaskFailed}}</span>
+                        <span>Unusable: {{row.nodeCountsByState.unusable}}</span>
+                    </div>
+                </div>
+            </bl-column>
+
+            <bl-column name="quotaStatus">
+                <div *blHeadCellDef>Quota status</div>
+                <div *blCellDef="let row">
+                    <span class="quota-pill" [ngClass]="quotaStatusClass(row)">
+                        {{quotaStatusLabel(row)}}
+                    </span>
+                </div>
+            </bl-column>
+
+            <bl-column name="alerts">
+                <div *blHeadCellDef>Alert indicators</div>
+                <div *blCellDef="let row">
+                    <span class="alert-indicator" [ngClass]="{ 'has-alerts': row.alerts.length > 0 }" [title]="row.alerts.join(', ')">
+                        {{alertIndicatorLabel(row)}}
+                    </span>
+                </div>
+            </bl-column>
+
+            <bl-column name="actions">
+                <div *blHeadCellDef>Actions</div>
+                <div *blCellDef="let row">
+                    <button mat-button type="button" (click)="resizeRow(row)" [disabled]="isRowBusy(row)">Resize</button>
+                    <button mat-button type="button" (click)="stopResizeRow(row)" [disabled]="isRowBusy(row)">Stop</button>
+                    <button mat-button type="button" (click)="cloneRow(row)" [disabled]="isRowBusy(row)">Clone</button>
+                    <button mat-button type="button" (click)="recreateRow(row)" [disabled]="isRowBusy(row)">Recreate</button>
+                    <button mat-button type="button" (click)="applyStartTaskRow(row)" [disabled]="isRowBusy(row)">Apply start task</button>
+                    <button mat-button type="button" (click)="deleteRow(row)" [disabled]="isRowBusy(row)">Delete</button>
+                    <button mat-button type="button" (click)="exportRow(row)" [disabled]="isRowBusy(row)">Export config JSON</button>
+                </div>
+            </bl-column>
+        </bl-table>
+
+        <div class="status-message" *ngIf="statusMessage">{{statusMessage}}</div>
+        <div class="status-message" *ngIf="actionMessage">{{actionMessage}}</div>
+        <div class="status-message" *ngIf="bulkSummary">{{bulkSummary}}</div>
+        <div class="error-message" *ngIf="refreshError">{{refreshError}}</div>
+        <div class="error-message" *ngIf="actionError">{{actionError}}</div>
+        <div class="export-json" *ngIf="exportedJson">
+            <h3>Export JSON</h3>
+            <pre>{{exportedJson}}</pre>
+        </div>
+
+        <div class="export-json" *ngIf="perAccountOutcomes.length > 0">
+            <h3>Per-account outcomes</h3>
+            <pre>{{perAccountOutcomes | json}}</pre>
+        </div>
+
+        <div class="start-task-section">
+            <h3>Start task rollout</h3>
+            <bl-start-task-editor
+                [currentTarget]="currentTarget"
+                [selectedTargets]="selectedTargets"
+                [displayedTargets]="displayedTargets"
+                [allTargets]="allTargets"
+                (previewRequested)="handleStartTaskPreview($event)"
+                (applyRequested)="handleStartTaskApply($event)">
+            </bl-start-task-editor>
+
+            <pre class="start-task-preview" *ngIf="startTaskPreviewText">{{startTaskPreviewText}}</pre>
+            <div class="status-message" *ngIf="startTaskRunning && startTaskProgress">
+                Applying start task: {{startTaskProgress.completedTargets}} / {{startTaskProgress.totalTargets}}
+            </div>
+            <div class="error-message" *ngIf="startTaskError">{{startTaskError}}</div>
+            <div class="status-message" *ngIf="startTaskProgress?.summary">
+                Start task summary:
+                {{startTaskProgress.summary.succeeded}} succeeded,
+                {{startTaskProgress.summary.failed}} failed,
+                {{startTaskProgress.summary.skipped}} skipped.
+            </div>
+        </div>
+
+        <div class="detail-section">
+            <h3>Pool detail</h3>
+            <bl-pool-detail-panel
+                [account]="selectedAccount"
+                [poolId]="activeItem?.poolId"
+                [summary]="selectedSummary">
+            </bl-pool-detail-panel>
+        </div>
+    </div>
+</div>

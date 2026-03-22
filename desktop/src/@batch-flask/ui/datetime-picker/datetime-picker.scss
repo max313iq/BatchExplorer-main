@@ -1,0 +1,40 @@
+@import "app/styles/variables";
+
+bl-datetime-picker {
+    .label {
+        display: flex;
+        flex-direction: column;
+        justify-content: center;
+    }
+
+    .time-picker {
+        display: flex;
+        align-items: center;
+
+        > .time-separator {
+            margin-right: 5px;
+            margin-left: 5px;
+        }
+        > .time-entry {
+            width: 40px;
+            height: 40px;
+            flex: 0 0 40px;
+        }
+    }
+
+    .timezone {
+        margin-left: 10px;
+        color: $secondary-text;
+    }
+
+    .mat-datepicker-toggle .mat-icon-button {
+        width: 24px;
+        height: 23px;
+        line-height: 24px;
+
+        > span.mat-button-wrapper > svg {
+            height: 16px;
+            width: 16px;
+        }
+    }
+}

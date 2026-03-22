@@ -1,0 +1,223 @@
+<div class="pool-detail-panel" *ngIf="poolId; else noPoolSelected">
+    <div class="summary-grid">
+        <div class="summary-item">
+            <div class="summary-label">Pool</div>
+            <div class="summary-value">{{poolId}}</div>
+        </div>
+        <div class="summary-item">
+            <div class="summary-label">Account</div>
+            <div class="summary-value">{{summary?.accountName || "-"}}</div>
+        </div>
+        <div class="summary-item">
+            <div class="summary-label">Region</div>
+            <div class="summary-value">{{summary?.location || "-"}}</div>
+        </div>
+        <div class="summary-item">
+            <div class="summary-label">Allocation state</div>
+            <div class="summary-value">{{summary?.allocationState || "-"}}</div>
+        </div>
+    </div>
+
+    <div class="alerts" *ngIf="summary?.alerts?.length">
+        <div class="alert-item" *ngFor="let alert of summary.alerts">{{alert}}</div>
+    </div>
+
+    <mat-tab-group [selectedIndex]="activeTabIndex" (selectedIndexChange)="onTabIndexChange($event)">
+        <mat-tab label="Overview">
+            <div class="overview-panel">
+                <div class="config-loading" *ngIf="loadingPoolConfig">
+                    <i class="fa fa-spinner fa-spin" aria-hidden="true"></i>
+                    Loading pool configuration...
+                </div>
+
+                <div class="action-error" *ngIf="configError">
+                    {{configError}}
+                </div>
+
+                <div class="config-grid" *ngIf="!loadingPoolConfig && poolConfiguration">
+                    <div class="config-item">
+                        <div class="config-label">VM size</div>
+                        <div class="config-value">{{poolConfiguration.vmSize}}</div>
+                    </div>
+                    <div class="config-item">
+                        <div class="config-label">Auto-scale</div>
+                        <div class="config-value">{{poolConfiguration.enableAutoScale ? "Enabled" : "Disabled"}}</div>
+                    </div>
+                    <div class="config-item">
+                        <div class="config-label">Dedicated (current / target)</div>
+                        <div class="config-value">{{poolConfiguration.currentDedicatedNodes}} / {{poolConfiguration.targetDedicatedNodes}}</div>
+                    </div>
+                    <div class="config-item">
+                        <div class="config-label">Low-priority (current / target)</div>
+                        <div class="config-value">{{poolConfiguration.currentLowPriorityNodes}} / {{poolConfiguration.targetLowPriorityNodes}}</div>
+                    </div>
+                    <div class="config-item">
+                        <div class="config-label">Task slots per node</div>
+                        <div class="config-value">{{poolConfiguration.taskSlotsPerNode}}</div>
+                    </div>
+                    <div class="config-item">
+                        <div class="config-label">Node agent SKU</div>
+                        <div class="config-value">{{poolConfiguration.nodeAgentSKUId}}</div>
+                    </div>
+                    <div class="config-item config-item-wide">
+                        <div class="config-label">Image reference</div>
+                        <div class="config-value">{{poolConfiguration.imageReference}}</div>
+                    </div>
+                </div>
+
+                <div class="start-task-summary" *ngIf="!loadingPoolConfig && poolConfiguration">
+                    <h4>Start task summary</h4>
+                    <div class="start-task-grid">
+                        <div class="config-item">
+                            <div class="config-label">Command line</div>
+                            <div class="config-value wrap">{{poolConfiguration.startTask.commandLine}}</div>
+                        </div>
+                        <div class="config-item">
+                            <div class="config-label">Wait for success</div>
+                            <div class="config-value">{{poolConfiguration.startTask.waitForSuccess ? "Yes" : "No"}}</div>
+                        </div>
+                        <div class="config-item">
+                            <div class="config-label">Max retries</div>
+                            <div class="config-value">{{poolConfiguration.startTask.maxTaskRetryCount}}</div>
+                        </div>
+                        <div class="config-item">
+                            <div class="config-label">Environment settings</div>
+                            <div class="config-value">{{poolConfiguration.startTask.environmentSettingsCount}}</div>
+                        </div>
+                        <div class="config-item">
+                            <div class="config-label">Resource files</div>
+                            <div class="config-value">{{poolConfiguration.startTask.resourceFilesCount}}</div>
+                        </div>
+                        <div class="config-item">
+                            <div class="config-label">User identity</div>
+                            <div class="config-value">{{poolConfiguration.startTask.userIdentity}}</div>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="overview-empty" *ngIf="!hasNodeCounts">
+                    Node state counts will appear here after discovery loads.
+                </div>
+
+                <div class="count-grid" *ngIf="hasNodeCounts">
+                    <div class="count-card" *ngFor="let item of summary.nodeCountsByState | keyvalue">
+                        <div class="count-key">{{item.key}}</div>
+                        <div class="count-value">{{item.value}}</div>
+                    </div>
+                </div>
+            </div>
+        </mat-tab>
+
+        <mat-tab label="Nodes">
+            <div class="nodes-toolbar">
+                <button mat-stroked-button type="button" (click)="refreshNodes()" [disabled]="loadingNodes || actionInProgress">
+                    Refresh nodes
+                </button>
+                <button mat-stroked-button color="warn" type="button"
+                    (click)="bulkRemoveSelected()"
+                    [disabled]="selectedNodeCount === 0 || loadingNodes || actionInProgress">
+                    Remove selected
+                </button>
+                <button mat-stroked-button type="button"
+                    (click)="bulkRebootSelected()"
+                    [disabled]="selectedNodeCount === 0 || loadingNodes || actionInProgress">
+                    Reboot selected
+                </button>
+                <button mat-stroked-button type="button"
+                    (click)="bulkReimageSelected()"
+                    [disabled]="selectedNodeCount === 0 || loadingNodes || actionInProgress">
+                    Reimage selected
+                </button>
+                <button mat-stroked-button type="button"
+                    (click)="bulkEnableSchedulingSelected()"
+                    [disabled]="selectedNodeCount === 0 || loadingNodes || actionInProgress">
+                    Enable scheduling
+                </button>
+                <button mat-stroked-button type="button"
+                    (click)="bulkDisableSchedulingSelected()"
+                    [disabled]="selectedNodeCount === 0 || loadingNodes || actionInProgress">
+                    Disable scheduling
+                </button>
+            </div>
+
+            <div class="action-message" *ngIf="actionMessage">
+                <i class="fa fa-spinner fa-spin" aria-hidden="true"></i>
+                {{actionMessage}}
+            </div>
+
+            <div class="action-error" *ngIf="actionError">
+                {{actionError}}
+            </div>
+
+            <div class="bulk-summary" *ngIf="lastBulkResult">
+                {{lastBulkResult.action}} finished:
+                {{lastBulkResult.successCount}} succeeded,
+                {{lastBulkResult.failureCount}} failed.
+            </div>
+
+            <div class="node-summary" *ngIf="lastNodeAction">
+                Last node action:
+                <span [class.success]="lastNodeAction.success" [class.failure]="!lastNodeAction.success">
+                    {{lastNodeAction.success ? "success" : "failed"}}
+                </span>
+            </div>
+
+            <div class="nodes-loading" *ngIf="loadingNodes">
+                <i class="fa fa-spinner fa-spin" aria-hidden="true"></i>
+                Loading nodes...
+            </div>
+
+            <div class="nodes-empty" *ngIf="!loadingNodes && nodesLoaded && nodes.length === 0">
+                No nodes found in this pool.
+            </div>
+
+            <table class="nodes-table" *ngIf="!loadingNodes && nodes.length > 0">
+                <thead>
+                    <tr>
+                        <th class="checkbox-column">
+                            <mat-checkbox
+                                [checked]="allNodesSelected"
+                                [indeterminate]="partialNodesSelected"
+                                (change)="toggleAllNodes($event.checked)">
+                            </mat-checkbox>
+                        </th>
+                        <th>Node ID</th>
+                        <th>State</th>
+                        <th>Scheduling</th>
+                        <th>State transition</th>
+                        <th>Errors</th>
+                        <th class="actions-column">Actions</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <tr *ngFor="let node of nodes">
+                        <td class="checkbox-column">
+                            <mat-checkbox
+                                [checked]="isNodeSelected(node.id)"
+                                (change)="toggleNodeSelection(node.id, $event.checked)">
+                            </mat-checkbox>
+                        </td>
+                        <td>{{node.id}}</td>
+                        <td>{{node.state}}</td>
+                        <td>{{node.schedulingState}}</td>
+                        <td>{{node.stateTransitionTime | date: 'short'}}</td>
+                        <td>{{nodeErrorsCount(node)}}</td>
+                        <td class="actions-column">
+                            <button mat-button color="warn" type="button" (click)="removeNode(node)" [disabled]="actionInProgress">Remove</button>
+                            <button mat-button type="button" (click)="rebootNode(node)" [disabled]="actionInProgress">Reboot</button>
+                            <button mat-button type="button" (click)="reimageNode(node)" [disabled]="actionInProgress">Reimage</button>
+                            <button mat-button type="button" (click)="enableScheduling(node)" [disabled]="actionInProgress">Enable</button>
+                            <button mat-button type="button" (click)="disableScheduling(node)" [disabled]="actionInProgress">Disable</button>
+                        </td>
+                    </tr>
+                </tbody>
+            </table>
+        </mat-tab>
+    </mat-tab-group>
+</div>
+
+<ng-template #noPoolSelected>
+    <div class="no-selection">
+        Select a pool to view node details.
+    </div>
+</ng-template>

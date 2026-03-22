@@ -1,0 +1,4 @@
+{
+  "root": true,
+  "extends": ["./util/common-config/.eslintrc-common.json", "prettier"]
+}

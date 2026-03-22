@@ -1,0 +1,21 @@
+@import "app/styles/variables";
+
+bl-file-group-create-form {
+    bl-directory-picker {
+        margin-right: 10px;
+    }
+
+    bl-button {
+        padding: 0 10px;
+        margin-bottom: 10px;
+    }
+
+    h4 {
+        margin-bottom: 5px;
+    }
+
+    p.exists {
+        margin-top: -10px;
+        color: $primary-color;
+    }
+}

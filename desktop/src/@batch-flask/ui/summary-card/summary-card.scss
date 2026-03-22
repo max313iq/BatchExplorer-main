@@ -1,0 +1,56 @@
+@import "app/styles/variables";
+
+bl-summary-card {
+    background: $card-background;
+    display: flex;
+
+    > .actions {
+        width: $action-btn-size + 1;
+    }
+
+    > .main-tile {
+        padding: 10px 10px 7px;
+        flex: 1;
+        display: flex;
+        flex-direction: column;
+        min-width: 0;
+
+        > .content-container {
+            display: flex;
+            > .content {
+                > .title {
+                    font-size: 16px;
+                    color: $primary-color;
+                }
+
+                > .subtitle {
+                    color: $secondary-text;
+                }
+
+                > .details {
+                    color: $secondary-text;
+
+                    bl-clickable {
+                        color: $primary-color;
+                    }
+                }
+            }
+        }
+
+        > .summary-footer {
+            display: flex;
+            align-items: center;
+            margin-top: 10px;
+        }
+    }
+
+    > [summaryTile] {
+        flex: 0 0 auto;
+        border-left: 1px solid $border-color;
+    }
+}
+
+.batch-explorer.high-contrast bl-summary-card {
+    border-bottom: 1px solid $border-color;
+    border-left: 1px solid $border-color;
+}

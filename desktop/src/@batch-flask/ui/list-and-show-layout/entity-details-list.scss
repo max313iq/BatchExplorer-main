@@ -1,0 +1,64 @@
+@import "app/styles/variables";
+
+bl-entity-details-list {
+    $header-height: 30px;
+    display: block;
+    position: relative;
+    height: 100%;
+    padding-top: 10px;
+
+    > .entity-details-list-header {
+        display: flex;
+        width: 100%;
+        height: $header-height;
+        align-items: center;
+
+        > .quicksearch {
+            flex: 1;
+
+            .toggle-advanced-filter {
+                display: block;
+                color: $primary-color;
+                cursor: pointer;
+                border-style: solid;
+                border-width: 1px 1px 1px 0;
+                border-color: $border-color;
+                font-size: 16px;
+                background: $button-basic-bg-color;
+                height: 26px;
+                width: 26px;
+                position: relative;
+                padding-left: 6px;
+                padding-top: 4px;
+
+                &:hover {
+                    color: $hover-bg-color;
+                }
+            }
+        }
+
+        > .actions {
+            font-size: 16px;
+
+            bl-button {
+                height: 24px;
+                width: 24px;
+                line-height: 24px;
+            }
+
+            bl-refresh-btn {
+                padding-right: 4px;
+            }
+        }
+    }
+
+    > .entity-details-list-content {
+        height:  calc(100% - #{$header-height});
+
+        .list {
+            height: 100%;
+            display: flex;
+            flex-direction: column;
+        }
+    }
+}

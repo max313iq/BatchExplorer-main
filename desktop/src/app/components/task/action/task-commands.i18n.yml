@@ -1,0 +1,4 @@
+task-commands:
+  rerun: Rerun
+  terminate: Terminate
+  delete: Delete

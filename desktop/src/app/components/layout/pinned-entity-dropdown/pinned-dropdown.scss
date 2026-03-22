@@ -1,0 +1,81 @@
+
+@import "app/styles/variables";
+
+bl-pinned-dropdown {
+    [bl-dropdown-content] {
+        min-width: 300px;
+        max-width: 350px;
+    }
+
+    .dropdown-favorite-container {
+        display: flex;
+        align-items: stretch;
+        justify-content: stretch;
+        padding: 0;
+    }
+
+    .dropdown-favorite-container > .favorite-item {
+        flex-grow: 2;
+        min-width: 250px;
+        cursor: pointer;
+        padding: 0;
+
+        &:hover {
+            i.fa {
+                color: $primary-color-dark;
+            }
+
+            &.selected {
+                color: white;
+            }
+        }
+
+        &.selected {
+            font-weight: bold;
+            color: $primary-color-dark;
+        }
+
+        > div {
+            flex: 1 1 auto;
+            text-align: left;
+            min-width: 20px;
+            text-overflow: ellipsis;
+            overflow-x: hidden;
+            padding: 5px 10px;
+
+            &:hover {
+                .fa {
+                    color: white;
+                }
+            }
+
+            & i {
+                margin-right: 5px;
+
+                &.fa {
+                    color: $primary-color-dark;
+                }
+            }
+        }
+    }
+
+    .dropdown-favorite-container > .delete {
+        flex: 0 0 30px;
+        background-color: $card-background;
+        color: $primary-color-dark;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        cursor: pointer;
+        border-left: 1px solid $border-color;
+        min-width: unset;
+
+        &:hover {
+            background-color: $danger-color;
+        }
+
+        &:active {
+            background-color:  $danger-color;
+        }
+    }
+}

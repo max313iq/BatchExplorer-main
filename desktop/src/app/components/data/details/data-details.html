@@ -1,0 +1,27 @@
+<bl-loading [status]="data.newDataStatus | async" [error]="data.error | async">
+    <div *ngIf="container" class="fit-details-container">
+        <bl-summary-card>
+            <div summaryTitle>{{container?.name}}</div>
+            <div summarySubtitle>
+                {{container.lease?.state}}
+            </div>
+            <bl-button-group summaryActions>
+                <bl-refresh-btn [refresh]="refresh"></bl-refresh-btn>
+                <bl-commands-list [commands]="commands" [entity]="container"></bl-commands-list>
+            </bl-button-group>
+        </bl-summary-card>
+        <bl-storage-error-display></bl-storage-error-display>
+        <bl-card class="details">
+            <bl-tab-group>
+                <bl-tab key="files">
+                    <bl-tab-label>Files</bl-tab-label>
+                    <bl-data-container-files [storageAccountId]="storageAccountId" [container]="container"></bl-data-container-files>
+                </bl-tab>
+                <bl-tab key="configuration">
+                    <bl-tab-label>Configuration</bl-tab-label>
+                    <bl-data-container-configuration [container]="container"></bl-data-container-configuration>
+                </bl-tab>
+            </bl-tab-group>
+        </bl-card>
+    </div>
+</bl-loading>

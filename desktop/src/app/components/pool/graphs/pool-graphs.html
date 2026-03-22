@@ -1,0 +1,120 @@
+<div>
+    <bl-banner *ngIf="startTaskFailedError"
+        [fixMessage]="'pool-graphs.fixes.edit-start-task' | i18n"
+        [fix]="openEditStartTask">
+        <div message>
+            {{'pool-graphs.errors.start-task-failed' | i18n: {
+                failed: startTaskFailedError.failedStartTaskNodes,
+                total: startTaskFailedError.nodeCount
+            } }}
+        </div>
+        <div [other-fix]="rebootFailedNodes"
+            [fixMessage]="'pool-graphs.fixes.reboot-failed-nodes' | i18n">
+        </div>
+        <div *ngIf="isPaasPool" [other-fix]="reimageFailedNodes"
+            [fixMessage]="'pool-graphs.fixes.reimage-failed-nodes' | i18n">
+        </div>
+    </bl-banner>
+    <bl-banner *ngIf="unusableNodeError">
+        <div message>
+            {{'pool-graphs.errors.unusable-nodes' | i18n: {
+                failed: unusableNodeError.failedUnusableNodes,
+                total: unusableNodeError.nodeCount
+            } }}
+        </div>
+    </bl-banner>
+</div>
+<bl-metrics-monitor class="graphs-container">
+    <!-- Only show the heatmap, available nodes and running tasks on the pool -->
+    <ng-container *ngIf="!node">
+        <bl-metrics-monitor-metric [label]="'pool-graphs.heatmap' | i18n">
+            <bl-nodes-heatmap blMonitorGraphPreview [pool]="pool" [nodes]="nodes" [showRunningTasks]="false"
+                [showLegend]="false" [interactive]="false" [limitNode]="10"></bl-nodes-heatmap>
+
+            <bl-nodes-heatmap blMonitorGraphChart [pool]="pool" [nodes]="nodes"></bl-nodes-heatmap>
+        </bl-metrics-monitor-metric>
+        <bl-metrics-monitor-metric *blFeatureOn="'pool.graphs.nodes'" [label]="'pool-graphs.available-nodes' | i18n">
+            <bl-history-graph blMonitorGraphPreview [max]="pool.targetNodes" [history]="runningNodesHistory.history"
+                [interactive]="false" [historySize]="selectedHistoryLength.value">
+            </bl-history-graph>
+
+            <bl-history-graph blMonitorGraphChart [max]="pool.targetNodes" class="full-display" [history]="runningNodesHistory.history"
+                [historySize]="selectedHistoryLength.value">
+            </bl-history-graph>
+        </bl-metrics-monitor-metric>
+        <bl-metrics-monitor-metric *blFeatureOn="'pool.graphs.tasks'" [label]="'pool-graphs.running-tasks' | i18n">
+            <bl-history-graph blMonitorGraphPreview [max]="maxRunningTasks" [history]="runningTaskHistory.history"
+                [interactive]="false" [historySize]="selectedHistoryLength.value">
+            </bl-history-graph>
+
+            <bl-history-graph blMonitorGraphChart [max]="maxRunningTasks" class="full-display" [history]="runningTaskHistory.history"
+                [historySize]="selectedHistoryLength.value">
+            </bl-history-graph>
+        </bl-metrics-monitor-metric>
+    </ng-container>
+    <ng-container  *blFeatureOn="'pool.graphs.insights'">
+        <ng-container *ngIf="appInsightsEnabled">
+            <bl-metrics-monitor-metric [label]="'pool-graphs.cpu' | i18n">
+                <bl-cpu-usage-graph blMonitorGraphPreview #cpuUsage [data]="performanceMetrics" [pool]="pool" [interactive]="false"></bl-cpu-usage-graph>
+                <div blMetricsStatus>{{cpuUsage.status | async}}</div>
+
+                <bl-cpu-usage-graph blMonitorGraphChart [data]="performanceMetrics" [pool]="pool" [showIndividualCpu]="node" class="full-display"></bl-cpu-usage-graph>
+            </bl-metrics-monitor-metric>
+            <bl-metrics-monitor-metric [label]="'pool-graphs.memory' | i18n">
+                <bl-memory-usage-graph blMonitorGraphPreview #memUsage [data]="performanceMetrics" [pool]="pool" [interactive]="false"></bl-memory-usage-graph>
+                <div blMetricsStatus>{{memUsage.status | async}}</div>
+
+                <bl-memory-usage-graph blMonitorGraphChart [data]="performanceMetrics" [pool]="pool" class="full-display"></bl-memory-usage-graph>
+            </bl-metrics-monitor-metric>
+            <bl-metrics-monitor-metric [label]="'pool-graphs.diskIO' | i18n">
+                <bl-disk-io-graph blMonitorGraphPreview #diskIO [data]="performanceMetrics" [pool]="pool" [interactive]="false"></bl-disk-io-graph>
+                <div blMetricsStatus>{{diskIO.status | async}}</div>
+
+                <bl-disk-io-graph blMonitorGraphChart [data]="performanceMetrics" [pool]="pool" class="full-display"></bl-disk-io-graph>
+            </bl-metrics-monitor-metric>
+            <bl-metrics-monitor-metric [label]="'pool-graphs.diskUsage' | i18n">
+                <bl-disk-usage-graph blMonitorGraphPreview #diskUsage [data]="performanceMetrics" [pool]="pool" [interactive]="false"></bl-disk-usage-graph>
+                <div blMetricsStatus>{{diskUsage.status | async}}</div>
+
+                <bl-disk-usage-graph blMonitorGraphChart [data]="performanceMetrics" [pool]="pool" class="full-display"></bl-disk-usage-graph>
+            </bl-metrics-monitor-metric>
+            <bl-metrics-monitor-metric [label]="'pool-graphs.network' | i18n">
+                <bl-network-usage-graph blMonitorGraphPreview #netUsage [data]="performanceMetrics" [pool]="pool" [interactive]="false"></bl-network-usage-graph>
+                <div blMetricsStatus>{{netUsage.status | async}}</div>
+
+                <bl-network-usage-graph blMonitorGraphChart metric="network" [data]="performanceMetrics" [pool]="pool" class="full-display"></bl-network-usage-graph>
+            </bl-metrics-monitor-metric>
+            <bl-metrics-monitor-metric [label]="'pool-graphs.gpu-usage' | i18n" *ngIf="hasGPU">
+                <bl-gpu-usage-graph blMonitorGraphPreview #gpuUsage [data]="performanceMetrics" [pool]="pool" [interactive]="false"></bl-gpu-usage-graph>
+                <div blMetricsStatus>{{gpuUsage.status | async}}</div>
+                <bl-gpu-usage-graph blMonitorGraphChart [data]="performanceMetrics" [pool]="pool" [showIndividualGpu]="node" class="full-display"></bl-gpu-usage-graph>
+            </bl-metrics-monitor-metric>
+            <bl-metrics-monitor-metric [label]="'pool-graphs.gpu-memory' | i18n" *ngIf="hasGPU">
+                <bl-gpu-memory-usage-graph blMonitorGraphPreview #gpuUsage [data]="performanceMetrics" [pool]="pool" [interactive]="false"></bl-gpu-memory-usage-graph>
+                <div blMetricsStatus>{{gpuUsage.status | async}}</div>
+                <bl-gpu-memory-usage-graph blMonitorGraphChart [data]="performanceMetrics" [pool]="pool" [showIndividualGpu]="node"
+                    class="full-display"></bl-gpu-memory-usage-graph>
+            </bl-metrics-monitor-metric>
+        </ng-container>
+    </ng-container>
+    <ng-container *ngIf="!appInsightsEnabled">
+        <bl-metrics-monitor-metric *blFeatureOn="'pool.graphs.insights'" [label]="'pool-graphs.application-insights' | i18n">
+            <bl-cpu-usage-graph blMonitorGraphPreview [data]="performanceMetrics" [pool]="pool" [interactive]="false"></bl-cpu-usage-graph>
+            <div blMetricsStatus>{{'pool-graphs.not-enabled' | i18n}}</div>
+
+            <bl-enable-app-insights-doc blMonitorGraphChart></bl-enable-app-insights-doc>
+        </bl-metrics-monitor-metric>
+    </ng-container>
+
+    <div blMetricsMonitorConfig>
+        <div class="history-length" *blFeatureOn="'pool.graphs.insights|pool.graphs.tasks|pool.graphs.nodes'">
+            {{'pool-graphs.last' | i18n}}
+            <bl-select [placeholder]="'pool-graphs.timespan.label' | i18n" [formControl]="selectedHistoryLength" class="select">
+                <bl-option [value]="historyLength.TenMinute" [label]="'pool-graphs.timespan.10min' | i18n"></bl-option>
+                <bl-option [value]="historyLength.OneHour" [label]="'pool-graphs.timespan.1h' | i18n"></bl-option>
+                <bl-option [value]="historyLength.OnDay" [label]="'pool-graphs.timespan.24h' | i18n"></bl-option>
+                <bl-option [value]="historyLength.OnWeek" [label]="'pool-graphs.timespan.7d' | i18n"></bl-option>
+            </bl-select>
+        </div>
+    </div>
+</bl-metrics-monitor>

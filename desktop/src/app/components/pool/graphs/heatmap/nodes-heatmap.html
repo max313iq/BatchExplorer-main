@@ -1,0 +1,19 @@
+<div class="heatmap-graph">
+    <div class="legend noselect" *ngIf="showLegend">
+        <bl-nodes-heatmap-legend [pool]="pool" [nodes]="nodes" [colors]="colors" (selectedStateChange)="selectState($event)"></bl-nodes-heatmap-legend>
+    </div>
+    <div class="heatmap-container" #heatmap>
+        <svg #svg>
+            <!-- <defs>
+                <pattern id="low-pri-stripes" width="10" height="10" patternUnits="userSpaceOnUse" patternTransform="rotate(45 50 50)">
+                    <line stroke="#fff" stroke-width="2px" y2="10"></line>
+                </pattern>
+            </defs> -->
+        </svg>
+
+        <div *ngIf="nodes.size === 0" class="no-nodes-container">
+            <div class="title">Pool has no nodes</div>
+        </div>
+    </div>
+
+</div>

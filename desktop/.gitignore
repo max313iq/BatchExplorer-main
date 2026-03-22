@@ -1,0 +1,11 @@
+build/
+dll/
+typings/
+logs/
+*.log*
+*.mem.csv
+.awcache
+*.stackdump
+.nyc_output/
+coverage.lcov
+documentation/

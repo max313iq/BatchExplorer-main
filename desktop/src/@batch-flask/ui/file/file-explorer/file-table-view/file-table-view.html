@@ -1,0 +1,43 @@
+<div class="file-table-view-header">
+    <bl-clickable (do)="goBack()" title="Go back" aria-label="Go back" class="go-back">
+        <i class="fa fa-arrow-circle-left" aria-hidden="true"></i>
+    </bl-clickable>
+
+    <div class="current-path">
+        <bl-file-path-navigator [name]="name" [navigator]="navigator" [path]="treeNode.path" (navigate)="navigate.emit($event)"></bl-file-path-navigator>
+    </div>
+</div>
+<div class="table-wrapper" (drop)="handleDrop($event)" (dragover)="handleDragHover($event)">
+    <bl-loading [status]="loadingStatus" [error]="error">
+        <div *ngIf="loadingStatus === LoadingStatus.Ready">
+            <bl-table [data]="treeRows" (activeItemChange)="selectNode($event)" [config]="tableConfig" (dropOnRow)="handleDropOnRow($event)">
+                <bl-column name="name">
+                    <div *blHeadCellDef>Name</div>
+                    <div *blCellDef="let treeNode">
+                        <span class="icon">
+                            <i class="fa" [class.fa-folder]="treeNode.isDirectory" [class.fa-file]="!treeNode.isDirectory" aria-hidden="true"></i>
+                        </span>
+                        <span>{{treeNode.name}}</span>
+                    </div>
+                </bl-column>
+                <bl-column name="contentLength" [defaultWidth]="80">
+                    <div *blHeadCellDef>Size</div>
+                    <div *blCellDef="let treeNode">{{treeNode.isDirectory ? "" : prettyFileSize(treeNode.contentLength)}}</div>
+                </bl-column>
+                <bl-column name="lastModified" [defaultWidth]="155">
+                    <div *blHeadCellDef>Last Modified</div>
+                    <div *blCellDef="let treeNode"><bl-date *ngIf="!treeNode.isDirectory" [date]="treeNode.lastModified"></bl-date></div>
+                </bl-column>
+            </bl-table>
+
+            <bl-no-item [itemCount]="treeNode.children.size">
+                <i icon class="fa fa-file small" aria-hidden="true"></i>
+                <span no-filter>There are no files in this directory</span>
+            </bl-no-item>
+        </div>
+    </bl-loading>
+    <div class="flex-separator"></div>
+    <div class="drop-hint" *ngIf="canDropExternalFiles">
+        <i class="fa fa-cloud-upload" aria-hidden="true"></i> Drag and drop local files here to upload.
+    </div>
+</div>

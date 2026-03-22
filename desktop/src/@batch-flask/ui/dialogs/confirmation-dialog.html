@@ -1,0 +1,12 @@
+<bl-simple-form
+    [submit]="submit"
+    [containerRef]="dialogRef"
+    [actionName]="'common.yes' | i18n"
+    [multiUse]="false"
+    size="small"
+    [stickyFooter]="false"
+    [title]="title">
+    <div class="message" *ngIf="description">
+        {{description}}
+    </div>
+</bl-simple-form>

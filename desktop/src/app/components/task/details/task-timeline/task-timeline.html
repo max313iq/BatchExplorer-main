@@ -1,0 +1,36 @@
+<div class="timeline">
+    <!-- Active-->
+    <bl-task-timeline-state state="active" [currentState]="task.state" [title]="activeMessage">
+        <bl-date [date]="task.creationTime"></bl-date>
+    </bl-task-timeline-state>
+    <div class="state-link" [class.locked]="active"></div>
+
+    <!-- Preparing (Optional) -->
+    <bl-task-timeline-state *ngIf="hasPreparationTask"
+        class="clickable"
+        state="preparing"
+        [currentState]="task.state"
+        [error]="preparingTaskFailed"
+        title="The preparation task failed on the node this task was scheduled on. The task will be rescheduled"
+        (click)="goToPreparationTask()">
+        --
+        <!-- TODO load the prep task info-->
+    </bl-task-timeline-state>
+    <div *ngIf="hasPreparationTask" class="state-link" [class.locked]="active || preparing"></div>
+
+    <!-- Running-->
+    <bl-task-timeline-state state="running" [currentState]="task.state">
+        <div *ngIf="started" [class.warn]="isTaskTimeoutClose" [class.error]="task.didTimeout" [title]="timeoutMessage">
+            <bl-timespan [startTime]="task.executionInfo?.startTime" [endTime]="task.executionInfo?.endTime"></bl-timespan>
+        </div>
+        <div *ngIf="started && retryCount" class="warn">{{retryCount}} retries</div>
+    </bl-task-timeline-state>
+    <div class="state-link" [class.locked]="!completed"></div>
+
+    <!-- Completed-->
+    <bl-task-timeline-state state="completed" [currentState]="task.state" [error]="task.didTimeout">
+        <div *ngIf="completed"><bl-date [date]="task.executionInfo?.endTime"></bl-date></div>
+        <div *ngIf="task.didTimeout" class="error">Task timed out</div>
+        <div *ngIf="completedWarning" class="warn">Exit code {{task.executionInfo?.exitCode}}</div>
+    </bl-task-timeline-state>
+</div>

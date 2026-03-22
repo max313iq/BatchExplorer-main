@@ -1,0 +1,46 @@
+@import "app/styles/variables";
+
+
+bl-tags {
+    &.editable {
+        display: flex;
+        height: 44px;
+        align-items: center;
+    }
+
+    .display {
+        display: flex;
+        align-items: center;
+
+        > .edit {
+            margin-left: 5px;
+            padding: 0 3px;
+        }
+    }
+
+
+    .editor {
+        display: flex;
+        align-items: center;
+
+        input {
+            min-width: 200px;
+        }
+
+        .input-suffix {
+            padding: 0;
+        }
+
+        .save, .cancel, .saving {
+            display: inline-block;
+            height: 24px;
+            width: 24px;
+            font-size: 20px;
+            text-align: center;
+        }
+    }
+
+    .no-tags {
+        color: $secondary-text;
+    }
+}

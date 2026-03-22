@@ -1,0 +1,50 @@
+.start-task-editor {
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+    padding: 12px;
+}
+
+.editor-grid {
+    display: grid;
+    grid-template-columns: 220px minmax(0, 1fr);
+    column-gap: 12px;
+    row-gap: 8px;
+    align-items: start;
+}
+
+.editor-grid textarea,
+.editor-grid input[type="number"],
+.editor-grid select {
+    width: 100%;
+    box-sizing: border-box;
+}
+
+.validation {
+    grid-column: 2;
+    color: #c0392b;
+    font-size: 12px;
+}
+
+.template-hint {
+    grid-column: 2;
+    color: #666;
+    font-size: 12px;
+}
+
+.actions {
+    display: flex;
+    gap: 8px;
+}
+
+.confirm-box {
+    border: 1px solid #d9d9d9;
+    border-radius: 4px;
+    padding: 12px;
+    background: #fafafa;
+}
+
+.confirm-actions {
+    display: flex;
+    gap: 8px;
+}

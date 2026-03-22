@@ -1,0 +1,17 @@
+bl-pool-advanced-filter {
+    display: block;
+}
+
+.editable-properties {
+    display: flex;
+
+    > bl-property-list, > .no-properties {
+        flex: 1;
+    }
+}
+
+bl-pool-graphs {
+    bl-banner {
+        margin-bottom: 15px;
+    }
+}

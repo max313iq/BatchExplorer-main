@@ -1,0 +1,78 @@
+{
+  "$schema": "./theme.schema.json",
+  "type": "standard",
+  "primary": "#2F71C4",
+  "primary-contrast": "#ffffff",
+  "danger": "#bc2f34",
+  "danger-contrast": "#ffffff",
+  "warn": "#a46026",
+  "warn-contrast": "#ffffff",
+  "success": "#118A0F",
+  "success-contrast": "#ffffff",
+  "main-background": "#f5f5f5",
+  "secondary-background": "#e5e5e5",
+  "card-background": "white",
+  "hover-bg": "#d5d5d5",
+  "selection": "var(--color-primary)",
+  "outline": "#528bff",
+  "border": "#919191",
+  "editor": "vs",
+  "text": {
+    "primary": "#262524",
+    "secondary": "#666666"
+  },
+  "breadcrumb": {
+    "text": "white",
+    "background": "#5b5b5b",
+    "hover-background": "#666666"
+  },
+  "header": {
+    "text": "white",
+    "background": "#333333",
+    "hover-background": "#757575"
+  },
+  "navigation": {
+    "text": "white",
+    "background": "#5b5b5b",
+    "hover-background": "#666666"
+  },
+  "footer": {
+    "text": "whitesmoke",
+    "background": "var(--color-primary)",
+    "hover": "#757575"
+  },
+  "file-explorer": {
+    "folder-icon": "#f8d979"
+  },
+  "button": {
+    "basic-text": "#2865bf",
+    "basic-bg": "#ebebeb",
+    "basic-hover-bg": "#d5d5d5",
+    "disabled-text": "#d5d5d5",
+    "focus-text": "var(--color-primary)",
+    "disabled-bg": "#ededed"
+  },
+  "monitorChart": {
+    "core-count": "#004e8c",
+    "low-priority-core-count": "#a36a00",
+    "task-start-event": "#6d5700",
+    "task-complete-event": "#0f700f",
+    "task-fail-event": "#bc2f34",
+    "starting-node-count": "#004e8c",
+    "idle-node-count": "#8764b8",
+    "running-node-count": "#0f700f",
+    "start-task-failed-node-count": "#bc2f34",
+    "rebooting-node-count": "#d93c20"
+  },
+  "input": {
+    "border": "#919191",
+    "focus-border": "var(--color-primary)",
+    "placeholder": "var(--color-text-secondary)",
+    "text": "var(--color-text-primary)",
+    "background": "#fff",
+    "disabled-border": "#d5d5d5",
+    "disabled-text": "var(--color-text-primary)",
+    "disabled-background": "#e5e5e5"
+  },
+  "chart-colors": ["#003f5c", "#bc2f34", "#4caf50", "#ffa600"]
+}

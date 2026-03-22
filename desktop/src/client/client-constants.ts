@@ -1,0 +1,78 @@
+import { app } from "electron";
+import * as mkdirp from "mkdirp";
+import * as net from "net";
+import * as path from "path";
+/**
+ * Root of BatchExplorer(This is relative to where this file is when in the build folder)
+ */
+const root = path.resolve(path.join(__dirname, "../.."));
+
+const portrange = 45032;
+function getPort(port = portrange): Promise<number> {
+    return new Promise((resolve, reject) => {
+        const server = net.createServer();
+        server.listen(port, () => {
+            server.once("close", () => {
+                resolve(port);
+            });
+            server.close();
+        });
+        server.on("error", (err) => {
+            getPort(port + 1).then((x) => {
+                resolve(x);
+            });
+        });
+    });
+}
+
+// eslint-disable-next-line @typescript-eslint/no-var-requires
+const packageConfig = require(`${root}/package.json`);
+
+export function clientFileUrl(path: string, protocol = true): { dev: string, prod: string } {
+    const prefix = protocol ? "file://" : "";
+    return {
+        dev: `${prefix}${root}/src/client/${path}`,
+        prod: `${prefix}${root}/build/client/${path}`,
+    };
+}
+
+const urls = {
+    main: {
+        dev: "http://localhost:3178/index.html",
+        prod: `file://${__dirname}/../../build/index.html`,
+    },
+    splash: {
+        dev: `file://${root}/src/client/splash-screen/splash-screen.html`,
+        prod: `file://${root}/build/client/splash-screen/splash-screen.html`,
+    },
+    proxyCredentials: clientFileUrl("proxy/proxy-credentials-window/proxy-credentials.html"),
+    manualProxyConfiguration:
+        clientFileUrl("proxy/manual-proxy-configuration-window/manual-proxy-configuration-window.html"),
+    recover: {
+        dev: `file://${root}/src/client/recover-window/recover-window.html`,
+        prod: `file://${root}/build/client/recover-window/recover-window.html`,
+    },
+    preloadInsecureTest: `${root}/build/client/preload-insecure-test.js`,
+    icon: __dirname + "/../assets/images/icon.ico",
+};
+
+const isAsar = (process?.mainModule?.filename.indexOf("app.asar") ?? -1) !== -1;
+const logsFolder = isAsar ? path.join(app.getPath("userData"), "logs") : path.join(root, "logs");
+
+const resourcesFolder = isAsar ? path.normalize(path.join(root, "..")) : root;
+
+mkdirp.sync(logsFolder);
+
+// eslint-disable-next-line @typescript-eslint/naming-convention,no-underscore-dangle,id-blacklist,id-match
+export const Constants = {
+    isAsar,
+    isDev: !isAsar,
+    root,
+    urls,
+    logsFolder,
+    resourcesFolder,
+    version: packageConfig.version,
+};
+
+// eslint-disable-next-line @typescript-eslint/naming-convention,no-underscore-dangle,id-blacklist,id-match
+export const ClientConstants = Constants;

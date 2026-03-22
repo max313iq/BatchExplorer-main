@@ -1,0 +1,88 @@
+@import "app/styles/variables";
+
+@keyframes flash {
+    0%, 50%, 100% {
+    }
+
+    25%, 75% {
+        background: map-get($warn, 300);
+    }
+}
+
+bl-node-property-display {
+
+    bl-property-group {
+        margin: 15px 0;
+    }
+
+    .property-content {
+        input {
+            width: 100%;
+        }
+
+        .input-container {
+            width: 100%;
+            display: flex;
+
+            .set-visible {
+                position: absolute;
+                line-height: 25px;
+                right: 5px;
+                font-size: 12pt;
+                cursor: pointer;
+            }
+
+            > .input {
+                position: relative;
+                flex: 1;
+            }
+
+            > .input-suffix {
+                background: $input-border-color;
+                border: 1px solid $input-border-color;
+                height: 26px;
+                min-width: 26px;
+                padding: 0 5px;
+                line-height: 26px;
+                vertical-align: middle;
+                color: $secondary-text;
+            }
+        }
+    }
+
+    .switch-strategy {
+        color: $link-color;
+        font-weight: normal;
+    }
+
+    .password-failure-hint {
+        position: absolute;
+        top: 27px;
+        left: 205px;
+        color: red;
+    }
+
+    .clipboard-info {
+        color: $secondary-text;
+    }
+
+    .ssh-key-pick {
+        cursor: pointer;
+        display: flex;
+
+        .value {
+            flex: 1;
+            min-width: 0;
+            text-overflow: ellipsis;
+            overflow: hidden;
+        }
+
+        .fa-wrench {
+            margin: 0 5px;
+        }
+    }
+
+    .flash {
+        animation: flash 1s 1;
+    }
+}

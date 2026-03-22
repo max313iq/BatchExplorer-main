@@ -1,0 +1,19 @@
+<div [formGroup]="form">
+    <div class="form-element">
+        <bl-form-field>
+            <bl-select formControlName="type" color="primary" placeholder="Container type" required>
+                <bl-option [value]="ContainerType.DockerCompatible" label="Docker compatible"></bl-option>
+            </bl-select>
+        </bl-form-field>
+    </div>
+    <div class="form-element">
+        <div class="form-left">
+            <h4>Container images</h4>
+            <bl-container-images-picker formControlName="containerImageNames"></bl-container-images-picker>
+        </div>
+        <div class="form-right">
+            <h4>Container registries</h4>
+            <bl-container-registry-picker formControlName="containerRegistries"></bl-container-registry-picker>
+        </div>
+    </div>
+</div>

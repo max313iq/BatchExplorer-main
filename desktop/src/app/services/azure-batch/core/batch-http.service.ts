@@ -1,0 +1,128 @@
+import { Location } from "@angular/common";
+import { HttpHandler, HttpHeaders, HttpParams } from "@angular/common/http";
+import { Injectable } from "@angular/core";
+import { HttpRequestOptions, HttpService, ServerError } from "@batch-flask/core";
+import { UrlUtils } from "@batch-flask/utils";
+import { ArmBatchAccount, BatchAccount, LocalBatchAccount } from "app/models";
+import { AuthService } from "app/services/aad";
+import { BatchAccountService } from "app/services/batch-account";
+import { BatchExplorerService } from "app/services/batch-explorer.service";
+import { Constants } from "common";
+import { Observable, from, throwError } from "rxjs";
+import { catchError, flatMap, map, retryWhen, shareReplay, take } from "rxjs/operators";
+import { BatchSharedKeyAuthenticator } from "./batch-shared-key-authenticator";
+
+export class InvalidAccountError extends Error {
+
+}
+@Injectable({providedIn: "root"})
+export class AzureBatchHttpService extends HttpService {
+    public get serviceUrl() {
+        return this.batchExplorer.azureEnvironment.batch;
+    }
+
+    constructor(
+        httpHandler: HttpHandler,
+        private auth: AuthService,
+        private accountService: BatchAccountService,
+        private batchExplorer: BatchExplorerService) {
+        super(httpHandler);
+    }
+
+    public request(method: any, uri?: any, options?: any): Observable<any> {
+        options = this._addApiVersion(uri, options);
+        return this.accountService.currentAccount.pipe(
+            take(1),
+            flatMap((account) => {
+                return this._requestForResolvedAccount(account, method, uri, options);
+            }),
+            shareReplay(1),
+        );
+    }
+
+    /**
+     * Execute a request against a specific account without mutating global account state.
+     */
+    public requestForAccount(account: BatchAccount, method: any, uri?: any, options?: any): Observable<any> {
+        options = this._addApiVersion(uri, options);
+        return this._requestForResolvedAccount(account, method, uri, options).pipe(
+            shareReplay(1),
+        );
+    }
+
+    private _setupRequestForArm(account: ArmBatchAccount, options) {
+        const tenantId = account.subscription.tenantId;
+        return this.auth.accessTokenData(tenantId, "batch").pipe(
+            map((accessToken) => this.addAuthorizationHeader(options, accessToken)),
+        );
+    }
+
+    private _setupRequestForSharedKey(account: LocalBatchAccount, method: string, uri: string, options) {
+        const sharedKey = new BatchSharedKeyAuthenticator(account.name, account.key);
+        return from(sharedKey.signRequest(method, uri, options)).pipe(map(() => options));
+    }
+
+    private _requestForResolvedAccount(account: BatchAccount, method: any, uri: any, options: any): Observable<any> {
+        const url = this._computeUrl(uri, account);
+        let setupRequest: Observable<any>;
+        if (account instanceof ArmBatchAccount) {
+            setupRequest = this._setupRequestForArm(account, options);
+        } else if (account instanceof LocalBatchAccount) {
+            setupRequest = this._setupRequestForSharedKey(account, method, url, options);
+        } else {
+            throw new InvalidAccountError(`Invalid account type ${account}`);
+        }
+
+        return setupRequest.pipe(
+            flatMap((setupOptions) => {
+                return super.request(
+                    method,
+                    url,
+                    setupOptions).pipe(
+                        retryWhen(attempts => this.retryWhen(attempts)),
+                        catchError((error) => {
+                            if (error.status === 0) {
+                                return throwError(new ServerError({
+                                    status: error.status,
+                                    statusText: error.statusText,
+                                    message: error.message,
+                                    code: error.name,
+                                }));
+                            }
+                            const err = ServerError.fromBatchHttp(error);
+                            return throwError(err);
+                        }),
+                    );
+            }),
+        );
+    }
+
+    private _addApiVersion(uri: string, options: HttpRequestOptions | null): HttpRequestOptions {
+        if (!options) {
+            options = {};
+        }
+        if (!(options.params instanceof HttpParams)) {
+            options.params = new HttpParams({ fromObject: options.params });
+        }
+
+        if (!options.params.has("api-version") && !uri.contains("api-version")) {
+            options.params = options.params.set("api-version", Constants.ApiVersion.batchService);
+        }
+        if (!options.headers) {
+            options.headers = new HttpHeaders();
+        }
+        options.headers = (options.headers as any)
+            .set("Content-Type", "application/json; odata=minimalmetadata; charset=UTF-8")
+            .set("Cache-Control", "no-cache");
+
+        return options;
+    }
+
+    private _computeUrl(uri: string, account: BatchAccount) {
+        if (UrlUtils.isHttpUrl(uri)) {
+            return uri;
+        } else {
+            return Location.joinWithSlash(account.url, uri);
+        }
+    }
+}

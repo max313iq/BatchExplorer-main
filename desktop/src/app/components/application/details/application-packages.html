@@ -1,0 +1,22 @@
+<bl-entity-details-list #listWrapper [showRefreshButton]="false" [showExpandButton]="false" [enableAdvancedFilter]="false"
+    addButtonHoverText="Add package version" (onAddEntity)="list?.addPackage($event)" filterPlaceholder="Filter by package version">
+    <div bl-list-buttons>
+        <!--
+            multi select - "add" enabled and "delete" enabled if allow updates is true
+            single select
+                - delete: enabled if allow updates is true
+                - update: enabled if allow updates is true and package is active
+                - activate: enabled if package is pending
+        -->
+        <bl-button color="danger" type="plain" title="Delete selected" [action]="deleteSelection" [disabled]="!deleteEnabled"
+            tooltipPosition="left">
+            <i class="fa fa-trash spin-hover" aria-hidden="true"></i>
+        </bl-button>
+        <bl-button color="light" type="plain" title="Activate pending package" [action]="activateSelection" [disabled]="!activateEnabled"
+            tooltipPosition="left">
+            <i class="fa fa-toggle-on spin-hover" aria-hidden="true"></i>
+        </bl-button>
+    </div>
+
+    <bl-application-package-table [application]="application" [filter]="listWrapper.filter" #list (selectionChange)="selectionChanged($event)"></bl-application-package-table>
+</bl-entity-details-list>

@@ -1,0 +1,165 @@
+import { Deferred } from "common";
+import { Subject } from "rxjs";
+
+export class MockBrowserWindow {
+    public destroy: jasmine.Spy;
+    public loadURL: jasmine.Spy;
+    public on: jasmine.Spy;
+    public addListener: jasmine.Spy;
+    public removeListener: jasmine.Spy;
+    public webContents: { on: jasmine.Spy, notify: (...args) => void };
+
+    private _isVisible = false;
+    private _events: { [key: string]: Subject<any> } = {};
+
+    constructor() {
+        this.destroy = jasmine.createSpy("destroy");
+        this.loadURL = jasmine.createSpy("loadURL");
+        this.on = jasmine.createSpy("on").and.callFake((event: string, callback: (...args) => void) => {
+            if (!(event in this._events)) {
+                this._events[event] = new Subject();
+            }
+            this._events[event].subscribe((data) => {
+                callback(...data.args);
+            });
+        });
+        this.addListener = jasmine.createSpy("addListener").and.callFake(
+            (event: string, callback: (...args) => void) => {
+                if (!(event in this._events)) {
+                    this._events[event] = new Subject();
+                }
+                this._events[event].subscribe((data) => {
+                    callback(...data.args);
+                });
+            });
+        this.removeListener = jasmine.createSpy("removeListener").and.callFake(
+            (event: string, _: (...args) => void) => {
+                if (event in this._events) {
+                    this._events[event].complete();
+                    delete this._events[event];
+                }
+            });
+        this.webContents = {
+            on: jasmine.createSpy("webcontents.on").and.callFake((event: string, callback: (...args) => void) => {
+                this.on(`webcontents.${event}`, callback);
+            }),
+            notify: (event: string, data: any) => {
+                this.notify(`webcontents.${event}`, data);
+            },
+        };
+    }
+
+    public isVisible() {
+        return this._isVisible;
+    }
+
+    public isFullScreen() {
+        return false;
+    }
+
+    public show() {
+        this._isVisible = true;
+    }
+
+    public hide() {
+        this._isVisible = false;
+    }
+
+    public notify(event: string, args: any[]) {
+        if (event in this._events) {
+            this._events[event].next({ args: args });
+        }
+    }
+}
+
+export class MockUniqueWindow {
+    public create: jasmine.Spy;
+    public show: jasmine.Spy;
+    public hide: jasmine.Spy;
+    public destroy: jasmine.Spy;
+    public domReady: Promise<void>;
+    private _visible: boolean = false;
+    private _domReadyDeferred: Deferred<void>;
+
+    constructor() {
+        this._domReadyDeferred = new Deferred();
+        this.domReady = this._domReadyDeferred.promise;
+
+        this.create = jasmine.createSpy("create").and.callFake(() => {
+            this._domReadyDeferred.resolve();
+        });
+        this.show = jasmine.createSpy("show").and.callFake(() => this._visible = true);
+        this.hide = jasmine.createSpy("hide").and.callFake(() => this._visible = false);
+        this.destroy = jasmine.createSpy("destroy").and.callFake(() => {
+            this._domReadyDeferred = new Deferred();
+            this.domReady = this._domReadyDeferred.promise;
+        });
+    }
+
+    public isVisible() {
+        return this._visible;
+    }
+}
+
+export class MockSplashScreen extends MockUniqueWindow {
+}
+
+export class MockAuthenticationWindow extends MockUniqueWindow {
+    public loadURL: jasmine.Spy;
+    private _onRedirectCallbacks: any[] = [];
+    private _onNavigateCallbacks: any[] = [];
+    private _onErrorCallback: any[] = [];
+    private _onCloseCallbacks: any[] = [];
+
+    constructor() {
+        super();
+
+        this.loadURL = jasmine.createSpy("loadURL");
+        this.destroy = this.destroy.and.callFake(() => {
+            this._onRedirectCallbacks = [];
+            this._onNavigateCallbacks = [];
+            this._onErrorCallback = [];
+            this._onCloseCallbacks = [];
+        });
+    }
+
+    public onRedirect(callback) {
+        this._onRedirectCallbacks.push(callback);
+    }
+
+    public onNavigate(callback) {
+        this._onNavigateCallbacks.push(callback);
+    }
+
+    public onError(callback) {
+        this._onErrorCallback.push(callback);
+    }
+
+    public onClose(callback) {
+        this._onCloseCallbacks.push(callback);
+    }
+
+    public notifyRedirect(newUrl) {
+        this._onRedirectCallbacks.forEach((callback) => {
+            callback(newUrl);
+        });
+    }
+
+    public notifyNavigate(newUrl) {
+        for (const callback of this._onNavigateCallbacks) {
+            callback(newUrl);
+        }
+    }
+
+    public notifyError(error: { code: number, description: string }) {
+        for (const callback of this._onErrorCallback) {
+            callback(error);
+        }
+    }
+
+    public notifyClose() {
+        for (const callback of this._onCloseCallbacks) {
+            callback();
+        }
+    }
+}

@@ -1,0 +1,23 @@
+<bl-browse-layout #layout [config]="layoutConfig">
+    <div blBrowseLayoutTitle>
+        Storage containers
+    </div>
+    <div blBrowseLayoutButtons>
+        <bl-button type="plain" icon="fa fa-plus spin-hover" color="light" title="Add a file group" [matMenuTriggerFor]="addFileGroupMenu"
+            (click)="addFileGroup()" (do)="addFileGroup()" [disabled]="!hasAutoStorage" [@.disabled]="true">
+        </bl-button>
+        <mat-menu #addFileGroupMenu="matMenu" [@.disabled]="true">
+            <button mat-menu-item (click)="openEmptyContainerForm()"> Empty container </button>
+            <ng-container *ngIf="dataSource === fileGroupsId">
+                <button mat-menu-item (click)="openEmptyContainerForm(true)"> Empty file group </button>
+            </ng-container>
+        </mat-menu>
+    </div>
+    <div pre-quicksearch>
+        <bl-storage-account-picker [ngModel]="dataSource" (ngModelChange)="updateDataSource($event)">
+            <bl-option [value]="fileGroupsId" label="File groups"></bl-option>
+            <bl-option value="-" label="--------------------" [disabled]="true"></bl-option>
+        </bl-storage-account-picker>
+    </div>
+    <bl-data-container-list blBrowseLayoutList [storageAccountId]="storageAccountId"></bl-data-container-list>
+</bl-browse-layout>

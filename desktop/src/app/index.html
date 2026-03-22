@@ -1,0 +1,29 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <title>Batch Explorer</title>
+
+    <% if (htmlWebpackPlugin.options.metadata.isDevServer) { %>
+        <base href="<%= htmlWebpackPlugin.options.metadata.baseUrl %>">
+    <% } %>
+
+    <!-- Jam.dev: screen recording and event capture -->
+    <meta name="jam:team" content="7918f421-5777-4a00-b483-772a6e3c1395" />
+    <script type="module" src="https://js.jam.dev/recorder.js"></script>
+    <script type="module" src="https://js.jam.dev/capture.js"></script>
+
+    <script>
+        window.STARTUP_TIME = new Date().getTime();
+    </script>
+</head>
+
+<body>
+    <bl-app>
+        <!--This should only show if doing a manual refresh of the page (F5, ctrl+R)-->
+        Loading...
+    </bl-app>
+</body>
+
+</html>

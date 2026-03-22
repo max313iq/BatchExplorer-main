@@ -1,0 +1,20 @@
+<div [formGroup]="containerSettings">
+    <div class="form-element">
+        <bl-form-field>
+            <input blInput [matAutocomplete]="auto" formControlName="imageName" placeholder="Image name" type="text">
+        </bl-form-field>
+        <mat-autocomplete #auto="matAutocomplete" >
+            <mat-option *ngFor="let image of containerConfiguration?.containerImageNames;trackBy: trackImage" [value]="image">
+                {{ image }}
+            </mat-option>
+        </mat-autocomplete>
+    </div>
+    <div class="form-element">
+        <bl-form-field>
+            <input blInput formControlName="containerRunOptions" placeholder="Container run option" type="text">
+        </bl-form-field>
+    </div>
+    <div class="form-element">
+        <bl-registry-picker formControlName="registry"></bl-registry-picker>
+    </div>
+</div>

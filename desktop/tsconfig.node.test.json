@@ -1,0 +1,15 @@
+{
+  "extends": "./tsconfig.node.json",
+  "compilerOptions": {
+    "strictNullChecks": false,
+    "sourceMap": true
+  },
+  // This is not actually used for building but to let the editor know what files use this config
+  "include": [
+    "./src/client/**/*.ts",
+    "./src/common/**/*.ts"
+  ],
+  "exclude": [
+    "node_modules",
+  ]
+}
