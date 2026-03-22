@@ -10,6 +10,7 @@ const BundleAnalyzerWebpackPlugin =
 const MonacoWebpackPlugin = require("monaco-editor-webpack-plugin");
 const webpack = require("webpack");
 const { EsbuildPlugin } = require("esbuild-loader");
+const { execSync } = require("child_process");
 
 const MODE_DEV = "development";
 const MODE_PROD = "production";
@@ -92,6 +93,88 @@ module.exports = (env) => {
             ],
             historyApiFallback: true,
             port: 9000,
+            setupMiddlewares: (middlewares, devServer) => {
+                // Resolve az CLI path — may not be in PATH for child processes on Windows
+                const azCmd = (() => {
+                    const candidates = [
+                        "az",
+                        "C:\\Program Files\\Microsoft SDKs\\Azure\\CLI2\\wbin\\az.cmd",
+                        "C:\\Program Files (x86)\\Microsoft SDKs\\Azure\\CLI2\\wbin\\az.cmd",
+                    ];
+                    for (const c of candidates) {
+                        try {
+                            execSync(`"${c}" --version`, {
+                                encoding: "utf-8",
+                                timeout: 10000,
+                                stdio: "pipe",
+                            });
+                            console.log("[az-proxy] Using az CLI at:", c);
+                            return `"${c}"`;
+                        } catch {
+                            /* try next */
+                        }
+                    }
+                    console.warn(
+                        "[az-proxy] az CLI not found, token requests will fail"
+                    );
+                    return "az";
+                })();
+
+                devServer.app.get("/api/token", (req, res) => {
+                    try {
+                        const resource =
+                            req.query.resource ||
+                            "https://management.azure.com";
+                        const result = execSync(
+                            `${azCmd} account get-access-token --resource ${resource} --output json`,
+                            { encoding: "utf-8", timeout: 15000 }
+                        );
+                        const parsed = JSON.parse(result);
+                        res.json({
+                            accessToken: parsed.accessToken,
+                            expiresOn: parsed.expiresOn,
+                            subscription: parsed.subscription,
+                            tenant: parsed.tenant,
+                        });
+                    } catch (err) {
+                        console.error(
+                            "Failed to get Azure token:",
+                            err.message
+                        );
+                        res.status(500).json({
+                            error: "Failed to get Azure CLI token. Run 'az login' first.",
+                            details: err.stderr || err.message,
+                        });
+                    }
+                });
+
+                devServer.app.get("/api/subscriptions", (req, res) => {
+                    try {
+                        const result = execSync(
+                            `${azCmd} account list --output json`,
+                            { encoding: "utf-8", timeout: 15000 }
+                        );
+                        const subs = JSON.parse(result).map((s) => ({
+                            subscriptionId: s.id,
+                            displayName: s.name,
+                            isDefault: s.isDefault,
+                            state: s.state,
+                            tenantId: s.tenantId,
+                        }));
+                        res.json(subs);
+                    } catch (err) {
+                        console.error(
+                            "Failed to list subscriptions:",
+                            err.message
+                        );
+                        res.status(500).json({
+                            error: "Failed to list subscriptions. Run 'az login' first.",
+                        });
+                    }
+                });
+
+                return middlewares;
+            },
             compress: true,
             headers: {
                 Connection: "keep-alive",

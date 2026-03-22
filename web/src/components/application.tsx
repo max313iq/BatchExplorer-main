@@ -18,6 +18,7 @@ import { PrimaryButton } from "@fluentui/react/lib/Button";
 import { translate } from "@azure/bonito-core";
 import { ThemeName } from "@azure/bonito-ui/lib/theme";
 import { AutoDashboard } from "./auto-ops";
+import { MultiRegionDashboard } from "../multi-region";
 
 //DefaultButton
 const dropdownStyles: Partial<IDropdownStyles> = {
@@ -100,6 +101,23 @@ export const Application: React.FC = () => {
                                 },
                             }}
                         ></PrimaryButton>
+                        <PrimaryButton
+                            text="Multi-Region"
+                            href="#/multi-region"
+                            iconProps={{ iconName: "Globe" }}
+                            styles={{
+                                root: {
+                                    background:
+                                        "linear-gradient(90deg, #107c10, #0078d4)",
+                                    border: "none",
+                                },
+                                rootHovered: {
+                                    background:
+                                        "linear-gradient(90deg, #0b5a0b, #005a9e)",
+                                    border: "none",
+                                },
+                            }}
+                        ></PrimaryButton>
 
                         <Dropdown
                             styles={dropdownStyles}
@@ -141,9 +159,10 @@ export const Application: React.FC = () => {
                                 />
                             }
                         />
+                        <Route path="/auto" element={<AutoDashboard />} />
                         <Route
-                            path="/auto"
-                            element={<AutoDashboard />}
+                            path="/multi-region"
+                            element={<MultiRegionDashboard />}
                         />
                         <Route path="/" element={<CertificatePage />} />
                     </Routes>

@@ -3,20 +3,20 @@
   "configurations": [
     {
       "name": "desktop-dev-server",
-      "runtimeExecutable": "npm.cmd",
-      "runtimeArgs": ["run", "dev-server"],
+      "runtimeExecutable": "cmd",
+      "runtimeArgs": ["/c", "cd desktop && npm run dev-server"],
       "port": 3178
     },
     {
       "name": "web-dev-server",
-      "runtimeExecutable": "npm.cmd",
-      "runtimeArgs": ["run", "start:dev"],
+      "runtimeExecutable": "cmd",
+      "runtimeArgs": ["/c", "cd web && npm run start:dev"],
       "port": 9000
     },
     {
       "name": "karma-test-runner",
-      "runtimeExecutable": "npm.cmd",
-      "runtimeArgs": ["run", "test-app"],
+      "runtimeExecutable": "cmd",
+      "runtimeArgs": ["/c", "cd desktop && npm run test-app"],
       "port": 9876
     }
   ]
