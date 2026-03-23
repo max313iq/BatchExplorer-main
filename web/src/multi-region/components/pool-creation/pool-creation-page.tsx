@@ -8,6 +8,7 @@ import {
     SelectionMode,
 } from "@fluentui/react/lib/DetailsList";
 import { Dropdown, IDropdownOption } from "@fluentui/react/lib/Dropdown";
+import { TextField } from "@fluentui/react/lib/TextField";
 import { Toggle } from "@fluentui/react/lib/Toggle";
 import { ProgressIndicator } from "@fluentui/react/lib/ProgressIndicator";
 import { MessageBar, MessageBarType } from "@fluentui/react/lib/MessageBar";
@@ -140,8 +141,14 @@ export const PoolCreationPage: React.FC<PoolCreationPageProps> = ({
     >(new Set());
     const [selectAll, setSelectAll] = React.useState(false);
     const [isRunning, setIsRunning] = React.useState(false);
-    const [smartMode, setSmartMode] = React.useState(false);
+    const [smartMode, setSmartMode] = React.useState(true);
     const [selectedVmSizes, setSelectedVmSizes] = React.useState<string[]>([]);
+    const [startTaskCmd, setStartTaskCmd] = React.useState(
+        '/bin/bash -c "echo Hello"'
+    );
+    const [quotaType, setQuotaType] = React.useState<
+        "lowPriority" | "dedicated"
+    >("lowPriority");
 
     // Load last pool config from preferences on mount
     React.useEffect(() => {
@@ -224,21 +231,58 @@ export const PoolCreationPage: React.FC<PoolCreationPageProps> = ({
 
     const handleCreate = React.useCallback(async () => {
         try {
-            const poolConfig = JSON.parse(poolConfigJson);
             setConfigError(null);
             setIsRunning(true);
 
             if (smartMode && selectedVmSizes.length > 0) {
+                // Build pool config from simple fields — no JSON editing needed
+                const poolConfig = {
+                    id: "pool",
+                    vmSize: selectedVmSizes[0].toLowerCase(),
+                    virtualMachineConfiguration: {
+                        nodeAgentSKUId: "batch.node.ubuntu 22.04",
+                        imageReference: {
+                            publisher: "canonical",
+                            offer: "0001-com-ubuntu-server-jammy",
+                            sku: "22_04-lts-gen2",
+                            version: "latest",
+                        },
+                    },
+                    resizeTimeout: "PT15M",
+                    targetDedicatedNodes: 0,
+                    targetLowPriorityNodes: 0,
+                    taskSlotsPerNode: 1,
+                    taskSchedulingPolicy: { nodeFillType: "Pack" },
+                    enableAutoScale: false,
+                    enableInterNodeCommunication: false,
+                    startTask: {
+                        commandLine: startTaskCmd,
+                        environmentSettings: [],
+                        maxTaskRetryCount: 3,
+                        resourceFiles: [],
+                        userIdentity: {
+                            autoUser: {
+                                scope: "pool",
+                                elevationLevel: "admin",
+                            },
+                        },
+                        waitForSuccess: true,
+                    },
+                    certificateReferences: [],
+                    metadata: [],
+                    userAccounts: [],
+                };
                 await orchestrator.execute({
                     action: "create_pools_smart",
                     payload: {
                         accountIds: Array.from(selectedAccountIds),
                         vmSizes: selectedVmSizes,
                         poolConfig,
-                        quotaType: "lowPriority",
+                        quotaType,
                     },
                 });
             } else {
+                const poolConfig = JSON.parse(poolConfigJson);
                 await orchestrator.execute({
                     action: "create_pools",
                     payload: {
@@ -260,6 +304,8 @@ export const PoolCreationPage: React.FC<PoolCreationPageProps> = ({
         poolConfigJson,
         smartMode,
         selectedVmSizes,
+        startTaskCmd,
+        quotaType,
     ]);
 
     const handleRetryFailedPools = React.useCallback(() => {
@@ -391,71 +437,159 @@ export const PoolCreationPage: React.FC<PoolCreationPageProps> = ({
                     />
                 )}
 
-                <Dropdown
-                    label="GPU VM Sizes (select up to 5, in priority order)"
-                    placeholder="Select VM sizes..."
-                    multiSelect
-                    options={VM_DROPDOWN_OPTIONS}
-                    selectedKeys={selectedVmSizes}
-                    onChange={(_e, option) => {
-                        if (!option) return;
-                        setSelectedVmSizes((prev) => {
-                            if (option.selected) {
-                                if (prev.length >= MAX_VM_SELECTIONS)
-                                    return prev;
-                                return [...prev, option.key as string];
-                            } else {
-                                return prev.filter((k) => k !== option.key);
-                            }
-                        });
-                    }}
-                    styles={{ root: { maxWidth: 450 } }}
-                />
-
                 <Toggle
-                    label="Smart Mode"
+                    label="Smart Mode (recommended)"
                     inlineLabel
                     checked={smartMode}
                     onChange={(_e, checked) => setSmartMode(!!checked)}
                     onText="On"
                     offText="Off"
                 />
-                {smartMode && (
-                    <MessageBar messageBarType={MessageBarType.info}>
-                        Smart Mode tries VM sizes in priority order per account.
-                        If the first VM size fails (capacity/quota), it falls
-                        back to the next. Pools are sized automatically based on
-                        available quota.
-                    </MessageBar>
-                )}
 
-                <div>
-                    <label
-                        style={{
-                            fontWeight: 600,
-                            fontSize: "14px",
-                            display: "block",
-                            marginBottom: "4px",
-                        }}
-                    >
-                        Pool Configuration (JSON)
-                    </label>
-                    <MonacoEditor
-                        language="json"
-                        value={poolConfigJson}
-                        onChange={(value) => handleEditorChange(value ?? "")}
-                        containerStyle={{
-                            height: "300px",
-                            border: "1px solid #edebe9",
-                        }}
-                        editorOptions={{
-                            minimap: { enabled: false },
-                            scrollBeyondLastLine: false,
-                            lineNumbers: "on",
-                            fontSize: 13,
-                        }}
-                    />
-                </div>
+                {smartMode ? (
+                    <>
+                        <MessageBar messageBarType={MessageBarType.info}>
+                            Smart Mode auto-calculates node counts from
+                            available quota. Select VM sizes in priority order —
+                            if one fails (capacity/quota), it falls back to the
+                            next. Maximizes quota usage automatically.
+                        </MessageBar>
+
+                        <Dropdown
+                            label="GPU VM Sizes (select up to 5, in priority order)"
+                            placeholder="Select VM sizes..."
+                            required
+                            multiSelect
+                            options={VM_DROPDOWN_OPTIONS}
+                            selectedKeys={selectedVmSizes}
+                            onChange={(_e, option) => {
+                                if (!option) return;
+                                setSelectedVmSizes((prev) => {
+                                    if (option.selected) {
+                                        if (prev.length >= MAX_VM_SELECTIONS)
+                                            return prev;
+                                        return [...prev, option.key as string];
+                                    } else {
+                                        return prev.filter(
+                                            (k) => k !== option.key
+                                        );
+                                    }
+                                });
+                            }}
+                            styles={{ root: { maxWidth: 500 } }}
+                        />
+
+                        {selectedVmSizes.length > 0 && (
+                            <div style={{ fontSize: 12, color: "#605e5c" }}>
+                                Priority order:{" "}
+                                {selectedVmSizes.map((v, i) => (
+                                    <span key={v}>
+                                        <strong>{i + 1}.</strong>{" "}
+                                        {v.replace("Standard_", "")}
+                                        {i < selectedVmSizes.length - 1
+                                            ? " → "
+                                            : ""}
+                                    </span>
+                                ))}
+                            </div>
+                        )}
+
+                        <Dropdown
+                            label="Quota Type"
+                            selectedKey={quotaType}
+                            options={[
+                                {
+                                    key: "lowPriority",
+                                    text: "Low Priority / Spot (cheaper, may be preempted)",
+                                },
+                                {
+                                    key: "dedicated",
+                                    text: "Dedicated (guaranteed, higher cost)",
+                                },
+                            ]}
+                            onChange={(_e, option) => {
+                                if (option)
+                                    setQuotaType(
+                                        option.key as
+                                            | "lowPriority"
+                                            | "dedicated"
+                                    );
+                            }}
+                            styles={{ root: { maxWidth: 500 } }}
+                        />
+
+                        <TextField
+                            label="Start Task Command"
+                            multiline
+                            rows={4}
+                            value={startTaskCmd}
+                            onChange={(_e, v) => setStartTaskCmd(v ?? "")}
+                            placeholder='/bin/bash -c "apt-get update && echo setup done"'
+                            styles={{
+                                root: { maxWidth: 700 },
+                                field: {
+                                    fontFamily: "Consolas, monospace",
+                                    fontSize: 13,
+                                },
+                            }}
+                        />
+                    </>
+                ) : (
+                    <>
+                        <Dropdown
+                            label="GPU VM Sizes (optional, select up to 5)"
+                            placeholder="Select VM sizes..."
+                            multiSelect
+                            options={VM_DROPDOWN_OPTIONS}
+                            selectedKeys={selectedVmSizes}
+                            onChange={(_e, option) => {
+                                if (!option) return;
+                                setSelectedVmSizes((prev) => {
+                                    if (option.selected) {
+                                        if (prev.length >= MAX_VM_SELECTIONS)
+                                            return prev;
+                                        return [...prev, option.key as string];
+                                    } else {
+                                        return prev.filter(
+                                            (k) => k !== option.key
+                                        );
+                                    }
+                                });
+                            }}
+                            styles={{ root: { maxWidth: 500 } }}
+                        />
+
+                        <div>
+                            <label
+                                style={{
+                                    fontWeight: 600,
+                                    fontSize: "14px",
+                                    display: "block",
+                                    marginBottom: "4px",
+                                }}
+                            >
+                                Pool Configuration (JSON)
+                            </label>
+                            <MonacoEditor
+                                language="json"
+                                value={poolConfigJson}
+                                onChange={(value) =>
+                                    handleEditorChange(value ?? "")
+                                }
+                                containerStyle={{
+                                    height: "300px",
+                                    border: "1px solid #edebe9",
+                                }}
+                                editorOptions={{
+                                    minimap: { enabled: false },
+                                    scrollBeyondLastLine: false,
+                                    lineNumbers: "on",
+                                    fontSize: 13,
+                                }}
+                            />
+                        </div>
+                    </>
+                )}
 
                 {configError && (
                     <MessageBar messageBarType={MessageBarType.error}>
