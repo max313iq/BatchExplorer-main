@@ -4,13 +4,20 @@ import { QuotaAgent } from "./quota-agent";
 import { MonitorAgent } from "./monitor-agent";
 import { FilterAgent } from "./filter-agent";
 import { PoolAgent } from "./pool-agent";
+import { NodeAgent } from "./node-agent";
+import { WorkflowAgent, WorkflowConfig } from "./workflow-agent";
 
 export type OrchestratorAction =
     | "create_accounts"
+    | "discover_accounts"
     | "submit_quota_requests"
     | "check_quota_status"
     | "filter_accounts"
-    | "create_pools";
+    | "create_pools"
+    | "list_nodes"
+    | "node_action"
+    | "run_workflow"
+    | "retry_failed";
 
 export class OrchestratorAgent implements Agent {
     readonly name = "orchestrator" as const;
@@ -20,12 +27,16 @@ export class OrchestratorAgent implements Agent {
     private readonly _monitor: MonitorAgent;
     private readonly _filter: FilterAgent;
     private readonly _pool: PoolAgent;
+    private readonly _node: NodeAgent;
+    private _workflowAgent: WorkflowAgent | null = null;
+
     constructor(private readonly _ctx: AgentContext) {
         this._provisioner = new ProvisionerAgent(_ctx);
         this._quota = new QuotaAgent(_ctx);
         this._monitor = new MonitorAgent(_ctx);
         this._filter = new FilterAgent(_ctx.store);
         this._pool = new PoolAgent(_ctx);
+        this._node = new NodeAgent(_ctx);
     }
 
     cancel(): void {
@@ -33,6 +44,10 @@ export class OrchestratorAgent implements Agent {
         this._quota.cancel();
         this._monitor.cancel();
         this._pool.cancel();
+        this._node.cancel();
+        if (this._workflowAgent) {
+            this._workflowAgent.cancel();
+        }
     }
 
     async execute(params: Record<string, unknown>): Promise<AgentResult> {
@@ -54,6 +69,22 @@ export class OrchestratorAgent implements Agent {
                     result = await this._provisioner.execute(
                         params.payload as Record<string, unknown>
                     );
+                    store.addNotification({
+                        type:
+                            result.status === "completed"
+                                ? "success"
+                                : "warning",
+                        message:
+                            result.status === "completed"
+                                ? "Account creation completed successfully"
+                                : `Account creation finished with status: ${result.status}`,
+                    });
+                    break;
+
+                case "discover_accounts":
+                    result = await this._discoverAccounts(
+                        params.payload as Record<string, unknown>
+                    );
                     break;
 
                 case "submit_quota_requests":
@@ -71,6 +102,16 @@ export class OrchestratorAgent implements Agent {
                     result = await this._quota.execute(
                         params.payload as Record<string, unknown>
                     );
+                    store.addNotification({
+                        type:
+                            result.status === "completed"
+                                ? "success"
+                                : "warning",
+                        message:
+                            result.status === "completed"
+                                ? "Quota requests submitted successfully"
+                                : `Quota submission finished with status: ${result.status}`,
+                    });
                     break;
 
                 case "check_quota_status":
@@ -109,6 +150,61 @@ export class OrchestratorAgent implements Agent {
                     }
 
                     result = await this._pool.execute(payload);
+                    store.addNotification({
+                        type:
+                            result.status === "completed"
+                                ? "success"
+                                : "warning",
+                        message:
+                            result.status === "completed"
+                                ? "Pool creation completed successfully"
+                                : `Pool creation finished with status: ${result.status}`,
+                    });
+                    break;
+                }
+
+                case "list_nodes":
+                    result = await this._node.execute(
+                        params.payload as Record<string, unknown>
+                    );
+                    break;
+
+                case "node_action":
+                    result = await this._node.execute(
+                        params.payload as Record<string, unknown>
+                    );
+                    break;
+
+                case "run_workflow": {
+                    const workflowConfig =
+                        params.payload as unknown as WorkflowConfig;
+                    this._workflowAgent = new WorkflowAgent(this._ctx);
+                    result = await this._workflowAgent.execute(workflowConfig);
+                    this._workflowAgent = null;
+                    break;
+                }
+
+                case "retry_failed": {
+                    const retryAccountIds = store.retryFailedAccounts();
+                    const retryQuotaIds = store.retryFailedQuotas();
+                    const retryPoolIds = store.retryFailedPools();
+
+                    result = {
+                        status: "completed",
+                        summary: {
+                            retriedAccounts: retryAccountIds.length,
+                            retriedQuotas: retryQuotaIds.length,
+                            retriedPools: retryPoolIds.length,
+                            accountIds: retryAccountIds,
+                            quotaIds: retryQuotaIds,
+                            poolIds: retryPoolIds,
+                        },
+                    };
+
+                    store.addNotification({
+                        type: "info",
+                        message: `Retry queued: ${retryAccountIds.length} accounts, ${retryQuotaIds.length} quotas, ${retryPoolIds.length} pools`,
+                    });
                     break;
                 }
 
@@ -136,6 +232,98 @@ export class OrchestratorAgent implements Agent {
                 status: "failed",
                 summary: { error: errorMsg },
             };
+        }
+    }
+
+    private async _discoverAccounts(
+        payload: Record<string, unknown>
+    ): Promise<AgentResult> {
+        const subscriptionId = payload.subscriptionId as string;
+        const { store, getAccessToken, armUrl } = this._ctx;
+
+        store.setAgentStatus("provisioner", "running");
+        store.addLog({
+            agent: "provisioner",
+            level: "info",
+            message: `Discovering existing Batch accounts in subscription ${subscriptionId.substring(0, 8)}...`,
+        });
+
+        try {
+            const token = await getAccessToken();
+            let url: string | null =
+                `${armUrl}/subscriptions/${subscriptionId}/providers/Microsoft.Batch/batchAccounts?api-version=2024-02-01`;
+            const allAccounts: any[] = [];
+
+            // Handle pagination
+            while (url) {
+                const response = await fetch(url, {
+                    headers: { Authorization: `Bearer ${token}` },
+                });
+                if (!response.ok) {
+                    const err = await response.json().catch(() => ({}));
+                    throw new Error(
+                        err?.error?.message ??
+                            `Discovery failed: ${response.status}`
+                    );
+                }
+                const data = await response.json();
+                allAccounts.push(...(data.value ?? []));
+                url = data.nextLink ?? null;
+            }
+
+            // Deduplicate against existing accounts in state
+            const existingIds = new Set(
+                store.getState().accounts.map((a) => a.id.toLowerCase())
+            );
+            let imported = 0;
+
+            for (const acct of allAccounts) {
+                const id = (acct.id as string) ?? "";
+                if (existingIds.has(id.toLowerCase())) continue;
+
+                // Parse resource group from the ARM id
+                const rgMatch = id.match(/resourceGroups\/([^/]+)/i);
+                const resourceGroup = rgMatch ? rgMatch[1] : "unknown";
+
+                store.addAccount({
+                    id,
+                    accountName: acct.name,
+                    resourceGroup,
+                    subscriptionId,
+                    region: acct.location,
+                    provisioningState: "created",
+                    createdAt:
+                        acct.properties?.creationTime ??
+                        new Date().toISOString(),
+                    error: null,
+                });
+                imported++;
+            }
+
+            store.setAgentStatus("provisioner", "completed");
+            store.addLog({
+                agent: "provisioner",
+                level: "info",
+                message: `Discovered ${allAccounts.length} Batch accounts, imported ${imported} new (${allAccounts.length - imported} already tracked)`,
+            });
+
+            return {
+                status: "completed",
+                summary: {
+                    total: allAccounts.length,
+                    imported,
+                    skipped: allAccounts.length - imported,
+                },
+            };
+        } catch (error: any) {
+            const errorMsg = error?.message ?? String(error);
+            store.setAgentStatus("provisioner", "error");
+            store.addLog({
+                agent: "provisioner",
+                level: "error",
+                message: `Discovery failed: ${errorMsg}`,
+            });
+            throw error;
         }
     }
 
@@ -167,5 +355,8 @@ export class OrchestratorAgent implements Agent {
     }
     get pool(): PoolAgent {
         return this._pool;
+    }
+    get node(): NodeAgent {
+        return this._node;
     }
 }

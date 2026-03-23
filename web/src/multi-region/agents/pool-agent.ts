@@ -21,7 +21,7 @@ export class PoolAgent implements Agent {
 
     async execute(params: Record<string, unknown>): Promise<AgentResult> {
         const input = params as unknown as PoolInput;
-        const { store, scheduler, getAccessToken } = this._ctx;
+        const { store, scheduler, getBatchAccessToken } = this._ctx;
         this._cancelled = false;
 
         store.setAgentStatus("pool", "running");
@@ -74,7 +74,7 @@ export class PoolAgent implements Agent {
                 });
 
                 await scheduler.run(accountId, async () => {
-                    const token = await getAccessToken();
+                    const token = await getBatchAccessToken();
                     const batchUrl = `https://${account.accountName}.${account.region}.batch.azure.com/pools?api-version=2024-07-01.20.0`;
 
                     const response = await fetch(batchUrl, {

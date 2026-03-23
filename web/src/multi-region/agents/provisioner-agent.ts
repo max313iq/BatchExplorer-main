@@ -32,7 +32,10 @@ function generateAccountName(region: string): string {
 
 function generateResourceGroup(region: string): string {
     const now = new Date();
-    const ts = now.toISOString().replace(/[-:T]/g, "").substring(0, 15);
+    const ts = now
+        .toISOString()
+        .replace(/[-:T.Z]/g, "")
+        .substring(0, 14);
     return `rg-batch-${region}-${ts}`;
 }
 
@@ -64,6 +67,24 @@ export class ProvisionerAgent implements Agent {
 
         for (const region of input.regions) {
             if (this._cancelled) break;
+
+            // Skip regions that already have a created account for this subscription
+            const existing = store
+                .getState()
+                .accounts.find(
+                    (a) =>
+                        a.region === region &&
+                        a.subscriptionId === input.subscriptionId &&
+                        a.provisioningState === "created"
+                );
+            if (existing) {
+                store.addLog({
+                    agent: "provisioner",
+                    level: "warn",
+                    message: `Account already exists for ${region} (${existing.accountName}), skipping`,
+                });
+                continue;
+            }
 
             const accountName = generateAccountName(region);
             const resourceGroup = generateResourceGroup(region);

@@ -1,9 +1,5 @@
 import * as React from "react";
-import {
-    Stack,
-    IStackTokens,
-    IStackStyles,
-} from "@fluentui/react/lib/Stack";
+import { Stack, IStackTokens, IStackStyles } from "@fluentui/react/lib/Stack";
 import { Text } from "@fluentui/react/lib/Text";
 import { Pivot, PivotItem } from "@fluentui/react/lib/Pivot";
 import { useAppTheme } from "@azure/bonito-ui/lib/theme";
@@ -64,10 +60,7 @@ export const AutoDashboard: React.FC = () => {
                     root: { marginBottom: 8 },
                 }}
             >
-                <PivotItem
-                    headerText="Bulk Create Pools"
-                    itemIcon="Add"
-                >
+                <PivotItem headerText="Bulk Create Pools" itemIcon="Add">
                     <BulkPoolCreator onCreated={triggerRefresh} />
                 </PivotItem>
                 <PivotItem headerText="Pool Overview" itemIcon="ViewList">

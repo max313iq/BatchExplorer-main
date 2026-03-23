@@ -1,9 +1,5 @@
 import * as React from "react";
-import {
-    Stack,
-    IStackTokens,
-    IStackStyles,
-} from "@fluentui/react/lib/Stack";
+import { Stack, IStackTokens, IStackStyles } from "@fluentui/react/lib/Stack";
 import { Text } from "@fluentui/react/lib/Text";
 import {
     DetailsList,
@@ -41,19 +37,18 @@ export const PoolListView: React.FC<PoolListViewProps> = ({ refreshKey }) => {
     const [pools, setPools] = React.useState<PoolOutput[]>([]);
     const [loading, setLoading] = React.useState(true);
     const [searchText, setSearchText] = React.useState("");
-    const [selectedPool, setSelectedPool] =
-        React.useState<PoolOutput | null>(null);
+    const [selectedPool, setSelectedPool] = React.useState<PoolOutput | null>(
+        null
+    );
     const [detailOpen, setDetailOpen] = React.useState(false);
 
     const loadPools = React.useCallback(async () => {
         setLoading(true);
         try {
-            const poolService =
-                getEnvironment().getInjectable<PoolService>(
-                    BatchDependencyName.PoolService
-                );
-            const result =
-                await poolService.listByAccountId(FAKE_ACCOUNT_ID);
+            const poolService = getEnvironment().getInjectable<PoolService>(
+                BatchDependencyName.PoolService
+            );
+            const result = await poolService.listByAccountId(FAKE_ACCOUNT_ID);
             setPools(result);
         } catch {
             setPools([]);
@@ -369,8 +364,8 @@ const PoolDetailPanel: React.FC<{ pool: PoolOutput }> = ({ pool }) => {
         },
         {
             label: "OS Image",
-            value: props?.deploymentConfiguration
-                ?.virtualMachineConfiguration?.imageReference
+            value: props?.deploymentConfiguration?.virtualMachineConfiguration
+                ?.imageReference
                 ? `${props.deploymentConfiguration.virtualMachineConfiguration.imageReference.publisher} / ${props.deploymentConfiguration.virtualMachineConfiguration.imageReference.offer} / ${props.deploymentConfiguration.virtualMachineConfiguration.imageReference.sku}`
                 : "N/A",
         },

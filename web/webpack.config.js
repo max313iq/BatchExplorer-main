@@ -82,6 +82,13 @@ module.exports = (env) => {
             open: OPTS.LAUNCH_BROWSER ? true : false,
             host: "127.0.0.1",
             hot: true,
+            client: {
+                overlay: {
+                    errors: true,
+                    warnings: false,
+                    runtimeErrors: false,
+                },
+            },
             static: [
                 {
                     directory: "dev-server",
@@ -145,6 +152,46 @@ module.exports = (env) => {
                             error: "Failed to get Azure CLI token. Run 'az login' first.",
                             details: err.stderr || err.message,
                         });
+                    }
+                });
+
+                // Batch data-plane token (for pool creation)
+                devServer.app.get("/api/token/batch", (req, res) => {
+                    try {
+                        const result = execSync(
+                            `${azCmd} account get-access-token --resource https://batch.core.windows.net --output json`,
+                            { encoding: "utf-8", timeout: 15000 }
+                        );
+                        const parsed = JSON.parse(result);
+                        res.json({
+                            accessToken: parsed.accessToken,
+                            expiresOn: parsed.expiresOn,
+                            subscription: parsed.subscription,
+                            tenant: parsed.tenant,
+                        });
+                    } catch (err) {
+                        console.error(
+                            "Failed to get Batch token:",
+                            err.message
+                        );
+                        res.status(500).json({
+                            error: "Failed to get Batch data-plane token. Run 'az login' first.",
+                            details: err.stderr || err.message,
+                        });
+                    }
+                });
+
+                // Login status check
+                devServer.app.get("/api/auth/status", (req, res) => {
+                    try {
+                        execSync(`${azCmd} account show --output json`, {
+                            encoding: "utf-8",
+                            timeout: 10000,
+                            stdio: "pipe",
+                        });
+                        res.json({ loggedIn: true });
+                    } catch {
+                        res.json({ loggedIn: false });
                     }
                 });
 

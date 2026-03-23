@@ -1,6 +1,7 @@
 import * as React from "react";
 import { Dropdown, IDropdownOption } from "@fluentui/react/lib/Dropdown";
 import { SearchBox } from "@fluentui/react/lib/SearchBox";
+import { IconButton } from "@fluentui/react/lib/Button";
 import { Stack, IStackTokens } from "@fluentui/react/lib/Stack";
 import {
     useMultiRegionStore,
@@ -54,6 +55,9 @@ const stackTokens: IStackTokens = { childrenGap: 12 };
 export const GlobalFilterBar: React.FC = () => {
     const store = useMultiRegionStore();
     const state = useMultiRegionState();
+    const searchTimerRef = React.useRef<ReturnType<typeof setTimeout> | null>(
+        null
+    );
 
     const regionOptions: IDropdownOption[] = React.useMemo(
         () =>
@@ -89,6 +93,41 @@ export const GlobalFilterBar: React.FC = () => {
         { key: "failed", text: "Failed" },
     ];
 
+    // Debounced search handler
+    const handleSearchChange = React.useCallback(
+        (_e: any, value?: string) => {
+            if (searchTimerRef.current) {
+                clearTimeout(searchTimerRef.current);
+            }
+            searchTimerRef.current = setTimeout(() => {
+                store.setGlobalFilter({
+                    searchText: value ?? "",
+                });
+            }, 300);
+        },
+        [store]
+    );
+
+    // Cleanup debounce timer on unmount
+    React.useEffect(() => {
+        return () => {
+            if (searchTimerRef.current) {
+                clearTimeout(searchTimerRef.current);
+            }
+        };
+    }, []);
+
+    // Clear all filters to defaults
+    const handleClearFilters = React.useCallback(() => {
+        store.setGlobalFilter({
+            regions: [],
+            subscriptionIds: [],
+            quotaStatus: "all",
+            provisioningState: "all",
+            searchText: "",
+        });
+    }, [store]);
+
     return (
         <div
             style={{
@@ -97,7 +136,7 @@ export const GlobalFilterBar: React.FC = () => {
                 borderBottom: "1px solid #edebe9",
             }}
         >
-            <Stack horizontal tokens={stackTokens} wrap>
+            <Stack horizontal tokens={stackTokens} wrap verticalAlign="end">
                 <Dropdown
                     placeholder="Filter by region"
                     label="Regions"
@@ -162,13 +201,16 @@ export const GlobalFilterBar: React.FC = () => {
                 />
                 <SearchBox
                     placeholder="Search accounts..."
-                    value={state.globalFilter.searchText}
-                    onChange={(_e, value) => {
-                        store.setGlobalFilter({
-                            searchText: value ?? "",
-                        });
-                    }}
+                    defaultValue={state.globalFilter.searchText}
+                    onChange={handleSearchChange}
                     styles={{ root: { width: 200, marginTop: 22 } }}
+                />
+                <IconButton
+                    iconProps={{ iconName: "ClearFilter" }}
+                    title="Clear Filters"
+                    ariaLabel="Clear all filters"
+                    onClick={handleClearFilters}
+                    styles={{ root: { marginTop: 22 } }}
                 />
             </Stack>
         </div>

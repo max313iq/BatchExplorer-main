@@ -1,5 +1,5 @@
 import * as React from "react";
-import { PrimaryButton } from "@fluentui/react/lib/Button";
+import { PrimaryButton, DefaultButton } from "@fluentui/react/lib/Button";
 import { Dropdown, IDropdownOption } from "@fluentui/react/lib/Dropdown";
 import { TextField } from "@fluentui/react/lib/TextField";
 import {
@@ -11,7 +11,10 @@ import {
 import { ProgressIndicator } from "@fluentui/react/lib/ProgressIndicator";
 import { Checkbox } from "@fluentui/react/lib/Checkbox";
 import { Stack, IStackTokens } from "@fluentui/react/lib/Stack";
-import { useMultiRegionState } from "../../store/store-context";
+import {
+    useMultiRegionState,
+    useMultiRegionStore,
+} from "../../store/store-context";
 import { StatusBadge } from "../shared/status-badge";
 import { OrchestratorAgent } from "../../agents/orchestrator-agent";
 
@@ -25,6 +28,10 @@ export const QuotaRequestsPage: React.FC<QuotaRequestsPageProps> = ({
     orchestrator,
 }) => {
     const state = useMultiRegionState();
+    const store = useMultiRegionStore();
+
+    // Pre-fill from user preferences on mount
+    const prefsLoaded = React.useRef(false);
     const [quotaType, setQuotaType] = React.useState<string>("LowPriority");
     const [newLimit, setNewLimit] = React.useState("680");
     const [email, setEmail] = React.useState("");
@@ -32,8 +39,66 @@ export const QuotaRequestsPage: React.FC<QuotaRequestsPageProps> = ({
     const [selectedAccountIds, setSelectedAccountIds] = React.useState<
         Set<string>
     >(new Set());
+    const [customToken, setCustomToken] = React.useState("");
+    const [ticketSubscriptionId, setTicketSubscriptionId] = React.useState("");
     const [selectAll, setSelectAll] = React.useState(false);
     const [isRunning, setIsRunning] = React.useState(false);
+
+    React.useEffect(() => {
+        if (prefsLoaded.current) return;
+        prefsLoaded.current = true;
+        const prefs = store.getUserPreferences();
+        if (prefs.lastEmail) {
+            setEmail(prefs.lastEmail);
+        }
+        if (prefs.lastQuotaLimit) {
+            setNewLimit(String(prefs.lastQuotaLimit));
+        }
+        if (prefs.lastQuotaType) {
+            setQuotaType(prefs.lastQuotaType);
+        }
+        if (prefs.lastSupportPlanId) {
+            setSupportPlanId(prefs.lastSupportPlanId);
+        }
+    }, [store]);
+
+    // Save preferences when fields change
+    const handleEmailChange = React.useCallback(
+        (value: string) => {
+            setEmail(value);
+            store.saveUserPreferences({ lastEmail: value });
+        },
+        [store]
+    );
+
+    const handleNewLimitChange = React.useCallback(
+        (value: string) => {
+            setNewLimit(value);
+            const parsed = parseInt(value, 10);
+            if (!isNaN(parsed)) {
+                store.saveUserPreferences({ lastQuotaLimit: parsed });
+            }
+        },
+        [store]
+    );
+
+    const handleQuotaTypeChange = React.useCallback(
+        (value: string) => {
+            setQuotaType(value);
+            store.saveUserPreferences({
+                lastQuotaType: value as "LowPriority" | "Dedicated" | "Spot",
+            });
+        },
+        [store]
+    );
+
+    const handleSupportPlanIdChange = React.useCallback(
+        (value: string) => {
+            setSupportPlanId(value);
+            store.saveUserPreferences({ lastSupportPlanId: value });
+        },
+        [store]
+    );
 
     const createdAccounts = state.accounts.filter(
         (a) => a.provisioningState === "created"
@@ -68,6 +133,9 @@ export const QuotaRequestsPage: React.FC<QuotaRequestsPageProps> = ({
                         language: "en-us",
                     },
                     supportPlanId,
+                    customToken: customToken.trim() || undefined,
+                    ticketSubscriptionId:
+                        ticketSubscriptionId.trim() || undefined,
                 },
             });
         } finally {
@@ -175,13 +243,15 @@ export const QuotaRequestsPage: React.FC<QuotaRequestsPageProps> = ({
                         label="Quota Type"
                         options={quotaTypeOptions}
                         selectedKey={quotaType}
-                        onChange={(_e, o) => o && setQuotaType(o.key as string)}
+                        onChange={(_e, o) =>
+                            o && handleQuotaTypeChange(o.key as string)
+                        }
                         styles={{ dropdown: { width: 180 } }}
                     />
                     <TextField
                         label="New Limit (vCPUs)"
                         value={newLimit}
-                        onChange={(_e, v) => setNewLimit(v ?? "680")}
+                        onChange={(_e, v) => handleNewLimitChange(v ?? "680")}
                         type="number"
                         styles={{ root: { width: 130 } }}
                     />
@@ -190,30 +260,58 @@ export const QuotaRequestsPage: React.FC<QuotaRequestsPageProps> = ({
                 <TextField
                     label="Contact Email"
                     value={email}
-                    onChange={(_e, v) => setEmail(v ?? "")}
+                    onChange={(_e, v) => handleEmailChange(v ?? "")}
                     placeholder="your@email.com"
                     styles={{ root: { maxWidth: 350 } }}
                 />
                 <TextField
                     label="Support Plan ID"
                     value={supportPlanId}
-                    onChange={(_e, v) => setSupportPlanId(v ?? "")}
+                    onChange={(_e, v) => handleSupportPlanIdChange(v ?? "")}
                     placeholder="U291cmNlOk..."
                     styles={{ root: { maxWidth: 450 } }}
                 />
-
-                <PrimaryButton
-                    text={
-                        isRunning
-                            ? "Submitting..."
-                            : `Submit ${selectedAccountIds.size} Quota Requests`
+                <TextField
+                    label="Bearer Token (optional — leave empty to use Azure CLI token)"
+                    value={customToken}
+                    onChange={(_e, v) => setCustomToken(v ?? "")}
+                    placeholder="Paste Bearer token here, or leave empty for auto"
+                    multiline
+                    rows={3}
+                    styles={{ root: { maxWidth: 550 } }}
+                    description={
+                        customToken.trim()
+                            ? "Using custom token"
+                            : "Using auto token from Azure CLI"
                     }
-                    disabled={
-                        isRunning || selectedAccountIds.size === 0 || !email
-                    }
-                    onClick={handleSubmit}
-                    styles={{ root: { maxWidth: 300 } }}
                 />
+
+                <Stack horizontal tokens={{ childrenGap: 8 }}>
+                    <PrimaryButton
+                        text={
+                            isRunning
+                                ? "Submitting..."
+                                : `Submit ${selectedAccountIds.size} Quota Requests`
+                        }
+                        disabled={
+                            isRunning || selectedAccountIds.size === 0 || !email
+                        }
+                        onClick={handleSubmit}
+                        styles={{ root: { maxWidth: 300 } }}
+                    />
+                    {isRunning && (
+                        <DefaultButton
+                            text="Stop"
+                            onClick={() => orchestrator.cancel()}
+                            styles={{
+                                root: {
+                                    borderColor: "#d13438",
+                                    color: "#d13438",
+                                },
+                            }}
+                        />
+                    )}
+                </Stack>
             </Stack>
 
             {isRunning && (

@@ -12,6 +12,17 @@ const STATUS_COLORS: Record<string, { bg: string; text: string }> = {
     running: { bg: "#deecf9", text: "#004578" },
     completed: { bg: "#dff6dd", text: "#107c10" },
     error: { bg: "#fde7e9", text: "#a80000" },
+    // Node states
+    rebooting: { bg: "#fff4ce", text: "#8a6d00" },
+    reimaging: { bg: "#fff4ce", text: "#8a6d00" },
+    starting: { bg: "#deecf9", text: "#004578" },
+    waitingforstarttask: { bg: "#fff4ce", text: "#8a6d00" },
+    starttaskfailed: { bg: "#fde7e9", text: "#a80000" },
+    unusable: { bg: "#fde7e9", text: "#a80000" },
+    offline: { bg: "#f3f2f1", text: "#605e5c" },
+    preempted: { bg: "#fff4ce", text: "#8a6d00" },
+    leavingpool: { bg: "#fff4ce", text: "#8a6d00" },
+    unknown: { bg: "#f3f2f1", text: "#605e5c" },
 };
 
 interface StatusBadgeProps {

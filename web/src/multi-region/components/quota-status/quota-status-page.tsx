@@ -2,6 +2,7 @@ import * as React from "react";
 import { DefaultButton } from "@fluentui/react/lib/Button";
 import { Pivot, PivotItem } from "@fluentui/react/lib/Pivot";
 import { Toggle } from "@fluentui/react/lib/Toggle";
+import { Dropdown, IDropdownOption } from "@fluentui/react/lib/Dropdown";
 import {
     DetailsList,
     DetailsListLayoutMode,
@@ -16,6 +17,13 @@ import { QuotaRequest } from "../../store/store-types";
 
 const stackTokens: IStackTokens = { childrenGap: 12 };
 
+const INTERVAL_OPTIONS: IDropdownOption[] = [
+    { key: "30", text: "30 seconds" },
+    { key: "60", text: "60 seconds" },
+    { key: "120", text: "2 minutes" },
+    { key: "300", text: "5 minutes" },
+];
+
 interface QuotaStatusPageProps {
     orchestrator: OrchestratorAgent;
 }
@@ -25,6 +33,7 @@ export const QuotaStatusPage: React.FC<QuotaStatusPageProps> = ({
 }) => {
     const state = useMultiRegionState();
     const [autoRefresh, setAutoRefresh] = React.useState(false);
+    const [refreshInterval, setRefreshInterval] = React.useState(60);
     const [isRefreshing, setIsRefreshing] = React.useState(false);
     const monitorRef = React.useRef<ReturnType<typeof setTimeout> | null>(null);
 
@@ -37,6 +46,16 @@ export const QuotaStatusPage: React.FC<QuotaStatusPageProps> = ({
     const deniedRequests = state.quotaRequests.filter(
         (r) => r.status === "denied"
     );
+
+    // Auto-enable refresh on mount if there are pending/submitted quotas
+    const autoEnabledRef = React.useRef(false);
+    React.useEffect(() => {
+        if (autoEnabledRef.current) return;
+        if (pendingRequests.length > 0) {
+            autoEnabledRef.current = true;
+            setAutoRefresh(true);
+        }
+    }, [pendingRequests.length]);
 
     const handleRefresh = React.useCallback(async () => {
         setIsRefreshing(true);
@@ -68,13 +87,13 @@ export const QuotaStatusPage: React.FC<QuotaStatusPageProps> = ({
             }
         };
 
-        monitorRef.current = setInterval(poll, 60000);
+        monitorRef.current = setInterval(poll, refreshInterval * 1000);
         poll();
 
         return () => {
             if (monitorRef.current) clearInterval(monitorRef.current);
         };
-    }, [autoRefresh, orchestrator]);
+    }, [autoRefresh, refreshInterval, orchestrator]);
 
     const columns: IColumn[] = [
         {
@@ -153,10 +172,24 @@ export const QuotaStatusPage: React.FC<QuotaStatusPageProps> = ({
                     iconProps={{ iconName: "Refresh" }}
                 />
                 <Toggle
-                    label="Auto-refresh (60s)"
+                    label="Auto-refresh"
                     checked={autoRefresh}
                     onChange={(_e, checked) => setAutoRefresh(!!checked)}
                     inlineLabel
+                />
+                <Dropdown
+                    label="Interval"
+                    options={INTERVAL_OPTIONS}
+                    selectedKey={String(refreshInterval)}
+                    onChange={(_e, option) => {
+                        if (option) {
+                            setRefreshInterval(
+                                parseInt(option.key as string, 10)
+                            );
+                        }
+                    }}
+                    styles={{ dropdown: { width: 130 } }}
+                    disabled={!autoRefresh}
                 />
             </Stack>
 

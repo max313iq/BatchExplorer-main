@@ -7,6 +7,7 @@ export interface AgentContext {
     scheduler: RequestScheduler;
     armUrl: string;
     getAccessToken: () => Promise<string>;
+    getBatchAccessToken: () => Promise<string>;
 }
 
 export interface AgentResult {

@@ -1,5 +1,5 @@
 import * as React from "react";
-import { PrimaryButton } from "@fluentui/react/lib/Button";
+import { PrimaryButton, DefaultButton } from "@fluentui/react/lib/Button";
 import { Checkbox } from "@fluentui/react/lib/Checkbox";
 import {
     DetailsList,
@@ -11,7 +11,10 @@ import { ProgressIndicator } from "@fluentui/react/lib/ProgressIndicator";
 import { MessageBar, MessageBarType } from "@fluentui/react/lib/MessageBar";
 import { Stack, IStackTokens } from "@fluentui/react/lib/Stack";
 import { MonacoEditor } from "@azure/bonito-ui/lib/components";
-import { useMultiRegionState } from "../../store/store-context";
+import {
+    useMultiRegionState,
+    useMultiRegionStore,
+} from "../../store/store-context";
 import { StatusBadge } from "../shared/status-badge";
 import { OrchestratorAgent } from "../../agents/orchestrator-agent";
 
@@ -59,6 +62,7 @@ export const PoolCreationPage: React.FC<PoolCreationPageProps> = ({
     orchestrator,
 }) => {
     const state = useMultiRegionState();
+    const store = useMultiRegionStore();
     const [poolConfigJson, setPoolConfigJson] = React.useState(
         JSON.stringify(DEFAULT_POOL_CONFIG, null, 2)
     );
@@ -68,6 +72,40 @@ export const PoolCreationPage: React.FC<PoolCreationPageProps> = ({
     >(new Set());
     const [selectAll, setSelectAll] = React.useState(false);
     const [isRunning, setIsRunning] = React.useState(false);
+
+    // Load last pool config from preferences on mount
+    React.useEffect(() => {
+        const prefs = store.getUserPreferences();
+        if (prefs.lastPoolConfig) {
+            setPoolConfigJson(prefs.lastPoolConfig);
+        }
+    }, [store]);
+
+    // Save pool config to preferences when editor value changes (debounced)
+    const saveTimerRef = React.useRef<ReturnType<typeof setTimeout> | null>(
+        null
+    );
+    const handleEditorChange = React.useCallback(
+        (value: string) => {
+            setPoolConfigJson(value);
+            if (saveTimerRef.current) {
+                clearTimeout(saveTimerRef.current);
+            }
+            saveTimerRef.current = setTimeout(() => {
+                store.saveUserPreferences({ lastPoolConfig: value });
+            }, 1000);
+        },
+        [store]
+    );
+
+    // Cleanup debounce timer on unmount
+    React.useEffect(() => {
+        return () => {
+            if (saveTimerRef.current) {
+                clearTimeout(saveTimerRef.current);
+            }
+        };
+    }, []);
 
     // Only show accounts with approved quota or created status
     const eligibleAccounts = state.accounts.filter((a) => {
@@ -105,6 +143,19 @@ export const PoolCreationPage: React.FC<PoolCreationPageProps> = ({
             setIsRunning(false);
         }
     }, [orchestrator, selectedAccountIds, poolConfigJson]);
+
+    const handleRetryFailedPools = React.useCallback(() => {
+        const ids = store.retryFailedPools();
+        store.addNotification({
+            type: "info",
+            message: `Retrying ${ids.length} failed pool(s)...`,
+            autoDismissMs: 5000,
+        });
+    }, [store]);
+
+    const failedPoolCount = state.pools.filter(
+        (p) => p.provisioningState === "failed"
+    ).length;
 
     const accountColumns: IColumn[] = [
         {
@@ -236,7 +287,7 @@ export const PoolCreationPage: React.FC<PoolCreationPageProps> = ({
                     <MonacoEditor
                         language="json"
                         value={poolConfigJson}
-                        onChange={(value) => setPoolConfigJson(value ?? "")}
+                        onChange={(value) => handleEditorChange(value ?? "")}
                         containerStyle={{
                             height: "300px",
                             border: "1px solid #edebe9",
@@ -256,16 +307,37 @@ export const PoolCreationPage: React.FC<PoolCreationPageProps> = ({
                     </MessageBar>
                 )}
 
-                <PrimaryButton
-                    text={
-                        isRunning
-                            ? "Creating Pools..."
-                            : `Create Pools on ${selectedAccountIds.size} Accounts`
-                    }
-                    disabled={isRunning || selectedAccountIds.size === 0}
-                    onClick={handleCreate}
-                    styles={{ root: { maxWidth: 300 } }}
-                />
+                <Stack horizontal tokens={{ childrenGap: 8 }}>
+                    <PrimaryButton
+                        text={
+                            isRunning
+                                ? "Creating Pools..."
+                                : `Create Pools on ${selectedAccountIds.size} Accounts`
+                        }
+                        disabled={isRunning || selectedAccountIds.size === 0}
+                        onClick={handleCreate}
+                        styles={{ root: { maxWidth: 300 } }}
+                    />
+                    {isRunning && (
+                        <DefaultButton
+                            text="Stop"
+                            onClick={() => orchestrator.cancel()}
+                            styles={{
+                                root: {
+                                    borderColor: "#d13438",
+                                    color: "#d13438",
+                                },
+                            }}
+                        />
+                    )}
+                    {failedPoolCount > 0 && !isRunning && (
+                        <DefaultButton
+                            text={`Retry Failed Pools (${failedPoolCount})`}
+                            onClick={handleRetryFailedPools}
+                            iconProps={{ iconName: "Refresh" }}
+                        />
+                    )}
+                </Stack>
             </Stack>
 
             {isRunning && (

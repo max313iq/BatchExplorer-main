@@ -1,9 +1,5 @@
 import * as React from "react";
-import {
-    Stack,
-    IStackTokens,
-    IStackStyles,
-} from "@fluentui/react/lib/Stack";
+import { Stack, IStackTokens, IStackStyles } from "@fluentui/react/lib/Stack";
 import { Text } from "@fluentui/react/lib/Text";
 import {
     PrimaryButton,
@@ -11,10 +7,7 @@ import {
     IconButton,
 } from "@fluentui/react/lib/Button";
 import { TextField } from "@fluentui/react/lib/TextField";
-import {
-    Dropdown,
-    IDropdownOption,
-} from "@fluentui/react/lib/Dropdown";
+import { Dropdown, IDropdownOption } from "@fluentui/react/lib/Dropdown";
 import { SpinButton } from "@fluentui/react/lib/SpinButton";
 import { ProgressIndicator } from "@fluentui/react/lib/ProgressIndicator";
 import { MessageBar, MessageBarType } from "@fluentui/react/lib/MessageBar";
@@ -236,9 +229,7 @@ export const BulkPoolCreator: React.FC<BulkPoolCreatorProps> = ({
                         })
                         .catch((err: Error) => {
                             failed++;
-                            errors.push(
-                                `${poolName}: ${err.message}`
-                            );
+                            errors.push(`${poolName}: ${err.message}`);
                         })
                 );
             }
@@ -294,14 +285,10 @@ export const BulkPoolCreator: React.FC<BulkPoolCreatorProps> = ({
                             step={1}
                             value={String(poolCount)}
                             onIncrement={(v) =>
-                                setPoolCount(
-                                    Math.min(Number(v) + 1, 5000)
-                                )
+                                setPoolCount(Math.min(Number(v) + 1, 5000))
                             }
                             onDecrement={(v) =>
-                                setPoolCount(
-                                    Math.max(Number(v) - 1, 1)
-                                )
+                                setPoolCount(Math.max(Number(v) - 1, 1))
                             }
                             onValidate={(v) => {
                                 const n = parseInt(v);
@@ -375,10 +362,7 @@ export const BulkPoolCreator: React.FC<BulkPoolCreatorProps> = ({
                             onDecrement={(v) =>
                                 setTemplate((t) => ({
                                     ...t,
-                                    dedicatedNodes: Math.max(
-                                        Number(v) - 1,
-                                        0
-                                    ),
+                                    dedicatedNodes: Math.max(Number(v) - 1, 0),
                                 }))
                             }
                             onValidate={(v) => {
@@ -608,8 +592,7 @@ export const BulkPoolCreator: React.FC<BulkPoolCreatorProps> = ({
                     />
                     {!progress.inProgress && progress.failed === 0 && (
                         <MessageBar messageBarType={MessageBarType.success}>
-                            All {progress.completed} pools created
-                            successfully.
+                            All {progress.completed} pools created successfully.
                         </MessageBar>
                     )}
                     {progress.failed > 0 && (
