@@ -9,6 +9,26 @@ import { WorkflowAgent, WorkflowConfig } from "./workflow-agent";
 import { RequestDeduplicator } from "../scheduling/request-deduplicator";
 import { PoolInfo, AccountInfo, QuotaSuggestion } from "../store/store-types";
 
+/** Bounded-concurrency Promise.all — runs `fn` on each item with at most `concurrency` in flight */
+async function pMap<T, R>(
+    items: T[],
+    fn: (item: T) => Promise<R>,
+    concurrency = 6
+): Promise<R[]> {
+    const results: R[] = new Array(items.length);
+    let idx = 0;
+    const run = async () => {
+        while (idx < items.length) {
+            const i = idx++;
+            results[i] = await fn(items[i]);
+        }
+    };
+    await Promise.all(
+        Array.from({ length: Math.min(concurrency, items.length) }, () => run())
+    );
+    return results;
+}
+
 function generateCorrelationId(): string {
     return "xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx".replace(/[xy]/g, (c) => {
         const r = (Math.random() * 16) | 0;
@@ -590,26 +610,45 @@ export class OrchestratorAgent implements Agent {
             const allAccounts: Array<{ acct: any; subId: string }> = [];
             let failedSubs = 0;
 
-            for (const subId of subscriptionIds) {
-                try {
-                    const accounts =
-                        await this._discoverAccountsForSubscription(
+            // Parallel discovery across subscriptions (up to 8 concurrent)
+            const subResults = await pMap(
+                subscriptionIds,
+                async (subId) => {
+                    try {
+                        const accounts =
+                            await this._discoverAccountsForSubscription(
+                                subId,
+                                token,
+                                armUrl
+                            );
+                        return {
                             subId,
-                            token,
-                            armUrl
-                        );
-                    for (const acct of accounts) {
-                        allAccounts.push({ acct, subId });
+                            accounts,
+                            error: null as string | null,
+                        };
+                    } catch (error: any) {
+                        return {
+                            subId,
+                            accounts: [] as any[],
+                            error: error?.message ?? String(error),
+                        };
                     }
-                } catch (error: any) {
-                    const errorMsg = error?.message ?? String(error);
+                },
+                8
+            );
+
+            for (const result of subResults) {
+                if (result.error) {
                     store.addLog({
                         agent: "provisioner",
                         level: "error",
-                        message: `Discovery failed for subscription ${subId.substring(0, 8)}: ${errorMsg}`,
+                        message: `Discovery failed for subscription ${result.subId.substring(0, 8)}: ${result.error}`,
                     });
                     failedSubs++;
-                    // Continue with other subscriptions
+                } else {
+                    for (const acct of result.accounts) {
+                        allAccounts.push({ acct, subId: result.subId });
+                    }
                 }
             }
 
@@ -689,84 +728,86 @@ export class OrchestratorAgent implements Agent {
             message: `Refreshing pool info for ${accounts.length} accounts`,
         });
 
-        const allPools: PoolInfo[] = [];
         let failedCount = 0;
+        const token = await getBatchAccessToken();
 
-        for (const account of accounts) {
-            try {
-                const token = await getBatchAccessToken();
-                let url: string | null =
-                    `https://${account.accountName}.${account.region}.batch.azure.com/pools?api-version=2024-07-01.20.0`;
-
-                while (url) {
-                    const response = await fetch(url, {
-                        headers: {
-                            Authorization: `Bearer ${token}`,
-                        },
-                    });
-
-                    if (!response.ok) {
-                        const err = await response.json().catch(() => ({}));
-                        throw new Error(
-                            err?.error?.message ??
-                                `Failed to list pools: ${response.status}`
-                        );
-                    }
-
-                    const data = await response.json();
-                    const pools = (data.value ?? []) as Array<
-                        Record<string, any>
-                    >;
-
-                    for (const p of pools) {
-                        const resizeErrors: string[] = [];
-                        if (p.resizeErrors && Array.isArray(p.resizeErrors)) {
-                            for (const re of p.resizeErrors) {
-                                resizeErrors.push(
-                                    re.message ?? re.code ?? String(re)
-                                );
-                            }
-                        }
-
-                        allPools.push({
-                            id: `${account.id}/pools/${p.id}`,
-                            accountId: account.id,
-                            accountName: account.accountName,
-                            region: account.region,
-                            poolId: p.id ?? "",
-                            vmSize: p.vmSize ?? "",
-                            state: p.state ?? "unknown",
-                            allocationState: p.allocationState ?? "unknown",
-                            targetDedicatedNodes: p.targetDedicatedNodes ?? 0,
-                            currentDedicatedNodes: p.currentDedicatedNodes ?? 0,
-                            targetLowPriorityNodes:
-                                p.targetLowPriorityNodes ?? 0,
-                            currentLowPriorityNodes:
-                                p.currentLowPriorityNodes ?? 0,
-                            taskSlotsPerNode: p.taskSlotsPerNode ?? 1,
-                            enableAutoScale: p.enableAutoScale ?? false,
-                            autoScaleFormula: p.autoScaleFormula,
-                            resizeErrors:
-                                resizeErrors.length > 0
-                                    ? resizeErrors
-                                    : undefined,
-                            lastModified: p.lastModified,
-                            creationTime: p.creationTime,
-                            startTask: p.startTask ?? undefined,
+        // Parallel pool fetch — up to 10 accounts at once
+        const poolResults = await pMap(
+            accounts,
+            async (account) => {
+                try {
+                    const pools: PoolInfo[] = [];
+                    let url: string | null =
+                        `https://${account.accountName}.${account.region}.batch.azure.com/pools?api-version=2024-07-01.20.0`;
+                    while (url) {
+                        const resp = await fetch(url, {
+                            headers: { Authorization: `Bearer ${token}` },
                         });
+                        if (!resp.ok) {
+                            const e = await resp.json().catch(() => ({}));
+                            throw new Error(
+                                e?.error?.message ?? `${resp.status}`
+                            );
+                        }
+                        const data = await resp.json();
+                        for (const p of (data.value ?? []) as Record<
+                            string,
+                            any
+                        >[]) {
+                            const re: string[] = [];
+                            if (Array.isArray(p.resizeErrors))
+                                for (const r of p.resizeErrors)
+                                    re.push(r.message ?? r.code ?? String(r));
+                            pools.push({
+                                id: `${account.id}/pools/${p.id}`,
+                                accountId: account.id,
+                                accountName: account.accountName,
+                                region: account.region,
+                                poolId: p.id ?? "",
+                                vmSize: p.vmSize ?? "",
+                                state: p.state ?? "unknown",
+                                allocationState: p.allocationState ?? "unknown",
+                                targetDedicatedNodes:
+                                    p.targetDedicatedNodes ?? 0,
+                                currentDedicatedNodes:
+                                    p.currentDedicatedNodes ?? 0,
+                                targetLowPriorityNodes:
+                                    p.targetLowPriorityNodes ?? 0,
+                                currentLowPriorityNodes:
+                                    p.currentLowPriorityNodes ?? 0,
+                                taskSlotsPerNode: p.taskSlotsPerNode ?? 1,
+                                enableAutoScale: p.enableAutoScale ?? false,
+                                autoScaleFormula: p.autoScaleFormula,
+                                resizeErrors: re.length > 0 ? re : undefined,
+                                lastModified: p.lastModified,
+                                creationTime: p.creationTime,
+                                startTask: p.startTask ?? undefined,
+                            });
+                        }
+                        url = data["odata.nextLink"] ?? null;
                     }
-
-                    url = data["odata.nextLink"] ?? null;
+                    return { account, pools, error: null as string | null };
+                } catch (error: any) {
+                    return {
+                        account,
+                        pools: [] as PoolInfo[],
+                        error: error?.message ?? String(error),
+                    };
                 }
-            } catch (error: any) {
-                const errorMsg = error?.message ?? String(error);
+            },
+            10
+        );
+
+        const allPools: PoolInfo[] = [];
+        for (const r of poolResults) {
+            if (r.error) {
                 store.addLog({
                     agent: "orchestrator",
                     level: "error",
-                    message: `Failed to refresh pools for ${account.accountName}: ${errorMsg}`,
+                    message: `Failed pools for ${r.account.accountName}: ${r.error}`,
                 });
                 failedCount++;
-            }
+            } else allPools.push(...r.pools);
         }
 
         store.setPoolInfos(allPools);
@@ -806,208 +847,164 @@ export class OrchestratorAgent implements Agent {
             message: `Refreshing account info for ${accounts.length} accounts across all subscriptions`,
         });
 
-        const allAccountInfos: AccountInfo[] = [];
         let failedCount = 0;
+        const [armToken, batchToken] = await Promise.all([
+            getAccessToken(),
+            getBatchAccessToken(),
+        ]);
 
-        // Fetch fresh pool data per account for accurate usage calculation
-        const poolsByAccount = new Map<string, PoolInfo[]>();
-
-        for (const account of accounts) {
-            try {
-                const batchToken = await getBatchAccessToken();
-                let poolUrl: string | null =
-                    `https://${account.accountName}.${account.region}.batch.azure.com/pools?api-version=2024-07-01.20.0`;
-                const accountPools: PoolInfo[] = [];
-
-                while (poolUrl) {
-                    const poolResponse = await fetch(poolUrl, {
-                        headers: { Authorization: `Bearer ${batchToken}` },
-                    });
-                    if (!poolResponse.ok) break;
-                    const poolData = await poolResponse.json();
-                    const pools = (poolData.value ?? []) as Array<
-                        Record<string, any>
-                    >;
-
-                    for (const p of pools) {
-                        accountPools.push({
-                            id: `${account.id}/pools/${p.id}`,
-                            accountId: account.id,
-                            accountName: account.accountName,
-                            region: account.region,
-                            poolId: p.id ?? "",
-                            vmSize: p.vmSize ?? "",
-                            state: p.state ?? "unknown",
-                            allocationState: p.allocationState ?? "unknown",
-                            targetDedicatedNodes: p.targetDedicatedNodes ?? 0,
-                            currentDedicatedNodes: p.currentDedicatedNodes ?? 0,
-                            targetLowPriorityNodes:
-                                p.targetLowPriorityNodes ?? 0,
-                            currentLowPriorityNodes:
-                                p.currentLowPriorityNodes ?? 0,
-                            taskSlotsPerNode: p.taskSlotsPerNode ?? 1,
-                            enableAutoScale: p.enableAutoScale ?? false,
-                            autoScaleFormula: p.autoScaleFormula,
-                            resizeErrors: undefined,
-                            lastModified: p.lastModified,
-                            creationTime: p.creationTime,
-                            startTask: p.startTask ?? undefined,
-                        });
-                    }
-
-                    poolUrl = poolData["odata.nextLink"] ?? null;
-                }
-
-                poolsByAccount.set(account.id, accountPools);
-            } catch {
-                // If pool fetch fails, use empty - still try ARM for quotas
-                poolsByAccount.set(account.id, []);
-            }
-        }
-
-        for (const account of accounts) {
-            try {
-                const token = await getAccessToken();
-                const rgMatch = account.id.match(/resourceGroups\/([^/]+)/i);
-                const resourceGroup = rgMatch
-                    ? rgMatch[1]
-                    : account.resourceGroup;
-
-                const url = `${armUrl}/subscriptions/${account.subscriptionId}/resourceGroups/${resourceGroup}/providers/Microsoft.Batch/batchAccounts/${account.accountName}?api-version=2024-02-01`;
-
-                const response = await fetch(url, {
-                    headers: { Authorization: `Bearer ${token}` },
-                });
-
-                if (!response.ok) {
-                    const err = await response.json().catch(() => ({}));
-                    throw new Error(
-                        err?.error?.message ??
-                            `Failed to get account info: ${response.status}`
+        // Single parallel pass: fetch pools + ARM quota simultaneously per account (up to 10 concurrent)
+        const acctResults = await pMap(
+            accounts,
+            async (account) => {
+                try {
+                    const rgMatch = account.id.match(
+                        /resourceGroups\/([^/]+)/i
                     );
-                }
+                    const resourceGroup = rgMatch
+                        ? rgMatch[1]
+                        : account.resourceGroup;
 
-                const data = await response.json();
-                const props = data.properties ?? {};
+                    // Fetch pools (Batch API) and quota (ARM API) in parallel for this account
+                    const [poolsData, armData] = await Promise.all([
+                        (async () => {
+                            const pools: {
+                                vmSize: string;
+                                lpNodes: number;
+                                dedNodes: number;
+                            }[] = [];
+                            let url: string | null =
+                                `https://${account.accountName}.${account.region}.batch.azure.com/pools?api-version=2024-07-01.20.0`;
+                            while (url) {
+                                const r = await fetch(url, {
+                                    headers: {
+                                        Authorization: `Bearer ${batchToken}`,
+                                    },
+                                });
+                                if (!r.ok) break;
+                                const d = await r.json();
+                                for (const p of (d.value ?? []) as any[])
+                                    pools.push({
+                                        vmSize: p.vmSize ?? "",
+                                        lpNodes: p.currentLowPriorityNodes ?? 0,
+                                        dedNodes: p.currentDedicatedNodes ?? 0,
+                                    });
+                                url = d["odata.nextLink"] ?? null;
+                            }
+                            return pools;
+                        })(),
+                        (async () => {
+                            const url = `${armUrl}/subscriptions/${account.subscriptionId}/resourceGroups/${resourceGroup}/providers/Microsoft.Batch/batchAccounts/${account.accountName}?api-version=2024-02-01`;
+                            const r = await fetch(url, {
+                                headers: {
+                                    Authorization: `Bearer ${armToken}`,
+                                },
+                            });
+                            if (!r.ok) {
+                                const e = await r.json().catch(() => ({}));
+                                throw new Error(
+                                    e?.error?.message ?? `${r.status}`
+                                );
+                            }
+                            return await r.json();
+                        })(),
+                    ]);
 
-                // Parse quotas as numbers, defaulting to 0 if missing or non-numeric
-                const lowPriorityCoreQuota: number =
-                    typeof props.lowPriorityCoreQuota === "number"
-                        ? props.lowPriorityCoreQuota
-                        : Number(props.lowPriorityCoreQuota) || 0;
-                const poolQuota: number =
-                    typeof props.poolQuota === "number"
-                        ? props.poolQuota
-                        : Number(props.poolQuota) || 0;
-                const activeJobAndJobScheduleQuota: number =
-                    typeof props.activeJobAndJobScheduleQuota === "number"
-                        ? props.activeJobAndJobScheduleQuota
-                        : Number(props.activeJobAndJobScheduleQuota) || 0;
-
-                // Check if per-VM-family enforcement is enabled
-                const dedicatedCoreQuotaPerVMFamilyEnforced: boolean =
-                    props.dedicatedCoreQuotaPerVMFamilyEnforced ?? false;
-
-                // Get fresh pool data for this account
-                const accountPools = poolsByAccount.get(account.id) ?? [];
-                const poolCount = accountPools.length;
-
-                // LP cores used: sum currentLowPriorityNodes * vCPUs for each pool
-                const lowPriorityCoresUsed = accountPools.reduce(
-                    (sum, p) =>
-                        sum +
-                        p.currentLowPriorityNodes * getVCpus(p.vmSize || ""),
-                    0
-                );
-
-                // Dedicated cores used: ALWAYS 0 (we never use dedicated)
-                const dedicatedCoresUsed = 0;
-
-                // Determine dedicated core quota
-                let dedicatedCoreQuota: number;
-                let dedicatedCoreQuotaPerVMFamily:
-                    | Array<{
-                          name: string;
-                          coreQuota: number;
-                          coresUsed: number;
-                          coresFree: number;
-                      }>
-                    | undefined;
-
-                if (
-                    dedicatedCoreQuotaPerVMFamilyEnforced &&
-                    Array.isArray(props.dedicatedCoreQuotaPerVMFamily)
-                ) {
-                    const familyQuotas =
-                        props.dedicatedCoreQuotaPerVMFamily as Array<{
-                            name: string;
-                            coreQuota: number;
-                        }>;
-
-                    // Dedicated is always unused so coresUsed=0, coresFree=coreQuota
-                    dedicatedCoreQuotaPerVMFamily = familyQuotas.map((fq) => {
-                        const quota =
-                            typeof fq.coreQuota === "number"
-                                ? fq.coreQuota
-                                : Number(fq.coreQuota) || 0;
-                        return {
-                            name: fq.name,
-                            coreQuota: quota,
-                            coresUsed: 0,
-                            coresFree: quota,
-                        };
-                    });
-
-                    // Total dedicated quota is sum of all family quotas
-                    dedicatedCoreQuota = familyQuotas.reduce(
-                        (sum, fq) =>
-                            sum +
-                            (typeof fq.coreQuota === "number"
-                                ? fq.coreQuota
-                                : Number(fq.coreQuota) || 0),
+                    const props = armData.properties ?? {};
+                    const toNum = (v: unknown) =>
+                        typeof v === "number" ? v : Number(v) || 0;
+                    const lowPriorityCoreQuota = toNum(
+                        props.lowPriorityCoreQuota
+                    );
+                    const poolQuota = toNum(props.poolQuota);
+                    const activeJobAndJobScheduleQuota = toNum(
+                        props.activeJobAndJobScheduleQuota
+                    );
+                    const dedicatedCoreQuotaPerVMFamilyEnforced: boolean =
+                        props.dedicatedCoreQuotaPerVMFamilyEnforced ?? false;
+                    const poolCount = poolsData.length;
+                    const lowPriorityCoresUsed = poolsData.reduce(
+                        (s, p) => s + p.lpNodes * getVCpus(p.vmSize),
                         0
                     );
-                } else {
-                    dedicatedCoreQuota =
-                        typeof props.dedicatedCoreQuota === "number"
-                            ? props.dedicatedCoreQuota
-                            : Number(props.dedicatedCoreQuota) || 0;
+
+                    let dedicatedCoreQuota: number;
+                    let dedicatedCoreQuotaPerVMFamily:
+                        | Array<{
+                              name: string;
+                              coreQuota: number;
+                              coresUsed: number;
+                              coresFree: number;
+                          }>
+                        | undefined;
+                    if (
+                        dedicatedCoreQuotaPerVMFamilyEnforced &&
+                        Array.isArray(props.dedicatedCoreQuotaPerVMFamily)
+                    ) {
+                        const fqs =
+                            props.dedicatedCoreQuotaPerVMFamily as Array<{
+                                name: string;
+                                coreQuota: number;
+                            }>;
+                        dedicatedCoreQuotaPerVMFamily = fqs.map((fq) => {
+                            const q = toNum(fq.coreQuota);
+                            return {
+                                name: fq.name,
+                                coreQuota: q,
+                                coresUsed: 0,
+                                coresFree: q,
+                            };
+                        });
+                        dedicatedCoreQuota = fqs.reduce(
+                            (s, fq) => s + toNum(fq.coreQuota),
+                            0
+                        );
+                    } else {
+                        dedicatedCoreQuota = toNum(props.dedicatedCoreQuota);
+                    }
+
+                    const info: AccountInfo = {
+                        id: account.id,
+                        accountName: account.accountName,
+                        subscriptionId: account.subscriptionId,
+                        region: account.region,
+                        resourceGroup,
+                        dedicatedCoreQuota,
+                        lowPriorityCoreQuota,
+                        poolQuota,
+                        activeJobAndJobScheduleQuota,
+                        dedicatedCoresUsed: 0,
+                        lowPriorityCoresUsed,
+                        poolCount,
+                        dedicatedCoresFree: dedicatedCoreQuota,
+                        lowPriorityCoresFree:
+                            lowPriorityCoreQuota - lowPriorityCoresUsed,
+                        poolsFree: poolQuota - poolCount,
+                        dedicatedCoreQuotaPerVMFamilyEnforced,
+                        dedicatedCoreQuotaPerVMFamily,
+                    };
+                    return { info, error: null as string | null };
+                } catch (error: any) {
+                    return {
+                        info: null as AccountInfo | null,
+                        error: error?.message ?? String(error),
+                    };
                 }
+            },
+            10
+        );
 
-                // Free LP = quota - used
-                const lowPriorityCoresFree =
-                    lowPriorityCoreQuota - lowPriorityCoresUsed;
-                // Free dedicated = dedicatedCoreQuota (always free since we don't use dedicated)
-                const dedicatedCoresFree = dedicatedCoreQuota;
-
-                allAccountInfos.push({
-                    id: account.id,
-                    accountName: account.accountName,
-                    subscriptionId: account.subscriptionId,
-                    region: account.region,
-                    resourceGroup,
-                    dedicatedCoreQuota,
-                    lowPriorityCoreQuota,
-                    poolQuota,
-                    activeJobAndJobScheduleQuota,
-                    dedicatedCoresUsed,
-                    lowPriorityCoresUsed,
-                    poolCount,
-                    dedicatedCoresFree,
-                    lowPriorityCoresFree,
-                    poolsFree: poolQuota - poolCount,
-                    dedicatedCoreQuotaPerVMFamilyEnforced,
-                    dedicatedCoreQuotaPerVMFamily,
-                });
-            } catch (error: any) {
-                const errorMsg = error?.message ?? String(error);
+        const allAccountInfos: AccountInfo[] = [];
+        for (let i = 0; i < acctResults.length; i++) {
+            const r = acctResults[i];
+            if (r.error || !r.info) {
                 store.addLog({
                     agent: "orchestrator",
                     level: "error",
-                    message: `Failed to refresh account info for ${account.accountName}: ${errorMsg}`,
+                    message: `Failed account info for ${accounts[i].accountName}: ${r.error}`,
                 });
                 failedCount++;
-            }
+            } else allAccountInfos.push(r.info);
         }
 
         store.setAccountInfos(allAccountInfos);
