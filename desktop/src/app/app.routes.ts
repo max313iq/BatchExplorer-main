@@ -100,5 +100,9 @@ export const routes: Routes = [
     {
         path: "welcome",
         component: WelcomeComponent,
-    }
+    },
+    {
+        path: "multi-region",
+        loadChildren: () => import("./components/multi-region/multi-region.module").then(m => m.MultiRegionModule),
+    },
 ];

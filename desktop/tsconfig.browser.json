@@ -3,6 +3,7 @@
   "include": [
     "src/app",
     "src/@batch-flask/utils/logging",
+    "../web/src/multi-region",
   ],
   "exclude": [
     "**/*.spec.ts",

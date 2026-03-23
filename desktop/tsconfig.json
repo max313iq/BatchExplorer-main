@@ -36,6 +36,8 @@
       "*": [
         "src/*",
       ],
+      "multi-region": ["../web/src/multi-region/index.ts"],
+      "multi-region/*": ["../web/src/multi-region/*"],
     },
     "types": [
       "node",

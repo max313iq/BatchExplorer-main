@@ -34,6 +34,11 @@
             </bl-clickable>
         </ng-container>
     </ng-container>
+    <ng-container *ngIf="loggedIn">
+        <bl-clickable routerLink="/multi-region" routerLinkActive="active" title="Multi-Region Manager">
+            <i class="fa fa-globe fa-lg" aria-hidden="true"></i><div class="label">Multi-Region</div>
+        </bl-clickable>
+    </ng-container>
     <ng-container *ngIf="!loggedIn">
         <bl-clickable routerLink="welcome" routerLinkActive="active" title="Home">
             <i class="fa fa-lg fa-home" aria-hidden="true"></i>
