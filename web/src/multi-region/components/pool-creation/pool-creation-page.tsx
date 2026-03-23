@@ -20,65 +20,35 @@ import {
 } from "../../store/store-context";
 import { StatusBadge } from "../shared/status-badge";
 import { OrchestratorAgent } from "../../agents/orchestrator-agent";
+import { IconButton } from "@fluentui/react/lib/Button";
 
 const stackTokens: IStackTokens = { childrenGap: 12 };
 
 const GPU_VMS = [
-    { key: "Standard_NC6s_v3", text: "NC6s_v3 (6 vCPUs, 1×V100)", vCPUs: 6 },
     {
-        key: "Standard_NC12s_v3",
-        text: "NC12s_v3 (12 vCPUs, 2×V100)",
-        vCPUs: 12,
-    },
-    {
-        key: "Standard_NC24s_v3",
-        text: "NC24s_v3 (24 vCPUs, 4×V100)",
-        vCPUs: 24,
-    },
-    {
-        key: "Standard_NC4as_T4_v3",
-        text: "NC4as_T4_v3 (4 vCPUs, 1×T4)",
-        vCPUs: 4,
-    },
-    {
-        key: "Standard_NC16as_T4_v3",
-        text: "NC16as_T4_v3 (16 vCPUs, 1×T4)",
-        vCPUs: 16,
-    },
-    {
-        key: "Standard_NC64as_T4_v3",
-        text: "NC64as_T4_v3 (64 vCPUs, 4×T4)",
-        vCPUs: 64,
-    },
-    {
-        key: "Standard_ND96amsr_A100_v4",
-        text: "ND96amsr_A100_v4 (96 vCPUs, 8×A100 80GB)",
-        vCPUs: 96,
-    },
-    {
-        key: "Standard_ND96asr_A100_v4",
-        text: "ND96asr_A100_v4 (96 vCPUs, 8×A100 40GB)",
-        vCPUs: 96,
-    },
-    {
-        key: "Standard_NV36ads_A10_v5",
-        text: "NV36ads_A10_v5 (36 vCPUs, 1×A10)",
-        vCPUs: 36,
-    },
-    {
-        key: "Standard_NV72ads_A10_v5",
-        text: "NV72ads_A10_v5 (72 vCPUs, 2×A10)",
-        vCPUs: 72,
+        key: "Standard_ND40rs_v2",
+        text: "ND40rs_v2 (40 vCPUs, 8×V100, 672 GB)",
+        vCPUs: 40,
     },
     {
         key: "Standard_ND96isr_H100_v5",
-        text: "ND96isr_H100_v5 (96 vCPUs, 8×H100)",
+        text: "ND96isr_H100_v5 (96 vCPUs, 8×H100, 1900 GB)",
         vCPUs: 96,
     },
     {
-        key: "Standard_ND40rs_v2",
-        text: "ND40rs_v2 (40 vCPUs, 8×V100)",
-        vCPUs: 40,
+        key: "Standard_NC24s_v3",
+        text: "NC24s_v3 (24 vCPUs, 4×V100, 448 GB)",
+        vCPUs: 24,
+    },
+    {
+        key: "Standard_NC12s_v3",
+        text: "NC12s_v3 (12 vCPUs, 2×V100, 224 GB)",
+        vCPUs: 12,
+    },
+    {
+        key: "Standard_NC6s_v3",
+        text: "NC6s_v3 (6 vCPUs, 1×V100, 112 GB)",
+        vCPUs: 6,
     },
 ];
 
@@ -123,6 +93,11 @@ const DEFAULT_POOL_CONFIG = {
     userAccounts: [],
 };
 
+interface EnvVar {
+    name: string;
+    value: string;
+}
+
 interface PoolCreationPageProps {
     orchestrator: OrchestratorAgent;
 }
@@ -146,9 +121,7 @@ export const PoolCreationPage: React.FC<PoolCreationPageProps> = ({
     const [startTaskCmd, setStartTaskCmd] = React.useState(
         '/bin/bash -c "echo Hello"'
     );
-    const [quotaType, setQuotaType] = React.useState<
-        "lowPriority" | "dedicated"
-    >("lowPriority");
+    const [envVars, setEnvVars] = React.useState<EnvVar[]>([]);
 
     // Load last pool config from preferences on mount
     React.useEffect(() => {
@@ -184,36 +157,6 @@ export const PoolCreationPage: React.FC<PoolCreationPageProps> = ({
         };
     }, []);
 
-    // Auto-update JSON config when smart mode is on and VM sizes are selected
-    React.useEffect(() => {
-        if (!smartMode || selectedVmSizes.length === 0) return;
-        try {
-            const config = JSON.parse(poolConfigJson);
-            const firstVm = GPU_VMS.find((vm) => vm.key === selectedVmSizes[0]);
-            if (!firstVm) return;
-
-            config.vmSize = selectedVmSizes[0].toLowerCase();
-
-            // Auto-calc targetLowPriorityNodes from first selected account's free quota
-            const accountInfos = state.accountInfos;
-            if (accountInfos.length > 0 && selectedAccountIds.size > 0) {
-                const firstAccountId = Array.from(selectedAccountIds)[0];
-                const info = accountInfos.find((a) => a.id === firstAccountId);
-                if (info) {
-                    const freeQuota = info.lowPriorityCoresFree;
-                    const maxNodes = Math.floor(freeQuota / firstVm.vCPUs);
-                    config.targetLowPriorityNodes = Math.max(0, maxNodes);
-                }
-            }
-
-            const newJson = JSON.stringify(config, null, 2);
-            setPoolConfigJson(newJson);
-            store.saveUserPreferences({ lastPoolConfig: newJson });
-        } catch {
-            // JSON parse error — don't update
-        }
-    }, [smartMode, selectedVmSizes, selectedAccountIds]);
-
     // Only show accounts with approved quota or created status
     const eligibleAccounts = state.accounts.filter((a) => {
         if (a.provisioningState !== "created") return false;
@@ -229,12 +172,37 @@ export const PoolCreationPage: React.FC<PoolCreationPageProps> = ({
         }
     }, [selectAll, eligibleAccounts.length]);
 
+    // Env var helpers
+    const addEnvVar = React.useCallback(() => {
+        setEnvVars((prev) => [...prev, { name: "", value: "" }]);
+    }, []);
+
+    const removeEnvVar = React.useCallback((index: number) => {
+        setEnvVars((prev) => prev.filter((_, i) => i !== index));
+    }, []);
+
+    const updateEnvVar = React.useCallback(
+        (index: number, field: "name" | "value", val: string) => {
+            setEnvVars((prev) =>
+                prev.map((ev, i) =>
+                    i === index ? { ...ev, [field]: val } : ev
+                )
+            );
+        },
+        []
+    );
+
     const handleCreate = React.useCallback(async () => {
         try {
             setConfigError(null);
             setIsRunning(true);
 
             if (smartMode && selectedVmSizes.length > 0) {
+                // Build environment settings from the env var UI
+                const environmentSettings = envVars
+                    .filter((ev) => ev.name.trim() !== "")
+                    .map((ev) => ({ name: ev.name, value: ev.value }));
+
                 // Build pool config from simple fields — no JSON editing needed
                 const poolConfig = {
                     id: "pool",
@@ -257,7 +225,7 @@ export const PoolCreationPage: React.FC<PoolCreationPageProps> = ({
                     enableInterNodeCommunication: false,
                     startTask: {
                         commandLine: startTaskCmd,
-                        environmentSettings: [],
+                        environmentSettings,
                         maxTaskRetryCount: 3,
                         resourceFiles: [],
                         userIdentity: {
@@ -278,7 +246,7 @@ export const PoolCreationPage: React.FC<PoolCreationPageProps> = ({
                         accountIds: Array.from(selectedAccountIds),
                         vmSizes: selectedVmSizes,
                         poolConfig,
-                        quotaType,
+                        quotaType: "lowPriority",
                     },
                 });
             } else {
@@ -305,7 +273,7 @@ export const PoolCreationPage: React.FC<PoolCreationPageProps> = ({
         smartMode,
         selectedVmSizes,
         startTaskCmd,
-        quotaType,
+        envVars,
     ]);
 
     const handleRetryFailedPools = React.useCallback(() => {
@@ -450,9 +418,10 @@ export const PoolCreationPage: React.FC<PoolCreationPageProps> = ({
                     <>
                         <MessageBar messageBarType={MessageBarType.info}>
                             Smart Mode auto-calculates node counts from
-                            available quota. Select VM sizes in priority order —
-                            if one fails (capacity/quota), it falls back to the
-                            next. Maximizes quota usage automatically.
+                            available LP quota. Select VM sizes in priority
+                            order — if one fails (capacity/quota), it falls back
+                            to the next. targetDedicatedNodes is always 0; only
+                            low-priority/spot nodes are used.
                         </MessageBar>
 
                         <Dropdown
@@ -487,41 +456,17 @@ export const PoolCreationPage: React.FC<PoolCreationPageProps> = ({
                                         <strong>{i + 1}.</strong>{" "}
                                         {v.replace("Standard_", "")}
                                         {i < selectedVmSizes.length - 1
-                                            ? " → "
+                                            ? " \u2192 "
                                             : ""}
                                     </span>
                                 ))}
                             </div>
                         )}
 
-                        <Dropdown
-                            label="Quota Type"
-                            selectedKey={quotaType}
-                            options={[
-                                {
-                                    key: "lowPriority",
-                                    text: "Low Priority / Spot (cheaper, may be preempted)",
-                                },
-                                {
-                                    key: "dedicated",
-                                    text: "Dedicated (guaranteed, higher cost)",
-                                },
-                            ]}
-                            onChange={(_e, option) => {
-                                if (option)
-                                    setQuotaType(
-                                        option.key as
-                                            | "lowPriority"
-                                            | "dedicated"
-                                    );
-                            }}
-                            styles={{ root: { maxWidth: 500 } }}
-                        />
-
                         <TextField
-                            label="Start Task Command"
+                            label="Start Task Command Line"
                             multiline
-                            rows={4}
+                            rows={6}
                             value={startTaskCmd}
                             onChange={(_e, v) => setStartTaskCmd(v ?? "")}
                             placeholder='/bin/bash -c "apt-get update && echo setup done"'
@@ -530,9 +475,81 @@ export const PoolCreationPage: React.FC<PoolCreationPageProps> = ({
                                 field: {
                                     fontFamily: "Consolas, monospace",
                                     fontSize: 13,
+                                    minHeight: 120,
                                 },
                             }}
                         />
+
+                        <div>
+                            <label
+                                style={{
+                                    fontWeight: 600,
+                                    fontSize: "14px",
+                                    display: "block",
+                                    marginBottom: "4px",
+                                }}
+                            >
+                                Start Task Environment Variables
+                            </label>
+                            {envVars.map((ev, idx) => (
+                                <Stack
+                                    key={idx}
+                                    horizontal
+                                    tokens={{ childrenGap: 8 }}
+                                    verticalAlign="end"
+                                    styles={{
+                                        root: { marginBottom: 4 },
+                                    }}
+                                >
+                                    <TextField
+                                        placeholder="Name"
+                                        value={ev.name}
+                                        onChange={(_e, v) =>
+                                            updateEnvVar(idx, "name", v ?? "")
+                                        }
+                                        styles={{
+                                            root: { width: 200 },
+                                            field: {
+                                                fontFamily:
+                                                    "Consolas, monospace",
+                                                fontSize: 13,
+                                            },
+                                        }}
+                                    />
+                                    <TextField
+                                        placeholder="Value"
+                                        value={ev.value}
+                                        onChange={(_e, v) =>
+                                            updateEnvVar(idx, "value", v ?? "")
+                                        }
+                                        styles={{
+                                            root: { width: 400 },
+                                            field: {
+                                                fontFamily:
+                                                    "Consolas, monospace",
+                                                fontSize: 13,
+                                            },
+                                        }}
+                                    />
+                                    <IconButton
+                                        iconProps={{ iconName: "Delete" }}
+                                        title="Remove"
+                                        onClick={() => removeEnvVar(idx)}
+                                        styles={{
+                                            root: { color: "#a80000" },
+                                        }}
+                                    />
+                                </Stack>
+                            ))}
+                            <DefaultButton
+                                text="Add Environment Variable"
+                                iconProps={{ iconName: "Add" }}
+                                onClick={addEnvVar}
+                                styles={{
+                                    root: { marginTop: 4 },
+                                }}
+                            />
+                        </div>
                     </>
                 ) : (
                     <>

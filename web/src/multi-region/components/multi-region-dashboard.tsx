@@ -26,6 +26,7 @@ import { PoolCreationPage } from "./pool-creation/pool-creation-page";
 import { NodesPage } from "./nodes/nodes-page";
 import { PoolInfoPage } from "./pool-info/pool-info-page";
 import { AccountInfoPage } from "./account-info/account-info-page";
+import { UnusedQuotaPage } from "./unused-quota/unused-quota-page";
 import { AgentLogPanel } from "./shared/agent-log-panel";
 import { ActivityPanel } from "./shared/activity-panel";
 
@@ -395,6 +396,13 @@ const PageContent: React.FC<{
             return <PoolInfoPage orchestrator={orchestrator} />;
         case "account-info":
             return <AccountInfoPage orchestrator={orchestrator} />;
+        case "unused-quota":
+            return (
+                <UnusedQuotaPage
+                    orchestrator={orchestrator}
+                    onNavigate={onNavigate}
+                />
+            );
         case "nodes":
             return <NodesPage orchestrator={orchestrator} />;
         default:

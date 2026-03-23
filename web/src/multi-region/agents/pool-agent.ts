@@ -23,18 +23,11 @@ function vmShortName(vmSize: string): string {
 
 /** Map of VM size keys to vCPU counts used for quota math */
 const VM_VCPUS: Record<string, number> = {
-    Standard_NC6s_v3: 6,
-    Standard_NC12s_v3: 12,
-    Standard_NC24s_v3: 24,
-    Standard_NC4as_T4_v3: 4,
-    Standard_NC16as_T4_v3: 16,
-    Standard_NC64as_T4_v3: 64,
-    Standard_ND96amsr_A100_v4: 96,
-    Standard_ND96asr_A100_v4: 96,
-    Standard_NV36ads_A10_v5: 36,
-    Standard_NV72ads_A10_v5: 72,
-    Standard_ND96isr_H100_v5: 96,
     Standard_ND40rs_v2: 40,
+    Standard_ND96isr_H100_v5: 96,
+    Standard_NC24s_v3: 24,
+    Standard_NC12s_v3: 12,
+    Standard_NC6s_v3: 6,
 };
 
 function isCapacityOrQuotaError(errorMsg: string): boolean {
@@ -96,12 +89,18 @@ export class PoolAgent implements Agent {
 
             const internalId = uuidV4();
 
+            // Always force targetDedicatedNodes = 0
+            const poolConfig = {
+                ...input.poolConfig,
+                targetDedicatedNodes: 0,
+            };
+
             const pool: ManagedPool = {
                 id: internalId,
                 accountId,
                 poolId,
                 provisioningState: "pending",
-                config: input.poolConfig,
+                config: poolConfig,
                 createdAt: new Date().toISOString(),
                 error: null,
             };
@@ -123,7 +122,7 @@ export class PoolAgent implements Agent {
                                 "application/json; odata=minimalmetadata",
                             Authorization: `Bearer ${token}`,
                         },
-                        body: JSON.stringify(input.poolConfig),
+                        body: JSON.stringify(poolConfig),
                     });
 
                     if (!response.ok) {
@@ -193,6 +192,8 @@ export class PoolAgent implements Agent {
      * capacity/quota error, falls back to the next. If a pool is created
      * but doesn't use all available quota, a second pool may be created
      * with the next VM size for the remaining quota.
+     *
+     * ALWAYS uses targetDedicatedNodes = 0 and only LP quota.
      */
     async executeWithFallback(params: {
         accountIds: string[];
@@ -200,7 +201,7 @@ export class PoolAgent implements Agent {
         poolConfig: Record<string, unknown>;
         quotaType: "lowPriority" | "dedicated";
     }): Promise<AgentResult> {
-        const { accountIds, vmSizes, poolConfig, quotaType } = params;
+        const { accountIds, vmSizes, poolConfig } = params;
         const { store, scheduler, getBatchAccessToken } = this._ctx;
         this._cancelled = false;
 
@@ -219,6 +220,11 @@ export class PoolAgent implements Agent {
             error: string;
         }> = [];
 
+        // Extract startTask from the payload pool config
+        const startTask = poolConfig.startTask as
+            | Record<string, unknown>
+            | undefined;
+
         for (const accountId of accountIds) {
             if (this._cancelled) break;
 
@@ -235,22 +241,20 @@ export class PoolAgent implements Agent {
                 continue;
             }
 
-            // Get free quota from AccountInfo in the store
+            // Get free LP quota from AccountInfo in the store
+            // ALWAYS use LP quota only, never dedicated
             const accountInfo: AccountInfo | undefined =
                 currentState.accountInfos.find((a) => a.id === accountId);
             let remainingQuota = 0;
             if (accountInfo) {
-                remainingQuota =
-                    quotaType === "dedicated"
-                        ? accountInfo.dedicatedCoresFree
-                        : accountInfo.lowPriorityCoresFree;
+                remainingQuota = accountInfo.lowPriorityCoresFree;
             }
 
             if (remainingQuota <= 0) {
                 store.addLog({
                     agent: "pool",
                     level: "warn",
-                    message: `No free ${quotaType} quota on ${account.accountName}, skipping`,
+                    message: `No free LP quota on ${account.accountName}, skipping`,
                 });
                 continue;
             }
@@ -263,13 +267,14 @@ export class PoolAgent implements Agent {
 
                 const vmSize = vmSizes[vmIdx];
                 const vCPUs = VM_VCPUS[vmSize] ?? 1;
+                // Compute maxNodes using ONLY LP quota: floor(freeLpCores / vCPUs)
                 const maxNodes = Math.floor(remainingQuota / vCPUs);
 
                 if (maxNodes <= 0) {
                     store.addLog({
                         agent: "pool",
                         level: "info",
-                        message: `${account.accountName}: not enough quota (${remainingQuota} cores) for ${vmSize} (${vCPUs} vCPUs), trying next`,
+                        message: `${account.accountName}: not enough LP quota (${remainingQuota} cores) for ${vmSize} (${vCPUs} vCPUs), trying next`,
                     });
                     continue;
                 }
@@ -277,20 +282,19 @@ export class PoolAgent implements Agent {
                 const shortName = vmShortName(vmSize);
                 const currentPoolId = `gpu-${shortName}-${random4()}`;
 
-                const currentConfig = {
+                // ALWAYS set targetDedicatedNodes = 0, only use LP nodes
+                const currentConfig: Record<string, unknown> = {
                     ...poolConfig,
                     id: currentPoolId,
                     vmSize: vmSize.toLowerCase(),
-                    ...(quotaType === "dedicated"
-                        ? {
-                              targetDedicatedNodes: maxNodes,
-                              targetLowPriorityNodes: 0,
-                          }
-                        : {
-                              targetDedicatedNodes: 0,
-                              targetLowPriorityNodes: maxNodes,
-                          }),
+                    targetDedicatedNodes: 0,
+                    targetLowPriorityNodes: maxNodes,
                 };
+
+                // Ensure startTask from payload is included in every pool config
+                if (startTask) {
+                    currentConfig.startTask = startTask;
+                }
 
                 const internalId = uuidV4();
                 const pool: ManagedPool = {
@@ -342,7 +346,7 @@ export class PoolAgent implements Agent {
                     store.addLog({
                         agent: "pool",
                         level: "info",
-                        message: `Created pool "${currentPoolId}" (${vmSize}, ${maxNodes} nodes) on ${account.accountName}`,
+                        message: `Created pool "${currentPoolId}" (${vmSize}, ${maxNodes} LP nodes) on ${account.accountName}`,
                     });
                     totalCreated++;
                     accountCreated = true;
@@ -355,7 +359,7 @@ export class PoolAgent implements Agent {
                         store.addLog({
                             agent: "pool",
                             level: "info",
-                            message: `${account.accountName}: ${remainingQuota} cores remaining, trying next VM size for partial fill`,
+                            message: `${account.accountName}: ${remainingQuota} LP cores remaining, trying next VM size for partial fill`,
                         });
                         // Continue the loop — next iteration picks next VM
                         continue;

@@ -36,6 +36,7 @@ export { SidebarNav } from "./components/shared/sidebar-nav";
 export type { PageKey } from "./components/shared/sidebar-nav";
 export { OverviewPage } from "./components/overview/overview-page";
 export { LoadingSkeleton } from "./components/shared/loading-skeleton";
+export { UnusedQuotaPage } from "./components/unused-quota/unused-quota-page";
 
 // Constants & Helpers
 export { AZURE_REGIONS } from "./components/shared/constants";

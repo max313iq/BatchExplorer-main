@@ -19,45 +19,11 @@ function generateCorrelationId(): string {
 
 function getVCpus(vmSize: string): number {
     const map: Record<string, number> = {
-        standard_nc6: 6,
-        standard_nc12: 12,
-        standard_nc24: 24,
-        standard_nc24r: 24,
-        standard_nc6s_v3: 6,
-        standard_nc12s_v3: 12,
-        standard_nc24s_v3: 24,
-        standard_nc24rs_v3: 24,
-        standard_nc4as_t4_v3: 4,
-        standard_nc8as_t4_v3: 8,
-        standard_nc16as_t4_v3: 16,
-        standard_nc64as_t4_v3: 64,
-        standard_nd96amsr_a100_v4: 96,
-        standard_nd96asr_a100_v4: 96,
-        standard_nd96isr_h100_v5: 96,
         standard_nd40rs_v2: 40,
-        standard_nv6: 6,
-        standard_nv12: 12,
-        standard_nv24: 24,
-        standard_nv6ads_a10_v5: 6,
-        standard_nv12ads_a10_v5: 12,
-        standard_nv18ads_a10_v5: 18,
-        standard_nv36ads_a10_v5: 36,
-        standard_nv36adms_a10_v5: 36,
-        standard_nv72ads_a10_v5: 72,
-        standard_d2s_v3: 2,
-        standard_d4s_v3: 4,
-        standard_d8s_v3: 8,
-        standard_d16s_v3: 16,
-        standard_d32s_v3: 32,
-        standard_d48s_v3: 48,
-        standard_d64s_v3: 64,
-        standard_f2s_v2: 2,
-        standard_f4s_v2: 4,
-        standard_f8s_v2: 8,
-        standard_f16s_v2: 16,
-        standard_f32s_v2: 32,
-        standard_f48s_v2: 48,
-        standard_f72s_v2: 72,
+        standard_nd96isr_h100_v5: 96,
+        standard_nc24s_v3: 24,
+        standard_nc12s_v3: 12,
+        standard_nc6s_v3: 6,
     };
     return map[vmSize.toLowerCase().replace(/\s/g, "")] || 1;
 }
@@ -257,18 +223,81 @@ export class OrchestratorAgent implements Agent {
                         unknown
                     >;
                     store.updateActivity(actId, { progress: 20 });
+
+                    // Pre-filter accounts: check for resizing pools and
+                    // adjust available LP quota accordingly
+                    const requestedAccountIds =
+                        (smartPayload.accountIds as string[]) ?? [];
+                    const currentPoolInfos = store.getState().poolInfos;
+                    const currentAccountInfos = store.getState().accountInfos;
+                    const filteredAccountIds: string[] = [];
+
+                    for (const accountId of requestedAccountIds) {
+                        const accountInfo = currentAccountInfos.find(
+                            (a) => a.id === accountId
+                        );
+                        if (!accountInfo) {
+                            filteredAccountIds.push(accountId);
+                            continue;
+                        }
+
+                        // Check if any pool in this account is currently resizing
+                        const accountPools = currentPoolInfos.filter(
+                            (p) => p.accountId === accountId
+                        );
+                        const resizingPools = accountPools.filter(
+                            (p) => p.allocationState === "resizing"
+                        );
+
+                        if (resizingPools.length > 0) {
+                            // Calculate LP cores consumed by resizing pools
+                            let resizingCoresConsumed = 0;
+                            for (const rp of resizingPools) {
+                                resizingCoresConsumed +=
+                                    rp.targetLowPriorityNodes *
+                                    getVCpus(rp.vmSize || "");
+                            }
+
+                            const remainingFreeLp =
+                                accountInfo.lowPriorityCoresFree -
+                                resizingCoresConsumed;
+
+                            if (remainingFreeLp <= 0) {
+                                store.addLog({
+                                    agent: "orchestrator",
+                                    level: "info",
+                                    message: `Skipping ${accountInfo.accountName} — all LP quota consumed by resizing pool`,
+                                });
+                                continue;
+                            }
+
+                            // There IS remaining quota; adjust the accountInfo
+                            // in the store so pool agent sees the correct
+                            // remaining value.
+                            store.updateAccountInfo(accountId, {
+                                lowPriorityCoresFree: remainingFreeLp,
+                            });
+                            store.addLog({
+                                agent: "orchestrator",
+                                level: "info",
+                                message: `${accountInfo.accountName}: resizing pool consuming ${resizingCoresConsumed} LP cores, ${remainingFreeLp} LP cores remaining for new pool`,
+                            });
+                        }
+
+                        filteredAccountIds.push(accountId);
+                    }
+
+                    // Ensure targetDedicatedNodes = 0 in pool config
+                    const smartPoolConfig =
+                        (smartPayload.poolConfig as Record<string, unknown>) ??
+                        {};
+                    smartPoolConfig.targetDedicatedNodes = 0;
+
                     result = await this._pool.executeWithFallback({
-                        accountIds: (smartPayload.accountIds as string[]) ?? [],
+                        accountIds: filteredAccountIds,
                         vmSizes: (smartPayload.vmSizes as string[]) ?? [],
-                        poolConfig:
-                            (smartPayload.poolConfig as Record<
-                                string,
-                                unknown
-                            >) ?? {},
-                        quotaType:
-                            (smartPayload.quotaType as
-                                | "lowPriority"
-                                | "dedicated") ?? "lowPriority",
+                        poolConfig: smartPoolConfig,
+                        quotaType: "lowPriority",
                     });
                     store.addNotification({
                         type:
@@ -436,7 +465,9 @@ export class OrchestratorAgent implements Agent {
         if (!payload) return action;
         switch (action) {
             case "discover_accounts":
-                return `subscription ${(payload.subscriptionId as string)?.substring(0, 8) ?? ""}...`;
+                return payload.subscriptionId
+                    ? `subscription ${(payload.subscriptionId as string).substring(0, 8)}...`
+                    : "all subscriptions";
             case "create_accounts":
                 return `${(payload.regions as string[])?.length ?? 0} regions`;
             case "submit_quota_requests":
@@ -478,40 +509,108 @@ export class OrchestratorAgent implements Agent {
         }
     }
 
+    private async _discoverAccountsForSubscription(
+        subscriptionId: string,
+        token: string,
+        armUrl: string
+    ): Promise<any[]> {
+        let url: string | null =
+            `${armUrl}/subscriptions/${subscriptionId}/providers/Microsoft.Batch/batchAccounts?api-version=2024-02-01`;
+        const allAccounts: any[] = [];
+
+        // Handle pagination
+        while (url) {
+            const response = await fetch(url, {
+                headers: { Authorization: `Bearer ${token}` },
+            });
+            if (!response.ok) {
+                const err = await response.json().catch(() => ({}));
+                throw new Error(
+                    err?.error?.message ??
+                        `Discovery failed for subscription ${subscriptionId.substring(0, 8)}: ${response.status}`
+                );
+            }
+            const data = await response.json();
+            allAccounts.push(...(data.value ?? []));
+            url = data.nextLink ?? null;
+        }
+
+        return allAccounts;
+    }
+
     private async _discoverAccounts(
         payload: Record<string, unknown>
     ): Promise<AgentResult> {
-        const subscriptionId = payload.subscriptionId as string;
         const { store, getAccessToken, armUrl } = this._ctx;
+        const subscriptionId = payload.subscriptionId as string | undefined;
 
         store.setAgentStatus("provisioner", "running");
-        store.addLog({
-            agent: "provisioner",
-            level: "info",
-            message: `Discovering existing Batch accounts in subscription ${subscriptionId.substring(0, 8)}...`,
-        });
 
         try {
             const token = await getAccessToken();
-            let url: string | null =
-                `${armUrl}/subscriptions/${subscriptionId}/providers/Microsoft.Batch/batchAccounts?api-version=2024-02-01`;
-            const allAccounts: any[] = [];
 
-            // Handle pagination
-            while (url) {
-                const response = await fetch(url, {
-                    headers: { Authorization: `Bearer ${token}` },
+            // Determine which subscriptions to discover
+            let subscriptionIds: string[];
+
+            if (subscriptionId) {
+                // Single subscription mode
+                subscriptionIds = [subscriptionId];
+                store.addLog({
+                    agent: "provisioner",
+                    level: "info",
+                    message: `Discovering Batch accounts in subscription ${subscriptionId.substring(0, 8)}...`,
                 });
-                if (!response.ok) {
-                    const err = await response.json().catch(() => ({}));
+            } else {
+                // Cross-subscription mode: fetch ALL subscriptions
+                store.addLog({
+                    agent: "provisioner",
+                    level: "info",
+                    message:
+                        "Fetching all subscriptions for cross-subscription discovery...",
+                });
+
+                const subsResponse = await fetch("/api/subscriptions");
+                if (!subsResponse.ok) {
                     throw new Error(
-                        err?.error?.message ??
-                            `Discovery failed: ${response.status}`
+                        `Failed to list subscriptions: ${subsResponse.status}`
                     );
                 }
-                const data = await response.json();
-                allAccounts.push(...(data.value ?? []));
-                url = data.nextLink ?? null;
+                const subs = await subsResponse.json();
+                subscriptionIds = (subs as any[]).map(
+                    (s: any) => s.subscriptionId as string
+                );
+
+                store.addLog({
+                    agent: "provisioner",
+                    level: "info",
+                    message: `Found ${subscriptionIds.length} subscriptions to discover`,
+                });
+            }
+
+            const allAccounts: Array<{ acct: any; subId: string }> = [];
+            let failedSubs = 0;
+
+            for (const subId of subscriptionIds) {
+                try {
+                    const accounts =
+                        await this._discoverAccountsForSubscription(
+                            subId,
+                            token,
+                            armUrl
+                        );
+                    for (const acct of accounts) {
+                        allAccounts.push({ acct, subId });
+                    }
+                } catch (error: any) {
+                    const errorMsg = error?.message ?? String(error);
+                    store.addLog({
+                        agent: "provisioner",
+                        level: "error",
+                        message: `Discovery failed for subscription ${subId.substring(0, 8)}: ${errorMsg}`,
+                    });
+                    failedSubs++;
+                    // Continue with other subscriptions
+                }
             }
 
             // Deduplicate against existing accounts in state
@@ -520,7 +619,7 @@ export class OrchestratorAgent implements Agent {
             );
             let imported = 0;
 
-            for (const acct of allAccounts) {
+            for (const { acct, subId } of allAccounts) {
                 const id = (acct.id as string) ?? "";
                 if (existingIds.has(id.toLowerCase())) continue;
 
@@ -532,7 +631,7 @@ export class OrchestratorAgent implements Agent {
                     id,
                     accountName: acct.name,
                     resourceGroup,
-                    subscriptionId,
+                    subscriptionId: subId,
                     region: acct.location,
                     provisioningState: "created",
                     createdAt:
@@ -547,15 +646,22 @@ export class OrchestratorAgent implements Agent {
             store.addLog({
                 agent: "provisioner",
                 level: "info",
-                message: `Discovered ${allAccounts.length} Batch accounts, imported ${imported} new (${allAccounts.length - imported} already tracked)`,
+                message: `Discovered ${allAccounts.length} accounts across ${subscriptionIds.length} subscriptions, imported ${imported} new (${allAccounts.length - imported} already tracked, ${failedSubs} subscriptions failed)`,
             });
 
             return {
-                status: "completed",
+                status:
+                    failedSubs === 0
+                        ? "completed"
+                        : failedSubs === subscriptionIds.length
+                          ? "failed"
+                          : "partial",
                 summary: {
                     total: allAccounts.length,
                     imported,
                     skipped: allAccounts.length - imported,
+                    subscriptionsQueried: subscriptionIds.length,
+                    subscriptionsFailed: failedSubs,
                 },
             };
         } catch (error: any) {
@@ -687,7 +793,8 @@ export class OrchestratorAgent implements Agent {
     }
 
     private async _refreshAccountInfo(): Promise<AgentResult> {
-        const { store, getAccessToken, armUrl } = this._ctx;
+        const { store, getAccessToken, getBatchAccessToken, armUrl } =
+            this._ctx;
         const state = store.getState();
         const accounts = state.accounts.filter(
             (a) => a.provisioningState === "created"
@@ -696,14 +803,67 @@ export class OrchestratorAgent implements Agent {
         store.addLog({
             agent: "orchestrator",
             level: "info",
-            message: `Refreshing account info for ${accounts.length} accounts`,
+            message: `Refreshing account info for ${accounts.length} accounts across all subscriptions`,
         });
 
         const allAccountInfos: AccountInfo[] = [];
         let failedCount = 0;
 
-        // Use the current poolInfos from the store to compute usage
-        const poolInfos = store.getState().poolInfos;
+        // Fetch fresh pool data per account for accurate usage calculation
+        const poolsByAccount = new Map<string, PoolInfo[]>();
+
+        for (const account of accounts) {
+            try {
+                const batchToken = await getBatchAccessToken();
+                let poolUrl: string | null =
+                    `https://${account.accountName}.${account.region}.batch.azure.com/pools?api-version=2024-07-01.20.0`;
+                const accountPools: PoolInfo[] = [];
+
+                while (poolUrl) {
+                    const poolResponse = await fetch(poolUrl, {
+                        headers: { Authorization: `Bearer ${batchToken}` },
+                    });
+                    if (!poolResponse.ok) break;
+                    const poolData = await poolResponse.json();
+                    const pools = (poolData.value ?? []) as Array<
+                        Record<string, any>
+                    >;
+
+                    for (const p of pools) {
+                        accountPools.push({
+                            id: `${account.id}/pools/${p.id}`,
+                            accountId: account.id,
+                            accountName: account.accountName,
+                            region: account.region,
+                            poolId: p.id ?? "",
+                            vmSize: p.vmSize ?? "",
+                            state: p.state ?? "unknown",
+                            allocationState: p.allocationState ?? "unknown",
+                            targetDedicatedNodes: p.targetDedicatedNodes ?? 0,
+                            currentDedicatedNodes: p.currentDedicatedNodes ?? 0,
+                            targetLowPriorityNodes:
+                                p.targetLowPriorityNodes ?? 0,
+                            currentLowPriorityNodes:
+                                p.currentLowPriorityNodes ?? 0,
+                            taskSlotsPerNode: p.taskSlotsPerNode ?? 1,
+                            enableAutoScale: p.enableAutoScale ?? false,
+                            autoScaleFormula: p.autoScaleFormula,
+                            resizeErrors: undefined,
+                            lastModified: p.lastModified,
+                            creationTime: p.creationTime,
+                            startTask: p.startTask ?? undefined,
+                        });
+                    }
+
+                    poolUrl = poolData["odata.nextLink"] ?? null;
+                }
+
+                poolsByAccount.set(account.id, accountPools);
+            } catch {
+                // If pool fetch fails, use empty - still try ARM for quotas
+                poolsByAccount.set(account.id, []);
+            }
+        }
 
         for (const account of accounts) {
             try {
@@ -730,32 +890,38 @@ export class OrchestratorAgent implements Agent {
                 const data = await response.json();
                 const props = data.properties ?? {};
 
-                const lowPriorityCoreQuota = props.lowPriorityCoreQuota ?? 0;
-                const poolQuota = props.poolQuota ?? 0;
-                const activeJobAndJobScheduleQuota =
-                    props.activeJobAndJobScheduleQuota ?? 0;
+                // Parse quotas as numbers, defaulting to 0 if missing or non-numeric
+                const lowPriorityCoreQuota: number =
+                    typeof props.lowPriorityCoreQuota === "number"
+                        ? props.lowPriorityCoreQuota
+                        : Number(props.lowPriorityCoreQuota) || 0;
+                const poolQuota: number =
+                    typeof props.poolQuota === "number"
+                        ? props.poolQuota
+                        : Number(props.poolQuota) || 0;
+                const activeJobAndJobScheduleQuota: number =
+                    typeof props.activeJobAndJobScheduleQuota === "number"
+                        ? props.activeJobAndJobScheduleQuota
+                        : Number(props.activeJobAndJobScheduleQuota) || 0;
 
                 // Check if per-VM-family enforcement is enabled
                 const dedicatedCoreQuotaPerVMFamilyEnforced: boolean =
                     props.dedicatedCoreQuotaPerVMFamilyEnforced ?? false;
 
-                // Compute usage from poolInfos
-                const accountPools = poolInfos.filter(
-                    (p) => p.accountId === account.id
-                );
-                const dedicatedCoresUsed = accountPools.reduce(
-                    (sum, p) =>
-                        sum +
-                        p.currentDedicatedNodes * getVCpus(p.vmSize || ""),
-                    0
-                );
+                // Get fresh pool data for this account
+                const accountPools = poolsByAccount.get(account.id) ?? [];
+                const poolCount = accountPools.length;
+
+                // LP cores used: sum currentLowPriorityNodes * vCPUs for each pool
                 const lowPriorityCoresUsed = accountPools.reduce(
                     (sum, p) =>
                         sum +
                         p.currentLowPriorityNodes * getVCpus(p.vmSize || ""),
                     0
                 );
-                const poolCount = accountPools.length;
+
+                // Dedicated cores used: ALWAYS 0 (we never use dedicated)
+                const dedicatedCoresUsed = 0;
 
                 // Determine dedicated core quota
                 let dedicatedCoreQuota: number;
@@ -778,40 +944,41 @@ export class OrchestratorAgent implements Agent {
                             coreQuota: number;
                         }>;
 
+                    // Dedicated is always unused so coresUsed=0, coresFree=coreQuota
                     dedicatedCoreQuotaPerVMFamily = familyQuotas.map((fq) => {
-                        const familyLower = fq.name.toLowerCase();
-                        let coresUsed = 0;
-                        for (const pool of accountPools) {
-                            const vmLower = (pool.vmSize || "")
-                                .toLowerCase()
-                                .replace(/s/g, "");
-                            const prefix = vmLower
-                                .replace(/standard_/, "")
-                                .replace(/[0-9_]/g, "")
-                                .replace(/svd+/g, "")
-                                .substring(0, 2);
-                            if (familyLower.includes(prefix)) {
-                                coresUsed +=
-                                    pool.currentDedicatedNodes *
-                                    getVCpus(pool.vmSize || "");
-                            }
-                        }
+                        const quota =
+                            typeof fq.coreQuota === "number"
+                                ? fq.coreQuota
+                                : Number(fq.coreQuota) || 0;
                         return {
                             name: fq.name,
-                            coreQuota: fq.coreQuota,
-                            coresUsed,
-                            coresFree: fq.coreQuota - coresUsed,
+                            coreQuota: quota,
+                            coresUsed: 0,
+                            coresFree: quota,
                         };
                     });
 
                     // Total dedicated quota is sum of all family quotas
                     dedicatedCoreQuota = familyQuotas.reduce(
-                        (sum, fq) => sum + fq.coreQuota,
+                        (sum, fq) =>
+                            sum +
+                            (typeof fq.coreQuota === "number"
+                                ? fq.coreQuota
+                                : Number(fq.coreQuota) || 0),
                         0
                     );
                 } else {
-                    dedicatedCoreQuota = props.dedicatedCoreQuota ?? 0;
+                    dedicatedCoreQuota =
+                        typeof props.dedicatedCoreQuota === "number"
+                            ? props.dedicatedCoreQuota
+                            : Number(props.dedicatedCoreQuota) || 0;
                 }
+
+                // Free LP = quota - used
+                const lowPriorityCoresFree =
+                    lowPriorityCoreQuota - lowPriorityCoresUsed;
+                // Free dedicated = dedicatedCoreQuota (always free since we don't use dedicated)
+                const dedicatedCoresFree = dedicatedCoreQuota;
 
                 allAccountInfos.push({
                     id: account.id,
@@ -826,9 +993,8 @@ export class OrchestratorAgent implements Agent {
                     dedicatedCoresUsed,
                     lowPriorityCoresUsed,
                     poolCount,
-                    dedicatedCoresFree: dedicatedCoreQuota - dedicatedCoresUsed,
-                    lowPriorityCoresFree:
-                        lowPriorityCoreQuota - lowPriorityCoresUsed,
+                    dedicatedCoresFree,
+                    lowPriorityCoresFree,
                     poolsFree: poolQuota - poolCount,
                     dedicatedCoreQuotaPerVMFamilyEnforced,
                     dedicatedCoreQuotaPerVMFamily,
@@ -872,13 +1038,11 @@ export class OrchestratorAgent implements Agent {
         const accountInfos = store.getState().accountInfos;
 
         const GPU_VMS = [
-            { name: "Standard_NC6s_v3", vCPUs: 6 },
-            { name: "Standard_NC24s_v3", vCPUs: 24 },
-            { name: "Standard_NC4as_T4_v3", vCPUs: 4 },
-            { name: "Standard_NC16as_T4_v3", vCPUs: 16 },
-            { name: "Standard_ND96amsr_A100_v4", vCPUs: 96 },
-            { name: "Standard_NV36ads_A10_v5", vCPUs: 36 },
             { name: "Standard_ND40rs_v2", vCPUs: 40 },
+            { name: "Standard_ND96isr_H100_v5", vCPUs: 96 },
+            { name: "Standard_NC24s_v3", vCPUs: 24 },
+            { name: "Standard_NC12s_v3", vCPUs: 12 },
+            { name: "Standard_NC6s_v3", vCPUs: 6 },
         ];
 
         const accountsWithFreeQuota = accountInfos.filter(

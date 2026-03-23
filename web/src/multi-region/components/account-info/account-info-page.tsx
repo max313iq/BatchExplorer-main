@@ -11,7 +11,7 @@ import { Text } from "@fluentui/react/lib/Text";
 import { Toggle } from "@fluentui/react/lib/Toggle";
 import { Spinner, SpinnerSize } from "@fluentui/react/lib/Spinner";
 import { Icon } from "@fluentui/react/lib/Icon";
-import { TooltipHost, DirectionalHint } from "@fluentui/react/lib/Tooltip";
+import { Checkbox } from "@fluentui/react/lib/Checkbox";
 import { useMultiRegionState } from "../../store/store-context";
 import { OrchestratorAgent } from "../../agents/orchestrator-agent";
 import { AccountInfo } from "../../store/store-types";
@@ -20,12 +20,12 @@ export interface AccountInfoPageProps {
     orchestrator: OrchestratorAgent;
 }
 
-function usageColor(used: number, quota: number): string {
+function lpUsageColor(used: number, quota: number): string {
     if (quota <= 0) return "#999";
     const pct = (used / quota) * 100;
-    if (pct > 95) return "#d13438";
-    if (pct > 80) return "#e3a400";
-    return "#ccc";
+    if (pct > 80) return "#d13438";
+    if (pct > 50) return "#e3a400";
+    return "#107c10";
 }
 
 function usagePct(used: number, quota: number): number {
@@ -38,7 +38,7 @@ const UsageBar: React.FC<{ used: number; quota: number }> = ({
     quota,
 }) => {
     const pct = usagePct(used, quota);
-    const color = usageColor(used, quota);
+    const color = lpUsageColor(used, quota);
     return (
         <Stack tokens={{ childrenGap: 4 }}>
             <span style={{ color, fontSize: 12, fontWeight: 600 }}>
@@ -66,12 +66,68 @@ const UsageBar: React.FC<{ used: number; quota: number }> = ({
     );
 };
 
+type SortDirection = "asc" | "desc";
+
+interface SortConfig {
+    key: string;
+    direction: SortDirection;
+}
+
+function getSortValue(item: AccountInfo, key: string): string | number {
+    switch (key) {
+        case "accountName":
+            return item.accountName;
+        case "region":
+            return item.region;
+        case "subscription":
+            return item.subscriptionId;
+        case "lpQuota":
+            return item.lowPriorityCoreQuota;
+        case "lpUsed":
+            return item.lowPriorityCoresUsed;
+        case "lpFree":
+            return item.lowPriorityCoresFree;
+        case "dedicatedQuota":
+            return item.dedicatedCoreQuota;
+        case "poolCount":
+            return item.poolCount;
+        case "poolQuota":
+            return item.poolQuota;
+        case "poolsFree":
+            return item.poolsFree;
+        default:
+            return 0;
+    }
+}
+
+function sortAccounts(
+    accounts: AccountInfo[],
+    sortConfig: SortConfig | null
+): AccountInfo[] {
+    if (!sortConfig) return accounts;
+    const sorted = [...accounts].sort((a, b) => {
+        const aVal = getSortValue(a, sortConfig.key);
+        const bVal = getSortValue(b, sortConfig.key);
+        if (typeof aVal === "string" && typeof bVal === "string") {
+            const cmp = aVal.localeCompare(bVal);
+            return sortConfig.direction === "asc" ? cmp : -cmp;
+        }
+        const cmp = (aVal as number) - (bVal as number);
+        return sortConfig.direction === "asc" ? cmp : -cmp;
+    });
+    return sorted;
+}
+
 export const AccountInfoPage: React.FC<AccountInfoPageProps> = ({
     orchestrator,
 }) => {
     const state = useMultiRegionState();
     const [loading, setLoading] = React.useState(false);
     const [autoRefresh, setAutoRefresh] = React.useState(false);
+    const [sortConfig, setSortConfig] = React.useState<SortConfig | null>(null);
+    const [selectedIds, setSelectedIds] = React.useState<Set<string>>(
+        new Set()
+    );
     const intervalRef = React.useRef<ReturnType<typeof setInterval> | null>(
         null
     );
@@ -95,7 +151,18 @@ export const AccountInfoPage: React.FC<AccountInfoPageProps> = ({
         setAutoRefresh(false);
     }, []);
 
-    // Auto-refresh
+    // Auto-load on mount when accountInfos is empty
+    React.useEffect(() => {
+        if (state.accountInfos.length === 0) {
+            orchestrator
+                .execute({ action: "refresh_account_info", payload: {} })
+                .catch(() => {
+                    /* handled by orchestrator */
+                });
+        }
+    }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
+    // Auto-refresh interval
     React.useEffect(() => {
         if (autoRefresh) {
             intervalRef.current = setInterval(() => {
@@ -109,7 +176,34 @@ export const AccountInfoPage: React.FC<AccountInfoPageProps> = ({
         }
     }, [autoRefresh, refresh]);
 
-    const accounts = state.accountInfos;
+    const accounts = React.useMemo(
+        () => sortAccounts(state.accountInfos, sortConfig),
+        [state.accountInfos, sortConfig]
+    );
+
+    const allSelected =
+        accounts.length > 0 && selectedIds.size === accounts.length;
+    const someSelected = selectedIds.size > 0 && !allSelected;
+
+    const toggleSelectAll = React.useCallback(() => {
+        if (allSelected) {
+            setSelectedIds(new Set());
+        } else {
+            setSelectedIds(new Set(accounts.map((a) => a.id)));
+        }
+    }, [allSelected, accounts]);
+
+    const toggleSelect = React.useCallback((id: string) => {
+        setSelectedIds((prev) => {
+            const next = new Set(prev);
+            if (next.has(id)) {
+                next.delete(id);
+            } else {
+                next.add(id);
+            }
+            return next;
+        });
+    }, []);
 
     // Summary stats
     const totalAccounts = accounts.length;
@@ -128,8 +222,45 @@ export const AccountInfoPage: React.FC<AccountInfoPageProps> = ({
     const totalLpFree = totalLpQuota - totalLpUsed;
     const totalPools = accounts.reduce((s, a) => s + a.poolCount, 0);
 
+    const handleColumnClick = React.useCallback(
+        (_ev?: React.MouseEvent<HTMLElement>, column?: IColumn) => {
+            if (!column) return;
+            setSortConfig((prev) => {
+                if (prev && prev.key === column.key) {
+                    return {
+                        key: column.key,
+                        direction: prev.direction === "asc" ? "desc" : "asc",
+                    };
+                }
+                return { key: column.key, direction: "asc" };
+            });
+        },
+        []
+    );
+
     const columns: IColumn[] = React.useMemo(
         () => [
+            {
+                key: "select",
+                name: "",
+                minWidth: 32,
+                maxWidth: 32,
+                onRender: (item: AccountInfo) => (
+                    <Checkbox
+                        checked={selectedIds.has(item.id)}
+                        onChange={() => toggleSelect(item.id)}
+                        styles={{ root: { marginTop: 2 } }}
+                    />
+                ),
+                onRenderHeader: () => (
+                    <Checkbox
+                        checked={allSelected}
+                        indeterminate={someSelected}
+                        onChange={toggleSelectAll}
+                        styles={{ root: { marginTop: 2 } }}
+                    />
+                ),
+            },
             {
                 key: "accountName",
                 name: "Account Name",
@@ -137,6 +268,11 @@ export const AccountInfoPage: React.FC<AccountInfoPageProps> = ({
                 minWidth: 120,
                 maxWidth: 200,
                 isResizable: true,
+                isSorted: sortConfig?.key === "accountName",
+                isSortedDescending:
+                    sortConfig?.key === "accountName" &&
+                    sortConfig?.direction === "desc",
+                onColumnClick: handleColumnClick,
             },
             {
                 key: "region",
@@ -145,131 +281,60 @@ export const AccountInfoPage: React.FC<AccountInfoPageProps> = ({
                 minWidth: 80,
                 maxWidth: 120,
                 isResizable: true,
+                isSorted: sortConfig?.key === "region",
+                isSortedDescending:
+                    sortConfig?.key === "region" &&
+                    sortConfig?.direction === "desc",
+                onColumnClick: handleColumnClick,
             },
             {
                 key: "subscription",
-                name: "Subscription",
-                minWidth: 100,
-                maxWidth: 160,
+                name: "Subscription ID",
+                minWidth: 90,
+                maxWidth: 110,
                 isResizable: true,
+                isSorted: sortConfig?.key === "subscription",
+                isSortedDescending:
+                    sortConfig?.key === "subscription" &&
+                    sortConfig?.direction === "desc",
+                onColumnClick: handleColumnClick,
                 onRender: (item: AccountInfo) => (
                     <span
                         style={{ fontSize: 11, color: "#999" }}
                         title={item.subscriptionId}
                     >
-                        {item.subscriptionId.substring(0, 13)}...
+                        {item.subscriptionId.substring(0, 8)}...
                     </span>
                 ),
             },
             {
-                key: "dedicatedCores",
-                name: "Dedicated Cores",
-                minWidth: 110,
-                maxWidth: 160,
+                key: "lpQuota",
+                name: "LP Quota",
+                minWidth: 70,
+                maxWidth: 90,
                 isResizable: true,
-                onRender: (item: AccountInfo) => {
-                    const bar = (
-                        <UsageBar
-                            used={item.dedicatedCoresUsed}
-                            quota={item.dedicatedCoreQuota}
-                        />
-                    );
-                    if (
-                        !item.dedicatedCoreQuotaPerVMFamilyEnforced ||
-                        !item.dedicatedCoreQuotaPerVMFamily ||
-                        item.dedicatedCoreQuotaPerVMFamily.length === 0
-                    ) {
-                        return bar;
-                    }
-                    const tooltipContent = (
-                        <div style={{ padding: 4, maxWidth: 300 }}>
-                            <div
-                                style={{
-                                    fontWeight: 600,
-                                    marginBottom: 6,
-                                    fontSize: 12,
-                                    color: "#eee",
-                                }}
-                            >
-                                Per-VM Family Quota
-                            </div>
-                            {item.dedicatedCoreQuotaPerVMFamily.map((fq) => (
-                                <div
-                                    key={fq.name}
-                                    style={{
-                                        display: "flex",
-                                        justifyContent: "space-between",
-                                        fontSize: 11,
-                                        padding: "2px 0",
-                                        color:
-                                            fq.coreQuota > 0 ? "#ccc" : "#666",
-                                    }}
-                                >
-                                    <span>{fq.name}</span>
-                                    <span
-                                        style={{
-                                            color: usageColor(
-                                                fq.coresUsed,
-                                                fq.coreQuota
-                                            ),
-                                            fontWeight: 600,
-                                            marginLeft: 12,
-                                        }}
-                                    >
-                                        {fq.coresUsed} / {fq.coreQuota}
-                                    </span>
-                                </div>
-                            ))}
-                        </div>
-                    );
-                    return (
-                        <TooltipHost
-                            content={tooltipContent}
-                            directionalHint={DirectionalHint.bottomLeftEdge}
-                            calloutProps={{
-                                styles: {
-                                    root: {
-                                        background: "#252525",
-                                    },
-                                    beak: {
-                                        background: "#252525",
-                                    },
-                                    beakCurtain: {
-                                        background: "#252525",
-                                    },
-                                    calloutMain: {
-                                        background: "#252525",
-                                    },
-                                },
-                            }}
-                        >
-                            <Stack
-                                horizontal
-                                verticalAlign="center"
-                                tokens={{ childrenGap: 4 }}
-                            >
-                                {bar}
-                                <Icon
-                                    iconName="Info"
-                                    styles={{
-                                        root: {
-                                            fontSize: 10,
-                                            color: "#0078d4",
-                                            cursor: "pointer",
-                                        },
-                                    }}
-                                />
-                            </Stack>
-                        </TooltipHost>
-                    );
-                },
+                isSorted: sortConfig?.key === "lpQuota",
+                isSortedDescending:
+                    sortConfig?.key === "lpQuota" &&
+                    sortConfig?.direction === "desc",
+                onColumnClick: handleColumnClick,
+                onRender: (item: AccountInfo) => (
+                    <span style={{ color: "#ccc" }}>
+                        {item.lowPriorityCoreQuota}
+                    </span>
+                ),
             },
             {
-                key: "lowPriorityCores",
-                name: "Low Priority Cores",
-                minWidth: 110,
-                maxWidth: 140,
+                key: "lpUsed",
+                name: "LP Used",
+                minWidth: 70,
+                maxWidth: 90,
                 isResizable: true,
+                isSorted: sortConfig?.key === "lpUsed",
+                isSortedDescending:
+                    sortConfig?.key === "lpUsed" &&
+                    sortConfig?.direction === "desc",
+                onColumnClick: handleColumnClick,
                 onRender: (item: AccountInfo) => (
                     <UsageBar
                         used={item.lowPriorityCoresUsed}
@@ -278,55 +343,16 @@ export const AccountInfoPage: React.FC<AccountInfoPageProps> = ({
                 ),
             },
             {
-                key: "pools",
-                name: "Pools",
-                minWidth: 80,
-                maxWidth: 100,
-                isResizable: true,
-                onRender: (item: AccountInfo) => (
-                    <span
-                        style={{
-                            color: usageColor(item.poolCount, item.poolQuota),
-                        }}
-                    >
-                        {item.poolCount} / {item.poolQuota}
-                    </span>
-                ),
-            },
-            {
-                key: "jobsQuota",
-                name: "Jobs Quota",
-                fieldName: "activeJobAndJobScheduleQuota",
+                key: "lpFree",
+                name: "LP Free",
                 minWidth: 70,
                 maxWidth: 90,
                 isResizable: true,
-            },
-            {
-                key: "freeDedicated",
-                name: "Free Dedicated",
-                minWidth: 80,
-                maxWidth: 100,
-                isResizable: true,
-                onRender: (item: AccountInfo) => (
-                    <span
-                        style={{
-                            color:
-                                item.dedicatedCoresFree > 0
-                                    ? "#107c10"
-                                    : "#999",
-                            fontWeight: item.dedicatedCoresFree > 0 ? 600 : 400,
-                        }}
-                    >
-                        {item.dedicatedCoresFree}
-                    </span>
-                ),
-            },
-            {
-                key: "freeLowPriority",
-                name: "Free Low Priority",
-                minWidth: 90,
-                maxWidth: 110,
-                isResizable: true,
+                isSorted: sortConfig?.key === "lpFree",
+                isSortedDescending:
+                    sortConfig?.key === "lpFree" &&
+                    sortConfig?.direction === "desc",
+                onColumnClick: handleColumnClick,
                 onRender: (item: AccountInfo) => (
                     <span
                         style={{
@@ -343,11 +369,63 @@ export const AccountInfoPage: React.FC<AccountInfoPageProps> = ({
                 ),
             },
             {
-                key: "freePoolSlots",
-                name: "Free Pool Slots",
-                minWidth: 80,
-                maxWidth: 100,
+                key: "dedicatedQuota",
+                name: "Dedicated (unused)",
+                minWidth: 100,
+                maxWidth: 130,
                 isResizable: true,
+                isSorted: sortConfig?.key === "dedicatedQuota",
+                isSortedDescending:
+                    sortConfig?.key === "dedicatedQuota" &&
+                    sortConfig?.direction === "desc",
+                onColumnClick: handleColumnClick,
+                onRender: (item: AccountInfo) => (
+                    <span style={{ color: "#888" }}>
+                        {item.dedicatedCoreQuota}
+                    </span>
+                ),
+            },
+            {
+                key: "poolCount",
+                name: "Pool Count",
+                minWidth: 70,
+                maxWidth: 90,
+                isResizable: true,
+                isSorted: sortConfig?.key === "poolCount",
+                isSortedDescending:
+                    sortConfig?.key === "poolCount" &&
+                    sortConfig?.direction === "desc",
+                onColumnClick: handleColumnClick,
+                onRender: (item: AccountInfo) => (
+                    <span style={{ color: "#ccc" }}>{item.poolCount}</span>
+                ),
+            },
+            {
+                key: "poolQuota",
+                name: "Pool Quota",
+                minWidth: 70,
+                maxWidth: 90,
+                isResizable: true,
+                isSorted: sortConfig?.key === "poolQuota",
+                isSortedDescending:
+                    sortConfig?.key === "poolQuota" &&
+                    sortConfig?.direction === "desc",
+                onColumnClick: handleColumnClick,
+                onRender: (item: AccountInfo) => (
+                    <span style={{ color: "#ccc" }}>{item.poolQuota}</span>
+                ),
+            },
+            {
+                key: "poolsFree",
+                name: "Pools Free",
+                minWidth: 70,
+                maxWidth: 90,
+                isResizable: true,
+                isSorted: sortConfig?.key === "poolsFree",
+                isSortedDescending:
+                    sortConfig?.key === "poolsFree" &&
+                    sortConfig?.direction === "desc",
+                onColumnClick: handleColumnClick,
                 onRender: (item: AccountInfo) => (
                     <span
                         style={{
@@ -360,7 +438,15 @@ export const AccountInfoPage: React.FC<AccountInfoPageProps> = ({
                 ),
             },
         ],
-        []
+        [
+            sortConfig,
+            selectedIds,
+            allSelected,
+            someSelected,
+            handleColumnClick,
+            toggleSelect,
+            toggleSelectAll,
+        ]
     );
 
     return (
@@ -380,7 +466,7 @@ export const AccountInfoPage: React.FC<AccountInfoPageProps> = ({
                     Account Info
                 </Text>
                 <PrimaryButton
-                    text="Refresh Account Info"
+                    text="Refresh"
                     iconProps={{ iconName: "Refresh" }}
                     onClick={refresh}
                     disabled={loading}
@@ -462,8 +548,7 @@ export const AccountInfoPage: React.FC<AccountInfoPageProps> = ({
             {/* DetailsList */}
             {accounts.length === 0 ? (
                 <Text variant="medium" styles={{ root: { color: "#666" } }}>
-                    No account info available. Click "Refresh Account Info" to
-                    load data.
+                    No account info available. Click "Refresh" to load data.
                 </Text>
             ) : (
                 <div

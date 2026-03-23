@@ -5,8 +5,13 @@ import {
     IColumn,
     Selection,
     SelectionMode,
+    CheckboxVisibility,
 } from "@fluentui/react/lib/DetailsList";
-import { PrimaryButton, DefaultButton } from "@fluentui/react/lib/Button";
+import {
+    PrimaryButton,
+    DefaultButton,
+    IconButton,
+} from "@fluentui/react/lib/Button";
 import { Stack } from "@fluentui/react/lib/Stack";
 import { Text } from "@fluentui/react/lib/Text";
 import { Toggle } from "@fluentui/react/lib/Toggle";
@@ -17,14 +22,36 @@ import { SpinButton } from "@fluentui/react/lib/SpinButton";
 import { TextField } from "@fluentui/react/lib/TextField";
 import { Label } from "@fluentui/react/lib/Label";
 import { MessageBar, MessageBarType } from "@fluentui/react/lib/MessageBar";
+import { Dropdown, IDropdownOption } from "@fluentui/react/lib/Dropdown";
+import { Checkbox } from "@fluentui/react/lib/Checkbox";
 import { useMultiRegionState } from "../../store/store-context";
 import { OrchestratorAgent } from "../../agents/orchestrator-agent";
 import { PoolInfo } from "../../store/store-types";
 import { StatusBadge } from "../shared/status-badge";
+import { getVCpus } from "../shared/vm-sizes";
 
 export interface PoolInfoPageProps {
     orchestrator: OrchestratorAgent;
 }
+
+interface EnvVar {
+    name: string;
+    value: string;
+}
+
+type SortKey =
+    | "poolId"
+    | "accountName"
+    | "region"
+    | "vmSize"
+    | "state"
+    | "allocationState"
+    | "dedicated"
+    | "lowPriority"
+    | "taskSlots"
+    | "autoScale"
+    | "resizeErrors"
+    | "created";
 
 export const PoolInfoPage: React.FC<PoolInfoPageProps> = ({ orchestrator }) => {
     const state = useMultiRegionState();
@@ -34,24 +61,32 @@ export const PoolInfoPage: React.FC<PoolInfoPageProps> = ({ orchestrator }) => {
         null
     );
 
-    // Selection state
-    const [selectedPool, setSelectedPool] = React.useState<PoolInfo | null>(
-        null
-    );
+    // Selection state (multiple)
+    const [selectedPools, setSelectedPools] = React.useState<PoolInfo[]>([]);
 
     const selection = React.useMemo(
         () =>
             new Selection({
                 onSelectionChanged: () => {
-                    const selected = selection.getSelection();
-                    setSelectedPool(
-                        selected.length > 0 ? (selected[0] as PoolInfo) : null
-                    );
+                    const selected = selection.getSelection() as PoolInfo[];
+                    setSelectedPools(selected);
                 },
                 getKey: (item: any) => item.id,
             }),
         []
     );
+
+    // Sort state
+    const [sortKey, setSortKey] = React.useState<SortKey | null>(null);
+    const [sortDescending, setSortDescending] = React.useState(false);
+
+    // Filter state
+    const [searchText, setSearchText] = React.useState("");
+    const [filterRegions, setFilterRegions] = React.useState<string[]>([]);
+    const [filterVmSizes, setFilterVmSizes] = React.useState<string[]>([]);
+    const [filterAllocationState, setFilterAllocationState] =
+        React.useState<string>("all");
+    const [filterState, setFilterState] = React.useState<string>("all");
 
     // Resize dialog state
     const [showResizeDialog, setShowResizeDialog] = React.useState(false);
@@ -61,7 +96,14 @@ export const PoolInfoPage: React.FC<PoolInfoPageProps> = ({ orchestrator }) => {
 
     // Start task dialog state
     const [showStartTaskDialog, setShowStartTaskDialog] = React.useState(false);
-    const [startTaskJson, setStartTaskJson] = React.useState("");
+    const [startTaskCommandLine, setStartTaskCommandLine] = React.useState("");
+    const [startTaskEnvVars, setStartTaskEnvVars] = React.useState<EnvVar[]>(
+        []
+    );
+    const [startTaskMaxRetryCount, setStartTaskMaxRetryCount] =
+        React.useState(3);
+    const [startTaskWaitForSuccess, setStartTaskWaitForSuccess] =
+        React.useState(true);
     const [startTaskError, setStartTaskError] = React.useState<string | null>(
         null
     );
@@ -86,7 +128,7 @@ export const PoolInfoPage: React.FC<PoolInfoPageProps> = ({ orchestrator }) => {
         setAutoRefresh(false);
     }, []);
 
-    // Auto-refresh
+    // Auto-refresh (30s)
     React.useEffect(() => {
         if (autoRefresh) {
             intervalRef.current = setInterval(() => {
@@ -100,7 +142,161 @@ export const PoolInfoPage: React.FC<PoolInfoPageProps> = ({ orchestrator }) => {
         }
     }, [autoRefresh, refresh]);
 
+    // Auto-load on mount if poolInfos is empty
+    React.useEffect(() => {
+        if (state.poolInfos.length === 0 && state.accounts.length > 0) {
+            refresh();
+        }
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, []);
+
     const pools = state.poolInfos;
+
+    // Unique values for filter dropdowns
+    const uniqueRegions = React.useMemo(
+        () => [...new Set(pools.map((p) => p.region))].sort(),
+        [pools]
+    );
+    const uniqueVmSizes = React.useMemo(
+        () => [...new Set(pools.map((p) => p.vmSize))].sort(),
+        [pools]
+    );
+
+    const regionOptions: IDropdownOption[] = React.useMemo(
+        () => uniqueRegions.map((r) => ({ key: r, text: r })),
+        [uniqueRegions]
+    );
+    const vmSizeOptions: IDropdownOption[] = React.useMemo(
+        () => uniqueVmSizes.map((v) => ({ key: v, text: v })),
+        [uniqueVmSizes]
+    );
+    const allocationStateOptions: IDropdownOption[] = [
+        { key: "all", text: "All" },
+        { key: "steady", text: "Steady" },
+        { key: "resizing", text: "Resizing" },
+        { key: "stopping", text: "Stopping" },
+    ];
+    const stateOptions: IDropdownOption[] = [
+        { key: "all", text: "All" },
+        { key: "active", text: "Active" },
+        { key: "deleting", text: "Deleting" },
+    ];
+
+    // Apply filters
+    const filteredPools = React.useMemo(() => {
+        let result = pools;
+
+        if (searchText.trim()) {
+            const lower = searchText.toLowerCase();
+            result = result.filter(
+                (p) =>
+                    p.poolId.toLowerCase().includes(lower) ||
+                    p.accountName.toLowerCase().includes(lower) ||
+                    p.region.toLowerCase().includes(lower) ||
+                    p.vmSize.toLowerCase().includes(lower) ||
+                    p.state.toLowerCase().includes(lower) ||
+                    p.allocationState.toLowerCase().includes(lower)
+            );
+        }
+
+        if (filterRegions.length > 0) {
+            result = result.filter((p) => filterRegions.includes(p.region));
+        }
+
+        if (filterVmSizes.length > 0) {
+            result = result.filter((p) => filterVmSizes.includes(p.vmSize));
+        }
+
+        if (filterAllocationState !== "all") {
+            result = result.filter(
+                (p) => p.allocationState === filterAllocationState
+            );
+        }
+
+        if (filterState !== "all") {
+            result = result.filter((p) => p.state === filterState);
+        }
+
+        return result;
+    }, [
+        pools,
+        searchText,
+        filterRegions,
+        filterVmSizes,
+        filterAllocationState,
+        filterState,
+    ]);
+
+    // Apply sorting
+    const sortedPools = React.useMemo(() => {
+        if (!sortKey) return filteredPools;
+
+        const sorted = [...filteredPools];
+        const dir = sortDescending ? -1 : 1;
+
+        sorted.sort((a, b) => {
+            let aVal: string | number = "";
+            let bVal: string | number = "";
+
+            switch (sortKey) {
+                case "poolId":
+                    aVal = a.poolId;
+                    bVal = b.poolId;
+                    break;
+                case "accountName":
+                    aVal = a.accountName;
+                    bVal = b.accountName;
+                    break;
+                case "region":
+                    aVal = a.region;
+                    bVal = b.region;
+                    break;
+                case "vmSize":
+                    aVal = a.vmSize;
+                    bVal = b.vmSize;
+                    break;
+                case "state":
+                    aVal = a.state;
+                    bVal = b.state;
+                    break;
+                case "allocationState":
+                    aVal = a.allocationState;
+                    bVal = b.allocationState;
+                    break;
+                case "dedicated":
+                    aVal = a.currentDedicatedNodes;
+                    bVal = b.currentDedicatedNodes;
+                    break;
+                case "lowPriority":
+                    aVal = a.currentLowPriorityNodes;
+                    bVal = b.currentLowPriorityNodes;
+                    break;
+                case "taskSlots":
+                    aVal = a.taskSlotsPerNode;
+                    bVal = b.taskSlotsPerNode;
+                    break;
+                case "autoScale":
+                    aVal = a.enableAutoScale ? 1 : 0;
+                    bVal = b.enableAutoScale ? 1 : 0;
+                    break;
+                case "resizeErrors":
+                    aVal = a.resizeErrors?.length ?? 0;
+                    bVal = b.resizeErrors?.length ?? 0;
+                    break;
+                case "created":
+                    aVal = a.creationTime ?? "";
+                    bVal = b.creationTime ?? "";
+                    break;
+            }
+
+            if (typeof aVal === "number" && typeof bVal === "number") {
+                return (aVal - bVal) * dir;
+            }
+            return String(aVal).localeCompare(String(bVal)) * dir;
+        });
+
+        return sorted;
+    }, [filteredPools, sortKey, sortDescending]);
 
     // Summary stats
     const totalPools = pools.length;
@@ -117,22 +313,36 @@ export const PoolInfoPage: React.FC<PoolInfoPageProps> = ({ orchestrator }) => {
         (p) => p.allocationState === "resizing"
     ).length;
 
-    // Get LP quota hint for selected pool
-    const getLpQuotaHint = (): string => {
-        if (!selectedPool) return "";
-        const accountInfo = state.accountInfos.find(
-            (a) => a.id === selectedPool.accountId
-        );
-        if (!accountInfo) return "Quota info not available";
-        return `Available LP quota: ${accountInfo.lowPriorityCoresFree} cores`;
+    // Selected pool (first selected for single-pool actions)
+    const selectedPool = selectedPools.length > 0 ? selectedPools[0] : null;
+
+    // Get LP quota info for selected pool
+    const getAccountInfoForPool = (pool: PoolInfo | null) => {
+        if (!pool) return null;
+        return state.accountInfos.find((a) => a.id === pool.accountId) ?? null;
     };
+
+    const selectedAccountInfo = getAccountInfoForPool(selectedPool);
 
     // Resize dialog handlers
     const openResizeDialog = () => {
         if (!selectedPool) return;
-        setResizeDedicated(selectedPool.targetDedicatedNodes);
-        setResizeLowPriority(selectedPool.targetLowPriorityNodes);
+        const acctInfo = getAccountInfoForPool(selectedPool);
+        const freeLpCores = acctInfo?.lowPriorityCoresFree ?? 0;
+        const vmVCpus = getVCpus(selectedPool.vmSize);
+        const maxLpNodes = Math.floor(freeLpCores / vmVCpus);
+
+        setResizeDedicated(0);
+        setResizeLowPriority(maxLpNodes);
         setShowResizeDialog(true);
+    };
+
+    const getMaxLpNodes = (): number => {
+        if (!selectedPool) return 0;
+        const acctInfo = getAccountInfoForPool(selectedPool);
+        const freeLpCores = acctInfo?.lowPriorityCoresFree ?? 0;
+        const vmVCpus = getVCpus(selectedPool.vmSize);
+        return Math.floor(freeLpCores / vmVCpus);
     };
 
     const submitResize = async () => {
@@ -159,20 +369,64 @@ export const PoolInfoPage: React.FC<PoolInfoPageProps> = ({ orchestrator }) => {
     // Start task dialog handlers
     const openStartTaskDialog = () => {
         if (!selectedPool) return;
-        setStartTaskJson(JSON.stringify(selectedPool.startTask || {}, null, 2));
+        const existing = selectedPool.startTask || {};
+        setStartTaskCommandLine((existing.commandLine as string) ?? "");
+        const envSettings =
+            (existing.environmentSettings as Array<{
+                name: string;
+                value: string;
+            }>) ?? [];
+        setStartTaskEnvVars(
+            envSettings.length > 0
+                ? envSettings.map((e) => ({ name: e.name, value: e.value }))
+                : [{ name: "", value: "" }]
+        );
+        setStartTaskMaxRetryCount((existing.maxTaskRetryCount as number) ?? 3);
+        setStartTaskWaitForSuccess(
+            (existing.waitForSuccess as boolean) ?? true
+        );
         setStartTaskError(null);
         setShowStartTaskDialog(true);
     };
 
+    const addEnvVar = () => {
+        setStartTaskEnvVars((prev) => [...prev, { name: "", value: "" }]);
+    };
+
+    const removeEnvVar = (index: number) => {
+        setStartTaskEnvVars((prev) => prev.filter((_, i) => i !== index));
+    };
+
+    const updateEnvVar = (
+        index: number,
+        field: "name" | "value",
+        val: string
+    ) => {
+        setStartTaskEnvVars((prev) =>
+            prev.map((ev, i) => (i === index ? { ...ev, [field]: val } : ev))
+        );
+    };
+
     const submitStartTask = async () => {
         if (!selectedPool) return;
-        let parsedJson: Record<string, unknown>;
-        try {
-            parsedJson = JSON.parse(startTaskJson);
-        } catch (e: any) {
-            setStartTaskError(`Invalid JSON: ${e.message}`);
+        if (!startTaskCommandLine.trim()) {
+            setStartTaskError("Command line is required");
             return;
         }
+
+        const envSettings = startTaskEnvVars
+            .filter((ev) => ev.name.trim() !== "")
+            .map((ev) => ({ name: ev.name, value: ev.value }));
+
+        const startTaskPayload: Record<string, unknown> = {
+            commandLine: startTaskCommandLine,
+            maxTaskRetryCount: startTaskMaxRetryCount,
+            waitForSuccess: startTaskWaitForSuccess,
+        };
+        if (envSettings.length > 0) {
+            startTaskPayload.environmentSettings = envSettings;
+        }
+
         setStartTaskError(null);
         setStartTaskSubmitting(true);
         try {
@@ -181,7 +435,7 @@ export const PoolInfoPage: React.FC<PoolInfoPageProps> = ({ orchestrator }) => {
                 payload: {
                     accountId: selectedPool.accountId,
                     poolId: selectedPool.poolId,
-                    startTask: parsedJson,
+                    startTask: startTaskPayload,
                 },
             });
             setShowStartTaskDialog(false);
@@ -189,6 +443,30 @@ export const PoolInfoPage: React.FC<PoolInfoPageProps> = ({ orchestrator }) => {
             /* handled by orchestrator */
         } finally {
             setStartTaskSubmitting(false);
+        }
+    };
+
+    // Column sort handler
+    const handleColumnClick = (
+        _ev?: React.MouseEvent<HTMLElement>,
+        column?: IColumn
+    ) => {
+        if (!column?.data?.sortKey) return;
+        const key = column.data.sortKey as SortKey;
+        if (sortKey === key) {
+            setSortDescending(!sortDescending);
+        } else {
+            setSortKey(key);
+            setSortDescending(false);
+        }
+    };
+
+    // Select All handler
+    const handleSelectAll = (_ev?: React.FormEvent, checked?: boolean) => {
+        if (checked) {
+            selection.setAllSelected(true);
+        } else {
+            selection.setAllSelected(false);
         }
     };
 
@@ -201,6 +479,10 @@ export const PoolInfoPage: React.FC<PoolInfoPageProps> = ({ orchestrator }) => {
                 minWidth: 120,
                 maxWidth: 200,
                 isResizable: true,
+                isSorted: sortKey === "poolId",
+                isSortedDescending: sortKey === "poolId" && sortDescending,
+                onColumnClick: handleColumnClick,
+                data: { sortKey: "poolId" },
             },
             {
                 key: "accountName",
@@ -209,6 +491,10 @@ export const PoolInfoPage: React.FC<PoolInfoPageProps> = ({ orchestrator }) => {
                 minWidth: 100,
                 maxWidth: 160,
                 isResizable: true,
+                isSorted: sortKey === "accountName",
+                isSortedDescending: sortKey === "accountName" && sortDescending,
+                onColumnClick: handleColumnClick,
+                data: { sortKey: "accountName" },
             },
             {
                 key: "region",
@@ -217,6 +503,10 @@ export const PoolInfoPage: React.FC<PoolInfoPageProps> = ({ orchestrator }) => {
                 minWidth: 80,
                 maxWidth: 120,
                 isResizable: true,
+                isSorted: sortKey === "region",
+                isSortedDescending: sortKey === "region" && sortDescending,
+                onColumnClick: handleColumnClick,
+                data: { sortKey: "region" },
             },
             {
                 key: "vmSize",
@@ -225,6 +515,10 @@ export const PoolInfoPage: React.FC<PoolInfoPageProps> = ({ orchestrator }) => {
                 minWidth: 100,
                 maxWidth: 160,
                 isResizable: true,
+                isSorted: sortKey === "vmSize",
+                isSortedDescending: sortKey === "vmSize" && sortDescending,
+                onColumnClick: handleColumnClick,
+                data: { sortKey: "vmSize" },
             },
             {
                 key: "state",
@@ -232,6 +526,10 @@ export const PoolInfoPage: React.FC<PoolInfoPageProps> = ({ orchestrator }) => {
                 minWidth: 70,
                 maxWidth: 100,
                 isResizable: true,
+                isSorted: sortKey === "state",
+                isSortedDescending: sortKey === "state" && sortDescending,
+                onColumnClick: handleColumnClick,
+                data: { sortKey: "state" },
                 onRender: (item: PoolInfo) => (
                     <StatusBadge status={item.state} />
                 ),
@@ -243,6 +541,11 @@ export const PoolInfoPage: React.FC<PoolInfoPageProps> = ({ orchestrator }) => {
                 minWidth: 90,
                 maxWidth: 120,
                 isResizable: true,
+                isSorted: sortKey === "allocationState",
+                isSortedDescending:
+                    sortKey === "allocationState" && sortDescending,
+                onColumnClick: handleColumnClick,
+                data: { sortKey: "allocationState" },
             },
             {
                 key: "dedicated",
@@ -250,6 +553,10 @@ export const PoolInfoPage: React.FC<PoolInfoPageProps> = ({ orchestrator }) => {
                 minWidth: 80,
                 maxWidth: 110,
                 isResizable: true,
+                isSorted: sortKey === "dedicated",
+                isSortedDescending: sortKey === "dedicated" && sortDescending,
+                onColumnClick: handleColumnClick,
+                data: { sortKey: "dedicated" },
                 onRender: (item: PoolInfo) => (
                     <span>
                         {item.currentDedicatedNodes} /{" "}
@@ -263,6 +570,10 @@ export const PoolInfoPage: React.FC<PoolInfoPageProps> = ({ orchestrator }) => {
                 minWidth: 80,
                 maxWidth: 110,
                 isResizable: true,
+                isSorted: sortKey === "lowPriority",
+                isSortedDescending: sortKey === "lowPriority" && sortDescending,
+                onColumnClick: handleColumnClick,
+                data: { sortKey: "lowPriority" },
                 onRender: (item: PoolInfo) => (
                     <span>
                         {item.currentLowPriorityNodes} /{" "}
@@ -277,6 +588,10 @@ export const PoolInfoPage: React.FC<PoolInfoPageProps> = ({ orchestrator }) => {
                 minWidth: 60,
                 maxWidth: 80,
                 isResizable: true,
+                isSorted: sortKey === "taskSlots",
+                isSortedDescending: sortKey === "taskSlots" && sortDescending,
+                onColumnClick: handleColumnClick,
+                data: { sortKey: "taskSlots" },
             },
             {
                 key: "autoScale",
@@ -284,6 +599,10 @@ export const PoolInfoPage: React.FC<PoolInfoPageProps> = ({ orchestrator }) => {
                 minWidth: 60,
                 maxWidth: 80,
                 isResizable: true,
+                isSorted: sortKey === "autoScale",
+                isSortedDescending: sortKey === "autoScale" && sortDescending,
+                onColumnClick: handleColumnClick,
+                data: { sortKey: "autoScale" },
                 onRender: (item: PoolInfo) => (
                     <span>{item.enableAutoScale ? "Yes" : "No"}</span>
                 ),
@@ -294,6 +613,11 @@ export const PoolInfoPage: React.FC<PoolInfoPageProps> = ({ orchestrator }) => {
                 minWidth: 80,
                 maxWidth: 100,
                 isResizable: true,
+                isSorted: sortKey === "resizeErrors",
+                isSortedDescending:
+                    sortKey === "resizeErrors" && sortDescending,
+                onColumnClick: handleColumnClick,
+                data: { sortKey: "resizeErrors" },
                 onRender: (item: PoolInfo) => {
                     const count = item.resizeErrors?.length ?? 0;
                     return (
@@ -314,17 +638,22 @@ export const PoolInfoPage: React.FC<PoolInfoPageProps> = ({ orchestrator }) => {
                 minWidth: 120,
                 maxWidth: 160,
                 isResizable: true,
+                isSorted: sortKey === "created",
+                isSortedDescending: sortKey === "created" && sortDescending,
+                onColumnClick: handleColumnClick,
+                data: { sortKey: "created" },
                 onRender: (item: PoolInfo) =>
                     item.creationTime
                         ? new Date(item.creationTime).toLocaleString()
                         : "\u2014",
             },
         ],
-        []
+        [sortKey, sortDescending]
     );
 
     return (
         <div style={{ padding: "16px 0" }}>
+            {/* Header */}
             <Stack
                 horizontal
                 verticalAlign="center"
@@ -385,6 +714,113 @@ export const PoolInfoPage: React.FC<PoolInfoPageProps> = ({ orchestrator }) => {
                 />
             </Stack>
 
+            {/* Filter Bar */}
+            <Stack
+                horizontal
+                verticalAlign="end"
+                tokens={{ childrenGap: 12 }}
+                wrap
+                styles={{
+                    root: {
+                        padding: "12px 16px",
+                        background: "#1e1e1e",
+                        borderRadius: 6,
+                        marginBottom: 12,
+                    },
+                }}
+            >
+                <TextField
+                    placeholder="Search across all columns..."
+                    iconProps={{ iconName: "Search" }}
+                    value={searchText}
+                    onChange={(_e, val) => setSearchText(val ?? "")}
+                    styles={{
+                        root: { width: 220 },
+                        field: { fontSize: 13 },
+                    }}
+                />
+                <Dropdown
+                    placeholder="Region"
+                    multiSelect
+                    options={regionOptions}
+                    selectedKeys={filterRegions}
+                    onChange={(_e, option) => {
+                        if (!option) return;
+                        setFilterRegions((prev) =>
+                            option.selected
+                                ? [...prev, option.key as string]
+                                : prev.filter((r) => r !== option.key)
+                        );
+                    }}
+                    styles={{
+                        root: { width: 160 },
+                        dropdown: { fontSize: 13 },
+                    }}
+                />
+                <Dropdown
+                    placeholder="VM Size"
+                    multiSelect
+                    options={vmSizeOptions}
+                    selectedKeys={filterVmSizes}
+                    onChange={(_e, option) => {
+                        if (!option) return;
+                        setFilterVmSizes((prev) =>
+                            option.selected
+                                ? [...prev, option.key as string]
+                                : prev.filter((v) => v !== option.key)
+                        );
+                    }}
+                    styles={{
+                        root: { width: 180 },
+                        dropdown: { fontSize: 13 },
+                    }}
+                />
+                <Dropdown
+                    placeholder="Allocation State"
+                    options={allocationStateOptions}
+                    selectedKey={filterAllocationState}
+                    onChange={(_e, option) =>
+                        setFilterAllocationState(
+                            (option?.key as string) ?? "all"
+                        )
+                    }
+                    styles={{
+                        root: { width: 150 },
+                        dropdown: { fontSize: 13 },
+                    }}
+                />
+                <Dropdown
+                    placeholder="State"
+                    options={stateOptions}
+                    selectedKey={filterState}
+                    onChange={(_e, option) =>
+                        setFilterState((option?.key as string) ?? "all")
+                    }
+                    styles={{
+                        root: { width: 120 },
+                        dropdown: { fontSize: 13 },
+                    }}
+                />
+                {(searchText ||
+                    filterRegions.length > 0 ||
+                    filterVmSizes.length > 0 ||
+                    filterAllocationState !== "all" ||
+                    filterState !== "all") && (
+                    <DefaultButton
+                        text="Clear Filters"
+                        iconProps={{ iconName: "ClearFilter" }}
+                        onClick={() => {
+                            setSearchText("");
+                            setFilterRegions([]);
+                            setFilterVmSizes([]);
+                            setFilterAllocationState("all");
+                            setFilterState("all");
+                        }}
+                        styles={{ root: { fontSize: 12 } }}
+                    />
+                )}
+            </Stack>
+
             {/* Summary Stats */}
             <Stack
                 horizontal
@@ -428,9 +864,17 @@ export const PoolInfoPage: React.FC<PoolInfoPageProps> = ({ orchestrator }) => {
                     value={resizingPools}
                     color="#e3a400"
                 />
+                {filteredPools.length !== pools.length && (
+                    <SummaryStatItem
+                        icon="Filter"
+                        label="Showing"
+                        value={filteredPools.length}
+                        color="#999"
+                    />
+                )}
             </Stack>
 
-            {/* DetailsList */}
+            {/* Select All + DetailsList */}
             {pools.length === 0 ? (
                 <Text variant="medium" styles={{ root: { color: "#666" } }}>
                     No pool info available. Click &quot;Refresh Pool Info&quot;
@@ -444,12 +888,39 @@ export const PoolInfoPage: React.FC<PoolInfoPageProps> = ({ orchestrator }) => {
                         padding: 8,
                     }}
                 >
+                    <Stack
+                        horizontal
+                        verticalAlign="center"
+                        tokens={{ childrenGap: 8 }}
+                        styles={{ root: { padding: "4px 8px" } }}
+                    >
+                        <Checkbox
+                            label={`Select All (${filteredPools.length})`}
+                            onChange={handleSelectAll}
+                            checked={
+                                filteredPools.length > 0 &&
+                                selectedPools.length === filteredPools.length
+                            }
+                            styles={{
+                                label: { color: "#999", fontSize: 12 },
+                            }}
+                        />
+                        {selectedPools.length > 0 && (
+                            <Text
+                                variant="small"
+                                styles={{ root: { color: "#0078d4" } }}
+                            >
+                                {selectedPools.length} selected
+                            </Text>
+                        )}
+                    </Stack>
                     <DetailsList
-                        items={pools}
+                        items={sortedPools}
                         columns={columns}
                         layoutMode={DetailsListLayoutMode.fixedColumns}
-                        selectionMode={SelectionMode.single}
+                        selectionMode={SelectionMode.multiple}
                         selection={selection}
+                        checkboxVisibility={CheckboxVisibility.always}
                         compact
                         styles={{
                             root: { color: "#ccc" },
@@ -489,7 +960,7 @@ export const PoolInfoPage: React.FC<PoolInfoPageProps> = ({ orchestrator }) => {
                 modalProps={{
                     isBlocking: true,
                     styles: {
-                        main: { minWidth: 480 },
+                        main: { minWidth: 520 },
                     },
                 }}
             >
@@ -530,30 +1001,50 @@ export const PoolInfoPage: React.FC<PoolInfoPageProps> = ({ orchestrator }) => {
                                 </span>
                             </Label>
                         </Stack>
+
+                        {/* Quota info */}
+                        <MessageBar messageBarType={MessageBarType.info}>
+                            <Stack tokens={{ childrenGap: 4 }}>
+                                <span>
+                                    <b>LP Quota:</b>{" "}
+                                    {selectedAccountInfo?.lowPriorityCoreQuota ??
+                                        "N/A"}{" "}
+                                    cores | <b>LP Free:</b>{" "}
+                                    {selectedAccountInfo?.lowPriorityCoresFree ??
+                                        "N/A"}{" "}
+                                    cores
+                                </span>
+                                <span>
+                                    <b>VM vCPUs:</b>{" "}
+                                    {getVCpus(selectedPool.vmSize)} |{" "}
+                                    <b>Max LP Nodes:</b> {getMaxLpNodes()}
+                                </span>
+                            </Stack>
+                        </MessageBar>
+
                         <SpinButton
                             label="Target Dedicated Nodes"
                             min={0}
                             step={1}
                             value={String(resizeDedicated)}
-                            onChange={(_e, val) =>
-                                setResizeDedicated(
-                                    parseInt(val ?? "0", 10) || 0
-                                )
-                            }
-                            onIncrement={(val) => {
-                                const n = (parseInt(val, 10) || 0) + 1;
-                                setResizeDedicated(n);
-                                return String(n);
-                            }}
-                            onDecrement={(val) => {
-                                const n = Math.max(
-                                    0,
-                                    (parseInt(val, 10) || 0) - 1
-                                );
-                                setResizeDedicated(n);
-                                return String(n);
+                            disabled
+                            styles={{
+                                root: { opacity: 0.6 },
                             }}
                         />
+                        <Text
+                            variant="tiny"
+                            styles={{
+                                root: {
+                                    color: "#888",
+                                    fontStyle: "italic",
+                                    marginTop: -8,
+                                },
+                            }}
+                        >
+                            Dedicated nodes always set to 0 (read-only)
+                        </Text>
+
                         <SpinButton
                             label="Target Low-Priority Nodes"
                             min={0}
@@ -578,17 +1069,14 @@ export const PoolInfoPage: React.FC<PoolInfoPageProps> = ({ orchestrator }) => {
                                 return String(n);
                             }}
                         />
-                        <Text
-                            variant="small"
-                            styles={{
-                                root: {
-                                    color: "#888",
-                                    fontStyle: "italic",
-                                },
-                            }}
-                        >
-                            {getLpQuotaHint()}
-                        </Text>
+
+                        {resizeLowPriority > getMaxLpNodes() && (
+                            <MessageBar messageBarType={MessageBarType.warning}>
+                                Requested {resizeLowPriority} nodes exceeds the
+                                max available ({getMaxLpNodes()}) based on free
+                                LP quota. The resize may partially fail.
+                            </MessageBar>
+                        )}
                     </Stack>
                 )}
                 <DialogFooter>
@@ -618,29 +1106,112 @@ export const PoolInfoPage: React.FC<PoolInfoPageProps> = ({ orchestrator }) => {
                 modalProps={{
                     isBlocking: true,
                     styles: {
-                        main: { minWidth: 560 },
+                        main: { minWidth: 600, maxWidth: 700 },
                     },
                 }}
             >
                 <Stack tokens={{ childrenGap: 12 }}>
+                    {/* Command Line */}
                     <TextField
-                        label="Start Task Configuration (JSON)"
-                        multiline
-                        rows={16}
-                        value={startTaskJson}
+                        label="Command Line"
+                        value={startTaskCommandLine}
                         onChange={(_e, val) => {
-                            setStartTaskJson(val ?? "");
+                            setStartTaskCommandLine(val ?? "");
                             setStartTaskError(null);
                         }}
+                        placeholder="/bin/bash -c 'echo hello'"
                         styles={{
                             field: {
                                 fontFamily:
                                     "'Consolas', 'Courier New', monospace",
                                 fontSize: 13,
-                                lineHeight: "1.4",
                             },
                         }}
                     />
+
+                    {/* Environment Variables */}
+                    <Label>Environment Variables</Label>
+                    <Stack tokens={{ childrenGap: 6 }}>
+                        {startTaskEnvVars.map((ev, idx) => (
+                            <Stack
+                                key={idx}
+                                horizontal
+                                verticalAlign="end"
+                                tokens={{ childrenGap: 8 }}
+                            >
+                                <TextField
+                                    placeholder="Name"
+                                    value={ev.name}
+                                    onChange={(_e, val) =>
+                                        updateEnvVar(idx, "name", val ?? "")
+                                    }
+                                    styles={{ root: { width: 180 } }}
+                                />
+                                <TextField
+                                    placeholder="Value"
+                                    value={ev.value}
+                                    onChange={(_e, val) =>
+                                        updateEnvVar(idx, "value", val ?? "")
+                                    }
+                                    styles={{ root: { flex: 1 } }}
+                                />
+                                <IconButton
+                                    iconProps={{ iconName: "Delete" }}
+                                    title="Remove"
+                                    onClick={() => removeEnvVar(idx)}
+                                    styles={{
+                                        root: { height: 32, width: 32 },
+                                    }}
+                                />
+                            </Stack>
+                        ))}
+                        <DefaultButton
+                            text="Add Variable"
+                            iconProps={{ iconName: "Add" }}
+                            onClick={addEnvVar}
+                            styles={{
+                                root: { alignSelf: "flex-start", fontSize: 12 },
+                            }}
+                        />
+                    </Stack>
+
+                    {/* Max Retry Count */}
+                    <SpinButton
+                        label="Max Retry Count"
+                        min={0}
+                        max={10}
+                        step={1}
+                        value={String(startTaskMaxRetryCount)}
+                        onChange={(_e, val) =>
+                            setStartTaskMaxRetryCount(
+                                parseInt(val ?? "3", 10) || 3
+                            )
+                        }
+                        onIncrement={(val) => {
+                            const n = Math.min(
+                                10,
+                                (parseInt(val, 10) || 0) + 1
+                            );
+                            setStartTaskMaxRetryCount(n);
+                            return String(n);
+                        }}
+                        onDecrement={(val) => {
+                            const n = Math.max(0, (parseInt(val, 10) || 0) - 1);
+                            setStartTaskMaxRetryCount(n);
+                            return String(n);
+                        }}
+                    />
+
+                    {/* Wait for Success */}
+                    <Toggle
+                        label="Wait for Success"
+                        inlineLabel
+                        checked={startTaskWaitForSuccess}
+                        onChange={(_e, checked) =>
+                            setStartTaskWaitForSuccess(checked ?? true)
+                        }
+                    />
+
                     {startTaskError && (
                         <MessageBar messageBarType={MessageBarType.error}>
                             {startTaskError}

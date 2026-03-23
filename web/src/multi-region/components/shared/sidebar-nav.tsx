@@ -10,6 +10,7 @@ export type PageKey =
     | "pools"
     | "pool-info"
     | "account-info"
+    | "unused-quota"
     | "nodes";
 
 interface NavItem {
@@ -76,6 +77,14 @@ export const SidebarNav: React.FC<SidebarNavProps> = ({
                 label: "Account Info",
                 icon: "AccountManagement",
                 badge: state.accountInfos.length,
+            },
+            {
+                key: "unused-quota",
+                label: "Unused Quota",
+                icon: "Savings",
+                badge: state.accountInfos.filter(
+                    (a) => a.lowPriorityCoresFree > 0
+                ).length,
             },
             {
                 key: "nodes",
