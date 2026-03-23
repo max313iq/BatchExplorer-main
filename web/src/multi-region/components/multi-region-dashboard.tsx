@@ -23,6 +23,8 @@ import { QuotaRequestsPage } from "./quota-requests/quota-requests-page";
 import { QuotaStatusPage } from "./quota-status/quota-status-page";
 import { PoolCreationPage } from "./pool-creation/pool-creation-page";
 import { NodesPage } from "./nodes/nodes-page";
+import { PoolInfoPage } from "./pool-info/pool-info-page";
+import { AccountInfoPage } from "./account-info/account-info-page";
 import { AgentLogPanel } from "./shared/agent-log-panel";
 
 const DEFAULT_SCHEDULER_OPTIONS = {
@@ -322,6 +324,10 @@ const PageContent: React.FC<{
             return <QuotaStatusPage orchestrator={orchestrator} />;
         case "pools":
             return <PoolCreationPage orchestrator={orchestrator} />;
+        case "pool-info":
+            return <PoolInfoPage orchestrator={orchestrator} />;
+        case "account-info":
+            return <AccountInfoPage orchestrator={orchestrator} />;
         case "nodes":
             return <NodesPage orchestrator={orchestrator} />;
         default:

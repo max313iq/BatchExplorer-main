@@ -82,7 +82,12 @@ export interface ManagedNode {
     state: NodeState;
     vmSize?: string;
     ipAddress?: string;
+    isDedicated: boolean;
     lastBootTime?: string;
+    totalTasksRun?: number;
+    runningTasksCount?: number;
+    schedulingState?: string;
+    subscriptionId?: string;
     error?: string | null;
 }
 
@@ -168,6 +173,52 @@ export const DEFAULT_USER_PREFERENCES: UserPreferences = {
     sidebarCollapsed: false,
 };
 
+// --- Pool Info (rich detail from Batch data-plane) ---
+
+export interface PoolInfo {
+    id: string;
+    accountId: string;
+    accountName: string;
+    region: string;
+    poolId: string;
+    vmSize: string;
+    state: string; // active, deleting, etc.
+    allocationState: string; // steady, resizing, stopping
+    targetDedicatedNodes: number;
+    currentDedicatedNodes: number;
+    targetLowPriorityNodes: number;
+    currentLowPriorityNodes: number;
+    taskSlotsPerNode: number;
+    enableAutoScale: boolean;
+    autoScaleFormula?: string;
+    resizeErrors?: string[];
+    lastModified?: string;
+    creationTime?: string;
+}
+
+// --- Account Info (quotas + computed usage) ---
+
+export interface AccountInfo {
+    id: string;
+    accountName: string;
+    subscriptionId: string;
+    region: string;
+    resourceGroup: string;
+    // Quota info
+    dedicatedCoreQuota: number;
+    lowPriorityCoreQuota: number;
+    poolQuota: number;
+    activeJobAndJobScheduleQuota: number;
+    // Usage (computed from pools)
+    dedicatedCoresUsed: number;
+    lowPriorityCoresUsed: number;
+    poolCount: number;
+    // Computed
+    dedicatedCoresFree: number;
+    lowPriorityCoresFree: number;
+    poolsFree: number;
+}
+
 // --- Main State ---
 
 export interface MultiRegionState {
@@ -177,6 +228,8 @@ export interface MultiRegionState {
     quotaRequests: QuotaRequest[];
     pools: ManagedPool[];
     nodes: ManagedNode[];
+    poolInfos: PoolInfo[];
+    accountInfos: AccountInfo[];
     agentLogs: AgentLogEntry[];
     agentStatuses: Record<AgentName, AgentStatus>;
     globalFilter: GlobalFilter;
@@ -217,6 +270,8 @@ export function createInitialState(): MultiRegionState {
         quotaRequests: [],
         pools: [],
         nodes: [],
+        poolInfos: [],
+        accountInfos: [],
         agentLogs: [],
         agentStatuses: { ...DEFAULT_AGENT_STATUSES },
         globalFilter: { ...DEFAULT_GLOBAL_FILTER },

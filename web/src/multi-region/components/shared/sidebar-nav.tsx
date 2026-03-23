@@ -1,6 +1,6 @@
 import * as React from "react";
 import { Icon } from "@fluentui/react/lib/Icon";
-import { useDashboardStats } from "../../store/store-context";
+import { useMultiRegionState } from "../../store/store-context";
 
 export type PageKey =
     | "overview"
@@ -8,6 +8,8 @@ export type PageKey =
     | "quotas"
     | "quota-status"
     | "pools"
+    | "pool-info"
+    | "account-info"
     | "nodes";
 
 interface NavItem {
@@ -30,7 +32,7 @@ export const SidebarNav: React.FC<SidebarNavProps> = ({
     collapsed,
     onToggleCollapse,
 }) => {
-    const stats = useDashboardStats();
+    const state = useMultiRegionState();
 
     const items: NavItem[] = React.useMemo(
         () => [
@@ -39,34 +41,50 @@ export const SidebarNav: React.FC<SidebarNavProps> = ({
                 key: "accounts",
                 label: "Accounts",
                 icon: "ServerProcesses",
-                badge: stats.totalAccounts,
+                badge: state.accounts.length,
             },
             {
                 key: "quotas",
                 label: "Quotas",
                 icon: "AllCurrency",
-                badge: stats.pendingQuotas,
+                badge: state.quotaRequests.filter(
+                    (q) => q.status === "pending" || q.status === "submitted"
+                ).length,
             },
             {
                 key: "quota-status",
                 label: "Status",
                 icon: "Diagnostic",
-                badge: stats.approvedQuotas,
+                badge: state.quotaRequests.filter(
+                    (q) => q.status === "approved"
+                ).length,
             },
             {
                 key: "pools",
                 label: "Pools",
                 icon: "BuildQueue",
-                badge: stats.totalPools,
+                badge: state.pools.length,
+            },
+            {
+                key: "pool-info",
+                label: "Pool Info",
+                icon: "GridViewMedium",
+                badge: state.poolInfos.length,
+            },
+            {
+                key: "account-info",
+                label: "Account Info",
+                icon: "AccountManagement",
+                badge: state.accountInfos.length,
             },
             {
                 key: "nodes",
                 label: "Nodes",
                 icon: "Server",
-                badge: stats.totalNodes,
+                badge: state.nodes.length,
             },
         ],
-        [stats]
+        [state]
     );
 
     const width = collapsed ? 48 : 220;

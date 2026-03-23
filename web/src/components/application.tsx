@@ -1,26 +1,18 @@
-import { PlaygroundExample } from "@batch/ui-playground";
 import { defaultTheme, listThemes } from "@azure/bonito-ui";
-import { MonacoEditor } from "@azure/bonito-ui/lib/components";
-import { CertificatePage } from "@batch/ui-react/lib/components/certificate";
 import {
     Dropdown,
     IDropdownOption,
     IDropdownStyles,
 } from "@fluentui/react/lib/Dropdown";
 import * as React from "react";
-import { HashRouter, Route, Routes } from "react-router-dom";
+import { HashRouter, Route, Routes, Navigate } from "react-router-dom";
 import { AppRoot } from "./layout/app-root";
 import { Footer } from "./layout/footer";
 import { Header } from "./layout/header";
 import { Main } from "./layout/main";
-import { Stack, IStackTokens } from "@fluentui/react/lib/Stack";
-import { PrimaryButton } from "@fluentui/react/lib/Button";
-import { translate } from "@azure/bonito-core";
 import { ThemeName } from "@azure/bonito-ui/lib/theme";
-import { AutoDashboard } from "./auto-ops";
 import { MultiRegionDashboard } from "../multi-region";
 
-//DefaultButton
 const dropdownStyles: Partial<IDropdownStyles> = {
     dropdown: { width: 300 },
 };
@@ -39,132 +31,28 @@ export const Application: React.FC = () => {
         return options;
     }, []);
 
-    /* const linkStyle = {
-        textDecoration: "none",
-        color: "white",
-        //backgroundColor: "#056ce3",
-        backgroundColor: "#0939d6",
-        fontSize: "1.2em",
-        marginRight: "2em",
-    }; */
-
-    const stackTokens: IStackTokens = { childrenGap: 30 };
-
     return (
         <AppRoot theme={theme}>
             <HashRouter>
                 <Header>
-                    <Stack horizontal tokens={stackTokens}>
-                        <PrimaryButton
-                            text={translate("application.buttons.home")}
-                            href="#/"
-                        ></PrimaryButton>
-                        <PrimaryButton
-                            text={translate("application.buttons.editor")}
-                            href="#/editor"
-                        ></PrimaryButton>
-                        <PrimaryButton
-                            text={translate("application.buttons.playground")}
-                            href="#/playground"
-                        ></PrimaryButton>
-                        <PrimaryButton
-                            text="Full Auto"
-                            href="#/auto"
-                            iconProps={{ iconName: "Rocket" }}
-                            styles={{
-                                root: {
-                                    background:
-                                        "linear-gradient(90deg, #0078d4, #6b2fa0)",
-                                    border: "none",
-                                },
-                                rootHovered: {
-                                    background:
-                                        "linear-gradient(90deg, #005a9e, #5a2690)",
-                                    border: "none",
-                                },
-                            }}
-                        ></PrimaryButton>
-                        <PrimaryButton
-                            text="Full Auto"
-                            href="/auto"
-                            iconProps={{ iconName: "Rocket" }}
-                            styles={{
-                                root: {
-                                    background:
-                                        "linear-gradient(90deg, #0078d4, #6b2fa0)",
-                                    border: "none",
-                                },
-                                rootHovered: {
-                                    background:
-                                        "linear-gradient(90deg, #005a9e, #5a2690)",
-                                    border: "none",
-                                },
-                            }}
-                        ></PrimaryButton>
-                        <PrimaryButton
-                            text="Multi-Region"
-                            href="#/multi-region"
-                            iconProps={{ iconName: "Globe" }}
-                            styles={{
-                                root: {
-                                    background:
-                                        "linear-gradient(90deg, #107c10, #0078d4)",
-                                    border: "none",
-                                },
-                                rootHovered: {
-                                    background:
-                                        "linear-gradient(90deg, #0b5a0b, #005a9e)",
-                                    border: "none",
-                                },
-                            }}
-                        ></PrimaryButton>
-
-                        <Dropdown
-                            styles={dropdownStyles}
-                            defaultSelectedKey={defaultTheme}
-                            placeholder="Select a theme"
-                            label="Theme"
-                            options={themeOptions}
-                            onRenderLabel={() => <></>}
-                            onChange={(_, option) => {
-                                if (option) {
-                                    setTheme(option.key as ThemeName);
-                                }
-                            }}
-                        />
-                    </Stack>
+                    <Dropdown
+                        styles={dropdownStyles}
+                        defaultSelectedKey={defaultTheme}
+                        placeholder="Select a theme"
+                        label="Theme"
+                        options={themeOptions}
+                        onRenderLabel={() => <></>}
+                        onChange={(_, option) => {
+                            if (option) {
+                                setTheme(option.key as ThemeName);
+                            }
+                        }}
+                    />
                 </Header>
                 <Main>
                     <Routes>
-                        <Route
-                            path="/playground"
-                            element={<PlaygroundExample />}
-                        />
-                        <Route
-                            path="/editor"
-                            element={
-                                <MonacoEditor
-                                    language="json"
-                                    containerStyle={{
-                                        display: "flex",
-                                        flexDirection: "column",
-                                        flexGrow: 1,
-                                        width: "100%",
-                                    }}
-                                    editorOptions={{
-                                        minimap: {
-                                            enabled: false,
-                                        },
-                                    }}
-                                />
-                            }
-                        />
-                        <Route path="/auto" element={<AutoDashboard />} />
-                        <Route
-                            path="/multi-region"
-                            element={<MultiRegionDashboard />}
-                        />
-                        <Route path="/" element={<CertificatePage />} />
+                        <Route path="/" element={<MultiRegionDashboard />} />
+                        <Route path="*" element={<Navigate to="/" replace />} />
                     </Routes>
                 </Main>
                 <Footer />

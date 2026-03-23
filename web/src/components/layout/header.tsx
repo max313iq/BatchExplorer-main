@@ -31,7 +31,7 @@ export const Header: React.FC = (props) => {
                     userSelect: "none",
                 }}
             >
-                Batch Explorer
+                Azure Batch Manager
             </h1>
             <div
                 style={{

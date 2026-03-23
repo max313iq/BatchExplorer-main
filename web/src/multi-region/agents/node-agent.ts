@@ -9,13 +9,38 @@ function uuidV4(): string {
     });
 }
 
+const BATCH_API_VERSION = "2024-07-01.20.0";
+
 export interface NodeListInput {
     accountIds: string[];
 }
 
 export interface NodeActionInput {
-    action: "reboot" | "delete";
+    action:
+        | "reboot"
+        | "delete"
+        | "reimage"
+        | "disableScheduling"
+        | "enableScheduling";
     nodeIds: string[]; // internal ManagedNode ids
+}
+
+interface BatchPoolResponse {
+    id: string;
+    vmSize?: string;
+    "odata.nextLink"?: string;
+}
+
+interface BatchNodeResponse {
+    id: string;
+    state?: string;
+    ipAddress?: string;
+    isDedicated?: boolean;
+    lastBootUpTime?: string;
+    totalTasksRun?: number;
+    runningTasksCount?: number;
+    schedulingState?: string;
+    errors?: Array<{ code?: string; message?: string }>;
 }
 
 export class NodeAgent implements Agent {
@@ -31,13 +56,56 @@ export class NodeAgent implements Agent {
     async execute(params: Record<string, unknown>): Promise<AgentResult> {
         const actionType = params.actionType as string;
 
-        if (actionType === "reboot" || actionType === "delete") {
+        if (
+            actionType === "reboot" ||
+            actionType === "delete" ||
+            actionType === "reimage" ||
+            actionType === "disableScheduling" ||
+            actionType === "enableScheduling"
+        ) {
             return this._executeNodeAction(
                 params as unknown as NodeActionInput & { actionType: string }
             );
         }
 
         return this._listNodes(params as unknown as NodeListInput);
+    }
+
+    /**
+     * Fetch all pages from a paginated Batch API endpoint.
+     */
+    private async _fetchAllPages<T>(
+        initialUrl: string,
+        token: string
+    ): Promise<T[]> {
+        const results: T[] = [];
+        let url: string | undefined = initialUrl;
+
+        while (url) {
+            const response = await fetch(url, {
+                headers: {
+                    Authorization: `Bearer ${token}`,
+                    Accept: "application/json; odata=minimalmetadata",
+                },
+            });
+
+            if (!response.ok) {
+                const err = await response.json().catch(() => ({}));
+                throw new Error(
+                    err?.error?.message ??
+                        err?.message?.value ??
+                        `Batch API request failed: ${response.status}`
+                );
+            }
+
+            const data = await response.json();
+            const items: T[] = data.value ?? [];
+            results.push(...items);
+
+            url = data["odata.nextLink"] ?? undefined;
+        }
+
+        return results;
     }
 
     private async _listNodes(input: NodeListInput): Promise<AgentResult> {
@@ -61,67 +129,85 @@ export class NodeAgent implements Agent {
             const account = state.accounts.find((a) => a.id === accountId);
             if (!account) continue;
 
-            // Get pools for this account
-            const pools = state.pools.filter(
-                (p) =>
-                    p.accountId === accountId &&
-                    p.provisioningState === "created"
-            );
+            try {
+                await scheduler.run(accountId, async () => {
+                    const token = await getBatchAccessToken();
+                    const baseUrl = `https://${account.accountName}.${account.region}.batch.azure.com`;
 
-            for (const pool of pools) {
-                if (this._cancelled) break;
+                    // Step 1: List all pools for this account
+                    const poolsUrl = `${baseUrl}/pools?api-version=${BATCH_API_VERSION}`;
+                    const pools = await this._fetchAllPages<BatchPoolResponse>(
+                        poolsUrl,
+                        token
+                    );
 
-                try {
-                    await scheduler.run(accountId, async () => {
-                        const token = await getBatchAccessToken();
-                        const url = `https://${account.accountName}.${account.region}.batch.azure.com/pools/${pool.poolId}/nodes?api-version=2024-07-01.20.0`;
+                    // Step 2: For each pool, list all nodes
+                    for (const pool of pools) {
+                        if (this._cancelled) break;
 
-                        const response = await fetch(url, {
-                            headers: {
-                                Authorization: `Bearer ${token}`,
-                                Accept: "application/json; odata=minimalmetadata",
-                            },
-                        });
+                        const nodesUrl = `${baseUrl}/pools/${pool.id}/nodes?api-version=${BATCH_API_VERSION}`;
+                        let nodes: BatchNodeResponse[];
 
-                        if (!response.ok) {
-                            const err = await response.json().catch(() => ({}));
-                            throw new Error(
-                                err?.error?.message ??
-                                    err?.message?.value ??
-                                    `List nodes failed: ${response.status}`
-                            );
+                        try {
+                            nodes =
+                                await this._fetchAllPages<BatchNodeResponse>(
+                                    nodesUrl,
+                                    token
+                                );
+                        } catch (poolErr: any) {
+                            store.addLog({
+                                agent: "node",
+                                level: "warn",
+                                message: `Failed to list nodes for pool ${pool.id} in ${account.accountName}: ${poolErr?.message ?? String(poolErr)}`,
+                            });
+                            continue;
                         }
 
-                        const data = await response.json();
-                        const nodes = data.value ?? [];
-
                         for (const n of nodes) {
+                            const nodeState = (
+                                n.state ?? "unknown"
+                            ).toLowerCase() as NodeState;
+
+                            const nodeErrors = n.errors;
+                            let errorMsg: string | null = null;
+                            if (nodeErrors && nodeErrors.length > 0) {
+                                errorMsg = nodeErrors
+                                    .map(
+                                        (e) =>
+                                            `${e.code ?? "Error"}: ${e.message ?? "Unknown error"}`
+                                    )
+                                    .join("; ");
+                            }
+
                             allNodes.push({
                                 id: uuidV4(),
                                 accountId,
                                 accountName: account.accountName,
                                 region: account.region,
-                                poolId: pool.poolId,
+                                poolId: pool.id,
                                 nodeId: n.id,
-                                state: (
-                                    n.state ?? "unknown"
-                                ).toLowerCase() as NodeState,
-                                vmSize: n.vmSize,
+                                state: nodeState,
+                                vmSize: pool.vmSize,
                                 ipAddress: n.ipAddress,
-                                lastBootTime: n.lastBootTime,
-                                error: n.errors?.[0]?.message ?? null,
+                                isDedicated: n.isDedicated ?? true,
+                                lastBootTime: n.lastBootUpTime,
+                                totalTasksRun: n.totalTasksRun,
+                                runningTasksCount: n.runningTasksCount,
+                                schedulingState: n.schedulingState,
+                                subscriptionId: account.subscriptionId,
+                                error: errorMsg,
                             });
                         }
-                    });
-                } catch (error: any) {
-                    const errorMsg = error?.message ?? String(error);
-                    store.addLog({
-                        agent: "node",
-                        level: "error",
-                        message: `Failed to list nodes for ${account.accountName}/${pool.poolId}: ${errorMsg}`,
-                    });
-                    errors++;
-                }
+                    }
+                });
+            } catch (error: any) {
+                const errorMsg = error?.message ?? String(error);
+                store.addLog({
+                    agent: "node",
+                    level: "error",
+                    message: `Failed to list nodes for account ${account.accountName}: ${errorMsg}`,
+                });
+                errors++;
             }
         }
 
@@ -130,7 +216,7 @@ export class NodeAgent implements Agent {
         store.addLog({
             agent: "node",
             level: "info",
-            message: `Found ${allNodes.length} nodes across accounts (${errors} errors)`,
+            message: `Found ${allNodes.length} nodes across accounts (${errors} account-level errors)`,
         });
 
         return {
@@ -145,12 +231,38 @@ export class NodeAgent implements Agent {
         const { store, scheduler, getBatchAccessToken } = this._ctx;
         this._cancelled = false;
 
-        const action = input.actionType as "reboot" | "delete";
+        const action = input.actionType as
+            | "reboot"
+            | "delete"
+            | "reimage"
+            | "disableScheduling"
+            | "enableScheduling";
+
+        const actionLabels: Record<string, { present: string; past: string }> =
+            {
+                reboot: { present: "Rebooting", past: "Rebooted" },
+                delete: { present: "Removing", past: "Removed" },
+                reimage: { present: "Reimaging", past: "Reimaged" },
+                disableScheduling: {
+                    present: "Disabling scheduling on",
+                    past: "Disabled scheduling on",
+                },
+                enableScheduling: {
+                    present: "Enabling scheduling on",
+                    past: "Enabled scheduling on",
+                },
+            };
+
+        const label = actionLabels[action] ?? {
+            present: action,
+            past: action,
+        };
+
         store.setAgentStatus("node", "running");
         store.addLog({
             agent: "node",
             level: "info",
-            message: `${action === "reboot" ? "Rebooting" : "Deleting"} ${input.nodeIds.length} nodes`,
+            message: `${label.present} ${input.nodeIds.length} node(s)`,
         });
 
         let succeeded = 0;
@@ -171,62 +283,93 @@ export class NodeAgent implements Agent {
                     const token = await getBatchAccessToken();
                     const baseUrl = `https://${account.accountName}.${account.region}.batch.azure.com`;
 
-                    if (action === "reboot") {
-                        const url = `${baseUrl}/pools/${node.poolId}/nodes/${node.nodeId}/reboot?api-version=2024-07-01.20.0`;
-                        const response = await fetch(url, {
-                            method: "POST",
-                            headers: {
-                                "Content-Type":
-                                    "application/json; odata=minimalmetadata",
-                                Authorization: `Bearer ${token}`,
-                            },
-                            body: JSON.stringify({
+                    let url: string;
+                    let body: string | undefined;
+
+                    switch (action) {
+                        case "reboot":
+                            url = `${baseUrl}/pools/${node.poolId}/nodes/${node.nodeId}/reboot?api-version=${BATCH_API_VERSION}`;
+                            body = JSON.stringify({
                                 nodeRebootOption: "requeue",
-                            }),
-                        });
-                        if (!response.ok && response.status !== 202) {
-                            const err = await response.json().catch(() => ({}));
-                            throw new Error(
-                                err?.error?.message ??
-                                    `Reboot failed: ${response.status}`
-                            );
-                        }
-                    } else {
-                        // Delete = remove node from pool
-                        const url = `${baseUrl}/pools/${node.poolId}/removenodes?api-version=2024-07-01.20.0`;
-                        const response = await fetch(url, {
-                            method: "POST",
-                            headers: {
-                                "Content-Type":
-                                    "application/json; odata=minimalmetadata",
-                                Authorization: `Bearer ${token}`,
-                            },
-                            body: JSON.stringify({
+                            });
+                            break;
+                        case "delete":
+                            url = `${baseUrl}/pools/${node.poolId}/removenodes?api-version=${BATCH_API_VERSION}`;
+                            body = JSON.stringify({
                                 nodeList: [node.nodeId],
                                 nodeDeallocationOption: "requeue",
-                            }),
-                        });
-                        if (!response.ok && response.status !== 202) {
-                            const err = await response.json().catch(() => ({}));
-                            throw new Error(
-                                err?.error?.message ??
-                                    `Remove node failed: ${response.status}`
-                            );
-                        }
+                            });
+                            break;
+                        case "reimage":
+                            url = `${baseUrl}/pools/${node.poolId}/nodes/${node.nodeId}/reimage?api-version=${BATCH_API_VERSION}`;
+                            body = JSON.stringify({
+                                nodeReimageOption: "requeue",
+                            });
+                            break;
+                        case "disableScheduling":
+                            url = `${baseUrl}/pools/${node.poolId}/nodes/${node.nodeId}/disablescheduling?api-version=${BATCH_API_VERSION}`;
+                            body = undefined;
+                            break;
+                        case "enableScheduling":
+                            url = `${baseUrl}/pools/${node.poolId}/nodes/${node.nodeId}/enablescheduling?api-version=${BATCH_API_VERSION}`;
+                            body = undefined;
+                            break;
+                        default:
+                            throw new Error(`Unknown action: ${action}`);
+                    }
+
+                    const headers: Record<string, string> = {
+                        Authorization: `Bearer ${token}`,
+                    };
+                    if (body) {
+                        headers["Content-Type"] =
+                            "application/json; odata=minimalmetadata";
+                    }
+
+                    const response = await fetch(url, {
+                        method: "POST",
+                        headers,
+                        body,
+                    });
+
+                    if (!response.ok && response.status !== 202) {
+                        const err = await response.json().catch(() => ({}));
+                        throw new Error(
+                            err?.error?.message ??
+                                `${action} failed: ${response.status}`
+                        );
                     }
                 });
 
                 store.addLog({
                     agent: "node",
                     level: "info",
-                    message: `${action === "reboot" ? "Rebooted" : "Removed"} node ${node.nodeId} from ${account.accountName}/${node.poolId}`,
+                    message: `${label.past} node ${node.nodeId} in ${account.accountName}/${node.poolId}`,
                 });
 
-                if (action === "delete") {
-                    store.removeNode(internalId);
-                } else {
-                    store.updateNode(internalId, { state: "rebooting" });
+                // Update local store state after successful action
+                switch (action) {
+                    case "delete":
+                        store.removeNode(internalId);
+                        break;
+                    case "reboot":
+                        store.updateNode(internalId, { state: "rebooting" });
+                        break;
+                    case "reimage":
+                        store.updateNode(internalId, { state: "reimaging" });
+                        break;
+                    case "disableScheduling":
+                        store.updateNode(internalId, {
+                            schedulingState: "disabled",
+                        });
+                        break;
+                    case "enableScheduling":
+                        store.updateNode(internalId, {
+                            schedulingState: "enabled",
+                        });
+                        break;
                 }
+
                 succeeded++;
             } catch (error: any) {
                 const errorMsg = error?.message ?? String(error);

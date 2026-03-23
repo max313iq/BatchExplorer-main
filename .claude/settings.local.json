@@ -1,0 +1,20 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(curl -s http://localhost:9000/api/token)",
+      "Bash(python3 -c \"import sys,json; d=json.load\\(sys.stdin\\); print\\(''''Token OK, expires:'''', d.get\\(''''expiresOn'''',''''?''''\\)\\)\")",
+      "Bash(\"C:/Program Files/Microsoft SDKs/Azure/CLI2/wbin/az.cmd\" account get-access-token --resource https://management.azure.com --output json)",
+      "mcp__Claude_Preview__preview_start",
+      "Bash(xargs grep:*)",
+      "Bash(grep -r \"api/token\\\\|/api/\" /c/Users/Administrator/Desktop/BatchExplorer-main/web --include=\"*.ts\" --include=\"*.tsx\" --include=\"*.js\" ! -path \"*/node_modules/*\")",
+      "Bash(grep -r api/token /c/Users/Administrator/Desktop/BatchExplorer-main/web --include=*.ts --include=*.tsx --include=*.js)",
+      "Bash(grep -r api/ /c/Users/Administrator/Desktop/BatchExplorer-main/web/src --include=*.ts --include=*.tsx)",
+      "Bash(grep -r getAccessToken /c/Users/Administrator/Desktop/BatchExplorer-main/desktop/src --include=*.ts)",
+      "Bash(where az:*)",
+      "Bash(powershell -Command \"winget install -e --id Microsoft.AzureCLI --accept-package-agreements --accept-source-agreements\")",
+      "Bash(powershell -Command \"Start-Process msiexec.exe -ArgumentList ''/i'',''https://aka.ms/installazurecliwindowsx64'',''/quiet'',''/norestart'' -Wait\")",
+      "Bash(export PATH=\"/c/Program Files/Microsoft SDKs/Azure/CLI2/wbin:$PATH:/c/Program Files \\(x86\\)/Microsoft SDKs/Azure/CLI2/wbin\")",
+      "Bash(az version:*)"
+    ]
+  }
+}

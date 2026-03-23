@@ -1,4 +1,5 @@
 import {
+    AccountInfo,
     AgentLogEntry,
     AgentName,
     AgentStatus,
@@ -11,6 +12,7 @@ import {
     ManagedNode,
     ManagedPool,
     MultiRegionState,
+    PoolInfo,
     QuotaRequest,
     Subscription,
     ToastNotification,
@@ -148,6 +150,40 @@ export class MultiRegionStore {
         this._state = {
             ...this._state,
             nodes: this._state.nodes.filter((n) => n.id !== id),
+        };
+        this._notify();
+    }
+
+    // --- Pool Infos ---
+
+    setPoolInfos(pools: PoolInfo[]): void {
+        this._state = { ...this._state, poolInfos: [...pools] };
+        this._notify();
+    }
+
+    updatePoolInfo(id: string, patch: Partial<PoolInfo>): void {
+        this._state = {
+            ...this._state,
+            poolInfos: this._state.poolInfos.map((p) =>
+                p.id === id ? { ...p, ...patch } : p
+            ),
+        };
+        this._notify();
+    }
+
+    // --- Account Infos ---
+
+    setAccountInfos(accounts: AccountInfo[]): void {
+        this._state = { ...this._state, accountInfos: [...accounts] };
+        this._notify();
+    }
+
+    updateAccountInfo(id: string, patch: Partial<AccountInfo>): void {
+        this._state = {
+            ...this._state,
+            accountInfos: this._state.accountInfos.map((a) =>
+                a.id === id ? { ...a, ...patch } : a
+            ),
         };
         this._notify();
     }

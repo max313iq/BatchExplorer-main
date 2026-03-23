@@ -1,6 +1,7 @@
 import * as React from "react";
 import { Icon } from "@fluentui/react/lib/Icon";
 import { PrimaryButton, DefaultButton } from "@fluentui/react/lib/Button";
+import { Spinner, SpinnerSize } from "@fluentui/react/lib/Spinner";
 import { Stack } from "@fluentui/react/lib/Stack";
 import { Text } from "@fluentui/react/lib/Text";
 import {
@@ -311,22 +312,74 @@ export const OverviewPage: React.FC<OverviewPageProps> = ({
     onNavigate,
 }) => {
     const stats = useDashboardStats();
+    const state = useMultiRegionState();
+    const [refreshing, setRefreshing] = React.useState(false);
+
+    // Compute totals from poolInfos / accountInfos when available
+    const dedicatedUsed = React.useMemo(
+        () => state.accountInfos.reduce((s, a) => s + a.dedicatedCoresUsed, 0),
+        [state.accountInfos]
+    );
+    const dedicatedQuota = React.useMemo(
+        () => state.accountInfos.reduce((s, a) => s + a.dedicatedCoreQuota, 0),
+        [state.accountInfos]
+    );
+    const lpUsed = React.useMemo(
+        () =>
+            state.accountInfos.reduce((s, a) => s + a.lowPriorityCoresUsed, 0),
+        [state.accountInfos]
+    );
+    const lpQuota = React.useMemo(
+        () =>
+            state.accountInfos.reduce((s, a) => s + a.lowPriorityCoreQuota, 0),
+        [state.accountInfos]
+    );
+
+    const handleRefreshAll = React.useCallback(async () => {
+        setRefreshing(true);
+        try {
+            await orchestrator.execute({
+                action: "refresh_pool_info",
+                payload: {},
+            });
+            await orchestrator.execute({
+                action: "refresh_account_info",
+                payload: {},
+            });
+        } catch {
+            /* handled by orchestrator */
+        } finally {
+            setRefreshing(false);
+        }
+    }, [orchestrator]);
 
     return (
         <div style={{ padding: "16px 0" }}>
-            <Text
-                variant="xLarge"
-                styles={{
-                    root: {
-                        fontWeight: 600,
-                        color: "#eee",
-                        marginBottom: 16,
-                        display: "block",
-                    },
-                }}
+            <Stack
+                horizontal
+                verticalAlign="center"
+                tokens={{ childrenGap: 12 }}
+                styles={{ root: { marginBottom: 16 } }}
             >
-                Multi-Region Manager
-            </Text>
+                <Text
+                    variant="xLarge"
+                    styles={{
+                        root: {
+                            fontWeight: 600,
+                            color: "#eee",
+                        },
+                    }}
+                >
+                    Multi-Region Manager
+                </Text>
+                <PrimaryButton
+                    text="Refresh All"
+                    iconProps={{ iconName: "Refresh" }}
+                    onClick={handleRefreshAll}
+                    disabled={refreshing}
+                />
+                {refreshing && <Spinner size={SpinnerSize.small} />}
+            </Stack>
 
             {/* Stats Cards */}
             <div
@@ -410,6 +463,46 @@ export const OverviewPage: React.FC<OverviewPageProps> = ({
                         },
                     ]}
                 />
+                {state.accountInfos.length > 0 && (
+                    <>
+                        <StatCard
+                            icon="Server"
+                            title="Dedicated Cores"
+                            color="#00b7c3"
+                            onClick={() => onNavigate("account-info")}
+                            items={[
+                                {
+                                    label: "Used",
+                                    value: dedicatedUsed,
+                                    color: "#e3a400",
+                                },
+                                {
+                                    label: "Available",
+                                    value: dedicatedQuota,
+                                    color: "#107c10",
+                                },
+                            ]}
+                        />
+                        <StatCard
+                            icon="Server"
+                            title="Low Priority Cores"
+                            color="#8764b8"
+                            onClick={() => onNavigate("account-info")}
+                            items={[
+                                {
+                                    label: "Used",
+                                    value: lpUsed,
+                                    color: "#e3a400",
+                                },
+                                {
+                                    label: "Available",
+                                    value: lpQuota,
+                                    color: "#107c10",
+                                },
+                            ]}
+                        />
+                    </>
+                )}
             </div>
 
             {/* Agent Status */}
