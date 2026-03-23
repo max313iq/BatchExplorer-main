@@ -7,6 +7,8 @@ import {
     IColumn,
     SelectionMode,
 } from "@fluentui/react/lib/DetailsList";
+import { Dropdown, IDropdownOption } from "@fluentui/react/lib/Dropdown";
+import { Toggle } from "@fluentui/react/lib/Toggle";
 import { ProgressIndicator } from "@fluentui/react/lib/ProgressIndicator";
 import { MessageBar, MessageBarType } from "@fluentui/react/lib/MessageBar";
 import { Stack, IStackTokens } from "@fluentui/react/lib/Stack";
@@ -19,6 +21,72 @@ import { StatusBadge } from "../shared/status-badge";
 import { OrchestratorAgent } from "../../agents/orchestrator-agent";
 
 const stackTokens: IStackTokens = { childrenGap: 12 };
+
+const GPU_VMS = [
+    { key: "Standard_NC6s_v3", text: "NC6s_v3 (6 vCPUs, 1×V100)", vCPUs: 6 },
+    {
+        key: "Standard_NC12s_v3",
+        text: "NC12s_v3 (12 vCPUs, 2×V100)",
+        vCPUs: 12,
+    },
+    {
+        key: "Standard_NC24s_v3",
+        text: "NC24s_v3 (24 vCPUs, 4×V100)",
+        vCPUs: 24,
+    },
+    {
+        key: "Standard_NC4as_T4_v3",
+        text: "NC4as_T4_v3 (4 vCPUs, 1×T4)",
+        vCPUs: 4,
+    },
+    {
+        key: "Standard_NC16as_T4_v3",
+        text: "NC16as_T4_v3 (16 vCPUs, 1×T4)",
+        vCPUs: 16,
+    },
+    {
+        key: "Standard_NC64as_T4_v3",
+        text: "NC64as_T4_v3 (64 vCPUs, 4×T4)",
+        vCPUs: 64,
+    },
+    {
+        key: "Standard_ND96amsr_A100_v4",
+        text: "ND96amsr_A100_v4 (96 vCPUs, 8×A100 80GB)",
+        vCPUs: 96,
+    },
+    {
+        key: "Standard_ND96asr_A100_v4",
+        text: "ND96asr_A100_v4 (96 vCPUs, 8×A100 40GB)",
+        vCPUs: 96,
+    },
+    {
+        key: "Standard_NV36ads_A10_v5",
+        text: "NV36ads_A10_v5 (36 vCPUs, 1×A10)",
+        vCPUs: 36,
+    },
+    {
+        key: "Standard_NV72ads_A10_v5",
+        text: "NV72ads_A10_v5 (72 vCPUs, 2×A10)",
+        vCPUs: 72,
+    },
+    {
+        key: "Standard_ND96isr_H100_v5",
+        text: "ND96isr_H100_v5 (96 vCPUs, 8×H100)",
+        vCPUs: 96,
+    },
+    {
+        key: "Standard_ND40rs_v2",
+        text: "ND40rs_v2 (40 vCPUs, 8×V100)",
+        vCPUs: 40,
+    },
+];
+
+const VM_DROPDOWN_OPTIONS: IDropdownOption[] = GPU_VMS.map((vm) => ({
+    key: vm.key,
+    text: vm.text,
+}));
+
+const MAX_VM_SELECTIONS = 5;
 
 const DEFAULT_POOL_CONFIG = {
     id: "pool",
@@ -72,6 +140,8 @@ export const PoolCreationPage: React.FC<PoolCreationPageProps> = ({
     >(new Set());
     const [selectAll, setSelectAll] = React.useState(false);
     const [isRunning, setIsRunning] = React.useState(false);
+    const [smartMode, setSmartMode] = React.useState(false);
+    const [selectedVmSizes, setSelectedVmSizes] = React.useState<string[]>([]);
 
     // Load last pool config from preferences on mount
     React.useEffect(() => {
@@ -107,6 +177,36 @@ export const PoolCreationPage: React.FC<PoolCreationPageProps> = ({
         };
     }, []);
 
+    // Auto-update JSON config when smart mode is on and VM sizes are selected
+    React.useEffect(() => {
+        if (!smartMode || selectedVmSizes.length === 0) return;
+        try {
+            const config = JSON.parse(poolConfigJson);
+            const firstVm = GPU_VMS.find((vm) => vm.key === selectedVmSizes[0]);
+            if (!firstVm) return;
+
+            config.vmSize = selectedVmSizes[0].toLowerCase();
+
+            // Auto-calc targetLowPriorityNodes from first selected account's free quota
+            const accountInfos = state.accountInfos;
+            if (accountInfos.length > 0 && selectedAccountIds.size > 0) {
+                const firstAccountId = Array.from(selectedAccountIds)[0];
+                const info = accountInfos.find((a) => a.id === firstAccountId);
+                if (info) {
+                    const freeQuota = info.lowPriorityCoresFree;
+                    const maxNodes = Math.floor(freeQuota / firstVm.vCPUs);
+                    config.targetLowPriorityNodes = Math.max(0, maxNodes);
+                }
+            }
+
+            const newJson = JSON.stringify(config, null, 2);
+            setPoolConfigJson(newJson);
+            store.saveUserPreferences({ lastPoolConfig: newJson });
+        } catch {
+            // JSON parse error — don't update
+        }
+    }, [smartMode, selectedVmSizes, selectedAccountIds]);
+
     // Only show accounts with approved quota or created status
     const eligibleAccounts = state.accounts.filter((a) => {
         if (a.provisioningState !== "created") return false;
@@ -128,13 +228,25 @@ export const PoolCreationPage: React.FC<PoolCreationPageProps> = ({
             setConfigError(null);
             setIsRunning(true);
 
-            await orchestrator.execute({
-                action: "create_pools",
-                payload: {
-                    accountIds: Array.from(selectedAccountIds),
-                    poolConfig,
-                },
-            });
+            if (smartMode && selectedVmSizes.length > 0) {
+                await orchestrator.execute({
+                    action: "create_pools_smart",
+                    payload: {
+                        accountIds: Array.from(selectedAccountIds),
+                        vmSizes: selectedVmSizes,
+                        poolConfig,
+                        quotaType: "lowPriority",
+                    },
+                });
+            } else {
+                await orchestrator.execute({
+                    action: "create_pools",
+                    payload: {
+                        accountIds: Array.from(selectedAccountIds),
+                        poolConfig,
+                    },
+                });
+            }
         } catch (e: any) {
             if (e instanceof SyntaxError) {
                 setConfigError(`Invalid JSON: ${e.message}`);
@@ -142,7 +254,13 @@ export const PoolCreationPage: React.FC<PoolCreationPageProps> = ({
         } finally {
             setIsRunning(false);
         }
-    }, [orchestrator, selectedAccountIds, poolConfigJson]);
+    }, [
+        orchestrator,
+        selectedAccountIds,
+        poolConfigJson,
+        smartMode,
+        selectedVmSizes,
+    ]);
 
     const handleRetryFailedPools = React.useCallback(() => {
         const ids = store.retryFailedPools();
@@ -271,6 +389,44 @@ export const PoolCreationPage: React.FC<PoolCreationPageProps> = ({
                         selectionMode={SelectionMode.none}
                         compact
                     />
+                )}
+
+                <Dropdown
+                    label="GPU VM Sizes (select up to 5, in priority order)"
+                    placeholder="Select VM sizes..."
+                    multiSelect
+                    options={VM_DROPDOWN_OPTIONS}
+                    selectedKeys={selectedVmSizes}
+                    onChange={(_e, option) => {
+                        if (!option) return;
+                        setSelectedVmSizes((prev) => {
+                            if (option.selected) {
+                                if (prev.length >= MAX_VM_SELECTIONS)
+                                    return prev;
+                                return [...prev, option.key as string];
+                            } else {
+                                return prev.filter((k) => k !== option.key);
+                            }
+                        });
+                    }}
+                    styles={{ root: { maxWidth: 450 } }}
+                />
+
+                <Toggle
+                    label="Smart Mode"
+                    inlineLabel
+                    checked={smartMode}
+                    onChange={(_e, checked) => setSmartMode(!!checked)}
+                    onText="On"
+                    offText="Off"
+                />
+                {smartMode && (
+                    <MessageBar messageBarType={MessageBarType.info}>
+                        Smart Mode tries VM sizes in priority order per account.
+                        If the first VM size fails (capacity/quota), it falls
+                        back to the next. Pools are sized automatically based on
+                        available quota.
+                    </MessageBar>
                 )}
 
                 <div>

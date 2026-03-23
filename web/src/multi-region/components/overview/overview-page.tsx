@@ -1,9 +1,11 @@
 import * as React from "react";
 import { Icon } from "@fluentui/react/lib/Icon";
 import { PrimaryButton, DefaultButton } from "@fluentui/react/lib/Button";
+import { Checkbox } from "@fluentui/react/lib/Checkbox";
 import { Spinner, SpinnerSize } from "@fluentui/react/lib/Spinner";
 import { Stack } from "@fluentui/react/lib/Stack";
 import { Text } from "@fluentui/react/lib/Text";
+import { QuotaSuggestion } from "../../store/store-types";
 import {
     useDashboardStats,
     useMultiRegionState,
@@ -298,6 +300,373 @@ const QuickActions: React.FC<{
     );
 };
 
+// --- Unused Quota Section ---
+
+const UnusedQuotaSection: React.FC<{
+    orchestrator: OrchestratorAgent;
+}> = ({ orchestrator }) => {
+    const state = useMultiRegionState();
+    const [detecting, setDetecting] = React.useState(false);
+    const [creating, setCreating] = React.useState(false);
+    const [suggestions, setSuggestions] = React.useState<QuotaSuggestion[]>([]);
+    const [selectedIndices, setSelectedIndices] = React.useState<Set<number>>(
+        new Set()
+    );
+
+    const accountsWithFreeQuota = React.useMemo(
+        () =>
+            state.accountInfos.filter(
+                (a) => a.lowPriorityCoresFree > 0 || a.dedicatedCoresFree > 0
+            ),
+        [state.accountInfos]
+    );
+
+    const totalFreeLpCores = React.useMemo(
+        () =>
+            accountsWithFreeQuota.reduce(
+                (s, a) => s + a.lowPriorityCoresFree,
+                0
+            ),
+        [accountsWithFreeQuota]
+    );
+
+    const handleDetect = React.useCallback(async () => {
+        setDetecting(true);
+        setSuggestions([]);
+        setSelectedIndices(new Set());
+        try {
+            const result = await orchestrator.execute({
+                action: "detect_unused_quota",
+                payload: {},
+            });
+            const items = (result.summary as Record<string, unknown>)
+                ?.suggestions as QuotaSuggestion[];
+            setSuggestions(items ?? []);
+        } catch {
+            /* handled by orchestrator */
+        } finally {
+            setDetecting(false);
+        }
+    }, [orchestrator]);
+
+    const handleAutoCreate = React.useCallback(async () => {
+        const selected = suggestions.filter((_, i) => selectedIndices.has(i));
+        if (selected.length === 0) return;
+        setCreating(true);
+        try {
+            await orchestrator.execute({
+                action: "auto_create_pools_from_quota",
+                payload: { suggestions: selected },
+            });
+        } catch {
+            /* handled by orchestrator */
+        } finally {
+            setCreating(false);
+        }
+    }, [orchestrator, suggestions, selectedIndices]);
+
+    const toggleSelect = React.useCallback((index: number) => {
+        setSelectedIndices((prev) => {
+            const next = new Set(prev);
+            if (next.has(index)) {
+                next.delete(index);
+            } else {
+                next.add(index);
+            }
+            return next;
+        });
+    }, []);
+
+    const toggleSelectAll = React.useCallback(() => {
+        setSelectedIndices((prev) => {
+            if (prev.size === suggestions.length) {
+                return new Set();
+            }
+            return new Set(suggestions.map((_, i) => i));
+        });
+    }, [suggestions]);
+
+    return (
+        <div
+            style={{
+                background: "#1e1e1e",
+                borderRadius: 6,
+                padding: 16,
+                marginTop: 16,
+            }}
+        >
+            <Stack
+                horizontal
+                verticalAlign="center"
+                tokens={{ childrenGap: 12 }}
+                styles={{ root: { marginBottom: 12 } }}
+            >
+                <Icon
+                    iconName="Savings"
+                    styles={{ root: { fontSize: 18, color: "#e3a400" } }}
+                />
+                <Text
+                    variant="mediumPlus"
+                    styles={{
+                        root: { fontWeight: 600, color: "#eee" },
+                    }}
+                >
+                    Unused Quota
+                </Text>
+                {state.accountInfos.length > 0 && (
+                    <Text variant="small" styles={{ root: { color: "#888" } }}>
+                        {accountsWithFreeQuota.length} accounts with{" "}
+                        {totalFreeLpCores} free LP cores
+                    </Text>
+                )}
+                <DefaultButton
+                    text="Detect Unused Quota"
+                    iconProps={{ iconName: "Search" }}
+                    onClick={handleDetect}
+                    disabled={detecting || state.accountInfos.length === 0}
+                    styles={{
+                        root: { marginLeft: "auto" },
+                    }}
+                />
+                {detecting && <Spinner size={SpinnerSize.small} />}
+            </Stack>
+
+            {suggestions.length > 0 && (
+                <>
+                    <div
+                        style={{
+                            overflowX: "auto",
+                            marginBottom: 12,
+                        }}
+                    >
+                        <table
+                            style={{
+                                width: "100%",
+                                borderCollapse: "collapse",
+                                fontSize: 12,
+                            }}
+                        >
+                            <thead>
+                                <tr
+                                    style={{
+                                        borderBottom: "1px solid #333",
+                                    }}
+                                >
+                                    <th
+                                        style={{
+                                            padding: "6px 8px",
+                                            textAlign: "left",
+                                            color: "#888",
+                                        }}
+                                    >
+                                        <Checkbox
+                                            checked={
+                                                selectedIndices.size ===
+                                                    suggestions.length &&
+                                                suggestions.length > 0
+                                            }
+                                            onChange={toggleSelectAll}
+                                        />
+                                    </th>
+                                    <th
+                                        style={{
+                                            padding: "6px 8px",
+                                            textAlign: "left",
+                                            color: "#888",
+                                        }}
+                                    >
+                                        Account
+                                    </th>
+                                    <th
+                                        style={{
+                                            padding: "6px 8px",
+                                            textAlign: "left",
+                                            color: "#888",
+                                        }}
+                                    >
+                                        Region
+                                    </th>
+                                    <th
+                                        style={{
+                                            padding: "6px 8px",
+                                            textAlign: "right",
+                                            color: "#888",
+                                        }}
+                                    >
+                                        Free LP
+                                    </th>
+                                    <th
+                                        style={{
+                                            padding: "6px 8px",
+                                            textAlign: "right",
+                                            color: "#888",
+                                        }}
+                                    >
+                                        Free Dedicated
+                                    </th>
+                                    <th
+                                        style={{
+                                            padding: "6px 8px",
+                                            textAlign: "left",
+                                            color: "#888",
+                                        }}
+                                    >
+                                        VM Size
+                                    </th>
+                                    <th
+                                        style={{
+                                            padding: "6px 8px",
+                                            textAlign: "right",
+                                            color: "#888",
+                                        }}
+                                    >
+                                        Max LP Nodes
+                                    </th>
+                                    <th
+                                        style={{
+                                            padding: "6px 8px",
+                                            textAlign: "right",
+                                            color: "#888",
+                                        }}
+                                    >
+                                        Max Dedicated Nodes
+                                    </th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                {suggestions.map((s, i) => (
+                                    <tr
+                                        key={`${s.accountId}-${s.vmSize}-${i}`}
+                                        style={{
+                                            borderBottom: "1px solid #2a2a2a",
+                                            background: selectedIndices.has(i)
+                                                ? "#2a3040"
+                                                : "transparent",
+                                        }}
+                                    >
+                                        <td
+                                            style={{
+                                                padding: "6px 8px",
+                                            }}
+                                        >
+                                            <Checkbox
+                                                checked={selectedIndices.has(i)}
+                                                onChange={() => toggleSelect(i)}
+                                            />
+                                        </td>
+                                        <td
+                                            style={{
+                                                padding: "6px 8px",
+                                                color: "#ccc",
+                                            }}
+                                        >
+                                            {s.accountName}
+                                        </td>
+                                        <td
+                                            style={{
+                                                padding: "6px 8px",
+                                                color: "#999",
+                                            }}
+                                        >
+                                            {s.region}
+                                        </td>
+                                        <td
+                                            style={{
+                                                padding: "6px 8px",
+                                                textAlign: "right",
+                                                color: "#8764b8",
+                                            }}
+                                        >
+                                            {s.freeLpCores}
+                                        </td>
+                                        <td
+                                            style={{
+                                                padding: "6px 8px",
+                                                textAlign: "right",
+                                                color: "#00b7c3",
+                                            }}
+                                        >
+                                            {s.freeDedicatedCores}
+                                        </td>
+                                        <td
+                                            style={{
+                                                padding: "6px 8px",
+                                                color: "#ccc",
+                                            }}
+                                        >
+                                            {s.vmSize}
+                                        </td>
+                                        <td
+                                            style={{
+                                                padding: "6px 8px",
+                                                textAlign: "right",
+                                                color:
+                                                    s.maxLpNodes > 0
+                                                        ? "#107c10"
+                                                        : "#555",
+                                            }}
+                                        >
+                                            {s.maxLpNodes}
+                                        </td>
+                                        <td
+                                            style={{
+                                                padding: "6px 8px",
+                                                textAlign: "right",
+                                                color:
+                                                    s.maxDedicatedNodes > 0
+                                                        ? "#107c10"
+                                                        : "#555",
+                                            }}
+                                        >
+                                            {s.maxDedicatedNodes}
+                                        </td>
+                                    </tr>
+                                ))}
+                            </tbody>
+                        </table>
+                    </div>
+
+                    <Stack
+                        horizontal
+                        tokens={{ childrenGap: 8 }}
+                        verticalAlign="center"
+                    >
+                        <PrimaryButton
+                            text={`Auto-Create Pools (${selectedIndices.size})`}
+                            iconProps={{ iconName: "Add" }}
+                            onClick={handleAutoCreate}
+                            disabled={selectedIndices.size === 0 || creating}
+                        />
+                        {creating && <Spinner size={SpinnerSize.small} />}
+                        <Text
+                            variant="small"
+                            styles={{ root: { color: "#888" } }}
+                        >
+                            {selectedIndices.size} of {suggestions.length}{" "}
+                            selected
+                        </Text>
+                    </Stack>
+                </>
+            )}
+
+            {suggestions.length === 0 &&
+                !detecting &&
+                state.accountInfos.length > 0 && (
+                    <Text variant="small" styles={{ root: { color: "#666" } }}>
+                        Click "Detect Unused Quota" to find accounts with
+                        available cores for new GPU pools.
+                    </Text>
+                )}
+
+            {state.accountInfos.length === 0 && (
+                <Text variant="small" styles={{ root: { color: "#666" } }}>
+                    Refresh account info first to detect unused quota.
+                </Text>
+            )}
+        </div>
+    );
+};
+
 // --- Main Overview Page ---
 
 export interface OverviewPageProps {
@@ -504,6 +873,9 @@ export const OverviewPage: React.FC<OverviewPageProps> = ({
                     </>
                 )}
             </div>
+
+            {/* Unused Quota */}
+            <UnusedQuotaSection orchestrator={orchestrator} />
 
             {/* Agent Status */}
             <AgentStatusStrip />

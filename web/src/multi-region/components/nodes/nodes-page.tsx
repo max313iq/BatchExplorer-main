@@ -14,10 +14,11 @@ import { ProgressIndicator } from "@fluentui/react/lib/ProgressIndicator";
 import { Checkbox } from "@fluentui/react/lib/Checkbox";
 import { Toggle } from "@fluentui/react/lib/Toggle";
 import { Text } from "@fluentui/react/lib/Text";
+import { Dropdown, IDropdownOption } from "@fluentui/react/lib/Dropdown";
 import { useMultiRegionState } from "../../store/store-context";
 import { OrchestratorAgent } from "../../agents/orchestrator-agent";
 import { StatusBadge } from "../shared/status-badge";
-import { ManagedNode } from "../../store/store-types";
+import { ManagedNode, NodeState } from "../../store/store-types";
 
 interface NodesPageProps {
     orchestrator: OrchestratorAgent;
@@ -25,13 +26,26 @@ interface NodesPageProps {
 
 const stackTokens: IStackTokens = { childrenGap: 12 };
 
-const NON_WORKING_STATES = new Set([
-    "unusable",
+const ALL_NODE_STATES: NodeState[] = [
+    "idle",
+    "running",
+    "creating",
+    "leavingpool",
+    "rebooting",
+    "reimaging",
+    "starting",
     "starttaskfailed",
-    "offline",
-    "preempted",
     "unknown",
-]);
+    "unusable",
+    "offline",
+    "waitingforstarttask",
+    "preempted",
+];
+
+const NODE_STATE_OPTIONS: IDropdownOption[] = ALL_NODE_STATES.map((s) => ({
+    key: s,
+    text: s,
+}));
 
 type NodeActionType =
     | "reboot"
@@ -41,6 +55,7 @@ type NodeActionType =
     | "enableScheduling";
 
 const AUTO_REFRESH_INTERVAL_MS = 30_000;
+const AUTO_RECOVERY_INTERVAL_MS = 60_000;
 
 export const NodesPage: React.FC<NodesPageProps> = ({ orchestrator }) => {
     const state = useMultiRegionState();
@@ -51,10 +66,12 @@ export const NodesPage: React.FC<NodesPageProps> = ({ orchestrator }) => {
         new Set()
     );
     const [selectAll, setSelectAll] = React.useState(false);
-    const [filterNonWorking, setFilterNonWorking] = React.useState(false);
-    const [filterPreempted, setFilterPreempted] = React.useState(false);
+    const [selectedStates, setSelectedStates] = React.useState<string[]>(
+        ALL_NODE_STATES.slice()
+    );
     const [filterLowPriority, setFilterLowPriority] = React.useState(false);
     const [autoRefresh, setAutoRefresh] = React.useState(false);
+    const [autoRecovery, setAutoRecovery] = React.useState(false);
 
     const createdAccounts = state.accounts.filter(
         (a) => a.provisioningState === "created"
@@ -111,17 +128,15 @@ export const NodesPage: React.FC<NodesPageProps> = ({ orchestrator }) => {
     // --- Filtered display nodes ---
     const displayNodes = React.useMemo(() => {
         let nodes = state.nodes;
-        if (filterNonWorking) {
-            nodes = nodes.filter((n) => NON_WORKING_STATES.has(n.state));
-        }
-        if (filterPreempted) {
-            nodes = nodes.filter((n) => n.state === "preempted");
+        const stateSet = new Set(selectedStates);
+        if (stateSet.size < ALL_NODE_STATES.length) {
+            nodes = nodes.filter((n) => stateSet.has(n.state));
         }
         if (filterLowPriority) {
             nodes = nodes.filter((n) => !n.isDedicated);
         }
         return nodes;
-    }, [state.nodes, filterNonWorking, filterPreempted, filterLowPriority]);
+    }, [state.nodes, selectedStates, filterLowPriority]);
 
     const selection = React.useMemo(() => {
         const sel = new Selection({
@@ -159,6 +174,26 @@ export const NodesPage: React.FC<NodesPageProps> = ({ orchestrator }) => {
         }, AUTO_REFRESH_INTERVAL_MS);
         return () => clearInterval(interval);
     }, [autoRefresh, handleRefreshNodes]);
+
+    // --- Auto-recovery timer ---
+    React.useEffect(() => {
+        if (!autoRecovery) return;
+        const interval = setInterval(async () => {
+            const preemptedNodes = state.nodes.filter(
+                (n) => n.state === "preempted"
+            );
+            if (preemptedNodes.length === 0) return;
+            try {
+                await orchestrator.execute({
+                    action: "recover_preempted",
+                    payload: {},
+                });
+            } catch {
+                // Silently fail for auto-recovery; logs are written by the orchestrator
+            }
+        }, AUTO_RECOVERY_INTERVAL_MS);
+        return () => clearInterval(interval);
+    }, [autoRecovery, orchestrator, state.nodes]);
 
     const handleNodeAction = React.useCallback(
         async (action: NodeActionType) => {
@@ -198,6 +233,109 @@ export const NodesPage: React.FC<NodesPageProps> = ({ orchestrator }) => {
             }
         },
         [orchestrator, selectedNodeIds, selectAll, displayNodes]
+    );
+
+    // --- Bulk delete (grouped by pool) ---
+    const handleDeleteNodes = React.useCallback(async () => {
+        const ids = selectAll
+            ? displayNodes.map((n) => n.id)
+            : Array.from(selectedNodeIds);
+        if (ids.length === 0) return;
+
+        // Count unique pools
+        const poolSet = new Set<string>();
+        for (const id of ids) {
+            const node = state.nodes.find((n) => n.id === id);
+            if (node) poolSet.add(`${node.accountName}/${node.poolId}`);
+        }
+
+        const confirmed = window.confirm(
+            `Delete ${ids.length} nodes from ${poolSet.size} pool(s)?`
+        );
+        if (!confirmed) return;
+
+        setIsActing(true);
+        setError(null);
+        try {
+            await orchestrator.execute({
+                action: "delete_nodes",
+                payload: { nodeIds: ids },
+            });
+        } catch (err: any) {
+            setError(err?.message ?? String(err));
+        } finally {
+            setIsActing(false);
+        }
+    }, [orchestrator, selectedNodeIds, selectAll, displayNodes, state.nodes]);
+
+    // --- Recreate nodes ---
+    const handleRecreateNodes = React.useCallback(async () => {
+        const ids = selectAll
+            ? displayNodes.map((n) => n.id)
+            : Array.from(selectedNodeIds);
+        if (ids.length === 0) return;
+
+        const confirmed = window.confirm(
+            `Recreate ${ids.length} node(s)? Nodes will be removed and pool targets restored to trigger fresh allocation.`
+        );
+        if (!confirmed) return;
+
+        setIsActing(true);
+        setError(null);
+        try {
+            await orchestrator.execute({
+                action: "recreate_nodes",
+                payload: { nodeIds: ids },
+            });
+        } catch (err: any) {
+            setError(err?.message ?? String(err));
+        } finally {
+            setIsActing(false);
+        }
+    }, [orchestrator, selectedNodeIds, selectAll, displayNodes]);
+
+    // --- Recover preempted ---
+    const handleRecoverPreempted = React.useCallback(async () => {
+        const preemptedCount = state.nodes.filter(
+            (n) => n.state === "preempted"
+        ).length;
+        if (preemptedCount === 0) {
+            setError("No preempted nodes to recover.");
+            return;
+        }
+
+        const confirmed = window.confirm(
+            `Recover ${preemptedCount} preempted node(s)? This will re-request low-priority capacity for affected pools.`
+        );
+        if (!confirmed) return;
+
+        setIsActing(true);
+        setError(null);
+        try {
+            await orchestrator.execute({
+                action: "recover_preempted",
+                payload: {},
+            });
+        } catch (err: any) {
+            setError(err?.message ?? String(err));
+        } finally {
+            setIsActing(false);
+        }
+    }, [orchestrator, state.nodes]);
+
+    // --- Handle state filter dropdown ---
+    const handleStateFilterChange = React.useCallback(
+        (_event: React.FormEvent<HTMLDivElement>, option?: IDropdownOption) => {
+            if (!option) return;
+            setSelectedStates((prev) => {
+                if (option.selected) {
+                    return [...prev, option.key as string];
+                } else {
+                    return prev.filter((s) => s !== option.key);
+                }
+            });
+        },
+        []
     );
 
     // --- Columns ---
@@ -378,6 +516,13 @@ export const NodesPage: React.FC<NodesPageProps> = ({ orchestrator }) => {
                         onChange={(_, checked) => setAutoRefresh(!!checked)}
                         styles={{ root: { marginBottom: 0 } }}
                     />
+                    <Toggle
+                        label="Auto-Recovery (60s)"
+                        inlineLabel
+                        checked={autoRecovery}
+                        onChange={(_, checked) => setAutoRecovery(!!checked)}
+                        styles={{ root: { marginBottom: 0 } }}
+                    />
                 </Stack>
 
                 {error && (
@@ -507,7 +652,7 @@ export const NodesPage: React.FC<NodesPageProps> = ({ orchestrator }) => {
                 <Stack
                     horizontal
                     tokens={{ childrenGap: 12 }}
-                    verticalAlign="center"
+                    verticalAlign="end"
                     wrap
                 >
                     <PrimaryButton
@@ -532,17 +677,17 @@ export const NodesPage: React.FC<NodesPageProps> = ({ orchestrator }) => {
                             }}
                         />
                     )}
-                    <Checkbox
-                        label="Show non-working only"
-                        checked={filterNonWorking}
-                        onChange={(_, checked) =>
-                            setFilterNonWorking(!!checked)
-                        }
-                    />
-                    <Checkbox
-                        label="Show preempted only"
-                        checked={filterPreempted}
-                        onChange={(_, checked) => setFilterPreempted(!!checked)}
+                    <Dropdown
+                        placeholder="Filter by state"
+                        label="Node States"
+                        selectedKeys={selectedStates}
+                        onChange={handleStateFilterChange}
+                        multiSelect
+                        options={NODE_STATE_OPTIONS}
+                        styles={{
+                            dropdown: { minWidth: 200, maxWidth: 300 },
+                            root: { minWidth: 200 },
+                        }}
                     />
                     <Checkbox
                         label="Show low-priority only"
@@ -550,6 +695,7 @@ export const NodesPage: React.FC<NodesPageProps> = ({ orchestrator }) => {
                         onChange={(_, checked) =>
                             setFilterLowPriority(!!checked)
                         }
+                        styles={{ root: { marginTop: 24 } }}
                     />
                     <Checkbox
                         label={`Select all (${displayNodes.length})`}
@@ -564,6 +710,7 @@ export const NodesPage: React.FC<NodesPageProps> = ({ orchestrator }) => {
                                 setSelectedNodeIds(new Set());
                             }
                         }}
+                        styles={{ root: { marginTop: 24 } }}
                     />
                 </Stack>
 
@@ -594,14 +741,38 @@ export const NodesPage: React.FC<NodesPageProps> = ({ orchestrator }) => {
                         iconProps={{ iconName: "Play" }}
                     />
                     <DefaultButton
-                        text={`Delete (${actionCount})`}
-                        onClick={() => handleNodeAction("delete")}
+                        text={`Delete Nodes (${actionCount})`}
+                        onClick={handleDeleteNodes}
                         disabled={isActing || actionCount === 0}
                         iconProps={{ iconName: "Delete" }}
                         styles={{
                             root: {
                                 borderColor: "#a80000",
                                 color: "#a80000",
+                            },
+                        }}
+                    />
+                    <DefaultButton
+                        text={`Recreate Nodes (${actionCount})`}
+                        onClick={handleRecreateNodes}
+                        disabled={isActing || actionCount === 0}
+                        iconProps={{ iconName: "SyncOccurence" }}
+                        styles={{
+                            root: {
+                                borderColor: "#8764b8",
+                                color: "#8764b8",
+                            },
+                        }}
+                    />
+                    <DefaultButton
+                        text={`Recover Preempted (${summaryStats.preemptedCount})`}
+                        onClick={handleRecoverPreempted}
+                        disabled={isActing || summaryStats.preemptedCount === 0}
+                        iconProps={{ iconName: "Heart" }}
+                        styles={{
+                            root: {
+                                borderColor: "#d13438",
+                                color: "#d13438",
                             },
                         }}
                     />
@@ -619,11 +790,13 @@ export const NodesPage: React.FC<NodesPageProps> = ({ orchestrator }) => {
 
                 <div style={{ fontSize: 13, color: "#605e5c" }}>
                     {displayNodes.length} nodes
-                    {filterNonWorking ? " (non-working only)" : ""}
-                    {filterPreempted ? " (preempted only)" : ""}
+                    {selectedStates.length < ALL_NODE_STATES.length
+                        ? ` (filtered: ${selectedStates.join(", ")})`
+                        : ""}
                     {filterLowPriority ? " (low-priority only)" : ""}
                     {" | "}
                     {actionCount} selected
+                    {autoRecovery ? " | Auto-recovery ON" : ""}
                 </div>
 
                 {displayNodes.length > 0 ? (

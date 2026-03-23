@@ -4,6 +4,7 @@ import { DefaultButton, IconButton } from "@fluentui/react/lib/Button";
 import { Dropdown, IDropdownOption } from "@fluentui/react/lib/Dropdown";
 import { Stack } from "@fluentui/react/lib/Stack";
 import { Text } from "@fluentui/react/lib/Text";
+import { Toggle } from "@fluentui/react/lib/Toggle";
 import {
     MultiRegionStoreProvider,
     useMultiRegionState,
@@ -26,6 +27,7 @@ import { NodesPage } from "./nodes/nodes-page";
 import { PoolInfoPage } from "./pool-info/pool-info-page";
 import { AccountInfoPage } from "./account-info/account-info-page";
 import { AgentLogPanel } from "./shared/agent-log-panel";
+import { ActivityPanel } from "./shared/activity-panel";
 
 const DEFAULT_SCHEDULER_OPTIONS = {
     concurrency: 1,
@@ -77,15 +79,91 @@ async function getBatchAccessTokenFromCli(): Promise<string> {
     return _cachedBatchToken.accessToken;
 }
 
-async function checkAuthStatus(): Promise<boolean> {
+interface HealthCheckResult {
+    healthy: boolean;
+    error: string | null;
+}
+
+async function performHealthCheck(): Promise<HealthCheckResult> {
+    // Step 1: Check Azure CLI login
     try {
-        const res = await fetch("/api/auth/status");
-        if (!res.ok) return false;
-        const data = await res.json();
-        return data.loggedIn === true;
+        const authRes = await fetch("/api/auth/status");
+        if (!authRes.ok) {
+            return {
+                healthy: false,
+                error: "Cannot reach auth service. Is the proxy server running?",
+            };
+        }
+        const authData = await authRes.json();
+        if (authData.loggedIn !== true) {
+            return {
+                healthy: false,
+                error: "Azure CLI not logged in. Run `az login` then retry.",
+            };
+        }
     } catch {
-        return false;
+        return {
+            healthy: false,
+            error: "Cannot reach auth service. Is the proxy server running?",
+        };
     }
+
+    // Step 2: Check ARM token
+    try {
+        const armRes = await fetch("/api/token");
+        if (!armRes.ok) {
+            return {
+                healthy: false,
+                error: "Failed to acquire ARM token. Run `az login` to refresh credentials.",
+            };
+        }
+    } catch {
+        return {
+            healthy: false,
+            error: "Failed to acquire ARM token. Network error.",
+        };
+    }
+
+    // Step 3: Check Batch token
+    try {
+        const batchRes = await fetch("/api/token/batch");
+        if (!batchRes.ok) {
+            return {
+                healthy: false,
+                error: "Failed to acquire Batch token. Ensure your account has Batch service access.",
+            };
+        }
+    } catch {
+        return {
+            healthy: false,
+            error: "Failed to acquire Batch token. Network error.",
+        };
+    }
+
+    // Step 4: Check subscriptions
+    try {
+        const subsRes = await fetch("/api/subscriptions");
+        if (!subsRes.ok) {
+            return {
+                healthy: false,
+                error: "Failed to list subscriptions. Your account may not have any subscriptions.",
+            };
+        }
+        const subs = await subsRes.json();
+        if (!Array.isArray(subs) || subs.length === 0) {
+            return {
+                healthy: false,
+                error: "No Azure subscriptions found. Ensure your account has at least one active subscription.",
+            };
+        }
+    } catch {
+        return {
+            healthy: false,
+            error: "Failed to list subscriptions. Network error.",
+        };
+    }
+
+    return { healthy: true, error: null };
 }
 
 async function loadSubscriptions(store: MultiRegionStore): Promise<void> {
@@ -128,17 +206,17 @@ function exportSession(store: MultiRegionStore): void {
 // --- Auth Banner ---
 
 const AuthBanner: React.FC<{
-    loggedIn: boolean | null;
+    healthCheck: HealthCheckResult | null;
     onRetry: () => void;
-}> = ({ loggedIn, onRetry }) => {
-    if (loggedIn === null) {
+}> = ({ healthCheck, onRetry }) => {
+    if (healthCheck === null) {
         return (
             <MessageBar messageBarType={MessageBarType.info}>
-                Checking Azure CLI login status...
+                Running health check...
             </MessageBar>
         );
     }
-    if (!loggedIn) {
+    if (!healthCheck.healthy) {
         return (
             <MessageBar
                 messageBarType={MessageBarType.severeWarning}
@@ -154,18 +232,7 @@ const AuthBanner: React.FC<{
                     />
                 }
             >
-                <b>Azure CLI not logged in.</b> Run{" "}
-                <code
-                    style={{
-                        background: "#333",
-                        padding: "2px 6px",
-                        borderRadius: 3,
-                        color: "#eee",
-                    }}
-                >
-                    az login
-                </code>{" "}
-                then click Retry.
+                <b>Health check failed.</b> {healthCheck.error}
             </MessageBar>
         );
     }
@@ -339,11 +406,14 @@ const PageContent: React.FC<{
 
 const DashboardContent: React.FC = () => {
     const store = useMultiRegionStore();
-    const [loggedIn, setLoggedIn] = React.useState<boolean | null>(null);
+    const [healthCheck, setHealthCheck] =
+        React.useState<HealthCheckResult | null>(null);
     const [activePage, setActivePage] = React.useState<PageKey>("overview");
     const [sidebarCollapsed, setSidebarCollapsed] = React.useState(
         () => store.getUserPreferences().sidebarCollapsed
     );
+    const [autoRefreshEnabled, setAutoRefreshEnabled] = React.useState(true);
+    const autoRefreshRunningRef = React.useRef(false);
 
     const orchestrator = React.useMemo(
         () => new OrchestratorAgent(createAgentContext(store)),
@@ -351,10 +421,10 @@ const DashboardContent: React.FC = () => {
     );
 
     const checkLogin = React.useCallback(async () => {
-        setLoggedIn(null);
-        const ok = await checkAuthStatus();
-        setLoggedIn(ok);
-        if (ok) loadSubscriptions(store);
+        setHealthCheck(null);
+        const result = await performHealthCheck();
+        setHealthCheck(result);
+        if (result.healthy) loadSubscriptions(store);
     }, [store]);
 
     // Auto-save
@@ -375,12 +445,49 @@ const DashboardContent: React.FC = () => {
                             subscriptionId: prefs.lastSubscriptionId,
                         },
                     });
+                    // Chain: refresh pool info then account info after discover
+                    await orchestrator.execute({
+                        action: "refresh_pool_info",
+                        payload: {},
+                    });
+                    await orchestrator.execute({
+                        action: "refresh_account_info",
+                        payload: {},
+                    });
                 } catch {
                     /* silent */
                 }
             }
         });
     }, [checkLogin, orchestrator, store]);
+
+    // Periodic auto-refresh (60s interval)
+    React.useEffect(() => {
+        if (!autoRefreshEnabled) return;
+
+        const interval = setInterval(async () => {
+            if (autoRefreshRunningRef.current) return;
+            if (store.getState().accounts.length === 0) return;
+
+            autoRefreshRunningRef.current = true;
+            try {
+                await orchestrator.execute({
+                    action: "refresh_pool_info",
+                    payload: {},
+                });
+                await orchestrator.execute({
+                    action: "refresh_account_info",
+                    payload: {},
+                });
+            } catch {
+                /* silent */
+            } finally {
+                autoRefreshRunningRef.current = false;
+            }
+        }, 60000);
+
+        return () => clearInterval(interval);
+    }, [autoRefreshEnabled, orchestrator, store]);
 
     const handleToggleSidebar = React.useCallback(() => {
         setSidebarCollapsed((c) => {
@@ -394,7 +501,32 @@ const DashboardContent: React.FC = () => {
             style={{ display: "flex", flexDirection: "column", height: "100%" }}
         >
             <SessionBar store={store} />
-            <AuthBanner loggedIn={loggedIn} onRetry={checkLogin} />
+            <Stack
+                horizontal
+                verticalAlign="center"
+                tokens={{ childrenGap: 8 }}
+                styles={{
+                    root: {
+                        padding: "2px 12px",
+                        background: "#1e1e1e",
+                        borderBottom: "1px solid #2a2a2a",
+                    },
+                }}
+            >
+                <Toggle
+                    label="Auto-refresh (60s)"
+                    inlineLabel
+                    checked={autoRefreshEnabled}
+                    onChange={(_e, checked) =>
+                        setAutoRefreshEnabled(checked ?? false)
+                    }
+                    styles={{
+                        root: { marginBottom: 0 },
+                        label: { color: "#999", fontSize: 11 },
+                    }}
+                />
+            </Stack>
+            <AuthBanner healthCheck={healthCheck} onRetry={checkLogin} />
             <div style={{ display: "flex", flex: 1, overflow: "hidden" }}>
                 <SidebarNav
                     activeKey={activePage}
@@ -427,6 +559,7 @@ const DashboardContent: React.FC = () => {
                     </div>
                 </div>
             </div>
+            <ActivityPanel />
             <AgentLogPanel />
             <ToastContainer />
         </div>

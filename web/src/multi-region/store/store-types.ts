@@ -119,6 +119,26 @@ export interface GlobalFilter {
     searchText: string;
 }
 
+// --- Activities ---
+
+export type ActivityStatus =
+    | "pending"
+    | "running"
+    | "completed"
+    | "failed"
+    | "cancelled";
+
+export interface Activity {
+    id: string;
+    action: string;
+    target: string;
+    status: ActivityStatus;
+    progress?: number;
+    startedAt: string;
+    completedAt?: string;
+    error?: string;
+}
+
 // --- Toast Notifications ---
 
 export interface ToastNotification {
@@ -160,6 +180,7 @@ export interface UserPreferences {
     lastSupportPlanId: string;
     lastPoolConfig: string;
     sidebarCollapsed: boolean;
+    autoRecoveryEnabled: boolean;
 }
 
 export const DEFAULT_USER_PREFERENCES: UserPreferences = {
@@ -171,6 +192,7 @@ export const DEFAULT_USER_PREFERENCES: UserPreferences = {
     lastSupportPlanId: "",
     lastPoolConfig: "",
     sidebarCollapsed: false,
+    autoRecoveryEnabled: false,
 };
 
 // --- Pool Info (rich detail from Batch data-plane) ---
@@ -194,6 +216,7 @@ export interface PoolInfo {
     resizeErrors?: string[];
     lastModified?: string;
     creationTime?: string;
+    startTask?: Record<string, unknown>;
 }
 
 // --- Account Info (quotas + computed usage) ---
@@ -217,6 +240,28 @@ export interface AccountInfo {
     dedicatedCoresFree: number;
     lowPriorityCoresFree: number;
     poolsFree: number;
+    // Per-VM-family quota enforcement
+    dedicatedCoreQuotaPerVMFamilyEnforced: boolean;
+    dedicatedCoreQuotaPerVMFamily?: Array<{
+        name: string;
+        coreQuota: number;
+        coresUsed: number;
+        coresFree: number;
+    }>;
+}
+
+// --- Quota Suggestions ---
+
+export interface QuotaSuggestion {
+    accountId: string;
+    accountName: string;
+    region: string;
+    freeLpCores: number;
+    freeDedicatedCores: number;
+    vmSize: string;
+    vmSizeVCpus: number;
+    maxLpNodes: number;
+    maxDedicatedNodes: number;
 }
 
 // --- Main State ---
@@ -235,6 +280,7 @@ export interface MultiRegionState {
     globalFilter: GlobalFilter;
     notifications: ToastNotification[];
     workflow: WorkflowState;
+    activities: Activity[];
 }
 
 export const DEFAULT_GLOBAL_FILTER: GlobalFilter = {
@@ -277,5 +323,6 @@ export function createInitialState(): MultiRegionState {
         globalFilter: { ...DEFAULT_GLOBAL_FILTER },
         notifications: [],
         workflow: { ...DEFAULT_WORKFLOW_STATE },
+        activities: [],
     };
 }

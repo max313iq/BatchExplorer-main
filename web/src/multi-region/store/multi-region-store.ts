@@ -1,5 +1,6 @@
 import {
     AccountInfo,
+    Activity,
     AgentLogEntry,
     AgentName,
     AgentStatus,
@@ -251,6 +252,50 @@ export class MultiRegionStore {
         this._state = {
             ...this._state,
             notifications: this._state.notifications.filter((n) => n.id !== id),
+        };
+        this._notify();
+    }
+
+    // --- Activities ---
+
+    addActivity(activity: Omit<Activity, "id" | "startedAt">): string {
+        const id =
+            Math.random().toString(36).substring(2, 10) +
+            Math.random().toString(36).substring(2, 10);
+        const newActivity: Activity = {
+            ...activity,
+            id,
+            startedAt: new Date().toISOString(),
+        };
+        const activities = [...this._state.activities, newActivity];
+        // Keep max 100 activities
+        this._state = {
+            ...this._state,
+            activities: activities.slice(-100),
+        };
+        this._notify();
+        return id;
+    }
+
+    updateActivity(id: string, patch: Partial<Activity>): void {
+        this._state = {
+            ...this._state,
+            activities: this._state.activities.map((a) =>
+                a.id === id ? { ...a, ...patch } : a
+            ),
+        };
+        this._notify();
+    }
+
+    clearCompletedActivities(): void {
+        this._state = {
+            ...this._state,
+            activities: this._state.activities.filter(
+                (a) =>
+                    a.status !== "completed" &&
+                    a.status !== "failed" &&
+                    a.status !== "cancelled"
+            ),
         };
         this._notify();
     }

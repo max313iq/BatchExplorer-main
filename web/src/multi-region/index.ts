@@ -40,3 +40,14 @@ export { LoadingSkeleton } from "./components/shared/loading-skeleton";
 // Constants & Helpers
 export { AZURE_REGIONS } from "./components/shared/constants";
 export { getActionableErrorMessage } from "./components/shared/error-helpers";
+
+// VM Sizes
+export type { VmSizeInfo } from "./components/shared/vm-sizes";
+export {
+    getVmSizeInfo,
+    getVCpus,
+    getMaxNodes,
+    getGpuVmSizes,
+    getVmFamilyName,
+    getAllVmSizes,
+} from "./components/shared/vm-sizes";

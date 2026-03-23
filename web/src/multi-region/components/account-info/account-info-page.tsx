@@ -11,6 +11,7 @@ import { Text } from "@fluentui/react/lib/Text";
 import { Toggle } from "@fluentui/react/lib/Toggle";
 import { Spinner, SpinnerSize } from "@fluentui/react/lib/Spinner";
 import { Icon } from "@fluentui/react/lib/Icon";
+import { TooltipHost, DirectionalHint } from "@fluentui/react/lib/Tooltip";
 import { useMultiRegionState } from "../../store/store-context";
 import { OrchestratorAgent } from "../../agents/orchestrator-agent";
 import { AccountInfo } from "../../store/store-types";
@@ -164,14 +165,104 @@ export const AccountInfoPage: React.FC<AccountInfoPageProps> = ({
                 key: "dedicatedCores",
                 name: "Dedicated Cores",
                 minWidth: 110,
-                maxWidth: 140,
+                maxWidth: 160,
                 isResizable: true,
-                onRender: (item: AccountInfo) => (
-                    <UsageBar
-                        used={item.dedicatedCoresUsed}
-                        quota={item.dedicatedCoreQuota}
-                    />
-                ),
+                onRender: (item: AccountInfo) => {
+                    const bar = (
+                        <UsageBar
+                            used={item.dedicatedCoresUsed}
+                            quota={item.dedicatedCoreQuota}
+                        />
+                    );
+                    if (
+                        !item.dedicatedCoreQuotaPerVMFamilyEnforced ||
+                        !item.dedicatedCoreQuotaPerVMFamily ||
+                        item.dedicatedCoreQuotaPerVMFamily.length === 0
+                    ) {
+                        return bar;
+                    }
+                    const tooltipContent = (
+                        <div style={{ padding: 4, maxWidth: 300 }}>
+                            <div
+                                style={{
+                                    fontWeight: 600,
+                                    marginBottom: 6,
+                                    fontSize: 12,
+                                    color: "#eee",
+                                }}
+                            >
+                                Per-VM Family Quota
+                            </div>
+                            {item.dedicatedCoreQuotaPerVMFamily.map((fq) => (
+                                <div
+                                    key={fq.name}
+                                    style={{
+                                        display: "flex",
+                                        justifyContent: "space-between",
+                                        fontSize: 11,
+                                        padding: "2px 0",
+                                        color:
+                                            fq.coreQuota > 0 ? "#ccc" : "#666",
+                                    }}
+                                >
+                                    <span>{fq.name}</span>
+                                    <span
+                                        style={{
+                                            color: usageColor(
+                                                fq.coresUsed,
+                                                fq.coreQuota
+                                            ),
+                                            fontWeight: 600,
+                                            marginLeft: 12,
+                                        }}
+                                    >
+                                        {fq.coresUsed} / {fq.coreQuota}
+                                    </span>
+                                </div>
+                            ))}
+                        </div>
+                    );
+                    return (
+                        <TooltipHost
+                            content={tooltipContent}
+                            directionalHint={DirectionalHint.bottomLeftEdge}
+                            calloutProps={{
+                                styles: {
+                                    root: {
+                                        background: "#252525",
+                                    },
+                                    beak: {
+                                        background: "#252525",
+                                    },
+                                    beakCurtain: {
+                                        background: "#252525",
+                                    },
+                                    calloutMain: {
+                                        background: "#252525",
+                                    },
+                                },
+                            }}
+                        >
+                            <Stack
+                                horizontal
+                                verticalAlign="center"
+                                tokens={{ childrenGap: 4 }}
+                            >
+                                {bar}
+                                <Icon
+                                    iconName="Info"
+                                    styles={{
+                                        root: {
+                                            fontSize: 10,
+                                            color: "#0078d4",
+                                            cursor: "pointer",
+                                        },
+                                    }}
+                                />
+                            </Stack>
+                        </TooltipHost>
+                    );
+                },
             },
             {
                 key: "lowPriorityCores",
