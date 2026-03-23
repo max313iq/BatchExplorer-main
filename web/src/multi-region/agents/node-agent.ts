@@ -112,17 +112,26 @@ export class NodeAgent implements Agent {
         const { store, scheduler, getBatchAccessToken } = this._ctx;
         this._cancelled = false;
 
+        // Auto-discover: if no accountIds provided, use ALL created accounts from store
+        let accountIds = input.accountIds;
+        if (!accountIds || accountIds.length === 0) {
+            accountIds = store
+                .getState()
+                .accounts.filter((a) => a.provisioningState === "created")
+                .map((a) => a.id);
+        }
+
         store.setAgentStatus("node", "running");
         store.addLog({
             agent: "node",
             level: "info",
-            message: `Listing nodes across ${input.accountIds.length} accounts`,
+            message: `Listing nodes across ${accountIds.length} accounts`,
         });
 
         const allNodes: ManagedNode[] = [];
         let errors = 0;
 
-        for (const accountId of input.accountIds) {
+        for (const accountId of accountIds) {
             if (this._cancelled) break;
 
             const state = store.getState();

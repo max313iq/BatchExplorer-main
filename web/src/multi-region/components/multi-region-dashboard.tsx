@@ -438,35 +438,46 @@ const DashboardContent: React.FC = () => {
     // Auto-save
     React.useEffect(() => store.enableAutoSave(), [store]);
 
-    // Check auth + auto-discover on mount
+    // Auto-discover ALL resources on mount: accounts → pools → quotas → nodes
     React.useEffect(() => {
+        let cancelled = false;
         checkLogin().then(async () => {
-            const prefs = store.getUserPreferences();
-            if (
-                prefs.lastSubscriptionId &&
-                store.getState().accounts.length === 0
-            ) {
-                try {
-                    await orchestrator.execute({
-                        action: "discover_accounts",
-                        payload: {
-                            subscriptionId: prefs.lastSubscriptionId,
-                        },
-                    });
-                    // Chain: refresh pool info then account info after discover
-                    await orchestrator.execute({
+            if (cancelled) return;
+            try {
+                // Discover ALL accounts across ALL subscriptions
+                await orchestrator.execute({
+                    action: "discover_accounts",
+                    payload: {}, // empty = cross-subscription discovery
+                });
+                if (cancelled) return;
+
+                // Parallel: refresh pools + account info simultaneously
+                await Promise.all([
+                    orchestrator.execute({
                         action: "refresh_pool_info",
                         payload: {},
-                    });
-                    await orchestrator.execute({
+                    }),
+                    orchestrator.execute({
                         action: "refresh_account_info",
                         payload: {},
+                    }),
+                ]);
+                if (cancelled) return;
+
+                // Refresh nodes for all discovered pools
+                if (store.getState().poolInfos.length > 0) {
+                    await orchestrator.execute({
+                        action: "list_nodes",
+                        payload: {},
                     });
-                } catch {
-                    /* silent */
                 }
+            } catch {
+                /* silent — individual errors logged by agents */
             }
         });
+        return () => {
+            cancelled = true;
+        };
     }, [checkLogin, orchestrator, store]);
 
     // Periodic auto-refresh (60s interval)
@@ -479,14 +490,24 @@ const DashboardContent: React.FC = () => {
 
             autoRefreshRunningRef.current = true;
             try {
-                await orchestrator.execute({
-                    action: "refresh_pool_info",
-                    payload: {},
-                });
-                await orchestrator.execute({
-                    action: "refresh_account_info",
-                    payload: {},
-                });
+                // Parallel: pools + accounts
+                await Promise.all([
+                    orchestrator.execute({
+                        action: "refresh_pool_info",
+                        payload: {},
+                    }),
+                    orchestrator.execute({
+                        action: "refresh_account_info",
+                        payload: {},
+                    }),
+                ]);
+                // Then nodes
+                if (store.getState().poolInfos.length > 0) {
+                    await orchestrator.execute({
+                        action: "list_nodes",
+                        payload: {},
+                    });
+                }
             } catch {
                 /* silent */
             } finally {
