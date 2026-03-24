@@ -102,36 +102,35 @@ export interface MultiRegionDashboardProps {
 }
 
 async function performHealthCheck(): Promise<HealthCheckResult> {
-    // Entra ID only — no CLI fallback
-    const isAuth = await msalAuth.isAuthenticated();
-    if (!isAuth) {
-        return {
-            healthy: false,
-            error: "Not signed in. Click 'Sign in with Azure' to authenticate via Entra ID.",
-        };
-    }
+    // Entra ID only — check for active user first
     try {
+        const user = await msalAuth.getCurrentUser();
+        if (!user) {
+            return {
+                healthy: false,
+                error: "Not signed in. Click 'Sign in with Azure' to authenticate via Entra ID.",
+            };
+        }
+        // User exists — try to get tokens silently
         const armToken = await msalAuth.getArmToken();
         if (!armToken)
-            return {
-                healthy: false,
-                error: "Failed to acquire ARM token via Entra ID.",
-            };
+            return { healthy: false, error: "Failed to acquire ARM token." };
         const batchToken = await msalAuth.getBatchToken();
         if (!batchToken)
-            return {
-                healthy: false,
-                error: "Failed to acquire Batch token via Entra ID.",
-            };
+            return { healthy: false, error: "Failed to acquire Batch token." };
         const subs = await msalAuth.listSubscriptions();
         if (subs.length === 0)
             return { healthy: false, error: "No Azure subscriptions found." };
         return { healthy: true, error: null };
     } catch (e: any) {
-        return {
-            healthy: false,
-            error: e?.message ?? "Entra ID auth check failed.",
-        };
+        const msg = e?.message ?? String(e);
+        if (msg.includes("Not signed in") || msg.includes("no_account")) {
+            return {
+                healthy: false,
+                error: "Not signed in. Click 'Sign in with Azure' to authenticate via Entra ID.",
+            };
+        }
+        return { healthy: false, error: msg };
     }
 }
 
@@ -469,18 +468,27 @@ const DashboardContent: React.FC<{ tokenProvider?: TokenProvider }> = ({
         try {
             const account = await msalAuth.login();
             if (account) {
-                _authMode = "msal";
                 setCurrentAuthMode("msal");
                 setMsalUserName(
                     account.username ?? account.name ?? "Azure User"
                 );
-                // Re-run health check with new auth
-                checkLogin();
+                // Directly set healthy since we just logged in successfully
+                // Then load subscriptions and trigger discovery
+                setHealthCheck({ healthy: true, error: null });
+                try {
+                    await loadSubscriptions(store);
+                } catch {
+                    /* optional */
+                }
             }
         } catch (e: any) {
             console.error("Azure login failed:", e);
+            setHealthCheck({
+                healthy: false,
+                error: `Login failed: ${e?.message ?? "Unknown error"}`,
+            });
         }
-    }, [checkLogin]);
+    }, [store]);
 
     // Logout
     const handleLogout = React.useCallback(async () => {
