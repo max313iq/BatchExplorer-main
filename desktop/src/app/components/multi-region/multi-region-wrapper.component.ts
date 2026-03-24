@@ -7,7 +7,7 @@ import {
     ViewChild,
 } from "@angular/core";
 import * as React from "react";
-import * as ReactDOM from "react-dom/client";
+import * as ReactDOM from "react-dom";
 import { MultiRegionDashboard } from "multi-region";
 
 /**
@@ -41,19 +41,16 @@ import { MultiRegionDashboard } from "multi-region";
 export class MultiRegionWrapperComponent implements AfterViewInit, OnDestroy {
     @ViewChild("reactHost", { static: true }) hostRef!: ElementRef<HTMLDivElement>;
 
-    private _root: ReactDOM.Root | null = null;
-
     ngAfterViewInit(): void {
-        this._root = ReactDOM.createRoot(this.hostRef.nativeElement);
-        this._root.render(React.createElement(MultiRegionDashboard));
+        ReactDOM.render(
+            React.createElement(MultiRegionDashboard),
+            this.hostRef.nativeElement
+        );
     }
 
     ngOnDestroy(): void {
-        // Defer unmount to avoid React warning about synchronous unmount
-        if (this._root) {
-            const root = this._root;
-            this._root = null;
-            setTimeout(() => root.unmount(), 0);
+        if (this.hostRef?.nativeElement) {
+            ReactDOM.unmountComponentAtNode(this.hostRef.nativeElement);
         }
     }
 }

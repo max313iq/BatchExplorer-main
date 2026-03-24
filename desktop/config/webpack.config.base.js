@@ -22,7 +22,7 @@ const baseConfig = {
     },
 
     resolve: {
-        extensions: [".ts", ".js", ".json", ".scss", ".css", ".html"],
+        extensions: [".ts", ".tsx", ".js", ".jsx", ".json", ".scss", ".css", ".html"],
         modules: [helpers.root(), helpers.root("src"), "node_modules"],
         alias: {
             // Prevent duplicate copies of react from being resolved
@@ -42,7 +42,26 @@ const baseConfig = {
             {
                 test: /(?:\.ngfactory\.js|\.ngstyle\.js|\.ts)$/,
                 loader: '@ngtools/webpack',
-                exclude: [/\.spec\.ts/, /src\/test\//]
+                exclude: [/\.spec\.ts/, /src\/test\//, /\.tsx$/]
+            },
+            {
+                test: /\.tsx$/,
+                use: [
+                    {
+                        loader: 'ts-loader',
+                        options: {
+                            transpileOnly: true,
+                            compilerOptions: {
+                                jsx: 'react',
+                                module: 'esnext',
+                                moduleResolution: 'node',
+                                esModuleInterop: true,
+                                allowSyntheticDefaultImports: true,
+                            },
+                        },
+                    },
+                ],
+                exclude: [/node_modules/, /\.spec\.tsx?$/],
             },
             ...commonRules,
         ],
