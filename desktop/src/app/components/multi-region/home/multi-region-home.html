@@ -1,0 +1,68 @@
+<div class="multi-region-container">
+    <div class="sidebar">
+        <div class="sidebar-header">
+            <i class="fa fa-globe"></i> Multi-Region
+        </div>
+        <bl-clickable
+            routerLink="./"
+            routerLinkActive="active"
+            [routerLinkActiveOptions]="{exact: true}"
+        >
+            <i class="fa fa-home"></i> Overview
+        </bl-clickable>
+        <bl-clickable routerLink="./accounts" routerLinkActive="active">
+            <i class="fa fa-server"></i> Accounts
+            <span class="badge">{{accountCount}}</span>
+        </bl-clickable>
+        <bl-clickable routerLink="./account-info" routerLinkActive="active">
+            <i class="fa fa-info-circle"></i> Account Info
+            <span class="badge">{{quotaCount}}</span>
+        </bl-clickable>
+        <bl-clickable routerLink="./pools" routerLinkActive="active">
+            <i class="fa fa-plus-circle"></i> Pool Creation
+        </bl-clickable>
+        <bl-clickable routerLink="./pool-info" routerLinkActive="active">
+            <i class="fa fa-database"></i> Pool Info
+            <span class="badge">{{poolCount}}</span>
+        </bl-clickable>
+        <bl-clickable routerLink="./quotas" routerLinkActive="active">
+            <i class="fa fa-ticket"></i> Quota Requests
+        </bl-clickable>
+        <bl-clickable routerLink="./quota-status" routerLinkActive="active">
+            <i class="fa fa-check-circle"></i> Quota Status
+        </bl-clickable>
+        <bl-clickable routerLink="./unused-quota" routerLinkActive="active">
+            <i class="fa fa-exclamation-triangle"></i> Unused Quota
+        </bl-clickable>
+        <bl-clickable routerLink="./nodes" routerLinkActive="active">
+            <i class="fa fa-desktop"></i> Nodes
+            <span class="badge">{{nodeCount}}</span>
+        </bl-clickable>
+    </div>
+    <div class="main-area">
+        <div class="session-bar">
+            <span class="session-id">Session: {{sessionId}}</span>
+            <span class="session-stats">
+                <span class="stat">Accounts: {{accountCount}}</span>
+                <span class="stat">Pools: {{poolCount}}</span>
+                <span class="stat">Nodes: {{nodeCount}}</span>
+            </span>
+            <span class="session-actions">
+                <bl-clickable
+                    (do)="toggleAutoRefresh()"
+                    [class.active]="autoRefreshEnabled"
+                >
+                    <i
+                        class="fa"
+                        [class.fa-pause]="autoRefreshEnabled"
+                        [class.fa-play]="!autoRefreshEnabled"
+                    ></i>
+                    Auto-Refresh {{autoRefreshEnabled ? 'ON' : 'OFF'}}
+                </bl-clickable>
+            </span>
+        </div>
+        <div class="content">
+            <router-outlet></router-outlet>
+        </div>
+    </div>
+</div>

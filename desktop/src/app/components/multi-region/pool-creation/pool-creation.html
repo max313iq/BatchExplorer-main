@@ -1,0 +1,111 @@
+<div class="pool-creation-page">
+    <div class="page-header">
+        <h2>Smart Pool Creation</h2>
+    </div>
+
+    <div class="form-section">
+        <h3>VM Sizes (GPU)</h3>
+        <div class="vm-size-grid">
+            <bl-clickable
+                *ngFor="let vm of availableVmSizes"
+                (do)="toggleVmSize(vm)"
+                [class.active]="isVmSizeSelected(vm)"
+                class="vm-size-chip"
+            >
+                <i
+                    class="fa"
+                    [class.fa-check-square-o]="isVmSizeSelected(vm)"
+                    [class.fa-square-o]="!isVmSizeSelected(vm)"
+                ></i>
+                {{vm}}
+            </bl-clickable>
+        </div>
+    </div>
+
+    <div class="form-section">
+        <h3>Start Task</h3>
+        <div class="form-field">
+            <label>Command Line</label>
+            <input
+                type="text"
+                [(ngModel)]="startTaskCommand"
+                placeholder="/bin/bash -c 'echo hello'"
+                class="form-control"
+            />
+        </div>
+    </div>
+
+    <div class="form-section">
+        <h3>Environment Variables</h3>
+        <div class="env-var-row" *ngFor="let envVar of envVars; let i = index">
+            <input
+                type="text"
+                [(ngModel)]="envVar.name"
+                placeholder="Name"
+                class="form-control env-name"
+            />
+            <input
+                type="text"
+                [(ngModel)]="envVar.value"
+                placeholder="Value"
+                class="form-control env-value"
+            />
+            <bl-clickable (do)="removeEnvVar(i)" title="Remove">
+                <i class="fa fa-times"></i>
+            </bl-clickable>
+        </div>
+        <button mat-button (click)="addEnvVar()">
+            <i class="fa fa-plus"></i> Add Environment Variable
+        </button>
+    </div>
+
+    <div class="form-section">
+        <h3>Accounts</h3>
+        <div class="account-actions">
+            <bl-clickable (do)="selectAllAccounts()">Select All</bl-clickable>
+            <bl-clickable (do)="deselectAllAccounts()"
+                >Deselect All</bl-clickable
+            >
+            <span class="selection-count"
+                >{{selectedAccountIds.size}} of {{accounts.length}}
+                selected</span
+            >
+        </div>
+        <div class="account-list">
+            <div
+                *ngFor="let account of accounts"
+                class="account-row"
+                (click)="toggleAccountSelection(account.id)"
+                [class.selected]="isAccountSelected(account.id)"
+            >
+                <input
+                    type="checkbox"
+                    [checked]="isAccountSelected(account.id)"
+                />
+                <span class="account-name">{{account.accountName}}</span>
+                <span class="account-region">{{account.region}}</span>
+            </div>
+        </div>
+        <div *ngIf="accounts.length === 0" class="no-accounts">
+            No accounts discovered yet. Go to Overview and click Discover
+            Accounts first.
+        </div>
+    </div>
+
+    <div class="form-actions">
+        <button
+            mat-raised-button
+            color="primary"
+            (click)="createPools()"
+            [disabled]="creating || selectedVmSizes.size === 0 || selectedAccountIds.size === 0"
+        >
+            <i
+                class="fa"
+                [class.fa-spinner]="creating"
+                [class.fa-spin]="creating"
+                [class.fa-plus-circle]="!creating"
+            ></i>
+            {{creating ? 'Creating Pools...' : 'Create Pools'}}
+        </button>
+    </div>
+</div>

@@ -109,7 +109,7 @@ export class NodeAgent implements Agent {
     }
 
     private async _listNodes(input: NodeListInput): Promise<AgentResult> {
-        const { store, scheduler, getBatchAccessToken } = this._ctx;
+        const { store, getBatchAccessToken } = this._ctx;
         this._cancelled = false;
 
         // Auto-discover: if no accountIds provided, use ALL created accounts from store
@@ -125,99 +125,71 @@ export class NodeAgent implements Agent {
         store.addLog({
             agent: "node",
             level: "info",
-            message: `Listing nodes across ${accountIds.length} accounts`,
+            message: `Listing nodes across ${accountIds.length} accounts (parallel)`,
         });
 
-        const allNodes: ManagedNode[] = [];
-        let errors = 0;
+        const token = await getBatchAccessToken();
 
-        for (const accountId of accountIds) {
-            if (this._cancelled) break;
+        // Parallel fetch across ALL accounts — Batch GETs don't have strict 429
+        const MAX_CONCURRENT = 20;
+        const accountResults = await this._parallelMap(
+            accountIds,
+            async (accountId) => {
+                if (this._cancelled)
+                    return {
+                        nodes: [] as ManagedNode[],
+                        error: null as string | null,
+                    };
+                const state = store.getState();
+                const account = state.accounts.find((a) => a.id === accountId);
+                if (!account)
+                    return { nodes: [] as ManagedNode[], error: null };
 
-            const state = store.getState();
-            const account = state.accounts.find((a) => a.id === accountId);
-            if (!account) continue;
-
-            try {
-                await scheduler.run(accountId, async () => {
-                    const token = await getBatchAccessToken();
+                try {
                     const baseUrl = `https://${account.accountName}.${account.region}.batch.azure.com`;
-
-                    // Step 1: List all pools for this account
                     const poolsUrl = `${baseUrl}/pools?api-version=${BATCH_API_VERSION}`;
                     const pools = await this._fetchAllPages<BatchPoolResponse>(
                         poolsUrl,
                         token
                     );
 
-                    // Step 2: For each pool, list all nodes
-                    for (const pool of pools) {
-                        if (this._cancelled) break;
-
-                        const nodesUrl = `${baseUrl}/pools/${pool.id}/nodes?api-version=${BATCH_API_VERSION}`;
-                        let nodes: BatchNodeResponse[];
-
-                        try {
-                            nodes =
-                                await this._fetchAllPages<BatchNodeResponse>(
-                                    nodesUrl,
-                                    token
+                    // Parallel fetch nodes across ALL pools in this account
+                    const poolNodeResults = await this._parallelMap(
+                        pools,
+                        async (pool) => {
+                            if (this._cancelled) return [] as ManagedNode[];
+                            const nodesUrl = `${baseUrl}/pools/${pool.id}/nodes?api-version=${BATCH_API_VERSION}`;
+                            try {
+                                const nodes =
+                                    await this._fetchAllPages<BatchNodeResponse>(
+                                        nodesUrl,
+                                        token
+                                    );
+                                return nodes.map((n) =>
+                                    this._toBatchNode(n, account, pool)
                                 );
-                        } catch (poolErr: any) {
-                            store.addLog({
-                                agent: "node",
-                                level: "warn",
-                                message: `Failed to list nodes for pool ${pool.id} in ${account.accountName}: ${poolErr?.message ?? String(poolErr)}`,
-                            });
-                            continue;
-                        }
-
-                        for (const n of nodes) {
-                            const nodeState = (
-                                n.state ?? "unknown"
-                            ).toLowerCase() as NodeState;
-
-                            const nodeErrors = n.errors;
-                            let errorMsg: string | null = null;
-                            if (nodeErrors && nodeErrors.length > 0) {
-                                errorMsg = nodeErrors
-                                    .map(
-                                        (e) =>
-                                            `${e.code ?? "Error"}: ${e.message ?? "Unknown error"}`
-                                    )
-                                    .join("; ");
+                            } catch {
+                                return [] as ManagedNode[];
                             }
+                        },
+                        MAX_CONCURRENT
+                    );
+                    return { nodes: poolNodeResults.flat(), error: null };
+                } catch (error: any) {
+                    return {
+                        nodes: [] as ManagedNode[],
+                        error: error?.message ?? String(error),
+                    };
+                }
+            },
+            MAX_CONCURRENT
+        );
 
-                            allNodes.push({
-                                id: uuidV4(),
-                                accountId,
-                                accountName: account.accountName,
-                                region: account.region,
-                                poolId: pool.id,
-                                nodeId: n.id,
-                                state: nodeState,
-                                vmSize: pool.vmSize,
-                                ipAddress: n.ipAddress,
-                                isDedicated: n.isDedicated ?? true,
-                                lastBootTime: n.lastBootUpTime,
-                                totalTasksRun: n.totalTasksRun,
-                                runningTasksCount: n.runningTasksCount,
-                                schedulingState: n.schedulingState,
-                                subscriptionId: account.subscriptionId,
-                                error: errorMsg,
-                            });
-                        }
-                    }
-                });
-            } catch (error: any) {
-                const errorMsg = error?.message ?? String(error);
-                store.addLog({
-                    agent: "node",
-                    level: "error",
-                    message: `Failed to list nodes for account ${account.accountName}: ${errorMsg}`,
-                });
-                errors++;
-            }
+        const allNodes: ManagedNode[] = [];
+        let errors = 0;
+        for (const r of accountResults) {
+            if (r.error) errors++;
+            else allNodes.push(...r.nodes);
         }
 
         store.setNodes(allNodes);
@@ -402,5 +374,67 @@ export class NodeAgent implements Agent {
                       : "partial",
             summary: { total: input.nodeIds.length, succeeded, failed },
         };
+    }
+
+    private _toBatchNode(
+        n: BatchNodeResponse,
+        account: {
+            id: string;
+            accountName: string;
+            region: string;
+            subscriptionId: string;
+        },
+        pool: BatchPoolResponse
+    ): ManagedNode {
+        const nodeState = (n.state ?? "unknown").toLowerCase() as NodeState;
+        const nodeErrors = n.errors;
+        let errorMsg: string | null = null;
+        if (nodeErrors && nodeErrors.length > 0) {
+            errorMsg = nodeErrors
+                .map(
+                    (e) =>
+                        `${e.code ?? "Error"}: ${e.message ?? "Unknown error"}`
+                )
+                .join("; ");
+        }
+        return {
+            id: uuidV4(),
+            accountId: account.id,
+            accountName: account.accountName,
+            region: account.region,
+            poolId: pool.id,
+            nodeId: n.id,
+            state: nodeState,
+            vmSize: pool.vmSize,
+            ipAddress: n.ipAddress,
+            isDedicated: n.isDedicated ?? true,
+            lastBootTime: n.lastBootUpTime,
+            totalTasksRun: n.totalTasksRun,
+            runningTasksCount: n.runningTasksCount,
+            schedulingState: n.schedulingState,
+            subscriptionId: account.subscriptionId,
+            error: errorMsg,
+        };
+    }
+
+    private async _parallelMap<T, R>(
+        items: T[],
+        fn: (item: T) => Promise<R>,
+        concurrency: number
+    ): Promise<R[]> {
+        const results: R[] = new Array(items.length);
+        let idx = 0;
+        const run = async () => {
+            while (idx < items.length) {
+                const i = idx++;
+                results[i] = await fn(items[i]);
+            }
+        };
+        await Promise.all(
+            Array.from({ length: Math.min(concurrency, items.length) }, () =>
+                run()
+            )
+        );
+        return results;
     }
 }

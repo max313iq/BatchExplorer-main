@@ -4,13 +4,18 @@ import { ActivityMonitorComponent } from "@batch-flask/ui/activity/activity-moni
 import { RequireActiveBatchAccountGuard } from "app/components/common/guards";
 import { ThemeColorsComponent } from "app/components/misc/theme-colors";
 import { PoolStandaloneGraphsComponent } from "app/components/pool/graphs/standalone";
-import { AuthSettingsComponent, SettingsComponent } from "app/components/settings";
-import { AccountDefaultComponent, AccountDetailsComponent } from "./components/account/details";
+import {
+    AuthSettingsComponent,
+    SettingsComponent,
+} from "app/components/settings";
+import {
+    AccountDefaultComponent,
+    AccountDetailsComponent,
+} from "./components/account/details";
 import { AccountHomeComponent } from "./components/account/home/account-home.component";
 import { AccountMonitoringHomeComponent } from "./components/account/monitoring";
 import { PlaygroundRouteComponent } from "./components/misc/playground-route";
 import { WelcomeComponent } from "./components/welcome";
-
 
 export const routes: Routes = [
     { path: "", redirectTo: "welcome", pathMatch: "full" },
@@ -42,40 +47,54 @@ export const routes: Routes = [
     {
         path: "jobs",
         canActivate: [RequireActiveBatchAccountGuard],
-        loadChildren: () => import("./components/job/job.module").then(m => m.JobModule),
+        loadChildren: () =>
+            import("./components/job/job.module").then((m) => m.JobModule),
     },
     {
         path: "jobschedules",
         canActivate: [RequireActiveBatchAccountGuard],
-        loadChildren: () => import("./components/job-schedule/job-schedule.module").then(m => m.JobScheduleModule),
+        loadChildren: () =>
+            import("./components/job-schedule/job-schedule.module").then(
+                (m) => m.JobScheduleModule
+            ),
     },
     {
         path: "pools",
         canActivate: [RequireActiveBatchAccountGuard],
-        loadChildren: () => import("./components/pool/pool.module").then(m => m.PoolModule),
+        loadChildren: () =>
+            import("./components/pool/pool.module").then((m) => m.PoolModule),
     },
     {
         path: "certificates",
         canActivate: [RequireActiveBatchAccountGuard],
-        loadChildren: () => import("./components/certificate/certificate.module").then(m => m.CertificateModule),
+        loadChildren: () =>
+            import("./components/certificate/certificate.module").then(
+                (m) => m.CertificateModule
+            ),
     },
     {
         path: "applications",
         canActivate: [RequireActiveBatchAccountGuard],
-        loadChildren: () => import("./components/application/application.module").then(m => m.ApplicationModule),
+        loadChildren: () =>
+            import("./components/application/application.module").then(
+                (m) => m.ApplicationModule
+            ),
     },
     {
         path: "data",
         canActivate: [RequireActiveBatchAccountGuard],
-        loadChildren: () => import("./components/data/data.module").then(m => m.DataModule),
+        loadChildren: () =>
+            import("./components/data/data.module").then((m) => m.DataModule),
     },
     {
         path: "pools/:poolId/nodes",
-        loadChildren: () => import("./components/node/node.module").then(m => m.NodeModule),
+        loadChildren: () =>
+            import("./components/node/node.module").then((m) => m.NodeModule),
     },
     {
         path: "jobs/:jobId/tasks",
-        loadChildren: () => import("./components/task/task.module").then(m => m.TaskModule),
+        loadChildren: () =>
+            import("./components/task/task.module").then((m) => m.TaskModule),
     },
     {
         path: "theme/colors",
@@ -83,11 +102,11 @@ export const routes: Routes = [
     },
     {
         path: "playground",
-        component:  PlaygroundRouteComponent,
+        component: PlaygroundRouteComponent,
     },
     {
         path: "playground/:component",
-        component:  PlaygroundRouteComponent,
+        component: PlaygroundRouteComponent,
     },
     {
         path: "standalone/pools/:poolId/graphs",
@@ -103,6 +122,9 @@ export const routes: Routes = [
     },
     {
         path: "multi-region",
-        loadChildren: () => import("./components/multi-region/multi-region.module").then(m => m.MultiRegionModule),
+        loadChildren: () =>
+            import("./components/multi-region/multi-region.module").then(
+                (m) => m.MultiRegionModule
+            ),
     },
 ];

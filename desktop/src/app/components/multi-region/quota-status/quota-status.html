@@ -1,0 +1,48 @@
+<div class="quota-status-page">
+    <div class="page-header">
+        <h2>Quota Status</h2>
+        <button mat-raised-button color="primary" (click)="refresh()">
+            <i class="fa fa-refresh"></i> Refresh
+        </button>
+    </div>
+
+    <div class="quota-cards" *ngIf="accountInfos.length > 0">
+        <div class="quota-card" *ngFor="let info of accountInfos">
+            <div class="quota-card-header">
+                <strong>{{info.accountName}}</strong>
+                <span class="region-badge">{{info.region}}</span>
+            </div>
+            <div class="quota-card-body">
+                <div class="quota-row">
+                    <span>LP Cores:</span>
+                    <span
+                        >{{info.lowPriorityCoresUsed}} /
+                        {{info.lowPriorityCoreQuota}}</span
+                    >
+                </div>
+                <div class="quota-row">
+                    <span>Dedicated Cores:</span>
+                    <span
+                        >{{info.dedicatedCoresUsed}} /
+                        {{info.dedicatedCoreQuota}}</span
+                    >
+                </div>
+                <div class="quota-row">
+                    <span>Pools:</span>
+                    <span>{{info.poolCount}} / {{info.poolQuota}}</span>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <bl-no-item
+        [itemCount]="accountInfos.length"
+        *ngIf="accountInfos.length === 0"
+    >
+        <i icon class="fa fa-check-circle" aria-hidden="true"></i>
+        <span no-filter
+            >No quota data loaded. Run account discovery and refresh account
+            info first.</span
+        >
+    </bl-no-item>
+</div>

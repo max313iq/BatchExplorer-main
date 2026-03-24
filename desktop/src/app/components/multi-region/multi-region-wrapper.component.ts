@@ -8,7 +8,11 @@ import {
 } from "@angular/core";
 import * as React from "react";
 import * as ReactDOM from "react-dom";
-import { MultiRegionDashboard, TokenProvider, MultiRegionStore } from "multi-region";
+import {
+    MultiRegionDashboard,
+    TokenProvider,
+    MultiRegionStore,
+} from "multi-region";
 import { AuthService } from "app/services/aad";
 import { SubscriptionService } from "app/services/subscription/subscription.service";
 import { Subscription } from "rxjs";
@@ -44,25 +48,30 @@ import { first } from "rxjs/operators";
     changeDetection: ChangeDetectionStrategy.OnPush,
 })
 export class MultiRegionWrapperComponent implements AfterViewInit, OnDestroy {
-    @ViewChild("reactHost", { static: true }) hostRef!: ElementRef<HTMLDivElement>;
+    @ViewChild("reactHost", { static: true })
+    hostRef!: ElementRef<HTMLDivElement>;
 
     private _sub: Subscription;
 
     constructor(
         private authService: AuthService,
-        private subscriptionService: SubscriptionService,
+        private subscriptionService: SubscriptionService
     ) {}
 
     ngAfterViewInit(): void {
         // Wait for the current user to resolve their home tenant
-        this._sub = this.authService.currentUser.pipe(first()).subscribe(user => {
-            const tenantId = user?.tid ?? "organizations";
-            const tokenProvider = this._createTokenProvider(tenantId);
-            ReactDOM.render(
-                React.createElement(MultiRegionDashboard, { tokenProvider }),
-                this.hostRef.nativeElement
-            );
-        });
+        this._sub = this.authService.currentUser
+            .pipe(first())
+            .subscribe((user) => {
+                const tenantId = user?.tid ?? "organizations";
+                const tokenProvider = this._createTokenProvider(tenantId);
+                ReactDOM.render(
+                    React.createElement(MultiRegionDashboard, {
+                        tokenProvider,
+                    }),
+                    this.hostRef.nativeElement
+                );
+            });
     }
 
     ngOnDestroy(): void {
@@ -75,44 +84,72 @@ export class MultiRegionWrapperComponent implements AfterViewInit, OnDestroy {
     private _createTokenProvider(tenantId: string): TokenProvider {
         return {
             getAccessToken: async () => {
-                const token = await this.authService.getAccessToken(tenantId, null);
+                const token = await this.authService.getAccessToken(
+                    tenantId,
+                    null
+                );
                 return token.accessToken;
             },
             getBatchAccessToken: async () => {
-                const token = await this.authService.getAccessToken(tenantId, "batch" as any);
+                const token = await this.authService.getAccessToken(
+                    tenantId,
+                    "batch" as any
+                );
                 return token.accessToken;
             },
             checkHealth: async () => {
                 try {
-                    const armToken = await this.authService.getAccessToken(tenantId, null);
+                    const armToken = await this.authService.getAccessToken(
+                        tenantId,
+                        null
+                    );
                     if (!armToken?.accessToken) {
-                        return { healthy: false, error: "Failed to acquire ARM token. Please sign in." };
+                        return {
+                            healthy: false,
+                            error: "Failed to acquire ARM token. Please sign in.",
+                        };
                     }
-                    const batchToken = await this.authService.getAccessToken(tenantId, "batch" as any);
+                    const batchToken = await this.authService.getAccessToken(
+                        tenantId,
+                        "batch" as any
+                    );
                     if (!batchToken?.accessToken) {
-                        return { healthy: false, error: "Failed to acquire Batch token. Check your account access." };
+                        return {
+                            healthy: false,
+                            error: "Failed to acquire Batch token. Check your account access.",
+                        };
                     }
                     const subs = await this.subscriptionService.subscriptions
-                        .pipe(first()).toPromise();
+                        .pipe(first())
+                        .toPromise();
                     if (!subs || subs.size === 0) {
-                        return { healthy: false, error: "No Azure subscriptions found." };
+                        return {
+                            healthy: false,
+                            error: "No Azure subscriptions found.",
+                        };
                     }
                     return { healthy: true, error: null };
                 } catch (e) {
-                    return { healthy: false, error: e?.message ?? "Auth check failed." };
+                    return {
+                        healthy: false,
+                        error: e?.message ?? "Auth check failed.",
+                    };
                 }
             },
             loadSubscriptions: async (store: MultiRegionStore) => {
                 try {
                     const subs = await this.subscriptionService.subscriptions
-                        .pipe(first()).toPromise();
+                        .pipe(first())
+                        .toPromise();
                     store.setSubscriptions(
-                        subs.toArray().map(s => ({
+                        subs.toArray().map((s) => ({
                             subscriptionId: s.subscriptionId,
                             displayName: s.displayName,
                         }))
                     );
-                } catch { /* subscriptions are optional */ }
+                } catch {
+                    /* subscriptions are optional */
+                }
             },
         };
     }

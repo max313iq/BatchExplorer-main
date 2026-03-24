@@ -1,2 +1,11 @@
 export { MultiRegionModule } from "./multi-region.module";
-export { MultiRegionWrapperComponent } from "./multi-region-wrapper.component";
+export { MultiRegionHomeComponent } from "./home/multi-region-home.component";
+export { OverviewComponent } from "./overview/overview.component";
+export { AccountListComponent } from "./account-list/account-list.component";
+export { AccountInfoComponent } from "./account-info/account-info.component";
+export { PoolCreationComponent } from "./pool-creation/pool-creation.component";
+export { PoolInfoComponent } from "./pool-info/pool-info.component";
+export { QuotaRequestsComponent } from "./quota-requests/quota-requests.component";
+export { QuotaStatusComponent } from "./quota-status/quota-status.component";
+export { UnusedQuotaComponent } from "./unused-quota/unused-quota.component";
+export { NodesComponent } from "./nodes/nodes.component";

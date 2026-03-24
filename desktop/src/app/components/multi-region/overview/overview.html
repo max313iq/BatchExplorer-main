@@ -1,0 +1,77 @@
+<div class="overview-page">
+    <div class="overview-actions">
+        <button mat-raised-button color="primary" (click)="refreshAll()">
+            <i class="fa fa-refresh"></i> Refresh All
+        </button>
+        <button mat-raised-button (click)="discoverAccounts()">
+            <i class="fa fa-search"></i> Discover Accounts
+        </button>
+    </div>
+
+    <div class="stat-cards">
+        <div class="stat-card">
+            <div class="stat-value">{{accountCount}}</div>
+            <div class="stat-label">Accounts</div>
+        </div>
+        <div class="stat-card">
+            <div class="stat-value">{{totalLpQuota}}</div>
+            <div class="stat-label">LP Quota (Total)</div>
+        </div>
+        <div class="stat-card">
+            <div class="stat-value">{{totalLpUsed}}</div>
+            <div class="stat-label">LP Used</div>
+        </div>
+        <div class="stat-card">
+            <div class="stat-value">{{totalDedicatedQuota}}</div>
+            <div class="stat-label">Dedicated Quota</div>
+        </div>
+        <div class="stat-card">
+            <div class="stat-value">{{totalDedicatedUsed}}</div>
+            <div class="stat-label">Dedicated Used</div>
+        </div>
+        <div class="stat-card">
+            <div class="stat-value">{{poolCount}}</div>
+            <div class="stat-label">Pools</div>
+        </div>
+        <div class="stat-card">
+            <div class="stat-value">{{nodeCount}}</div>
+            <div class="stat-label">Nodes</div>
+        </div>
+    </div>
+
+    <div class="overview-section" *ngIf="accounts.length > 0">
+        <h3>Recent Accounts</h3>
+        <div class="mini-table">
+            <div class="mini-row header-row">
+                <span class="col-name">Account</span>
+                <span class="col-region">Region</span>
+                <span class="col-state">State</span>
+            </div>
+            <div class="mini-row" *ngFor="let account of accounts | slice:0:10">
+                <span class="col-name">{{account.accountName}}</span>
+                <span class="col-region">{{account.region}}</span>
+                <span class="col-state">{{account.provisioningState}}</span>
+            </div>
+        </div>
+    </div>
+
+    <div class="overview-section" *ngIf="pools.length > 0">
+        <h3>Recent Pools</h3>
+        <div class="mini-table">
+            <div class="mini-row header-row">
+                <span class="col-name">Pool ID</span>
+                <span class="col-account">Account</span>
+                <span class="col-state">Allocation</span>
+                <span class="col-nodes">Dedicated</span>
+            </div>
+            <div class="mini-row" *ngFor="let pool of pools | slice:0:10">
+                <span class="col-name">{{pool.poolId}}</span>
+                <span class="col-account">{{pool.accountName}}</span>
+                <span class="col-state">{{pool.allocationState}}</span>
+                <span class="col-nodes"
+                    >{{pool.currentDedicatedNodes}}/{{pool.targetDedicatedNodes}}</span
+                >
+            </div>
+        </div>
+    </div>
+</div>

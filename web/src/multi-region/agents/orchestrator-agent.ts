@@ -10,10 +10,15 @@ import { RequestDeduplicator } from "../scheduling/request-deduplicator";
 import { PoolInfo, AccountInfo, QuotaSuggestion } from "../store/store-types";
 
 /** Bounded-concurrency Promise.all — runs `fn` on each item with at most `concurrency` in flight */
+// High concurrency for read-only GET operations (ARM/Batch GETs don't have strict 429 limits)
+const READ_CONCURRENCY = 20;
+// Lower concurrency for write operations (PUT/POST/DELETE hit 429 more easily)
+const WRITE_CONCURRENCY = 3;
+
 async function pMap<T, R>(
     items: T[],
     fn: (item: T) => Promise<R>,
-    concurrency = 6
+    concurrency = READ_CONCURRENCY
 ): Promise<R[]> {
     const results: R[] = new Array(items.length);
     let idx = 0;
@@ -610,7 +615,7 @@ export class OrchestratorAgent implements Agent {
             const allAccounts: Array<{ acct: any; subId: string }> = [];
             let failedSubs = 0;
 
-            // Parallel discovery across subscriptions (up to 8 concurrent)
+            // Parallel discovery across ALL subscriptions — ARM GETs have no strict 429
             const subResults = await pMap(
                 subscriptionIds,
                 async (subId) => {
@@ -634,7 +639,7 @@ export class OrchestratorAgent implements Agent {
                         };
                     }
                 },
-                8
+                READ_CONCURRENCY
             );
 
             for (const result of subResults) {
@@ -731,7 +736,7 @@ export class OrchestratorAgent implements Agent {
         let failedCount = 0;
         const token = await getBatchAccessToken();
 
-        // Parallel pool fetch — up to 10 accounts at once
+        // Parallel pool fetch — Batch GETs have no strict 429
         const poolResults = await pMap(
             accounts,
             async (account) => {
@@ -795,7 +800,7 @@ export class OrchestratorAgent implements Agent {
                     };
                 }
             },
-            10
+            READ_CONCURRENCY
         );
 
         const allPools: PoolInfo[] = [];
@@ -853,7 +858,7 @@ export class OrchestratorAgent implements Agent {
             getBatchAccessToken(),
         ]);
 
-        // Single parallel pass: fetch pools + ARM quota simultaneously per account (up to 10 concurrent)
+        // Single parallel pass: fetch pools + ARM quota simultaneously per account — no 429 on reads
         const acctResults = await pMap(
             accounts,
             async (account) => {

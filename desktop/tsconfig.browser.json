@@ -3,14 +3,15 @@
   "include": [
     "src/app",
     "src/@batch-flask/utils/logging",
-    "../web/src/multi-region",
+    "../web/src/multi-region"
   ],
   "exclude": [
     "**/*.spec.ts",
     "src/test/**/*.ts",
     "src/client",
     "test/**/*.ts",
-    "**/testing**/*"
+    "**/testing**/*",
+    "src/app/components/multi-region-react/**"
   ],
   "angularCompilerOptions": {
     "disableTypeScriptVersionCheck": true

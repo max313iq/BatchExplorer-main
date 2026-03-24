@@ -1,0 +1,45 @@
+<div class="account-list-page">
+    <div class="page-header">
+        <h2>Managed Accounts</h2>
+        <button mat-raised-button color="primary" (click)="discoverAccounts()">
+            <i class="fa fa-search"></i> Discover Accounts
+        </button>
+    </div>
+
+    <bl-table [data]="accounts" *ngIf="accounts.length > 0">
+        <bl-column name="accountName">
+            <div *blHeadCellDef>Account Name</div>
+            <div *blCellDef="let account">{{account.accountName}}</div>
+        </bl-column>
+
+        <bl-column name="region">
+            <div *blHeadCellDef>Region</div>
+            <div *blCellDef="let account">{{account.region}}</div>
+        </bl-column>
+
+        <bl-column name="subscriptionId">
+            <div *blHeadCellDef>Subscription</div>
+            <div *blCellDef="let account">
+                {{account.subscriptionId | slice:0:13}}...
+            </div>
+        </bl-column>
+
+        <bl-column name="resourceGroup">
+            <div *blHeadCellDef>Resource Group</div>
+            <div *blCellDef="let account">{{account.resourceGroup}}</div>
+        </bl-column>
+
+        <bl-column name="provisioningState">
+            <div *blHeadCellDef>State</div>
+            <div *blCellDef="let account">{{account.provisioningState}}</div>
+        </bl-column>
+    </bl-table>
+
+    <bl-no-item [itemCount]="accounts.length" *ngIf="accounts.length === 0">
+        <i icon class="fa fa-server" aria-hidden="true"></i>
+        <span no-filter
+            >No accounts discovered. Click Discover Accounts to scan all
+            subscriptions.</span
+        >
+    </bl-no-item>
+</div>
