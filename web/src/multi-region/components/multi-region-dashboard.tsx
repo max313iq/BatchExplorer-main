@@ -463,24 +463,11 @@ const DashboardContent: React.FC<{ tokenProvider?: TokenProvider }> = ({
         }
     }, [store, tokenProvider]);
 
-    // Azure login via MSAL popup
+    // Azure login via MSAL redirect (page will navigate to Microsoft login)
     const handleLogin = React.useCallback(async () => {
         try {
-            const account = await msalAuth.login();
-            if (account) {
-                setCurrentAuthMode("msal");
-                setMsalUserName(
-                    account.username ?? account.name ?? "Azure User"
-                );
-                // Directly set healthy since we just logged in successfully
-                // Then load subscriptions and trigger discovery
-                setHealthCheck({ healthy: true, error: null });
-                try {
-                    await loadSubscriptions(store);
-                } catch {
-                    /* optional */
-                }
-            }
+            await msalAuth.login();
+            // Page redirects — won't reach here
         } catch (e: any) {
             console.error("Azure login failed:", e);
             setHealthCheck({
