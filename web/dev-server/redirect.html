@@ -1,0 +1,15 @@
+<!DOCTYPE html>
+<html>
+<head><title>Signing in...</title></head>
+<body>
+<script>
+    // MSAL popup redirect handler.
+    // After Azure AD auth completes, it redirects here with the token in the URL hash.
+    // MSAL in the parent window reads this hash and closes the popup automatically.
+    // If this page was opened as a full redirect (not popup), go back to the app.
+    if (!window.opener && !window.parent) {
+        window.location.href = window.location.origin;
+    }
+</script>
+</body>
+</html>

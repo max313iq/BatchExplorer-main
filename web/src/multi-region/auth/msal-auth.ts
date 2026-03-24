@@ -26,8 +26,8 @@ const msalConfig: Configuration = {
     auth: {
         clientId: AZURE_CLI_CLIENT_ID,
         authority: "https://login.microsoftonline.com/organizations",
-        redirectUri: window.location.origin,
-        navigateToLoginRequestUrl: true,
+        redirectUri: window.location.origin + "/redirect.html",
+        navigateToLoginRequestUrl: false,
     },
     cache: {
         cacheLocation: "sessionStorage",
@@ -101,6 +101,7 @@ export async function login(): Promise<AccountInfo | null> {
                 await msalApp.loginRedirect({
                     scopes: [ARM_SCOPE],
                     prompt: "select_account",
+                    redirectUri: window.location.origin + "/",
                 });
                 // Page will redirect — this won't return
                 return null;
