@@ -80,7 +80,8 @@ module.exports = (env) => {
 
         devServer: {
             open: OPTS.LAUNCH_BROWSER ? true : false,
-            host: "127.0.0.1",
+            host: "0.0.0.0",
+            allowedHosts: "all",
             hot: true,
             client: {
                 overlay: {
