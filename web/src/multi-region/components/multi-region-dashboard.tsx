@@ -29,6 +29,10 @@ import { AccountInfoPage } from "./account-info/account-info-page";
 import { UnusedQuotaPage } from "./unused-quota/unused-quota-page";
 import { AgentLogPanel } from "./shared/agent-log-panel";
 import { ActivityPanel } from "./shared/activity-panel";
+import * as msalAuth from "../auth/msal-auth";
+
+// Auth mode: "msal" = Entra ID login, "cli" = Azure CLI proxy
+let _authMode: "msal" | "cli" = "cli";
 
 const DEFAULT_SCHEDULER_OPTIONS = {
     concurrency: 1,
@@ -69,12 +73,22 @@ async function fetchTokenFromProxy(endpoint: string): Promise<CachedToken> {
 }
 
 async function getAccessTokenFromCli(): Promise<string> {
+    // MSAL first — direct Entra ID tokens
+    if (_authMode === "msal") {
+        return msalAuth.getArmToken();
+    }
+    // Fallback: CLI proxy
     if (isTokenValid(_cachedArmToken)) return _cachedArmToken!.accessToken;
     _cachedArmToken = await fetchTokenFromProxy("/api/token");
     return _cachedArmToken.accessToken;
 }
 
 async function getBatchAccessTokenFromCli(): Promise<string> {
+    // MSAL first — direct Entra ID tokens
+    if (_authMode === "msal") {
+        return msalAuth.getBatchToken();
+    }
+    // Fallback: CLI proxy
     if (isTokenValid(_cachedBatchToken)) return _cachedBatchToken!.accessToken;
     _cachedBatchToken = await fetchTokenFromProxy("/api/token/batch");
     return _cachedBatchToken.accessToken;
@@ -102,82 +116,82 @@ export interface MultiRegionDashboardProps {
 }
 
 async function performHealthCheck(): Promise<HealthCheckResult> {
-    // Step 1: Check Azure CLI login
+    // If MSAL mode, check MSAL auth
+    if (_authMode === "msal") {
+        try {
+            const armToken = await msalAuth.getArmToken();
+            if (!armToken)
+                return {
+                    healthy: false,
+                    error: "Failed to acquire ARM token via Entra ID.",
+                };
+            const batchToken = await msalAuth.getBatchToken();
+            if (!batchToken)
+                return {
+                    healthy: false,
+                    error: "Failed to acquire Batch token via Entra ID.",
+                };
+            const subs = await msalAuth.listSubscriptions();
+            if (subs.length === 0)
+                return {
+                    healthy: false,
+                    error: "No Azure subscriptions found.",
+                };
+            return { healthy: true, error: null };
+        } catch (e: any) {
+            return {
+                healthy: false,
+                error: e?.message ?? "Entra ID auth check failed.",
+            };
+        }
+    }
+
+    // CLI mode: check proxy endpoints
     try {
         const authRes = await fetch("/api/auth/status");
-        if (!authRes.ok) {
+        if (!authRes.ok)
             return {
                 healthy: false,
                 error: "Cannot reach auth service. Is the proxy server running?",
             };
-        }
         const authData = await authRes.json();
-        if (authData.loggedIn !== true) {
+        if (authData.loggedIn !== true)
             return {
                 healthy: false,
                 error: "Azure CLI not logged in. Run `az login` then retry.",
             };
-        }
     } catch {
         return {
             healthy: false,
-            error: "Cannot reach auth service. Is the proxy server running?",
+            error: "Cannot reach auth service. Use 'Sign in with Azure' button instead.",
         };
     }
 
-    // Step 2: Check ARM token
     try {
         const armRes = await fetch("/api/token");
-        if (!armRes.ok) {
-            return {
-                healthy: false,
-                error: "Failed to acquire ARM token. Run `az login` to refresh credentials.",
-            };
-        }
+        if (!armRes.ok)
+            return { healthy: false, error: "Failed to acquire ARM token." };
     } catch {
-        return {
-            healthy: false,
-            error: "Failed to acquire ARM token. Network error.",
-        };
+        return { healthy: false, error: "Failed to acquire ARM token." };
     }
 
-    // Step 3: Check Batch token
     try {
         const batchRes = await fetch("/api/token/batch");
-        if (!batchRes.ok) {
-            return {
-                healthy: false,
-                error: "Failed to acquire Batch token. Ensure your account has Batch service access.",
-            };
-        }
+        if (!batchRes.ok)
+            return { healthy: false, error: "Failed to acquire Batch token." };
     } catch {
-        return {
-            healthy: false,
-            error: "Failed to acquire Batch token. Network error.",
-        };
+        return { healthy: false, error: "Failed to acquire Batch token." };
     }
 
-    // Step 4: Check subscriptions
     try {
         const subsRes = await fetch("/api/subscriptions");
-        if (!subsRes.ok) {
-            return {
-                healthy: false,
-                error: "Failed to list subscriptions. Your account may not have any subscriptions.",
-            };
-        }
+        if (!subsRes.ok)
+            return { healthy: false, error: "Failed to list subscriptions." };
         const subs = await subsRes.json();
-        if (!Array.isArray(subs) || subs.length === 0) {
-            return {
-                healthy: false,
-                error: "No Azure subscriptions found. Ensure your account has at least one active subscription.",
-            };
-        }
+        if (!Array.isArray(subs) || subs.length === 0)
+            return { healthy: false, error: "No Azure subscriptions found." };
     } catch {
-        return {
-            healthy: false,
-            error: "Failed to list subscriptions. Network error.",
-        };
+        return { healthy: false, error: "Failed to list subscriptions." };
     }
 
     return { healthy: true, error: null };
@@ -185,6 +199,11 @@ async function performHealthCheck(): Promise<HealthCheckResult> {
 
 async function loadSubscriptions(store: MultiRegionStore): Promise<void> {
     try {
+        if (_authMode === "msal") {
+            const subs = await msalAuth.listSubscriptions();
+            store.setSubscriptions(subs);
+            return;
+        }
         const response = await fetch("/api/subscriptions");
         if (!response.ok) return;
         const subs = await response.json();
@@ -229,7 +248,11 @@ function exportSession(store: MultiRegionStore): void {
 const AuthBanner: React.FC<{
     healthCheck: HealthCheckResult | null;
     onRetry: () => void;
-}> = ({ healthCheck, onRetry }) => {
+    onLogin?: () => void;
+    onLogout?: () => void;
+    authMode?: "msal" | "cli";
+    userName?: string;
+}> = ({ healthCheck, onRetry, onLogin, onLogout, authMode, userName }) => {
     if (healthCheck === null) {
         return (
             <MessageBar messageBarType={MessageBarType.info}>
@@ -243,17 +266,63 @@ const AuthBanner: React.FC<{
                 messageBarType={MessageBarType.severeWarning}
                 isMultiline
                 actions={
-                    <DefaultButton
-                        text="Retry"
-                        onClick={onRetry}
-                        styles={{
-                            root: { height: 28, minWidth: 0 },
-                            label: { fontSize: 12 },
-                        }}
-                    />
+                    <Stack horizontal tokens={{ childrenGap: 8 }}>
+                        {onLogin && (
+                            <DefaultButton
+                                text="Sign in with Azure"
+                                iconProps={{ iconName: "AzureLogo" }}
+                                onClick={onLogin}
+                                styles={{
+                                    root: {
+                                        height: 28,
+                                        minWidth: 0,
+                                        backgroundColor: "#0078d4",
+                                        color: "white",
+                                        border: "none",
+                                    },
+                                    label: { fontSize: 12, color: "white" },
+                                    icon: { color: "white" },
+                                    rootHovered: {
+                                        backgroundColor: "#106ebe",
+                                        color: "white",
+                                    },
+                                }}
+                            />
+                        )}
+                        <DefaultButton
+                            text="Retry"
+                            onClick={onRetry}
+                            styles={{
+                                root: { height: 28, minWidth: 0 },
+                                label: { fontSize: 12 },
+                            }}
+                        />
+                    </Stack>
                 }
             >
                 <b>Health check failed.</b> {healthCheck.error}
+            </MessageBar>
+        );
+    }
+    // Authenticated — show user info
+    if (authMode === "msal" && userName) {
+        return (
+            <MessageBar
+                messageBarType={MessageBarType.success}
+                actions={
+                    onLogout ? (
+                        <DefaultButton
+                            text="Sign out"
+                            onClick={onLogout}
+                            styles={{
+                                root: { height: 24, minWidth: 0 },
+                                label: { fontSize: 11 },
+                            }}
+                        />
+                    ) : undefined
+                }
+            >
+                Signed in as <b>{userName}</b> via Entra ID
             </MessageBar>
         );
     }
@@ -444,6 +513,10 @@ const DashboardContent: React.FC<{ tokenProvider?: TokenProvider }> = ({
     );
     const [autoRefreshEnabled, setAutoRefreshEnabled] = React.useState(true);
     const autoRefreshRunningRef = React.useRef(false);
+    const [currentAuthMode, setCurrentAuthMode] = React.useState<
+        "msal" | "cli"
+    >(_authMode);
+    const [msalUserName, setMsalUserName] = React.useState<string>("");
 
     const orchestrator = React.useMemo(
         () => new OrchestratorAgent(createAgentContext(store, tokenProvider)),
@@ -464,6 +537,48 @@ const DashboardContent: React.FC<{ tokenProvider?: TokenProvider }> = ({
             }
         }
     }, [store, tokenProvider]);
+
+    // Azure login via MSAL popup
+    const handleLogin = React.useCallback(async () => {
+        try {
+            const account = await msalAuth.login();
+            if (account) {
+                _authMode = "msal";
+                setCurrentAuthMode("msal");
+                setMsalUserName(
+                    account.username ?? account.name ?? "Azure User"
+                );
+                // Re-run health check with new auth
+                checkLogin();
+            }
+        } catch (e: any) {
+            console.error("Azure login failed:", e);
+        }
+    }, [checkLogin]);
+
+    // Logout
+    const handleLogout = React.useCallback(async () => {
+        try {
+            await msalAuth.logout();
+            _authMode = "cli";
+            setCurrentAuthMode("cli");
+            setMsalUserName("");
+            setHealthCheck(null);
+        } catch {
+            /* ignore logout errors */
+        }
+    }, []);
+
+    // Check for existing MSAL session on mount
+    React.useEffect(() => {
+        msalAuth.getCurrentUser().then((user) => {
+            if (user) {
+                _authMode = "msal";
+                setCurrentAuthMode("msal");
+                setMsalUserName(user.username ?? user.name ?? "Azure User");
+            }
+        });
+    }, []);
 
     // Auto-save
     React.useEffect(() => store.enableAutoSave(), [store]);
@@ -585,7 +700,14 @@ const DashboardContent: React.FC<{ tokenProvider?: TokenProvider }> = ({
                     }}
                 />
             </Stack>
-            <AuthBanner healthCheck={healthCheck} onRetry={checkLogin} />
+            <AuthBanner
+                healthCheck={healthCheck}
+                onRetry={checkLogin}
+                onLogin={!tokenProvider ? handleLogin : undefined}
+                onLogout={currentAuthMode === "msal" ? handleLogout : undefined}
+                authMode={currentAuthMode}
+                userName={msalUserName}
+            />
             <div style={{ display: "flex", flex: 1, overflow: "hidden" }}>
                 <SidebarNav
                     activeKey={activePage}

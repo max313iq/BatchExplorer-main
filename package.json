@@ -16,6 +16,7 @@
     "node": ">=18.0.0"
   },
   "dependencies": {
+    "@azure/msal-browser": "^5.6.1",
     "@fluentui/azure-themes": "8.6.34",
     "@fluentui/react": "8.97.2",
     "claude": "^0.1.1",
@@ -50,6 +51,7 @@
     "markdownlint-cli2": "^0.4.0",
     "npm-run-all": "^4.1.5",
     "prettier": "^3.0.0",
+    "ts-loader": "^9.5.4",
     "typescript": "^4.9.0",
     "which": "^2.0.2"
   },
