@@ -79,21 +79,33 @@ export async function login(): Promise<AccountInfo | null> {
 
     _loginInProgress = (async () => {
         const msalApp = await getMsalInstance();
-        const loginRequest: PopupRequest = {
-            scopes: [ARM_SCOPE],
-            prompt: "select_account",
-        };
 
+        // Try popup first, fall back to redirect if blocked
         try {
-            const result = await msalApp.loginPopup(loginRequest);
+            const result = await msalApp.loginPopup({
+                scopes: [ARM_SCOPE],
+                prompt: "select_account",
+            });
             if (result.account) {
                 _activeAccount = result.account;
                 msalApp.setActiveAccount(result.account);
             }
             return result.account;
-        } catch (error: any) {
-            console.error("MSAL login failed:", error);
-            throw error;
+        } catch (popupError: any) {
+            // If popup is blocked, use redirect flow instead
+            if (
+                popupError?.errorCode === "popup_window_error" ||
+                popupError?.errorCode === "empty_window_error"
+            ) {
+                console.log("Popup blocked, using redirect flow...");
+                await msalApp.loginRedirect({
+                    scopes: [ARM_SCOPE],
+                    prompt: "select_account",
+                });
+                // Page will redirect — this won't return
+                return null;
+            }
+            throw popupError;
         } finally {
             _loginInProgress = null;
         }
@@ -108,7 +120,12 @@ export async function login(): Promise<AccountInfo | null> {
 export async function logout(): Promise<void> {
     const msalApp = await getMsalInstance();
     _activeAccount = null;
-    await msalApp.logoutPopup();
+    try {
+        await msalApp.logoutPopup();
+    } catch {
+        // If popup blocked, use redirect
+        await msalApp.logoutRedirect();
+    }
 }
 
 /**
