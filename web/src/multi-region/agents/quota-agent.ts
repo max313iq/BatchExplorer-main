@@ -239,7 +239,33 @@ export class QuotaAgent implements Agent {
                 await scheduler.run(account.subscriptionId, async () => {
                     const token = await resolveToken();
 
-                    // Randomize identity per request
+                    // Strategy: Try direct Quota API first (no paid support plan needed)
+                    // Falls back to Batch quota → Compute quota → Support Ticket
+                    const directResult = await this._tryDirectQuotaApi(
+                        account,
+                        input.quotaType,
+                        input.newLimit,
+                        token,
+                        armUrl,
+                        store
+                    );
+
+                    if (directResult.success) {
+                        store.addLog({
+                            agent: "quota",
+                            level: "info",
+                            message: `[${account.accountName}] Quota updated via direct API (no support ticket needed)`,
+                        });
+                        return; // Skip the support ticket path
+                    }
+
+                    store.addLog({
+                        agent: "quota",
+                        level: "info",
+                        message: `[${account.accountName}] Direct quota API unavailable (${directResult.error}), falling back to support ticket...`,
+                    });
+
+                    // Fallback: Support ticket path
                     const firstName = randomFrom(FIRST_NAMES);
                     const lastName = randomFrom(LAST_NAMES);
                     const country = randomFrom(COUNTRIES);
@@ -449,6 +475,239 @@ export class QuotaAgent implements Agent {
                 failures,
             },
         };
+    }
+
+    /**
+     * Direct Quota API path — works WITHOUT a paid support plan.
+     * Uses Microsoft.Quota provider to update Batch account quotas directly.
+     * Falls back to support ticket path if this fails.
+     */
+    private async _tryDirectQuotaApi(
+        account: {
+            accountName: string;
+            subscriptionId: string;
+            region: string;
+        },
+        quotaType: string,
+        newLimit: number,
+        token: string,
+        armUrl: string,
+        store: AgentContext["store"]
+    ): Promise<{ success: boolean; error?: string }> {
+        try {
+            // Scope for Batch quota: /subscriptions/{sub}/providers/Microsoft.Batch/locations/{region}
+            const scope = `/subscriptions/${account.subscriptionId}/providers/Microsoft.Batch/locations/${account.region}`;
+
+            // Step 1: List current quotas to find the resource name
+            const listUrl = `${armUrl}${scope}/quotas?api-version=2024-02-01`;
+            const listRes = await fetch(listUrl, {
+                headers: { Authorization: `Bearer ${token}` },
+            });
+
+            if (!listRes.ok) {
+                // Batch quota list might not work — try Compute scope for UserSubscription mode
+                return await this._tryComputeQuotaApi(
+                    account,
+                    quotaType,
+                    newLimit,
+                    token,
+                    armUrl,
+                    store
+                );
+            }
+
+            const listData = await listRes.json();
+            const quotas = listData.value ?? [];
+
+            store.addLog({
+                agent: "quota",
+                level: "info",
+                message: `[${account.accountName}] Found ${quotas.length} Batch quotas in ${account.region}`,
+            });
+
+            // Find the matching quota resource
+            let targetQuota: any = null;
+            for (const q of quotas) {
+                const name = (q.name ?? q.id ?? "").toLowerCase();
+                if (
+                    quotaType === "LowPriority" &&
+                    (name.includes("lowpriority") ||
+                        name.includes("low_priority") ||
+                        name.includes("spot"))
+                ) {
+                    targetQuota = q;
+                    break;
+                }
+                if (
+                    quotaType === "Dedicated" &&
+                    name.includes("dedicated") &&
+                    !name.includes("low")
+                ) {
+                    targetQuota = q;
+                    break;
+                }
+            }
+
+            if (!targetQuota) {
+                store.addLog({
+                    agent: "quota",
+                    level: "info",
+                    message: `[${account.accountName}] No direct Batch quota found for ${quotaType}, trying Compute path...`,
+                });
+                return await this._tryComputeQuotaApi(
+                    account,
+                    quotaType,
+                    newLimit,
+                    token,
+                    armUrl,
+                    store
+                );
+            }
+
+            // Step 2: Try to update the quota directly
+            const resourceName =
+                targetQuota.name ?? targetQuota.id?.split("/").pop() ?? "";
+            const updateUrl = `${armUrl}${scope}/quotas/${resourceName}?api-version=2024-02-01`;
+
+            const updateBody = {
+                properties: {
+                    limit: { limitObjectType: "LimitValue", value: newLimit },
+                    name: { value: resourceName },
+                },
+            };
+
+            const updateRes = await fetch(updateUrl, {
+                method: "PUT",
+                headers: {
+                    Authorization: `Bearer ${token}`,
+                    "Content-Type": "application/json",
+                },
+                body: JSON.stringify(updateBody),
+            });
+
+            if (updateRes.ok || updateRes.status === 202) {
+                const updateData = await updateRes.json().catch(() => ({}));
+                store.addLog({
+                    agent: "quota",
+                    level: "info",
+                    message: `[${account.accountName}] Direct quota update: ${updateRes.status} — ${JSON.stringify(updateData).substring(0, 200)}`,
+                });
+                return { success: true };
+            }
+
+            const errData = await updateRes.json().catch(() => ({}));
+            store.addLog({
+                agent: "quota",
+                level: "warn",
+                message: `[${account.accountName}] Direct quota API returned ${updateRes.status}: ${errData?.error?.message ?? JSON.stringify(errData).substring(0, 200)}`,
+            });
+            return {
+                success: false,
+                error: errData?.error?.message ?? `${updateRes.status}`,
+            };
+        } catch (e: any) {
+            return { success: false, error: e?.message ?? String(e) };
+        }
+    }
+
+    /**
+     * Compute quota path — for Batch accounts in UserSubscription pool allocation mode.
+     * Uses Microsoft.Quota provider against the Compute scope.
+     */
+    private async _tryComputeQuotaApi(
+        account: {
+            accountName: string;
+            subscriptionId: string;
+            region: string;
+        },
+        quotaType: string,
+        newLimit: number,
+        token: string,
+        armUrl: string,
+        store: AgentContext["store"]
+    ): Promise<{ success: boolean; error?: string }> {
+        try {
+            const scope = `/subscriptions/${account.subscriptionId}/providers/Microsoft.Compute/locations/${account.region}`;
+            const listUrl = `${armUrl}${scope}/quotas?api-version=2023-02-01`;
+
+            const listRes = await fetch(listUrl, {
+                headers: { Authorization: `Bearer ${token}` },
+            });
+
+            if (!listRes.ok) {
+                return {
+                    success: false,
+                    error: `Compute quota list failed: ${listRes.status}`,
+                };
+            }
+
+            const listData = await listRes.json();
+            const quotas = listData.value ?? [];
+
+            // For UserSubscription mode, we need to find the VM family quota
+            // LowPriority quotas are typically "lowPriority" prefixed families
+            const lpQuota = quotas.find((q: any) => {
+                const name = (
+                    q.properties?.name?.value ??
+                    q.name ??
+                    ""
+                ).toLowerCase();
+                return (
+                    name.includes("lowpriority") || name.includes("spotquota")
+                );
+            });
+
+            if (!lpQuota) {
+                store.addLog({
+                    agent: "quota",
+                    level: "warn",
+                    message: `[${account.accountName}] No Compute LP quota found in ${account.region}`,
+                });
+                return {
+                    success: false,
+                    error: "No matching Compute quota resource found",
+                };
+            }
+
+            const resourceName =
+                lpQuota.properties?.name?.value ?? lpQuota.name ?? "";
+            const updateUrl = `${armUrl}${scope}/quotas/${resourceName}?api-version=2023-02-01`;
+
+            const updateBody = {
+                properties: {
+                    limit: { limitObjectType: "LimitValue", value: newLimit },
+                    name: { value: resourceName },
+                },
+            };
+
+            const updateRes = await fetch(updateUrl, {
+                method: "PATCH",
+                headers: {
+                    Authorization: `Bearer ${token}`,
+                    "Content-Type": "application/json",
+                },
+                body: JSON.stringify(updateBody),
+            });
+
+            if (updateRes.ok || updateRes.status === 202) {
+                store.addLog({
+                    agent: "quota",
+                    level: "info",
+                    message: `[${account.accountName}] Compute quota update: ${updateRes.status}`,
+                });
+                return { success: true };
+            }
+
+            const errData = await updateRes.json().catch(() => ({}));
+            return {
+                success: false,
+                error:
+                    errData?.error?.message ??
+                    `Compute quota update: ${updateRes.status}`,
+            };
+        } catch (e: any) {
+            return { success: false, error: e?.message ?? String(e) };
+        }
     }
 
     private async _pollAsyncOp(
