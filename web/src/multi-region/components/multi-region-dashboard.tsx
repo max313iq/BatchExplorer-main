@@ -31,8 +31,8 @@ import { AgentLogPanel } from "./shared/agent-log-panel";
 import { ActivityPanel } from "./shared/activity-panel";
 import * as msalAuth from "../auth/msal-auth";
 
-// Auth mode: "msal" = Entra ID login, "cli" = Azure CLI proxy
-let _authMode: "msal" | "cli" = "cli";
+// Auth mode: always MSAL (Entra ID) — no CLI proxy fallback
+let _authMode: "msal" | "cli" = "msal";
 
 const DEFAULT_SCHEDULER_OPTIONS = {
     concurrency: 1,
@@ -73,25 +73,11 @@ async function fetchTokenFromProxy(endpoint: string): Promise<CachedToken> {
 }
 
 async function getAccessTokenFromCli(): Promise<string> {
-    // MSAL first — direct Entra ID tokens
-    if (_authMode === "msal") {
-        return msalAuth.getArmToken();
-    }
-    // Fallback: CLI proxy
-    if (isTokenValid(_cachedArmToken)) return _cachedArmToken!.accessToken;
-    _cachedArmToken = await fetchTokenFromProxy("/api/token");
-    return _cachedArmToken.accessToken;
+    return msalAuth.getArmToken();
 }
 
 async function getBatchAccessTokenFromCli(): Promise<string> {
-    // MSAL first — direct Entra ID tokens
-    if (_authMode === "msal") {
-        return msalAuth.getBatchToken();
-    }
-    // Fallback: CLI proxy
-    if (isTokenValid(_cachedBatchToken)) return _cachedBatchToken!.accessToken;
-    _cachedBatchToken = await fetchTokenFromProxy("/api/token/batch");
-    return _cachedBatchToken.accessToken;
+    return msalAuth.getBatchToken();
 }
 
 export interface HealthCheckResult {
@@ -116,103 +102,43 @@ export interface MultiRegionDashboardProps {
 }
 
 async function performHealthCheck(): Promise<HealthCheckResult> {
-    // If MSAL mode, check MSAL auth
-    if (_authMode === "msal") {
-        try {
-            const armToken = await msalAuth.getArmToken();
-            if (!armToken)
-                return {
-                    healthy: false,
-                    error: "Failed to acquire ARM token via Entra ID.",
-                };
-            const batchToken = await msalAuth.getBatchToken();
-            if (!batchToken)
-                return {
-                    healthy: false,
-                    error: "Failed to acquire Batch token via Entra ID.",
-                };
-            const subs = await msalAuth.listSubscriptions();
-            if (subs.length === 0)
-                return {
-                    healthy: false,
-                    error: "No Azure subscriptions found.",
-                };
-            return { healthy: true, error: null };
-        } catch (e: any) {
-            return {
-                healthy: false,
-                error: e?.message ?? "Entra ID auth check failed.",
-            };
-        }
-    }
-
-    // CLI mode: check proxy endpoints
-    try {
-        const authRes = await fetch("/api/auth/status");
-        if (!authRes.ok)
-            return {
-                healthy: false,
-                error: "Cannot reach auth service. Is the proxy server running?",
-            };
-        const authData = await authRes.json();
-        if (authData.loggedIn !== true)
-            return {
-                healthy: false,
-                error: "Azure CLI not logged in. Run `az login` then retry.",
-            };
-    } catch {
+    // Entra ID only — no CLI fallback
+    const isAuth = await msalAuth.isAuthenticated();
+    if (!isAuth) {
         return {
             healthy: false,
-            error: "Cannot reach auth service. Use 'Sign in with Azure' button instead.",
+            error: "Not signed in. Click 'Sign in with Azure' to authenticate via Entra ID.",
         };
     }
-
     try {
-        const armRes = await fetch("/api/token");
-        if (!armRes.ok)
-            return { healthy: false, error: "Failed to acquire ARM token." };
-    } catch {
-        return { healthy: false, error: "Failed to acquire ARM token." };
-    }
-
-    try {
-        const batchRes = await fetch("/api/token/batch");
-        if (!batchRes.ok)
-            return { healthy: false, error: "Failed to acquire Batch token." };
-    } catch {
-        return { healthy: false, error: "Failed to acquire Batch token." };
-    }
-
-    try {
-        const subsRes = await fetch("/api/subscriptions");
-        if (!subsRes.ok)
-            return { healthy: false, error: "Failed to list subscriptions." };
-        const subs = await subsRes.json();
-        if (!Array.isArray(subs) || subs.length === 0)
+        const armToken = await msalAuth.getArmToken();
+        if (!armToken)
+            return {
+                healthy: false,
+                error: "Failed to acquire ARM token via Entra ID.",
+            };
+        const batchToken = await msalAuth.getBatchToken();
+        if (!batchToken)
+            return {
+                healthy: false,
+                error: "Failed to acquire Batch token via Entra ID.",
+            };
+        const subs = await msalAuth.listSubscriptions();
+        if (subs.length === 0)
             return { healthy: false, error: "No Azure subscriptions found." };
-    } catch {
-        return { healthy: false, error: "Failed to list subscriptions." };
+        return { healthy: true, error: null };
+    } catch (e: any) {
+        return {
+            healthy: false,
+            error: e?.message ?? "Entra ID auth check failed.",
+        };
     }
-
-    return { healthy: true, error: null };
 }
 
 async function loadSubscriptions(store: MultiRegionStore): Promise<void> {
     try {
-        if (_authMode === "msal") {
-            const subs = await msalAuth.listSubscriptions();
-            store.setSubscriptions(subs);
-            return;
-        }
-        const response = await fetch("/api/subscriptions");
-        if (!response.ok) return;
-        const subs = await response.json();
-        store.setSubscriptions(
-            subs.map((s: any) => ({
-                subscriptionId: s.subscriptionId,
-                displayName: s.displayName,
-            }))
-        );
+        const subs = await msalAuth.listSubscriptions();
+        store.setSubscriptions(subs);
     } catch {
         /* subscriptions are optional */
     }
@@ -583,20 +509,22 @@ const DashboardContent: React.FC<{ tokenProvider?: TokenProvider }> = ({
     // Auto-save
     React.useEffect(() => store.enableAutoSave(), [store]);
 
-    // Auto-discover ALL resources on mount: accounts → pools → quotas → nodes
+    // Check auth on mount (don't auto-discover — wait for user to sign in)
     React.useEffect(() => {
+        checkLogin();
+    }, [checkLogin]);
+
+    // Auto-discover ALL resources ONLY after successful auth
+    React.useEffect(() => {
+        if (!healthCheck?.healthy) return;
         let cancelled = false;
-        checkLogin().then(async () => {
-            if (cancelled) return;
+        (async () => {
             try {
-                // Discover ALL accounts across ALL subscriptions
                 await orchestrator.execute({
                     action: "discover_accounts",
-                    payload: {}, // empty = cross-subscription discovery
+                    payload: {},
                 });
                 if (cancelled) return;
-
-                // Parallel: refresh pools + account info simultaneously
                 await Promise.all([
                     orchestrator.execute({
                         action: "refresh_pool_info",
@@ -608,8 +536,6 @@ const DashboardContent: React.FC<{ tokenProvider?: TokenProvider }> = ({
                     }),
                 ]);
                 if (cancelled) return;
-
-                // Refresh nodes for all discovered pools
                 if (store.getState().poolInfos.length > 0) {
                     await orchestrator.execute({
                         action: "list_nodes",
@@ -617,13 +543,13 @@ const DashboardContent: React.FC<{ tokenProvider?: TokenProvider }> = ({
                     });
                 }
             } catch {
-                /* silent — individual errors logged by agents */
+                /* logged by agents */
             }
-        });
+        })();
         return () => {
             cancelled = true;
         };
-    }, [checkLogin, orchestrator, store]);
+    }, [healthCheck?.healthy, orchestrator, store]);
 
     // Periodic auto-refresh (60s interval)
     React.useEffect(() => {

@@ -71,26 +71,35 @@ async function getMsalInstance(): Promise<PublicClientApplication> {
 
 /**
  * Force interactive login via popup. Returns the authenticated account.
+ * Serialized — only one login popup can be open at a time.
  */
 export async function login(): Promise<AccountInfo | null> {
-    const msalApp = await getMsalInstance();
+    // If a login is already in progress, wait for it
+    if (_loginInProgress) return _loginInProgress;
 
-    const loginRequest: PopupRequest = {
-        scopes: [ARM_SCOPE],
-        prompt: "select_account",
-    };
+    _loginInProgress = (async () => {
+        const msalApp = await getMsalInstance();
+        const loginRequest: PopupRequest = {
+            scopes: [ARM_SCOPE],
+            prompt: "select_account",
+        };
 
-    try {
-        const result = await msalApp.loginPopup(loginRequest);
-        if (result.account) {
-            _activeAccount = result.account;
-            msalApp.setActiveAccount(result.account);
+        try {
+            const result = await msalApp.loginPopup(loginRequest);
+            if (result.account) {
+                _activeAccount = result.account;
+                msalApp.setActiveAccount(result.account);
+            }
+            return result.account;
+        } catch (error: any) {
+            console.error("MSAL login failed:", error);
+            throw error;
+        } finally {
+            _loginInProgress = null;
         }
-        return result.account;
-    } catch (error: any) {
-        console.error("MSAL login failed:", error);
-        throw error;
-    }
+    })();
+
+    return _loginInProgress;
 }
 
 /**
@@ -126,8 +135,12 @@ export async function getCurrentUser(): Promise<AccountInfo | null> {
     return null;
 }
 
+// Serialize all interactive auth to prevent "interaction_in_progress" errors
+let _loginInProgress: Promise<AccountInfo | null> | null = null;
+
 /**
- * Acquire a token silently, falling back to popup if needed.
+ * Acquire a token silently. Does NOT auto-trigger popup —
+ * user must click "Sign in with Azure" first.
  */
 async function acquireToken(scopes: string[]): Promise<AuthenticationResult> {
     const msalApp = await getMsalInstance();
@@ -135,13 +148,12 @@ async function acquireToken(scopes: string[]): Promise<AuthenticationResult> {
     if (!_activeAccount) {
         const accounts = msalApp.getAllAccounts();
         if (accounts.length === 0) {
-            // No account — force login
-            const account = await login();
-            if (!account) throw new Error("Login required");
-        } else {
-            _activeAccount = accounts[0];
-            msalApp.setActiveAccount(accounts[0]);
+            throw new Error(
+                "Not signed in. Click 'Sign in with Azure' to authenticate."
+            );
         }
+        _activeAccount = accounts[0];
+        msalApp.setActiveAccount(accounts[0]);
     }
 
     const silentRequest: SilentRequest = {
@@ -154,7 +166,12 @@ async function acquireToken(scopes: string[]): Promise<AuthenticationResult> {
         return await msalApp.acquireTokenSilent(silentRequest);
     } catch (error) {
         if (error instanceof InteractionRequiredAuthError) {
-            // Token expired or consent needed — popup
+            // Token expired — try popup, but serialize to prevent concurrent popups
+            if (_loginInProgress) {
+                await _loginInProgress;
+                // After login completes, retry silent
+                return await msalApp.acquireTokenSilent(silentRequest);
+            }
             return await msalApp.acquireTokenPopup({ scopes });
         }
         throw error;
