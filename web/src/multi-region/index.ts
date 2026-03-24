@@ -30,6 +30,11 @@ export { PoolAgent } from "./agents/pool-agent";
 
 // Components
 export { MultiRegionDashboard } from "./components/multi-region-dashboard";
+export type {
+    TokenProvider,
+    MultiRegionDashboardProps,
+    HealthCheckResult,
+} from "./components/multi-region-dashboard";
 export { ToastContainer } from "./components/shared/toast-container";
 export { ErrorBoundary } from "./components/shared/error-boundary";
 export { SidebarNav } from "./components/shared/sidebar-nav";

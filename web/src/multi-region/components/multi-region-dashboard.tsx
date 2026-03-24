@@ -80,9 +80,25 @@ async function getBatchAccessTokenFromCli(): Promise<string> {
     return _cachedBatchToken.accessToken;
 }
 
-interface HealthCheckResult {
+export interface HealthCheckResult {
     healthy: boolean;
     error: string | null;
+}
+
+/**
+ * Optional token provider that, when supplied, overrides the proxy-based
+ * token fetching. This allows the desktop Electron app to inject its own
+ * MSAL-based auth without needing a dev server proxy.
+ */
+export interface TokenProvider {
+    getAccessToken: () => Promise<string>;
+    getBatchAccessToken: () => Promise<string>;
+    checkHealth: () => Promise<HealthCheckResult>;
+    loadSubscriptions: (store: MultiRegionStore) => Promise<void>;
+}
+
+export interface MultiRegionDashboardProps {
+    tokenProvider?: TokenProvider;
 }
 
 async function performHealthCheck(): Promise<HealthCheckResult> {
@@ -183,13 +199,17 @@ async function loadSubscriptions(store: MultiRegionStore): Promise<void> {
     }
 }
 
-function createAgentContext(store: MultiRegionStore): AgentContext {
+function createAgentContext(
+    store: MultiRegionStore,
+    tokenProvider?: TokenProvider
+): AgentContext {
     return {
         store,
         scheduler: new RequestScheduler(DEFAULT_SCHEDULER_OPTIONS),
         armUrl: "https://management.azure.com",
-        getAccessToken: getAccessTokenFromCli,
-        getBatchAccessToken: getBatchAccessTokenFromCli,
+        getAccessToken: tokenProvider?.getAccessToken ?? getAccessTokenFromCli,
+        getBatchAccessToken:
+            tokenProvider?.getBatchAccessToken ?? getBatchAccessTokenFromCli,
     };
 }
 
@@ -412,7 +432,9 @@ const PageContent: React.FC<{
 
 // --- Dashboard Content ---
 
-const DashboardContent: React.FC = () => {
+const DashboardContent: React.FC<{ tokenProvider?: TokenProvider }> = ({
+    tokenProvider,
+}) => {
     const store = useMultiRegionStore();
     const [healthCheck, setHealthCheck] =
         React.useState<HealthCheckResult | null>(null);
@@ -424,16 +446,24 @@ const DashboardContent: React.FC = () => {
     const autoRefreshRunningRef = React.useRef(false);
 
     const orchestrator = React.useMemo(
-        () => new OrchestratorAgent(createAgentContext(store)),
-        [store]
+        () => new OrchestratorAgent(createAgentContext(store, tokenProvider)),
+        [store, tokenProvider]
     );
 
     const checkLogin = React.useCallback(async () => {
         setHealthCheck(null);
-        const result = await performHealthCheck();
+        const result = tokenProvider
+            ? await tokenProvider.checkHealth()
+            : await performHealthCheck();
         setHealthCheck(result);
-        if (result.healthy) loadSubscriptions(store);
-    }, [store]);
+        if (result.healthy) {
+            if (tokenProvider) {
+                await tokenProvider.loadSubscriptions(store);
+            } else {
+                await loadSubscriptions(store);
+            }
+        }
+    }, [store, tokenProvider]);
 
     // Auto-save
     React.useEffect(() => store.enableAutoSave(), [store]);
@@ -597,13 +627,15 @@ const DashboardContent: React.FC = () => {
 
 // --- Root ---
 
-export const MultiRegionDashboard: React.FC = () => {
+export const MultiRegionDashboard: React.FC<MultiRegionDashboardProps> = ({
+    tokenProvider,
+}) => {
     const [store] = React.useState(() => new MultiRegionStore());
 
     return (
         <MultiRegionStoreProvider store={store}>
             <ErrorBoundary>
-                <DashboardContent />
+                <DashboardContent tokenProvider={tokenProvider} />
             </ErrorBoundary>
         </MultiRegionStoreProvider>
     );
