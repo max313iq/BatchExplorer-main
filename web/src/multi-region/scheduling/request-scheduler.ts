@@ -113,6 +113,16 @@ export class RequestScheduler {
         return scheduled;
     }
 
+    /** Number of requests currently queued or executing */
+    public get inflightCount(): number {
+        return this._inflightCount;
+    }
+
+    /** Number of concurrency slots currently in use */
+    public get activeCount(): number {
+        return this._activeCount;
+    }
+
     private async _executeScheduled<T>(fn: () => Promise<T>): Promise<T> {
         await this._acquireSlot();
         try {
@@ -146,13 +156,21 @@ export class RequestScheduler {
         const status = this._extractStatus(error);
         const retryAfterMs = this._extractRetryAfterMs(error);
         const baseDelayMs = this._getBackoffDelayMs(retryCount);
+
+        // Honor Retry-After header: use the maximum of backoff and Retry-After
         const delayMs = Math.max(baseDelayMs, retryAfterMs ?? 0);
 
         if (status === 0 || status == null) {
             return { shouldRetry: true, reason: "network", delayMs };
         }
         if (status === 429) {
-            return { shouldRetry: true, reason: "throttle", delayMs };
+            // For 429, always respect Retry-After if present, with a minimum floor
+            const throttleDelay = Math.max(delayMs, 1000);
+            return {
+                shouldRetry: true,
+                reason: "throttle",
+                delayMs: throttleDelay,
+            };
         }
         if (
             status === 503 ||
@@ -196,6 +214,10 @@ export class RequestScheduler {
         return typeof status === "number" ? status : null;
     }
 
+    /**
+     * Extract Retry-After header from error objects.
+     * Supports both seconds (numeric) and HTTP-date formats.
+     */
     private _extractRetryAfterMs(error: any): number | null {
         const value = this._readHeaderValue(error, "retry-after");
         if (!value) return null;

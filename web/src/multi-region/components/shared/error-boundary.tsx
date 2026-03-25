@@ -2,18 +2,24 @@ import * as React from "react";
 import { MessageBar, MessageBarType } from "@fluentui/react/lib/MessageBar";
 import { PrimaryButton } from "@fluentui/react/lib/Button";
 
+interface ErrorBoundaryProps {
+    children: React.ReactNode;
+    fallback?: React.ReactNode;
+}
+
 interface ErrorBoundaryState {
     hasError: boolean;
     error: Error | null;
+    resetKey: number;
 }
 
 export class ErrorBoundary extends React.Component<
-    { children: React.ReactNode },
+    ErrorBoundaryProps,
     ErrorBoundaryState
 > {
-    state: ErrorBoundaryState = { hasError: false, error: null };
+    state: ErrorBoundaryState = { hasError: false, error: null, resetKey: 0 };
 
-    static getDerivedStateFromError(error: Error): ErrorBoundaryState {
+    static getDerivedStateFromError(error: Error): Partial<ErrorBoundaryState> {
         return { hasError: true, error };
     }
 
@@ -21,8 +27,19 @@ export class ErrorBoundary extends React.Component<
         console.error("[ErrorBoundary]", error, info.componentStack);
     }
 
+    private handleReset = () => {
+        this.setState((prev) => ({
+            hasError: false,
+            error: null,
+            resetKey: prev.resetKey + 1,
+        }));
+    };
+
     render(): React.ReactNode {
         if (this.state.hasError) {
+            if (this.props.fallback) {
+                return this.props.fallback;
+            }
             return (
                 <div
                     style={{
@@ -44,13 +61,15 @@ export class ErrorBoundary extends React.Component<
                     </MessageBar>
                     <PrimaryButton
                         text="Reload Dashboard"
-                        onClick={() => {
-                            this.setState({ hasError: false, error: null });
-                        }}
+                        onClick={this.handleReset}
                     />
                 </div>
             );
         }
-        return this.props.children;
+        return (
+            <React.Fragment key={this.state.resetKey}>
+                {this.props.children}
+            </React.Fragment>
+        );
     }
 }

@@ -93,6 +93,9 @@ export function useDashboardStats() {
             failedPools: pools.filter((p) => p.provisioningState === "failed")
                 .length,
             totalNodes: nodes.length,
+            runningNodes: nodes.filter(
+                (n) => n.state === "running" || n.state === "idle"
+            ).length,
             nonWorkingNodes: nodes.filter(
                 (n) =>
                     n.state === "unusable" ||

@@ -11,8 +11,17 @@ function uuidV4(): string {
 
 const BATCH_API_VERSION = "2024-07-01.20.0";
 
+/**
+ * Optional token provider interface. When supplied, the agent calls
+ * `getToken()` instead of the context's `getBatchAccessToken`.
+ */
+export interface TokenProvider {
+    getToken(tenantId?: string): Promise<string>;
+}
+
 export interface NodeListInput {
     accountIds: string[];
+    tokenProvider?: TokenProvider;
 }
 
 export interface NodeActionInput {
@@ -23,24 +32,57 @@ export interface NodeActionInput {
         | "disableScheduling"
         | "enableScheduling";
     nodeIds: string[]; // internal ManagedNode ids
+    tokenProvider?: TokenProvider;
 }
 
+/**
+ * Batch data-plane response shape for a pool (used to correlate node
+ * dedication and vmSize).
+ */
 interface BatchPoolResponse {
     id: string;
     vmSize?: string;
+    targetDedicatedNodes?: number;
+    currentDedicatedNodes?: number;
+    targetLowPriorityNodes?: number;
+    currentLowPriorityNodes?: number;
     "odata.nextLink"?: string;
 }
 
+/**
+ * Full node response from the Batch data-plane API:
+ *   GET /pools/{poolId}/nodes?api-version=2024-07-01.20.0
+ */
 interface BatchNodeResponse {
     id: string;
     state?: string;
-    ipAddress?: string;
-    isDedicated?: boolean;
-    lastBootUpTime?: string;
-    totalTasksRun?: number;
-    runningTasksCount?: number;
     schedulingState?: string;
-    errors?: Array<{ code?: string; message?: string }>;
+    vmSize?: string;
+    isDedicated?: boolean;
+    runningTasksCount?: number;
+    totalTasksCount?: number;
+    totalTasksRun?: number;
+    lastBootTime?: string;
+    startTaskInfo?: {
+        exitCode?: number;
+        result?: string;
+        startTime?: string;
+        endTime?: string;
+        retryCount?: number;
+        failureInfo?: {
+            category?: string;
+            code?: string;
+            message?: string;
+            details?: Array<{ name?: string; value?: string }>;
+        };
+    };
+    errors?: Array<{
+        code?: string;
+        message?: string;
+        errorDetails?: Array<{ name?: string; value?: string }>;
+    }>;
+    ipAddress?: string;
+    affinityId?: string;
 }
 
 export class NodeAgent implements Agent {
@@ -72,7 +114,19 @@ export class NodeAgent implements Agent {
     }
 
     /**
-     * Fetch all pages from a paginated Batch API endpoint.
+     * Resolve a bearer token. If a TokenProvider was supplied in the input
+     * it takes precedence over the context's default accessor.
+     */
+    private async _resolveToken(provider?: TokenProvider): Promise<string> {
+        if (provider) {
+            return provider.getToken();
+        }
+        return this._ctx.getBatchAccessToken();
+    }
+
+    /**
+     * Fetch all pages from a paginated Batch data-plane endpoint.
+     * Follows `odata.nextLink` until exhausted.
      */
     private async _fetchAllPages<T>(
         initialUrl: string,
@@ -82,6 +136,8 @@ export class NodeAgent implements Agent {
         let url: string | undefined = initialUrl;
 
         while (url) {
+            if (this._cancelled) break;
+
             const response = await fetch(url, {
                 headers: {
                     Authorization: `Bearer ${token}`,
@@ -102,17 +158,22 @@ export class NodeAgent implements Agent {
             const items: T[] = data.value ?? [];
             results.push(...items);
 
+            // Follow pagination via odata.nextLink
             url = data["odata.nextLink"] ?? undefined;
         }
 
         return results;
     }
 
+    // -----------------------------------------------------------------
+    // List nodes
+    // -----------------------------------------------------------------
+
     private async _listNodes(input: NodeListInput): Promise<AgentResult> {
-        const { store, getBatchAccessToken } = this._ctx;
+        const { store } = this._ctx;
         this._cancelled = false;
 
-        // Auto-discover: if no accountIds provided, use ALL created accounts from store
+        // Auto-discover: if no accountIds provided, use ALL created accounts
         let accountIds = input.accountIds;
         if (!accountIds || accountIds.length === 0) {
             accountIds = store
@@ -128,9 +189,8 @@ export class NodeAgent implements Agent {
             message: `Listing nodes across ${accountIds.length} accounts (parallel)`,
         });
 
-        const token = await getBatchAccessToken();
+        const token = await this._resolveToken(input.tokenProvider);
 
-        // Parallel fetch across ALL accounts — Batch GETs don't have strict 429
         const MAX_CONCURRENT = 20;
         const accountResults = await this._parallelMap(
             accountIds,
@@ -138,46 +198,87 @@ export class NodeAgent implements Agent {
                 if (this._cancelled)
                     return {
                         nodes: [] as ManagedNode[],
+                        preempted: 0,
                         error: null as string | null,
                     };
                 const state = store.getState();
                 const account = state.accounts.find((a) => a.id === accountId);
                 if (!account)
-                    return { nodes: [] as ManagedNode[], error: null };
+                    return {
+                        nodes: [] as ManagedNode[],
+                        preempted: 0,
+                        error: null,
+                    };
 
                 try {
                     const baseUrl = `https://${account.accountName}.${account.region}.batch.azure.com`;
+
+                    // 1) Fetch pools — GET /pools?api-version=...
                     const poolsUrl = `${baseUrl}/pools?api-version=${BATCH_API_VERSION}`;
                     const pools = await this._fetchAllPages<BatchPoolResponse>(
                         poolsUrl,
                         token
                     );
 
-                    // Parallel fetch nodes across ALL pools in this account
+                    // 2) Parallel-fetch nodes across ALL pools in this account
+                    //    GET /pools/{poolId}/nodes?api-version=...
                     const poolNodeResults = await this._parallelMap(
                         pools,
                         async (pool) => {
-                            if (this._cancelled) return [] as ManagedNode[];
-                            const nodesUrl = `${baseUrl}/pools/${pool.id}/nodes?api-version=${BATCH_API_VERSION}`;
+                            if (this._cancelled)
+                                return {
+                                    nodes: [] as ManagedNode[],
+                                    preempted: 0,
+                                };
+
+                            const nodesUrl = `${baseUrl}/pools/${encodeURIComponent(pool.id)}/nodes?api-version=${BATCH_API_VERSION}`;
                             try {
-                                const nodes =
+                                const rawNodes =
                                     await this._fetchAllPages<BatchNodeResponse>(
                                         nodesUrl,
                                         token
                                     );
-                                return nodes.map((n) =>
-                                    this._toBatchNode(n, account, pool)
-                                );
+
+                                let preemptedCount = 0;
+                                const mapped = rawNodes.map((n, idx) => {
+                                    if (
+                                        n.state?.toLowerCase() === "preempted"
+                                    ) {
+                                        preemptedCount++;
+                                    }
+                                    return this._toBatchNode(
+                                        n,
+                                        account,
+                                        pool,
+                                        idx
+                                    );
+                                });
+                                return {
+                                    nodes: mapped,
+                                    preempted: preemptedCount,
+                                };
                             } catch {
-                                return [] as ManagedNode[];
+                                return {
+                                    nodes: [] as ManagedNode[],
+                                    preempted: 0,
+                                };
                             }
                         },
                         MAX_CONCURRENT
                     );
-                    return { nodes: poolNodeResults.flat(), error: null };
+
+                    const nodes: ManagedNode[] = [];
+                    let preempted = 0;
+                    for (const pr of poolNodeResults) {
+                        nodes.push(...pr.nodes);
+                        preempted += pr.preempted;
+                    }
+
+                    return { nodes, preempted, error: null };
                 } catch (error: any) {
                     return {
                         nodes: [] as ManagedNode[],
+                        preempted: 0,
                         error: error?.message ?? String(error),
                     };
                 }
@@ -187,9 +288,13 @@ export class NodeAgent implements Agent {
 
         const allNodes: ManagedNode[] = [];
         let errors = 0;
+        let totalPreempted = 0;
         for (const r of accountResults) {
             if (r.error) errors++;
-            else allNodes.push(...r.nodes);
+            else {
+                allNodes.push(...r.nodes);
+                totalPreempted += r.preempted;
+            }
         }
 
         store.setNodes(allNodes);
@@ -197,19 +302,27 @@ export class NodeAgent implements Agent {
         store.addLog({
             agent: "node",
             level: "info",
-            message: `Found ${allNodes.length} nodes across accounts (${errors} account-level errors)`,
+            message: `Found ${allNodes.length} nodes across accounts (${totalPreempted} preempted, ${errors} account-level errors)`,
         });
 
         return {
             status: errors === 0 ? "completed" : "partial",
-            summary: { total: allNodes.length, errors },
+            summary: {
+                total: allNodes.length,
+                preempted: totalPreempted,
+                errors,
+            },
         };
     }
+
+    // -----------------------------------------------------------------
+    // Node actions
+    // -----------------------------------------------------------------
 
     private async _executeNodeAction(
         input: NodeActionInput & { actionType: string }
     ): Promise<AgentResult> {
-        const { store, scheduler, getBatchAccessToken } = this._ctx;
+        const { store, scheduler } = this._ctx;
         this._cancelled = false;
 
         const action = input.actionType as
@@ -261,38 +374,41 @@ export class NodeAgent implements Agent {
 
             try {
                 await scheduler.run(node.accountId, async () => {
-                    const token = await getBatchAccessToken();
+                    const token = await this._resolveToken(input.tokenProvider);
                     const baseUrl = `https://${account.accountName}.${account.region}.batch.azure.com`;
 
                     let url: string;
                     let body: string | undefined;
 
+                    // All node actions are POST to
+                    //   /pools/{poolId}/nodes/{nodeId}/{action}
+                    // except "delete" which uses /pools/{poolId}/removenodes
                     switch (action) {
                         case "reboot":
-                            url = `${baseUrl}/pools/${node.poolId}/nodes/${node.nodeId}/reboot?api-version=${BATCH_API_VERSION}`;
+                            url = `${baseUrl}/pools/${encodeURIComponent(node.poolId)}/nodes/${encodeURIComponent(node.nodeId)}/reboot?api-version=${BATCH_API_VERSION}`;
                             body = JSON.stringify({
                                 nodeRebootOption: "requeue",
                             });
                             break;
                         case "delete":
-                            url = `${baseUrl}/pools/${node.poolId}/removenodes?api-version=${BATCH_API_VERSION}`;
+                            url = `${baseUrl}/pools/${encodeURIComponent(node.poolId)}/removenodes?api-version=${BATCH_API_VERSION}`;
                             body = JSON.stringify({
                                 nodeList: [node.nodeId],
                                 nodeDeallocationOption: "requeue",
                             });
                             break;
                         case "reimage":
-                            url = `${baseUrl}/pools/${node.poolId}/nodes/${node.nodeId}/reimage?api-version=${BATCH_API_VERSION}`;
+                            url = `${baseUrl}/pools/${encodeURIComponent(node.poolId)}/nodes/${encodeURIComponent(node.nodeId)}/reimage?api-version=${BATCH_API_VERSION}`;
                             body = JSON.stringify({
                                 nodeReimageOption: "requeue",
                             });
                             break;
                         case "disableScheduling":
-                            url = `${baseUrl}/pools/${node.poolId}/nodes/${node.nodeId}/disablescheduling?api-version=${BATCH_API_VERSION}`;
+                            url = `${baseUrl}/pools/${encodeURIComponent(node.poolId)}/nodes/${encodeURIComponent(node.nodeId)}/disablescheduling?api-version=${BATCH_API_VERSION}`;
                             body = undefined;
                             break;
                         case "enableScheduling":
-                            url = `${baseUrl}/pools/${node.poolId}/nodes/${node.nodeId}/enablescheduling?api-version=${BATCH_API_VERSION}`;
+                            url = `${baseUrl}/pools/${encodeURIComponent(node.poolId)}/nodes/${encodeURIComponent(node.nodeId)}/enablescheduling?api-version=${BATCH_API_VERSION}`;
                             body = undefined;
                             break;
                         default:
@@ -376,6 +492,18 @@ export class NodeAgent implements Agent {
         };
     }
 
+    // -----------------------------------------------------------------
+    // Map Batch API node response to ManagedNode
+    // -----------------------------------------------------------------
+
+    /**
+     * Convert a raw Batch data-plane node response into a ManagedNode.
+     *
+     * isDedicated mapping: the Batch API may return `isDedicated` on the
+     * node itself. When it is not present, we infer dedication from the
+     * pool counters -- if the node's ordinal index is less than the pool's
+     * `currentDedicatedNodes`, it is dedicated; otherwise low-priority.
+     */
     private _toBatchNode(
         n: BatchNodeResponse,
         account: {
@@ -384,19 +512,52 @@ export class NodeAgent implements Agent {
             region: string;
             subscriptionId: string;
         },
-        pool: BatchPoolResponse
+        pool: BatchPoolResponse,
+        nodeIndex: number
     ): ManagedNode {
         const nodeState = (n.state ?? "unknown").toLowerCase() as NodeState;
-        const nodeErrors = n.errors;
+
+        // --- isDedicated ---
+        let isDedicated: boolean;
+        if (typeof n.isDedicated === "boolean") {
+            isDedicated = n.isDedicated;
+        } else {
+            // Infer from pool counters: nodes indexed below
+            // currentDedicatedNodes are dedicated.
+            const currentDedicated = pool.currentDedicatedNodes ?? 0;
+            isDedicated =
+                (pool.targetDedicatedNodes ?? 0) > 0 &&
+                nodeIndex < currentDedicated;
+        }
+
+        // --- errors ---
         let errorMsg: string | null = null;
-        if (nodeErrors && nodeErrors.length > 0) {
-            errorMsg = nodeErrors
-                .map(
-                    (e) =>
-                        `${e.code ?? "Error"}: ${e.message ?? "Unknown error"}`
-                )
+        if (n.errors && n.errors.length > 0) {
+            errorMsg = n.errors
+                .map((e) => {
+                    let msg = `${e.code ?? "Error"}: ${e.message ?? "Unknown error"}`;
+                    if (e.errorDetails && e.errorDetails.length > 0) {
+                        const details = e.errorDetails
+                            .map((d) => `${d.name}=${d.value}`)
+                            .join(", ");
+                        msg += ` (${details})`;
+                    }
+                    return msg;
+                })
                 .join("; ");
         }
+
+        // --- startTaskInfo errors ---
+        if (
+            n.startTaskInfo?.result === "failure" ||
+            (n.startTaskInfo?.exitCode !== undefined &&
+                n.startTaskInfo.exitCode !== 0)
+        ) {
+            const stInfo = n.startTaskInfo;
+            const stMsg = `StartTask exit=${stInfo.exitCode ?? "?"} result=${stInfo.result ?? "unknown"}`;
+            errorMsg = errorMsg ? `${errorMsg}; ${stMsg}` : stMsg;
+        }
+
         return {
             id: uuidV4(),
             accountId: account.id,
@@ -405,17 +566,21 @@ export class NodeAgent implements Agent {
             poolId: pool.id,
             nodeId: n.id,
             state: nodeState,
-            vmSize: pool.vmSize,
+            vmSize: n.vmSize ?? pool.vmSize,
             ipAddress: n.ipAddress,
-            isDedicated: n.isDedicated ?? true,
-            lastBootTime: n.lastBootUpTime,
-            totalTasksRun: n.totalTasksRun,
+            isDedicated,
+            lastBootTime: n.lastBootTime,
+            totalTasksRun: n.totalTasksRun ?? n.totalTasksCount,
             runningTasksCount: n.runningTasksCount,
             schedulingState: n.schedulingState,
             subscriptionId: account.subscriptionId,
             error: errorMsg,
         };
     }
+
+    // -----------------------------------------------------------------
+    // Concurrency-limited parallel map
+    // -----------------------------------------------------------------
 
     private async _parallelMap<T, R>(
         items: T[],

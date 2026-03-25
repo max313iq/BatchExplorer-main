@@ -39,13 +39,31 @@ export { ToastContainer } from "./components/shared/toast-container";
 export { ErrorBoundary } from "./components/shared/error-boundary";
 export { SidebarNav } from "./components/shared/sidebar-nav";
 export type { PageKey } from "./components/shared/sidebar-nav";
-export { OverviewPage } from "./components/overview/overview-page";
+export { ActivityPanel } from "./components/shared/activity-panel";
 export { LoadingSkeleton } from "./components/shared/loading-skeleton";
+
+// Page components
+export { OverviewPage } from "./components/overview/overview-page";
+export { AccountProvisioningPage } from "./components/account-provisioning/account-provisioning-page";
+export { QuotaRequestsPage } from "./components/quota-requests/quota-requests-page";
+export { QuotaStatusPage } from "./components/quota-status/quota-status-page";
+export { PoolCreationPage } from "./components/pool-creation/pool-creation-page";
+export { PoolInfoPage } from "./components/pool-info/pool-info-page";
+export { AccountInfoPage } from "./components/account-info/account-info-page";
 export { UnusedQuotaPage } from "./components/unused-quota/unused-quota-page";
+export { NodesPage } from "./components/nodes/nodes-page";
 
 // Constants & Helpers
 export { AZURE_REGIONS } from "./components/shared/constants";
-export { getActionableErrorMessage } from "./components/shared/error-helpers";
+export {
+    classifyError,
+    getActionableErrorMessage,
+} from "./components/shared/error-helpers";
+export type {
+    ActionableError,
+    BatchApiError,
+    ErrorClassification,
+} from "./components/shared/error-helpers";
 
 // VM Sizes
 export type { VmSizeInfo } from "./components/shared/vm-sizes";

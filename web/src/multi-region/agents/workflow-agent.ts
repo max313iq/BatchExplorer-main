@@ -27,6 +27,10 @@ export class WorkflowAgent {
         this._orchestrator.cancel();
     }
 
+    /**
+     * Full provisioning workflow:
+     *   discover -> quota -> monitor -> pool
+     */
     async execute(config: WorkflowConfig): Promise<AgentResult> {
         const { store } = this._ctx;
         this._cancelled = false;
@@ -249,6 +253,216 @@ export class WorkflowAgent {
                 },
             };
         }
+    }
+
+    /**
+     * Refresh workflow: discover -> refresh pools -> refresh accounts -> detect unused quota.
+     * Used to update state without provisioning new resources.
+     */
+    async executeRefreshChain(subscriptionId: string): Promise<AgentResult> {
+        const { store } = this._ctx;
+        this._cancelled = false;
+
+        const stepResults: Record<string, AgentResult["summary"]> = {};
+        const completedSteps: string[] = [];
+
+        store.addLog({
+            agent: "orchestrator",
+            level: "info",
+            message:
+                "Refresh chain: starting discover -> refresh pools -> refresh accounts -> detect unused quota",
+        });
+
+        try {
+            // Step 1: Discover accounts
+            if (this._cancelled) {
+                return this._partialChainResult(completedSteps, stepResults);
+            }
+
+            const discoverResult = await this._orchestrator.execute({
+                action: "discover_accounts",
+                payload: { subscriptionId },
+            });
+            stepResults.discover = discoverResult.summary;
+
+            if (discoverResult.status === "failed") {
+                store.addLog({
+                    agent: "orchestrator",
+                    level: "error",
+                    message: `Refresh chain failed at discover: ${discoverResult.summary.error ?? "unknown"}`,
+                });
+                return {
+                    status: "failed",
+                    summary: {
+                        completedSteps,
+                        failedStep: "discover",
+                        stepResults,
+                    },
+                };
+            }
+            completedSteps.push("discover");
+
+            // Step 2: Refresh pools for all discovered accounts
+            if (this._cancelled) {
+                return this._partialChainResult(completedSteps, stepResults);
+            }
+
+            const accounts = store
+                .getState()
+                .accounts.filter((a) => a.provisioningState === "created");
+            const accountIds = accounts.map((a) => a.id);
+
+            store.addLog({
+                agent: "orchestrator",
+                level: "info",
+                message: `Refresh chain: refreshing pools for ${accountIds.length} accounts`,
+            });
+
+            const poolRefreshResult = await this._orchestrator.execute({
+                action: "refresh_pools",
+                payload: { accountIds },
+            });
+            stepResults.refreshPools = poolRefreshResult.summary;
+            completedSteps.push("refreshPools");
+
+            // Step 3: Refresh account details (quotas, usage)
+            if (this._cancelled) {
+                return this._partialChainResult(completedSteps, stepResults);
+            }
+
+            store.addLog({
+                agent: "orchestrator",
+                level: "info",
+                message: `Refresh chain: refreshing account details for ${accountIds.length} accounts`,
+            });
+
+            const accountRefreshResult = await this._orchestrator.execute({
+                action: "refresh_accounts",
+                payload: { accountIds },
+            });
+            stepResults.refreshAccounts = accountRefreshResult.summary;
+            completedSteps.push("refreshAccounts");
+
+            // Step 4: Detect unused quota
+            if (this._cancelled) {
+                return this._partialChainResult(completedSteps, stepResults);
+            }
+
+            store.addLog({
+                agent: "orchestrator",
+                level: "info",
+                message: "Refresh chain: detecting unused quota",
+            });
+
+            const unusedQuota = this._detectUnusedQuota();
+            stepResults.unusedQuota = unusedQuota;
+            completedSteps.push("detectUnusedQuota");
+
+            store.addLog({
+                agent: "orchestrator",
+                level: "info",
+                message: `Refresh chain complete: ${unusedQuota.accountsWithUnusedQuota} accounts have unused quota`,
+            });
+
+            return {
+                status: "completed",
+                summary: {
+                    completedSteps,
+                    stepResults,
+                },
+            };
+        } catch (error: any) {
+            const errorMsg = error?.message ?? String(error);
+            store.addLog({
+                agent: "orchestrator",
+                level: "error",
+                message: `Refresh chain error: ${errorMsg}`,
+            });
+            return {
+                status: "failed",
+                summary: {
+                    completedSteps,
+                    error: errorMsg,
+                    stepResults,
+                },
+            };
+        }
+    }
+
+    /**
+     * Detect accounts that have approved quota but no pools using that quota.
+     */
+    private _detectUnusedQuota(): Record<string, unknown> {
+        const state = this._ctx.store.getState();
+
+        const approvedAccounts = new Set(
+            state.quotaRequests
+                .filter((r) => r.status === "approved")
+                .map((r) => r.accountId)
+        );
+
+        const accountsWithPools = new Set(
+            state.pools
+                .filter((p) => p.provisioningState === "created")
+                .map((p) => p.accountId)
+        );
+
+        // Also check accountInfos for actual usage data
+        const accountsWithUsage = new Set(
+            state.accountInfos
+                .filter(
+                    (a) =>
+                        a.dedicatedCoresUsed > 0 || a.lowPriorityCoresUsed > 0
+                )
+                .map((a) => a.id)
+        );
+
+        const unused: Array<{
+            accountId: string;
+            accountName: string;
+            region: string;
+            approvedLimit: number;
+        }> = [];
+
+        for (const accountId of approvedAccounts) {
+            if (
+                accountsWithPools.has(accountId) ||
+                accountsWithUsage.has(accountId)
+            ) {
+                continue;
+            }
+            const account = state.accounts.find((a) => a.id === accountId);
+            const quota = state.quotaRequests.find(
+                (r) => r.accountId === accountId && r.status === "approved"
+            );
+            if (account && quota) {
+                unused.push({
+                    accountId,
+                    accountName: account.accountName,
+                    region: account.region,
+                    approvedLimit: quota.requestedLimit,
+                });
+            }
+        }
+
+        return {
+            accountsWithUnusedQuota: unused.length,
+            accounts: unused,
+        };
+    }
+
+    private _partialChainResult(
+        completedSteps: string[],
+        stepResults: Record<string, unknown>
+    ): AgentResult {
+        return {
+            status: "partial",
+            summary: {
+                completedSteps,
+                cancelled: true,
+                stepResults,
+            },
+        };
     }
 
     private _cancelledResult(

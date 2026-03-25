@@ -14,6 +14,7 @@ import { useMultiRegionState } from "../../store/store-context";
 import { StatusBadge } from "../shared/status-badge";
 import { OrchestratorAgent } from "../../agents/orchestrator-agent";
 import { QuotaRequest } from "../../store/store-types";
+import { DEFAULT_CONFIG } from "../shared/constants";
 
 const stackTokens: IStackTokens = { childrenGap: 12 };
 
@@ -33,9 +34,13 @@ export const QuotaStatusPage: React.FC<QuotaStatusPageProps> = ({
 }) => {
     const state = useMultiRegionState();
     const [autoRefresh, setAutoRefresh] = React.useState(false);
-    const [refreshInterval, setRefreshInterval] = React.useState(60);
+    const [refreshInterval, setRefreshInterval] = React.useState(
+        DEFAULT_CONFIG.defaultRefreshIntervalSec
+    );
     const [isRefreshing, setIsRefreshing] = React.useState(false);
-    const monitorRef = React.useRef<ReturnType<typeof setTimeout> | null>(null);
+    const intervalRef = React.useRef<ReturnType<typeof setInterval> | null>(
+        null
+    );
 
     const pendingRequests = state.quotaRequests.filter(
         (r) => r.status === "pending" || r.status === "submitted"
@@ -71,7 +76,10 @@ export const QuotaStatusPage: React.FC<QuotaStatusPageProps> = ({
 
     React.useEffect(() => {
         if (!autoRefresh) {
-            if (monitorRef.current) clearInterval(monitorRef.current);
+            if (intervalRef.current) {
+                clearInterval(intervalRef.current);
+                intervalRef.current = null;
+            }
             return;
         }
 
@@ -87,11 +95,14 @@ export const QuotaStatusPage: React.FC<QuotaStatusPageProps> = ({
             }
         };
 
-        monitorRef.current = setInterval(poll, refreshInterval * 1000);
+        intervalRef.current = setInterval(poll, refreshInterval * 1000);
         poll();
 
         return () => {
-            if (monitorRef.current) clearInterval(monitorRef.current);
+            if (intervalRef.current) {
+                clearInterval(intervalRef.current);
+                intervalRef.current = null;
+            }
         };
     }, [autoRefresh, refreshInterval, orchestrator]);
 

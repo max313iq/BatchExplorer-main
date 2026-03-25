@@ -6,6 +6,7 @@ import {
     useMultiRegionStore,
 } from "../../store/store-context";
 import { AgentLogEntry } from "../../store/store-types";
+import { DEFAULT_CONFIG } from "./constants";
 
 type LogLevel = "all" | "info" | "warn" | "error";
 
@@ -27,7 +28,8 @@ const LEVEL_OPTIONS: IDropdownOption[] = [
 
 function formatLogLine(log: AgentLogEntry): string {
     const ts = new Date(log.timestamp).toLocaleTimeString();
-    return `${ts} [${log.agent}] ${log.message}`;
+    const level = log.level.toUpperCase().padEnd(5);
+    return `${ts} [${log.agent}] ${level} ${log.message}`;
 }
 
 export const AgentLogPanel: React.FC = () => {
@@ -41,7 +43,7 @@ export const AgentLogPanel: React.FC = () => {
     const containerRef = React.useRef<HTMLDivElement>(null);
 
     const filteredLogs = React.useMemo(() => {
-        const recent = state.agentLogs.slice(-100);
+        const recent = state.agentLogs.slice(-DEFAULT_CONFIG.logRetentionCount);
         if (levelFilter === "all") return recent;
         return recent.filter((log) => log.level === levelFilter);
     }, [state.agentLogs, levelFilter]);
@@ -87,6 +89,16 @@ export const AgentLogPanel: React.FC = () => {
                     backgroundColor: "#252525",
                 }}
                 onClick={() => setExpanded(!expanded)}
+                role="button"
+                tabIndex={0}
+                onKeyDown={(e) => {
+                    if (e.key === "Enter" || e.key === " ") {
+                        e.preventDefault();
+                        setExpanded(!expanded);
+                    }
+                }}
+                aria-expanded={expanded}
+                aria-label="Toggle agent logs panel"
             >
                 <span
                     style={{
@@ -206,6 +218,8 @@ export const AgentLogPanel: React.FC = () => {
                                 style={{
                                     color: LOG_COLORS[log.level] ?? "#ccc",
                                     padding: "1px 0",
+                                    whiteSpace: "pre-wrap",
+                                    wordBreak: "break-word",
                                 }}
                             >
                                 <span style={{ opacity: 0.6, color: "#999" }}>
@@ -216,13 +230,19 @@ export const AgentLogPanel: React.FC = () => {
                                 <span
                                     style={{
                                         fontWeight: 600,
-                                        textTransform: "uppercase",
-                                        width: "50px",
-                                        display: "inline-block",
                                         color: "#999",
                                     }}
                                 >
                                     [{log.agent}]
+                                </span>{" "}
+                                <span
+                                    style={{
+                                        fontWeight: 600,
+                                        textTransform: "uppercase",
+                                        color: LOG_COLORS[log.level] ?? "#ccc",
+                                    }}
+                                >
+                                    {log.level}
                                 </span>{" "}
                                 {log.message}
                             </div>

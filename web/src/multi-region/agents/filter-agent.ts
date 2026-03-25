@@ -82,6 +82,9 @@ export class FilterAgent implements Agent {
         if (f.quotaStatus && f.quotaStatus !== "all") {
             accounts = accounts.filter((a) => {
                 const quota = quotaByAccount.get(a.id);
+                if (f.quotaStatus === "none") {
+                    return !quota;
+                }
                 return quota?.status === f.quotaStatus;
             });
         }

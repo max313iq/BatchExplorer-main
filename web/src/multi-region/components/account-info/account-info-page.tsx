@@ -20,11 +20,18 @@ export interface AccountInfoPageProps {
     orchestrator: OrchestratorAgent;
 }
 
+/** Safely read a numeric value, returning 0 for null/undefined/NaN */
+function safeNum(value: number | null | undefined): number {
+    if (value == null || isNaN(value)) return 0;
+    return value;
+}
+
+/** UsageBar color: green < 50%, orange 50-80%, red > 80% */
 function lpUsageColor(used: number, quota: number): string {
     if (quota <= 0) return "#999";
     const pct = (used / quota) * 100;
     if (pct > 80) return "#d13438";
-    if (pct > 50) return "#e3a400";
+    if (pct >= 50) return "#e3a400";
     return "#107c10";
 }
 
@@ -76,25 +83,25 @@ interface SortConfig {
 function getSortValue(item: AccountInfo, key: string): string | number {
     switch (key) {
         case "accountName":
-            return item.accountName;
+            return item.accountName ?? "";
         case "region":
-            return item.region;
+            return item.region ?? "";
         case "subscription":
-            return item.subscriptionId;
+            return item.subscriptionId ?? "";
         case "lpQuota":
-            return item.lowPriorityCoreQuota;
+            return safeNum(item.lowPriorityCoreQuota);
         case "lpUsed":
-            return item.lowPriorityCoresUsed;
+            return safeNum(item.lowPriorityCoresUsed);
         case "lpFree":
-            return item.lowPriorityCoresFree;
+            return safeNum(item.lowPriorityCoresFree);
         case "dedicatedQuota":
-            return item.dedicatedCoreQuota;
+            return safeNum(item.dedicatedCoreQuota);
         case "poolCount":
-            return item.poolCount;
+            return safeNum(item.poolCount);
         case "poolQuota":
-            return item.poolQuota;
+            return safeNum(item.poolQuota);
         case "poolsFree":
-            return item.poolsFree;
+            return safeNum(item.poolsFree);
         default:
             return 0;
     }
@@ -153,7 +160,7 @@ export const AccountInfoPage: React.FC<AccountInfoPageProps> = ({
 
     // Auto-load on mount when accountInfos is empty
     React.useEffect(() => {
-        if (state.accountInfos.length === 0) {
+        if (!state.accountInfos || state.accountInfos.length === 0) {
             orchestrator
                 .execute({ action: "refresh_account_info", payload: {} })
                 .catch(() => {
@@ -162,7 +169,7 @@ export const AccountInfoPage: React.FC<AccountInfoPageProps> = ({
         }
     }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
-    // Auto-refresh interval
+    // Auto-refresh interval (30s)
     React.useEffect(() => {
         if (autoRefresh) {
             intervalRef.current = setInterval(() => {
@@ -176,9 +183,11 @@ export const AccountInfoPage: React.FC<AccountInfoPageProps> = ({
         }
     }, [autoRefresh, refresh]);
 
+    const accountInfos = state.accountInfos ?? [];
+
     const accounts = React.useMemo(
-        () => sortAccounts(state.accountInfos, sortConfig),
-        [state.accountInfos, sortConfig]
+        () => sortAccounts(accountInfos, sortConfig),
+        [accountInfos, sortConfig]
     );
 
     const allSelected =
@@ -205,22 +214,22 @@ export const AccountInfoPage: React.FC<AccountInfoPageProps> = ({
         });
     }, []);
 
-    // Summary stats
+    // Summary stats with null-safe access
     const totalAccounts = accounts.length;
     const totalDedicatedQuota = accounts.reduce(
-        (s, a) => s + a.dedicatedCoreQuota,
+        (s, a) => s + safeNum(a.dedicatedCoreQuota),
         0
     );
     const totalLpUsed = accounts.reduce(
-        (s, a) => s + a.lowPriorityCoresUsed,
+        (s, a) => s + safeNum(a.lowPriorityCoresUsed),
         0
     );
     const totalLpQuota = accounts.reduce(
-        (s, a) => s + a.lowPriorityCoreQuota,
+        (s, a) => s + safeNum(a.lowPriorityCoreQuota),
         0
     );
     const totalLpFree = totalLpQuota - totalLpUsed;
-    const totalPools = accounts.reduce((s, a) => s + a.poolCount, 0);
+    const totalPools = accounts.reduce((s, a) => s + safeNum(a.poolCount), 0);
 
     const handleColumnClick = React.useCallback(
         (_ev?: React.MouseEvent<HTMLElement>, column?: IColumn) => {
@@ -273,6 +282,11 @@ export const AccountInfoPage: React.FC<AccountInfoPageProps> = ({
                     sortConfig?.key === "accountName" &&
                     sortConfig?.direction === "desc",
                 onColumnClick: handleColumnClick,
+                onRender: (item: AccountInfo) => (
+                    <span style={{ color: "#ccc" }}>
+                        {item.accountName ?? ""}
+                    </span>
+                ),
             },
             {
                 key: "region",
@@ -286,6 +300,9 @@ export const AccountInfoPage: React.FC<AccountInfoPageProps> = ({
                     sortConfig?.key === "region" &&
                     sortConfig?.direction === "desc",
                 onColumnClick: handleColumnClick,
+                onRender: (item: AccountInfo) => (
+                    <span style={{ color: "#ccc" }}>{item.region ?? ""}</span>
+                ),
             },
             {
                 key: "subscription",
@@ -298,14 +315,19 @@ export const AccountInfoPage: React.FC<AccountInfoPageProps> = ({
                     sortConfig?.key === "subscription" &&
                     sortConfig?.direction === "desc",
                 onColumnClick: handleColumnClick,
-                onRender: (item: AccountInfo) => (
-                    <span
-                        style={{ fontSize: 11, color: "#999" }}
-                        title={item.subscriptionId}
-                    >
-                        {item.subscriptionId.substring(0, 8)}...
-                    </span>
-                ),
+                onRender: (item: AccountInfo) => {
+                    const subId = item.subscriptionId ?? "";
+                    return (
+                        <span
+                            style={{ fontSize: 11, color: "#999" }}
+                            title={subId}
+                        >
+                            {subId.length > 8
+                                ? `${subId.substring(0, 8)}...`
+                                : subId}
+                        </span>
+                    );
+                },
             },
             {
                 key: "lpQuota",
@@ -320,7 +342,7 @@ export const AccountInfoPage: React.FC<AccountInfoPageProps> = ({
                 onColumnClick: handleColumnClick,
                 onRender: (item: AccountInfo) => (
                     <span style={{ color: "#ccc" }}>
-                        {item.lowPriorityCoreQuota}
+                        {safeNum(item.lowPriorityCoreQuota)}
                     </span>
                 ),
             },
@@ -337,8 +359,8 @@ export const AccountInfoPage: React.FC<AccountInfoPageProps> = ({
                 onColumnClick: handleColumnClick,
                 onRender: (item: AccountInfo) => (
                     <UsageBar
-                        used={item.lowPriorityCoresUsed}
-                        quota={item.lowPriorityCoreQuota}
+                        used={safeNum(item.lowPriorityCoresUsed)}
+                        quota={safeNum(item.lowPriorityCoreQuota)}
                     />
                 ),
             },
@@ -353,20 +375,19 @@ export const AccountInfoPage: React.FC<AccountInfoPageProps> = ({
                     sortConfig?.key === "lpFree" &&
                     sortConfig?.direction === "desc",
                 onColumnClick: handleColumnClick,
-                onRender: (item: AccountInfo) => (
-                    <span
-                        style={{
-                            color:
-                                item.lowPriorityCoresFree > 0
-                                    ? "#107c10"
-                                    : "#999",
-                            fontWeight:
-                                item.lowPriorityCoresFree > 0 ? 600 : 400,
-                        }}
-                    >
-                        {item.lowPriorityCoresFree}
-                    </span>
-                ),
+                onRender: (item: AccountInfo) => {
+                    const free = safeNum(item.lowPriorityCoresFree);
+                    return (
+                        <span
+                            style={{
+                                color: free > 0 ? "#107c10" : "#999",
+                                fontWeight: free > 0 ? 600 : 400,
+                            }}
+                        >
+                            {free}
+                        </span>
+                    );
+                },
             },
             {
                 key: "dedicatedQuota",
@@ -381,7 +402,7 @@ export const AccountInfoPage: React.FC<AccountInfoPageProps> = ({
                 onColumnClick: handleColumnClick,
                 onRender: (item: AccountInfo) => (
                     <span style={{ color: "#888" }}>
-                        {item.dedicatedCoreQuota}
+                        {safeNum(item.dedicatedCoreQuota)}
                     </span>
                 ),
             },
@@ -397,7 +418,9 @@ export const AccountInfoPage: React.FC<AccountInfoPageProps> = ({
                     sortConfig?.direction === "desc",
                 onColumnClick: handleColumnClick,
                 onRender: (item: AccountInfo) => (
-                    <span style={{ color: "#ccc" }}>{item.poolCount}</span>
+                    <span style={{ color: "#ccc" }}>
+                        {safeNum(item.poolCount)}
+                    </span>
                 ),
             },
             {
@@ -412,7 +435,9 @@ export const AccountInfoPage: React.FC<AccountInfoPageProps> = ({
                     sortConfig?.direction === "desc",
                 onColumnClick: handleColumnClick,
                 onRender: (item: AccountInfo) => (
-                    <span style={{ color: "#ccc" }}>{item.poolQuota}</span>
+                    <span style={{ color: "#ccc" }}>
+                        {safeNum(item.poolQuota)}
+                    </span>
                 ),
             },
             {
@@ -426,16 +451,19 @@ export const AccountInfoPage: React.FC<AccountInfoPageProps> = ({
                     sortConfig?.key === "poolsFree" &&
                     sortConfig?.direction === "desc",
                 onColumnClick: handleColumnClick,
-                onRender: (item: AccountInfo) => (
-                    <span
-                        style={{
-                            color: item.poolsFree > 0 ? "#107c10" : "#999",
-                            fontWeight: item.poolsFree > 0 ? 600 : 400,
-                        }}
-                    >
-                        {item.poolsFree}
-                    </span>
-                ),
+                onRender: (item: AccountInfo) => {
+                    const free = safeNum(item.poolsFree);
+                    return (
+                        <span
+                            style={{
+                                color: free > 0 ? "#107c10" : "#999",
+                                fontWeight: free > 0 ? 600 : 400,
+                            }}
+                        >
+                            {free}
+                        </span>
+                    );
+                },
             },
         ],
         [
@@ -548,7 +576,8 @@ export const AccountInfoPage: React.FC<AccountInfoPageProps> = ({
             {/* DetailsList */}
             {accounts.length === 0 ? (
                 <Text variant="medium" styles={{ root: { color: "#666" } }}>
-                    No account info available. Click "Refresh" to load data.
+                    No account info available. Click &quot;Refresh&quot; to load
+                    data.
                 </Text>
             ) : (
                 <div
@@ -612,7 +641,7 @@ const SummaryStatItem: React.FC<{
                 {label}
             </Text>
             <Text variant="large" styles={{ root: { fontWeight: 700, color } }}>
-                {value}
+                {value ?? 0}
                 {suffix ?? ""}
             </Text>
         </div>

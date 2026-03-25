@@ -4,6 +4,7 @@ export interface VmSizeInfo {
     vCPUs: number;
     gpuCount: number;
     gpuType: string;
+    gpuMemoryGB: number; // per-GPU VRAM in GB
     memoryGB: number;
     isGpu: boolean;
 }
@@ -19,6 +20,7 @@ const ALL_VM_SIZES: VmSizeInfo[] = [
         vCPUs: 40,
         gpuCount: 8,
         gpuType: "V100",
+        gpuMemoryGB: 32,
         memoryGB: 672,
         isGpu: true,
     },
@@ -28,6 +30,7 @@ const ALL_VM_SIZES: VmSizeInfo[] = [
         vCPUs: 96,
         gpuCount: 8,
         gpuType: "H100",
+        gpuMemoryGB: 80,
         memoryGB: 1900,
         isGpu: true,
     },
@@ -37,6 +40,7 @@ const ALL_VM_SIZES: VmSizeInfo[] = [
         vCPUs: 24,
         gpuCount: 4,
         gpuType: "V100",
+        gpuMemoryGB: 16,
         memoryGB: 448,
         isGpu: true,
     },
@@ -46,6 +50,7 @@ const ALL_VM_SIZES: VmSizeInfo[] = [
         vCPUs: 12,
         gpuCount: 2,
         gpuType: "V100",
+        gpuMemoryGB: 16,
         memoryGB: 224,
         isGpu: true,
     },
@@ -55,6 +60,7 @@ const ALL_VM_SIZES: VmSizeInfo[] = [
         vCPUs: 6,
         gpuCount: 1,
         gpuType: "V100",
+        gpuMemoryGB: 16,
         memoryGB: 112,
         isGpu: true,
     },

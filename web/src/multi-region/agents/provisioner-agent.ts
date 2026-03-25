@@ -26,7 +26,7 @@ function generateAccountName(region: string): string {
     const short = regionShort(region);
     const rand = randomAlphanumeric(4);
     const name = `batch${short}${rand}`;
-    // Batch account names must be 3–24 chars, lowercase alphanumeric
+    // Batch account names must be 3-24 chars, lowercase alphanumeric
     return name.substring(0, 24);
 }
 
@@ -38,6 +38,9 @@ function generateResourceGroup(region: string): string {
         .substring(0, 14);
     return `rg-batch-${region}-${ts}`;
 }
+
+/** Minimum delay between write operations (ms) to avoid throttling */
+const WRITE_RATE_LIMIT_MS = 500;
 
 export class ProvisionerAgent implements Agent {
     readonly name = "provisioner" as const;
@@ -61,9 +64,39 @@ export class ProvisionerAgent implements Agent {
             message: `Starting account provisioning for ${input.regions.length} regions`,
         });
 
+        // SAFETY: Validate that the subscription is enabled before creating accounts
+        const subscriptionOk = await this._validateSubscription(
+            input.subscriptionId,
+            armUrl,
+            getAccessToken
+        );
+        if (!subscriptionOk.valid) {
+            store.setAgentStatus("provisioner", "error");
+            store.addLog({
+                agent: "provisioner",
+                level: "error",
+                message: `Subscription ${input.subscriptionId} is not in a valid state: ${subscriptionOk.reason}. Aborting to prevent creating accounts that could be disabled.`,
+            });
+            return {
+                status: "failed",
+                summary: {
+                    total: input.regions.length,
+                    created: 0,
+                    failed: input.regions.length,
+                    failures: [
+                        {
+                            region: "*",
+                            error: `Subscription not valid: ${subscriptionOk.reason}`,
+                        },
+                    ],
+                },
+            };
+        }
+
         let created = 0;
         let failed = 0;
         const failures: Array<{ region: string; error: string }> = [];
+        let lastWriteTime = 0;
 
         for (const region of input.regions) {
             if (this._cancelled) break;
@@ -84,6 +117,15 @@ export class ProvisionerAgent implements Agent {
                     message: `Account already exists for ${region} (${existing.accountName}), skipping`,
                 });
                 continue;
+            }
+
+            // Rate limit writes: enforce minimum delay between create operations
+            const now = Date.now();
+            const elapsed = now - lastWriteTime;
+            if (elapsed < WRITE_RATE_LIMIT_MS && lastWriteTime > 0) {
+                await new Promise((r) =>
+                    setTimeout(r, WRITE_RATE_LIMIT_MS - elapsed)
+                );
             }
 
             const accountName = generateAccountName(region);
@@ -158,6 +200,8 @@ export class ProvisionerAgent implements Agent {
                     }
                 });
 
+                lastWriteTime = Date.now();
+
                 store.updateAccount(accountId, {
                     provisioningState: "created",
                 });
@@ -180,6 +224,7 @@ export class ProvisionerAgent implements Agent {
                 });
                 failures.push({ region, error: errorMsg });
                 failed++;
+                lastWriteTime = Date.now();
             }
         }
 
@@ -204,5 +249,62 @@ export class ProvisionerAgent implements Agent {
                 failures,
             },
         };
+    }
+
+    /**
+     * SAFETY: Validate that the subscription is in an active/enabled state.
+     * Never create accounts under disabled/warned/deleted subscriptions
+     * as they will be immediately disabled.
+     */
+    private async _validateSubscription(
+        subscriptionId: string,
+        armUrl: string,
+        getAccessToken: () => Promise<string>
+    ): Promise<{ valid: boolean; reason?: string }> {
+        try {
+            const token = await getAccessToken();
+            const url = `${armUrl}/subscriptions/${subscriptionId}?api-version=2022-12-01`;
+            const response = await fetch(url, {
+                headers: { Authorization: `Bearer ${token}` },
+            });
+
+            if (!response.ok) {
+                return {
+                    valid: false,
+                    reason: `Cannot verify subscription: HTTP ${response.status}`,
+                };
+            }
+
+            const data = await response.json();
+            const state = data?.subscriptionPolicies?.spendingLimit;
+            const subscriptionState = (data?.state ?? "").toLowerCase();
+
+            // Only allow Enabled subscriptions
+            if (subscriptionState !== "enabled" && subscriptionState !== "") {
+                return {
+                    valid: false,
+                    reason: `Subscription state is "${data?.state}" (expected "Enabled")`,
+                };
+            }
+
+            // Warn if spending limit is on (pay-as-you-go with spending limit = risk of disable)
+            if (state === "On") {
+                this._ctx.store.addLog({
+                    agent: "provisioner",
+                    level: "warn",
+                    message: `Subscription ${subscriptionId} has spending limit ON — accounts may be disabled if limit is reached`,
+                });
+            }
+
+            return { valid: true };
+        } catch (error: any) {
+            // If we cannot validate, proceed with caution but log a warning
+            this._ctx.store.addLog({
+                agent: "provisioner",
+                level: "warn",
+                message: `Could not validate subscription state: ${error?.message ?? error}. Proceeding with caution.`,
+            });
+            return { valid: true };
+        }
     }
 }

@@ -72,12 +72,12 @@ async function fetchTokenFromProxy(endpoint: string): Promise<CachedToken> {
     return { accessToken: data.accessToken, expiresOn: data.expiresOn };
 }
 
-async function getAccessTokenFromCli(): Promise<string> {
-    return msalAuth.getArmToken();
+async function getAccessTokenFromCli(tenantId?: string): Promise<string> {
+    return msalAuth.getArmToken(tenantId);
 }
 
-async function getBatchAccessTokenFromCli(): Promise<string> {
-    return msalAuth.getBatchToken();
+async function getBatchAccessTokenFromCli(tenantId?: string): Promise<string> {
+    return msalAuth.getBatchToken(tenantId);
 }
 
 export interface HealthCheckResult {
@@ -101,8 +101,15 @@ export interface MultiRegionDashboardProps {
     tokenProvider?: TokenProvider;
 }
 
-async function performHealthCheck(): Promise<HealthCheckResult> {
-    // Entra ID only — check for active user first
+async function performHealthCheck(
+    tokenProvider?: TokenProvider
+): Promise<HealthCheckResult> {
+    // Desktop mode: delegate entirely to the injected token provider
+    if (tokenProvider) {
+        return tokenProvider.checkHealth();
+    }
+
+    // Web mode: MSAL popup auth — check for active user first
     try {
         const user = await msalAuth.getCurrentUser();
         if (!user) {
@@ -118,9 +125,13 @@ async function performHealthCheck(): Promise<HealthCheckResult> {
         const batchToken = await msalAuth.getBatchToken();
         if (!batchToken)
             return { healthy: false, error: "Failed to acquire Batch token." };
-        const subs = await msalAuth.listSubscriptions();
-        if (subs.length === 0)
-            return { healthy: false, error: "No Azure subscriptions found." };
+        // Attempt to list subscriptions, but an empty list is NOT a failure
+        // as long as the user is authenticated and tokens are valid.
+        try {
+            await msalAuth.listSubscriptions();
+        } catch {
+            // Subscription listing is best-effort; auth is still healthy
+        }
         return { healthy: true, error: null };
     } catch (e: any) {
         const msg = e?.message ?? String(e);
@@ -450,9 +461,7 @@ const DashboardContent: React.FC<{ tokenProvider?: TokenProvider }> = ({
 
     const checkLogin = React.useCallback(async () => {
         setHealthCheck(null);
-        const result = tokenProvider
-            ? await tokenProvider.checkHealth()
-            : await performHealthCheck();
+        const result = await performHealthCheck(tokenProvider);
         setHealthCheck(result);
         if (result.healthy) {
             if (tokenProvider) {
@@ -461,13 +470,22 @@ const DashboardContent: React.FC<{ tokenProvider?: TokenProvider }> = ({
                 await loadSubscriptions(store);
             }
         }
+        return result;
     }, [store, tokenProvider]);
 
-    // Azure login via MSAL redirect (page will navigate to Microsoft login)
+    // Azure login via MSAL popup
     const handleLogin = React.useCallback(async () => {
         try {
-            await msalAuth.login();
-            // Page redirects — won't reach here
+            const account = await msalAuth.login();
+            if (account) {
+                _authMode = "msal";
+                setCurrentAuthMode("msal");
+                setMsalUserName(
+                    account.username ?? account.name ?? "Azure User"
+                );
+                // Immediately re-run the full health check pipeline
+                await checkLogin();
+            }
         } catch (e: any) {
             console.error("Azure login failed:", e);
             setHealthCheck({
@@ -475,7 +493,7 @@ const DashboardContent: React.FC<{ tokenProvider?: TokenProvider }> = ({
                 error: `Login failed: ${e?.message ?? "Unknown error"}`,
             });
         }
-    }, [store]);
+    }, [checkLogin]);
 
     // Logout
     const handleLogout = React.useCallback(async () => {
@@ -490,24 +508,29 @@ const DashboardContent: React.FC<{ tokenProvider?: TokenProvider }> = ({
         }
     }, []);
 
-    // Check for existing MSAL session on mount
+    // Wait for MSAL to process any redirect, THEN check auth
     React.useEffect(() => {
-        msalAuth.getCurrentUser().then((user) => {
+        let cancelled = false;
+        (async () => {
+            // getCurrentUser() triggers getMsalInstance() which processes
+            // the redirect hash. Must complete before health check.
+            const user = await msalAuth.getCurrentUser();
+            if (cancelled) return;
             if (user) {
                 _authMode = "msal";
                 setCurrentAuthMode("msal");
                 setMsalUserName(user.username ?? user.name ?? "Azure User");
             }
-        });
-    }, []);
+            // Now run the health check (MSAL is fully initialized)
+            await checkLogin();
+        })();
+        return () => {
+            cancelled = true;
+        };
+    }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
     // Auto-save
     React.useEffect(() => store.enableAutoSave(), [store]);
-
-    // Check auth on mount (don't auto-discover — wait for user to sign in)
-    React.useEffect(() => {
-        checkLogin();
-    }, [checkLogin]);
 
     // Auto-discover ALL resources ONLY after successful auth
     React.useEffect(() => {

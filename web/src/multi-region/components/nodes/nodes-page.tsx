@@ -42,6 +42,12 @@ const ALL_NODE_STATES: NodeState[] = [
     "preempted",
 ];
 
+const ERROR_STATES: Set<NodeState> = new Set([
+    "starttaskfailed",
+    "unusable",
+    "unknown",
+]);
+
 const NODE_STATE_OPTIONS: IDropdownOption[] = ALL_NODE_STATES.map((s) => ({
     key: s,
     text: s,
@@ -56,6 +62,27 @@ type NodeActionType =
 
 const AUTO_REFRESH_INTERVAL_MS = 30_000;
 const AUTO_RECOVERY_INTERVAL_MS = 60_000;
+
+interface SortConfig {
+    key: string;
+    isSortedDescending: boolean;
+}
+
+function compareValues(a: unknown, b: unknown, desc: boolean): number {
+    const aVal = a ?? "";
+    const bVal = b ?? "";
+    let result = 0;
+    if (typeof aVal === "number" && typeof bVal === "number") {
+        result = aVal - bVal;
+    } else if (typeof aVal === "boolean" && typeof bVal === "boolean") {
+        result = aVal === bVal ? 0 : aVal ? -1 : 1;
+    } else {
+        result = String(aVal).localeCompare(String(bVal), undefined, {
+            sensitivity: "base",
+        });
+    }
+    return desc ? -result : result;
+}
 
 export const NodesPage: React.FC<NodesPageProps> = ({ orchestrator }) => {
     const state = useMultiRegionState();
@@ -72,6 +99,7 @@ export const NodesPage: React.FC<NodesPageProps> = ({ orchestrator }) => {
     const [filterLowPriority, setFilterLowPriority] = React.useState(false);
     const [autoRefresh, setAutoRefresh] = React.useState(false);
     const [autoRecovery, setAutoRecovery] = React.useState(false);
+    const [sortConfig, setSortConfig] = React.useState<SortConfig | null>(null);
 
     const createdAccounts = state.accounts.filter(
         (a) => a.provisioningState === "created"
@@ -105,28 +133,34 @@ export const NodesPage: React.FC<NodesPageProps> = ({ orchestrator }) => {
     // --- Summary stats ---
     const summaryStats = React.useMemo(() => {
         const nodes = state.nodes;
-        const dedicatedCount = nodes.filter((n) => n.isDedicated).length;
-        const lowPriorityCount = nodes.filter((n) => !n.isDedicated).length;
+        const runningCount = nodes.filter((n) => n.state === "running").length;
+        const idleCount = nodes.filter((n) => n.state === "idle").length;
         const preemptedCount = nodes.filter(
             (n) => n.state === "preempted"
+        ).length;
+        const creatingCount = nodes.filter(
+            (n) => n.state === "creating"
+        ).length;
+        const errorCount = nodes.filter((n) =>
+            ERROR_STATES.has(n.state)
         ).length;
         const runningTasks = nodes.reduce(
             (sum, n) => sum + (n.runningTasksCount ?? 0),
             0
         );
-        const idleCount = nodes.filter((n) => n.state === "idle").length;
         return {
             total: nodes.length,
-            dedicatedCount,
-            lowPriorityCount,
-            preemptedCount,
-            runningTasks,
+            runningCount,
             idleCount,
+            preemptedCount,
+            creatingCount,
+            errorCount,
+            runningTasks,
         };
     }, [state.nodes]);
 
     // --- Filtered display nodes ---
-    const displayNodes = React.useMemo(() => {
+    const filteredNodes = React.useMemo(() => {
         let nodes = state.nodes;
         const stateSet = new Set(selectedStates);
         if (stateSet.size < ALL_NODE_STATES.length) {
@@ -137,6 +171,20 @@ export const NodesPage: React.FC<NodesPageProps> = ({ orchestrator }) => {
         }
         return nodes;
     }, [state.nodes, selectedStates, filterLowPriority]);
+
+    // --- Sorted display nodes ---
+    const displayNodes = React.useMemo(() => {
+        if (!sortConfig) return filteredNodes;
+
+        const { key, isSortedDescending } = sortConfig;
+        const sorted = [...filteredNodes];
+        sorted.sort((a, b) => {
+            const aVal = (a as any)[key];
+            const bVal = (b as any)[key];
+            return compareValues(aVal, bVal, isSortedDescending);
+        });
+        return sorted;
+    }, [filteredNodes, sortConfig]);
 
     const selection = React.useMemo(() => {
         const sel = new Selection({
@@ -338,155 +386,205 @@ export const NodesPage: React.FC<NodesPageProps> = ({ orchestrator }) => {
         []
     );
 
-    // --- Columns ---
-    const columns: IColumn[] = [
-        {
-            key: "nodeId",
-            name: "Node ID",
-            fieldName: "nodeId",
-            minWidth: 140,
-            maxWidth: 220,
-            isResizable: true,
+    // --- Column sort handler ---
+    const handleColumnClick = React.useCallback(
+        (_ev: React.MouseEvent<HTMLElement>, column: IColumn) => {
+            const fieldName = column.fieldName ?? column.key;
+            setSortConfig((prev) => {
+                if (prev && prev.key === fieldName) {
+                    return {
+                        key: fieldName,
+                        isSortedDescending: !prev.isSortedDescending,
+                    };
+                }
+                return { key: fieldName, isSortedDescending: false };
+            });
         },
-        {
-            key: "state",
-            name: "State",
-            fieldName: "state",
-            minWidth: 100,
-            maxWidth: 140,
-            onRender: (item: ManagedNode) => (
-                <StatusBadge status={item.state} />
-            ),
-        },
-        {
-            key: "isDedicated",
-            name: "Priority",
-            fieldName: "isDedicated",
-            minWidth: 90,
-            maxWidth: 120,
-            onRender: (item: ManagedNode) => (
-                <span
-                    style={{
-                        color: item.isDedicated ? "#0078d4" : "#ca5010",
-                        fontWeight: 600,
-                        fontSize: 12,
-                    }}
-                >
-                    {item.isDedicated ? "Dedicated" : "Low Priority"}
-                </span>
-            ),
-        },
-        {
-            key: "runningTasksCount",
-            name: "Running Tasks",
-            fieldName: "runningTasksCount",
-            minWidth: 90,
-            maxWidth: 120,
-            onRender: (item: ManagedNode) => (
-                <span style={{ fontSize: 12 }}>
-                    {item.runningTasksCount ?? 0}
-                </span>
-            ),
-        },
-        {
-            key: "schedulingState",
-            name: "Scheduling",
-            fieldName: "schedulingState",
-            minWidth: 80,
-            maxWidth: 110,
-            onRender: (item: ManagedNode) => {
-                const enabled =
-                    (item.schedulingState ?? "enabled").toLowerCase() ===
-                    "enabled";
-                return (
-                    <span
-                        style={{
-                            color: enabled ? "#107c10" : "#a80000",
-                            fontWeight: 600,
-                            fontSize: 12,
-                        }}
-                    >
-                        {enabled ? "Enabled" : "Disabled"}
-                    </span>
-                );
+        []
+    );
+
+    // --- Columns with sorting ---
+    const columns: IColumn[] = React.useMemo(() => {
+        const defs: IColumn[] = [
+            {
+                key: "nodeId",
+                name: "Node ID",
+                fieldName: "nodeId",
+                minWidth: 140,
+                maxWidth: 220,
+                isResizable: true,
             },
-        },
-        {
-            key: "totalTasksRun",
-            name: "Total Tasks Run",
-            fieldName: "totalTasksRun",
-            minWidth: 100,
-            maxWidth: 130,
-            onRender: (item: ManagedNode) => (
-                <span style={{ fontSize: 12 }}>{item.totalTasksRun ?? 0}</span>
-            ),
-        },
-        {
-            key: "accountName",
-            name: "Batch Account",
-            fieldName: "accountName",
-            minWidth: 130,
-            maxWidth: 200,
-            isResizable: true,
-        },
-        {
-            key: "region",
-            name: "Region",
-            fieldName: "region",
-            minWidth: 90,
-            maxWidth: 140,
-            isResizable: true,
-        },
-        {
-            key: "poolId",
-            name: "Pool",
-            fieldName: "poolId",
-            minWidth: 80,
-            maxWidth: 140,
-            isResizable: true,
-        },
-        {
-            key: "vmSize",
-            name: "VM Size",
-            fieldName: "vmSize",
-            minWidth: 120,
-            maxWidth: 180,
-            isResizable: true,
-        },
-        {
-            key: "ipAddress",
-            name: "IP Address",
-            fieldName: "ipAddress",
-            minWidth: 100,
-            maxWidth: 140,
-            isResizable: true,
-        },
-        {
-            key: "error",
-            name: "Error",
-            fieldName: "error",
-            minWidth: 150,
-            maxWidth: 300,
-            isResizable: true,
-            onRender: (item: ManagedNode) =>
-                item.error ? (
+            {
+                key: "poolId",
+                name: "Pool",
+                fieldName: "poolId",
+                minWidth: 80,
+                maxWidth: 140,
+                isResizable: true,
+            },
+            {
+                key: "accountName",
+                name: "Account",
+                fieldName: "accountName",
+                minWidth: 130,
+                maxWidth: 200,
+                isResizable: true,
+            },
+            {
+                key: "region",
+                name: "Region",
+                fieldName: "region",
+                minWidth: 90,
+                maxWidth: 140,
+                isResizable: true,
+            },
+            {
+                key: "state",
+                name: "State",
+                fieldName: "state",
+                minWidth: 100,
+                maxWidth: 140,
+                onRender: (item: ManagedNode) => (
+                    <StatusBadge status={item.state} />
+                ),
+            },
+            {
+                key: "isDedicated",
+                name: "Priority",
+                fieldName: "isDedicated",
+                minWidth: 90,
+                maxWidth: 120,
+                onRender: (item: ManagedNode) => (
                     <span
                         style={{
-                            color: "#a80000",
-                            fontSize: 12,
+                            color: item.isDedicated ? "#0078d4" : "#ca5010",
                             fontWeight: 600,
+                            fontSize: 12,
                         }}
-                        title={item.error}
                     >
-                        {item.error}
-                    </span>
-                ) : (
-                    <span style={{ color: "#605e5c", fontSize: 12 }}>
-                        {"\u2014"}
+                        {item.isDedicated ? "Dedicated" : "Low Priority"}
                     </span>
                 ),
-        },
-    ];
+            },
+            {
+                key: "runningTasksCount",
+                name: "Running Tasks",
+                fieldName: "runningTasksCount",
+                minWidth: 90,
+                maxWidth: 120,
+                onRender: (item: ManagedNode) => (
+                    <span style={{ fontSize: 12 }}>
+                        {item.runningTasksCount ?? 0}
+                    </span>
+                ),
+            },
+            {
+                key: "schedulingState",
+                name: "Scheduling",
+                fieldName: "schedulingState",
+                minWidth: 80,
+                maxWidth: 110,
+                onRender: (item: ManagedNode) => {
+                    const enabled =
+                        (item.schedulingState ?? "enabled").toLowerCase() ===
+                        "enabled";
+                    return (
+                        <span
+                            style={{
+                                color: enabled ? "#107c10" : "#a80000",
+                                fontWeight: 600,
+                                fontSize: 12,
+                            }}
+                        >
+                            {enabled ? "Enabled" : "Disabled"}
+                        </span>
+                    );
+                },
+            },
+            {
+                key: "ipAddress",
+                name: "IP Address",
+                fieldName: "ipAddress",
+                minWidth: 100,
+                maxWidth: 140,
+                isResizable: true,
+                onRender: (item: ManagedNode) => (
+                    <span style={{ fontSize: 12 }}>
+                        {item.ipAddress ?? "\u2014"}
+                    </span>
+                ),
+            },
+            {
+                key: "lastBootTime",
+                name: "Last Boot Time",
+                fieldName: "lastBootTime",
+                minWidth: 140,
+                maxWidth: 200,
+                isResizable: true,
+                onRender: (item: ManagedNode) => (
+                    <span style={{ fontSize: 12 }}>
+                        {item.lastBootTime
+                            ? new Date(item.lastBootTime).toLocaleString()
+                            : "\u2014"}
+                    </span>
+                ),
+            },
+            {
+                key: "error",
+                name: "Start Task / Error",
+                fieldName: "error",
+                minWidth: 150,
+                maxWidth: 300,
+                isResizable: true,
+                onRender: (item: ManagedNode) => {
+                    if (item.state === "starttaskfailed") {
+                        return (
+                            <span
+                                style={{
+                                    color: "#a80000",
+                                    fontSize: 12,
+                                    fontWeight: 600,
+                                }}
+                                title={item.error ?? "Start task failed"}
+                            >
+                                {item.error ?? "Exit code failure"}
+                            </span>
+                        );
+                    }
+                    return item.error ? (
+                        <span
+                            style={{
+                                color: "#a80000",
+                                fontSize: 12,
+                                fontWeight: 600,
+                            }}
+                            title={item.error}
+                        >
+                            {item.error}
+                        </span>
+                    ) : (
+                        <span style={{ color: "#605e5c", fontSize: 12 }}>
+                            {"\u2014"}
+                        </span>
+                    );
+                },
+            },
+        ];
+
+        // Apply sort indicators to all columns
+        return defs.map((col) => {
+            const fieldName = col.fieldName ?? col.key;
+            const isSorted = sortConfig?.key === fieldName;
+            return {
+                ...col,
+                isSorted,
+                isSortedDescending: isSorted
+                    ? sortConfig!.isSortedDescending
+                    : false,
+                onColumnClick: handleColumnClick,
+            };
+        });
+    }, [sortConfig, handleColumnClick]);
 
     const actionCount = selectAll ? displayNodes.length : selectedNodeIds.size;
 
@@ -555,40 +653,35 @@ export const NodesPage: React.FC<NodesPageProps> = ({ orchestrator }) => {
                         <Text
                             variant="small"
                             block
-                            styles={{ root: { color: "#0078d4" } }}
+                            styles={{ root: { color: "#004578" } }}
                         >
-                            Dedicated
+                            Running
                         </Text>
                         <Text
                             variant="xLarge"
                             styles={{
                                 root: {
                                     fontWeight: 700,
-                                    color: "#0078d4",
+                                    color: "#004578",
                                 },
                             }}
                         >
-                            {summaryStats.dedicatedCount}
+                            {summaryStats.runningCount}
                         </Text>
                     </div>
                     <div style={statCardStyle}>
                         <Text
                             variant="small"
                             block
-                            styles={{ root: { color: "#ca5010" } }}
+                            styles={{ root: { color: "#605e5c" } }}
                         >
-                            Low Priority
+                            Idle
                         </Text>
                         <Text
                             variant="xLarge"
-                            styles={{
-                                root: {
-                                    fontWeight: 700,
-                                    color: "#ca5010",
-                                },
-                            }}
+                            styles={{ root: { fontWeight: 700 } }}
                         >
-                            {summaryStats.lowPriorityCount}
+                            {summaryStats.idleCount}
                         </Text>
                     </div>
                     <div style={statCardStyle}>
@@ -615,35 +708,40 @@ export const NodesPage: React.FC<NodesPageProps> = ({ orchestrator }) => {
                         <Text
                             variant="small"
                             block
-                            styles={{ root: { color: "#107c10" } }}
+                            styles={{ root: { color: "#0078d4" } }}
                         >
-                            Running Tasks
+                            Creating
                         </Text>
                         <Text
                             variant="xLarge"
                             styles={{
                                 root: {
                                     fontWeight: 700,
-                                    color: "#107c10",
+                                    color: "#0078d4",
                                 },
                             }}
                         >
-                            {summaryStats.runningTasks}
+                            {summaryStats.creatingCount}
                         </Text>
                     </div>
                     <div style={statCardStyle}>
                         <Text
                             variant="small"
                             block
-                            styles={{ root: { color: "#605e5c" } }}
+                            styles={{ root: { color: "#a80000" } }}
                         >
-                            Idle Nodes
+                            Error States
                         </Text>
                         <Text
                             variant="xLarge"
-                            styles={{ root: { fontWeight: 700 } }}
+                            styles={{
+                                root: {
+                                    fontWeight: 700,
+                                    color: "#a80000",
+                                },
+                            }}
                         >
-                            {summaryStats.idleCount}
+                            {summaryStats.errorCount}
                         </Text>
                     </div>
                 </Stack>
@@ -812,7 +910,7 @@ export const NodesPage: React.FC<NodesPageProps> = ({ orchestrator }) => {
                 ) : (
                     <MessageBar messageBarType={MessageBarType.info}>
                         {state.nodes.length === 0
-                            ? 'No nodes loaded. Click "Refresh Nodes" to fetch nodes from all accounts with pools.'
+                            ? "No nodes found. Refresh pool info first."
                             : "No nodes match the current filter."}
                     </MessageBar>
                 )}

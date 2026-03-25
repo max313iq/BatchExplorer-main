@@ -18,42 +18,11 @@ import {
 } from "../../store/store-context";
 import { StatusBadge } from "../shared/status-badge";
 import { OrchestratorAgent } from "../../agents/orchestrator-agent";
-import { ManagedAccount } from "../../store/store-types";
-
-const AZURE_REGIONS = [
-    "eastus",
-    "eastus2",
-    "westus",
-    "westus2",
-    "westus3",
-    "centralus",
-    "northcentralus",
-    "southcentralus",
-    "canadacentral",
-    "canadaeast",
-    "northeurope",
-    "westeurope",
-    "uksouth",
-    "ukwest",
-    "francecentral",
-    "germanywestcentral",
-    "switzerlandnorth",
-    "norwayeast",
-    "swedencentral",
-    "southeastasia",
-    "eastasia",
-    "japaneast",
-    "japanwest",
-    "koreacentral",
-    "koreasouth",
-    "australiaeast",
-    "australiasoutheast",
-    "centralindia",
-    "southindia",
-    "brazilsouth",
-    "southafricanorth",
-    "uaenorth",
-];
+import {
+    AZURE_REGIONS,
+    DEFAULT_CONFIG,
+    isValidSubscriptionId,
+} from "../shared/constants";
 
 const stackTokens: IStackTokens = { childrenGap: 12 };
 
@@ -73,9 +42,9 @@ export const AccountProvisioningPage: React.FC<
     const [discoverError, setDiscoverError] = React.useState<string | null>(
         null
     );
-    const [discoveredAccounts, setDiscoveredAccounts] = React.useState<
-        ManagedAccount[]
-    >([]);
+    const [validationError, setValidationError] = React.useState<string | null>(
+        null
+    );
 
     // Pre-fill from user preferences on mount
     React.useEffect(() => {
@@ -92,6 +61,7 @@ export const AccountProvisioningPage: React.FC<
     const handleSubscriptionChange = React.useCallback(
         (newValue: string) => {
             setSubscriptionId(newValue);
+            setValidationError(null);
             store.saveUserPreferences({ lastSubscriptionId: newValue });
         },
         [store]
@@ -100,6 +70,10 @@ export const AccountProvisioningPage: React.FC<
     // Save regions preference when they change
     const handleRegionsChange = React.useCallback(
         (newRegions: string[]) => {
+            // Enforce max regions limit
+            if (newRegions.length > DEFAULT_CONFIG.maxRegionsPerRequest) {
+                return;
+            }
             setSelectedRegions(newRegions);
             store.saveUserPreferences({ lastRegions: newRegions });
         },
@@ -111,38 +85,71 @@ export const AccountProvisioningPage: React.FC<
         []
     );
 
+    const validateInputs = React.useCallback((): boolean => {
+        if (!subscriptionId.trim()) {
+            setValidationError("Subscription ID is required.");
+            return false;
+        }
+        // Only validate format when manually entered (not from dropdown)
+        if (
+            state.subscriptions.length === 0 &&
+            !isValidSubscriptionId(subscriptionId)
+        ) {
+            setValidationError(
+                "Subscription ID must be a valid UUID (e.g. 12345678-1234-1234-1234-123456789abc)."
+            );
+            return false;
+        }
+        if (selectedRegions.length === 0) {
+            setValidationError("Select at least one region.");
+            return false;
+        }
+        setValidationError(null);
+        return true;
+    }, [subscriptionId, selectedRegions, state.subscriptions.length]);
+
     const handleCreate = React.useCallback(async () => {
-        if (!subscriptionId || selectedRegions.length === 0) return;
+        if (!validateInputs()) return;
         setIsRunning(true);
         try {
             await orchestrator.execute({
                 action: "create_accounts",
                 payload: {
-                    subscriptionId,
+                    subscriptionId: subscriptionId.trim(),
                     regions: selectedRegions,
                 },
             });
         } finally {
             setIsRunning(false);
         }
-    }, [orchestrator, subscriptionId, selectedRegions]);
+    }, [orchestrator, subscriptionId, selectedRegions, validateInputs]);
 
     const handleDiscover = React.useCallback(async () => {
-        if (!subscriptionId) return;
+        if (!subscriptionId.trim()) {
+            setValidationError("Subscription ID is required.");
+            return;
+        }
+        if (
+            state.subscriptions.length === 0 &&
+            !isValidSubscriptionId(subscriptionId)
+        ) {
+            setValidationError("Subscription ID must be a valid UUID.");
+            return;
+        }
+        setValidationError(null);
         setIsDiscovering(true);
         setDiscoverError(null);
-        setDiscoveredAccounts([]);
         try {
             await orchestrator.execute({
                 action: "discover_accounts",
-                payload: { subscriptionId },
+                payload: { subscriptionId: subscriptionId.trim() },
             });
         } catch (err: any) {
             setDiscoverError(err?.message ?? String(err));
         } finally {
             setIsDiscovering(false);
         }
-    }, [orchestrator, subscriptionId]);
+    }, [orchestrator, subscriptionId, state.subscriptions.length]);
 
     const handleRetryFailed = React.useCallback(() => {
         const ids = store.retryFailedAccounts();
@@ -152,12 +159,6 @@ export const AccountProvisioningPage: React.FC<
             autoDismissMs: 5000,
         });
     }, [store]);
-
-    // Update discovered accounts when state changes
-    const importedIds = React.useMemo(
-        () => new Set(state.accounts.map((a) => a.id)),
-        [state.accounts]
-    );
 
     const columns: IColumn[] = [
         {
@@ -245,13 +246,23 @@ export const AccountProvisioningPage: React.FC<
                 Account Provisioning
             </h2>
 
+            {validationError && (
+                <MessageBar
+                    messageBarType={MessageBarType.error}
+                    onDismiss={() => setValidationError(null)}
+                    styles={{ root: { marginBottom: 12 } }}
+                >
+                    {validationError}
+                </MessageBar>
+            )}
+
             <Pivot styles={{ root: { marginBottom: 16 } }}>
                 <PivotItem headerText="Create New" itemIcon="Add">
                     <div style={{ paddingTop: 12 }}>
                         <Stack tokens={stackTokens}>
                             {subscriptionSelector}
                             <Dropdown
-                                label="Regions (select up to 20)"
+                                label={`Regions (select up to ${DEFAULT_CONFIG.maxRegionsPerRequest})`}
                                 placeholder="Select regions"
                                 multiSelect
                                 options={regionOptions}
@@ -271,11 +282,14 @@ export const AccountProvisioningPage: React.FC<
                                 styles={{ dropdown: { maxWidth: 450 } }}
                             />
 
-                            {selectedRegions.length > 20 && (
+                            {selectedRegions.length >=
+                                DEFAULT_CONFIG.maxRegionsPerRequest && (
                                 <MessageBar
                                     messageBarType={MessageBarType.warning}
                                 >
-                                    Maximum 20 regions recommended
+                                    Maximum{" "}
+                                    {DEFAULT_CONFIG.maxRegionsPerRequest}{" "}
+                                    regions reached
                                 </MessageBar>
                             )}
 
@@ -288,7 +302,7 @@ export const AccountProvisioningPage: React.FC<
                                     }
                                     disabled={
                                         isRunning ||
-                                        !subscriptionId ||
+                                        !subscriptionId.trim() ||
                                         selectedRegions.length === 0
                                     }
                                     onClick={handleCreate}
@@ -350,7 +364,9 @@ export const AccountProvisioningPage: React.FC<
                                             ? "Discovering..."
                                             : "Discover Batch Accounts"
                                     }
-                                    disabled={isDiscovering || !subscriptionId}
+                                    disabled={
+                                        isDiscovering || !subscriptionId.trim()
+                                    }
                                     onClick={handleDiscover}
                                     iconProps={{
                                         iconName: "Search",

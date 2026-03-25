@@ -5,6 +5,7 @@ import {
     useMultiRegionStore,
 } from "../../store/store-context";
 import { ToastNotification } from "../../store/store-types";
+import { DEFAULT_CONFIG } from "./constants";
 
 const TYPE_MAP: Record<ToastNotification["type"], MessageBarType> = {
     success: MessageBarType.success,
@@ -20,9 +21,32 @@ const DEFAULT_DISMISS: Record<ToastNotification["type"], number> = {
     error: 10000,
 };
 
+let _toastStyleInjected = false;
+
+function injectToastStyle() {
+    if (_toastStyleInjected) return;
+    _toastStyleInjected = true;
+    const style = document.createElement("style");
+    style.textContent = `
+        @keyframes slideInRight {
+            from {
+                transform: translateX(100%);
+                opacity: 0;
+            }
+            to {
+                transform: translateX(0);
+                opacity: 1;
+            }
+        }
+    `;
+    document.head.appendChild(style);
+}
+
 export const ToastContainer: React.FC = () => {
     const state = useMultiRegionState();
     const store = useMultiRegionStore();
+
+    React.useEffect(injectToastStyle, []);
 
     // Auto-dismiss timers
     React.useEffect(() => {
@@ -49,39 +73,43 @@ export const ToastContainer: React.FC = () => {
                 maxWidth: 400,
                 minWidth: 300,
             }}
+            role="status"
+            aria-live="polite"
         >
-            {state.notifications.slice(-5).map((n) => (
-                <div
-                    key={n.id}
-                    style={{
-                        animation: "slideInRight 0.3s ease-out",
-                        boxShadow: "0 4px 12px rgba(0,0,0,0.4)",
-                        borderRadius: 4,
-                    }}
-                >
-                    <MessageBar
-                        messageBarType={TYPE_MAP[n.type]}
-                        onDismiss={() => store.removeNotification(n.id)}
-                        dismissButtonAriaLabel="Close"
-                        styles={{
-                            root: {
-                                borderRadius: 4,
-                                background:
-                                    n.type === "success"
-                                        ? "#0e3b1e"
-                                        : n.type === "error"
-                                          ? "#3b0e0e"
-                                          : n.type === "warning"
-                                            ? "#3b2e0e"
-                                            : "#0e2a3b",
-                            },
-                            text: { color: "#e0e0e0" },
+            {state.notifications
+                .slice(-DEFAULT_CONFIG.maxToastNotifications)
+                .map((n) => (
+                    <div
+                        key={n.id}
+                        style={{
+                            animation: "slideInRight 0.3s ease-out",
+                            boxShadow: "0 4px 12px rgba(0,0,0,0.4)",
+                            borderRadius: 4,
                         }}
                     >
-                        {n.message}
-                    </MessageBar>
-                </div>
-            ))}
+                        <MessageBar
+                            messageBarType={TYPE_MAP[n.type]}
+                            onDismiss={() => store.removeNotification(n.id)}
+                            dismissButtonAriaLabel="Close"
+                            styles={{
+                                root: {
+                                    borderRadius: 4,
+                                    background:
+                                        n.type === "success"
+                                            ? "#0e3b1e"
+                                            : n.type === "error"
+                                              ? "#3b0e0e"
+                                              : n.type === "warning"
+                                                ? "#3b2e0e"
+                                                : "#0e2a3b",
+                                },
+                                text: { color: "#e0e0e0" },
+                            }}
+                        >
+                            {n.message}
+                        </MessageBar>
+                    </div>
+                ))}
         </div>
     );
 };

@@ -27,10 +27,13 @@ const STATUS_COLORS: Record<string, { bg: string; text: string }> = {
 
 interface StatusBadgeProps {
     status: string;
+    /** Optional override for the displayed label. */
+    label?: string;
 }
 
-export const StatusBadge: React.FC<StatusBadgeProps> = ({ status }) => {
-    const colors = STATUS_COLORS[status] ?? {
+export const StatusBadge: React.FC<StatusBadgeProps> = ({ status, label }) => {
+    const normalizedStatus = status.toLowerCase();
+    const colors = STATUS_COLORS[normalizedStatus] ?? {
         bg: "#f3f2f1",
         text: "#323130",
     };
@@ -47,8 +50,10 @@ export const StatusBadge: React.FC<StatusBadgeProps> = ({ status }) => {
                 color: colors.text,
                 textTransform: "capitalize",
             }}
+            title={status}
+            aria-label={`Status: ${status}`}
         >
-            {status}
+            {label ?? status}
         </span>
     );
 };

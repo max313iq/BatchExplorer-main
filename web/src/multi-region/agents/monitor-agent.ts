@@ -146,6 +146,8 @@ export class MonitorAgent implements Agent {
                     const data = await response.json();
                     const ticketStatus =
                         data?.properties?.status?.toLowerCase() ?? "";
+                    const severity =
+                        data?.properties?.severity?.toLowerCase() ?? "";
 
                     const now = new Date().toISOString();
 
@@ -156,14 +158,22 @@ export class MonitorAgent implements Agent {
                     ) {
                         // Check if it was approved or denied
                         const resolution = data?.properties?.resolution ?? "";
+                        const resolutionLower = resolution.toLowerCase();
+
                         if (
-                            ticketStatus === "closed" &&
-                            resolution.toLowerCase().includes("denied")
+                            resolutionLower.includes("denied") ||
+                            resolutionLower.includes("rejected") ||
+                            resolutionLower.includes("not approved")
                         ) {
                             store.updateQuotaRequest(req.id, {
                                 status: "denied",
                                 resolvedAt: now,
                                 lastCheckedAt: now,
+                            });
+                            store.addLog({
+                                agent: "monitor",
+                                level: "warn",
+                                message: `Ticket ${req.ticketId} DENIED: ${resolution}`,
                             });
                             denied++;
                         } else {
@@ -172,8 +182,26 @@ export class MonitorAgent implements Agent {
                                 resolvedAt: now,
                                 lastCheckedAt: now,
                             });
+                            store.addLog({
+                                agent: "monitor",
+                                level: "info",
+                                message: `Ticket ${req.ticketId} APPROVED`,
+                            });
                             approved++;
                         }
+                    } else if (
+                        ticketStatus === "open" &&
+                        severity === "critical"
+                    ) {
+                        // Escalated tickets — log but keep polling
+                        store.updateQuotaRequest(req.id, {
+                            lastCheckedAt: now,
+                        });
+                        store.addLog({
+                            agent: "monitor",
+                            level: "warn",
+                            message: `Ticket ${req.ticketId} escalated (critical severity), still pending`,
+                        });
                     } else {
                         store.updateQuotaRequest(req.id, {
                             lastCheckedAt: now,

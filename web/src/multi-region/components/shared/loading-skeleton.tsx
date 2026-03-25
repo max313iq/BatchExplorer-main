@@ -16,30 +16,37 @@ function injectShimmerStyle() {
 }
 
 export interface LoadingSkeletonProps {
+    /** Number of shimmer lines to render. Defaults to 3. */
     lines?: number;
+    /** CSS width of the skeleton container. Defaults to "100%". */
     width?: string;
+    /** Height of each shimmer line in pixels. Defaults to 14. */
+    lineHeight?: number;
 }
 
 export const LoadingSkeleton: React.FC<LoadingSkeletonProps> = ({
     lines = 3,
     width = "100%",
+    lineHeight = 14,
 }) => {
     React.useEffect(injectShimmerStyle, []);
 
     return (
         <div
             style={{ display: "flex", flexDirection: "column", gap: 10, width }}
+            role="progressbar"
+            aria-label="Loading content"
         >
             {Array.from({ length: lines }, (_, i) => (
                 <div
                     key={i}
                     style={{
-                        height: 14,
+                        height: lineHeight,
                         borderRadius: 4,
                         width: i === lines - 1 ? "60%" : "100%",
                         background:
                             "linear-gradient(90deg, #2a2a2a 25%, #333 50%, #2a2a2a 75%)",
-                        backgroundSize: "800px 14px",
+                        backgroundSize: `800px ${lineHeight}px`,
                         animation: "mr-shimmer 1.5s infinite linear",
                     }}
                 />

@@ -236,11 +236,12 @@ export class QuotaAgent implements Agent {
             store.addQuotaRequest(quotaRequest);
 
             try {
+                // Use the account's own subscription for scheduling (per-sub serialization)
                 await scheduler.run(account.subscriptionId, async () => {
                     const token = await resolveToken();
 
                     // Strategy: Try direct Quota API first (no paid support plan needed)
-                    // Falls back to Batch quota → Compute quota → Support Ticket
+                    // Falls back to Batch quota -> Compute quota -> Support Ticket
                     const directResult = await this._tryDirectQuotaApi(
                         account,
                         input.quotaType,
@@ -271,7 +272,7 @@ export class QuotaAgent implements Agent {
                     const country = randomFrom(COUNTRIES);
                     const timezone = randomFrom(TIMEZONES);
 
-                    // Use the Batch account's own subscription
+                    // Use the Batch account's own subscription for the ticket
                     const url = `${armUrl}/subscriptions/${account.subscriptionId}/providers/Microsoft.Support/supportTickets/${ticketGuid}?api-version=2025-06-01-preview`;
 
                     // Auto-detect support plan for this account's subscription
@@ -281,7 +282,7 @@ export class QuotaAgent implements Agent {
                         token
                     );
                     // Use auto-detected plan, or fall back to user-provided
-                    const rawPlan = detectedPlan || input.supportPlanId;
+                    const rawPlan = detectedPlan || input.supportPlanId || "";
                     const encodedPlan = rawPlan.includes("%3d")
                         ? rawPlan
                         : rawPlan.replace(/=/g, "%3d");

@@ -10,6 +10,7 @@ import {
 import { Dropdown, IDropdownOption } from "@fluentui/react/lib/Dropdown";
 import { TextField } from "@fluentui/react/lib/TextField";
 import { Toggle } from "@fluentui/react/lib/Toggle";
+import { SpinButton } from "@fluentui/react/lib/SpinButton";
 import { ProgressIndicator } from "@fluentui/react/lib/ProgressIndicator";
 import { MessageBar, MessageBarType } from "@fluentui/react/lib/MessageBar";
 import { Stack, IStackTokens } from "@fluentui/react/lib/Stack";
@@ -27,27 +28,27 @@ const stackTokens: IStackTokens = { childrenGap: 12 };
 const GPU_VMS = [
     {
         key: "Standard_ND40rs_v2",
-        text: "ND40rs_v2 (40 vCPUs, 8×V100, 672 GB)",
+        text: "ND40rs_v2 (40 vCPUs, 8\u00d7V100, 672 GB)",
         vCPUs: 40,
     },
     {
         key: "Standard_ND96isr_H100_v5",
-        text: "ND96isr_H100_v5 (96 vCPUs, 8×H100, 1900 GB)",
+        text: "ND96isr_H100_v5 (96 vCPUs, 8\u00d7H100, 1900 GB)",
         vCPUs: 96,
     },
     {
         key: "Standard_NC24s_v3",
-        text: "NC24s_v3 (24 vCPUs, 4×V100, 448 GB)",
+        text: "NC24s_v3 (24 vCPUs, 4\u00d7V100, 448 GB)",
         vCPUs: 24,
     },
     {
         key: "Standard_NC12s_v3",
-        text: "NC12s_v3 (12 vCPUs, 2×V100, 224 GB)",
+        text: "NC12s_v3 (12 vCPUs, 2\u00d7V100, 224 GB)",
         vCPUs: 12,
     },
     {
         key: "Standard_NC6s_v3",
-        text: "NC6s_v3 (6 vCPUs, 1×V100, 112 GB)",
+        text: "NC6s_v3 (6 vCPUs, 1\u00d7V100, 112 GB)",
         vCPUs: 6,
     },
 ];
@@ -102,6 +103,32 @@ interface PoolCreationPageProps {
     orchestrator: OrchestratorAgent;
 }
 
+/**
+ * Compute the LP node count for a given account based on its approved
+ * quota and the vCPU requirement of the chosen VM size.
+ * Returns 0 when there is no approved quota or the VM lookup fails.
+ */
+function computeLpNodeCount(
+    accountId: string,
+    vmSizeKey: string,
+    quotaRequests: Array<{
+        accountId: string;
+        status: string;
+        approvedLimit?: number;
+        currentUsage?: number;
+    }>
+): number {
+    const vm = GPU_VMS.find((v) => v.key === vmSizeKey);
+    if (!vm) return 0;
+    const quota = quotaRequests.find(
+        (q) => q.accountId === accountId && q.status === "approved"
+    );
+    if (!quota || !quota.approvedLimit) return 0;
+    const freeQuota = (quota.approvedLimit ?? 0) - (quota.currentUsage ?? 0);
+    if (freeQuota <= 0) return 0;
+    return Math.floor(freeQuota / vm.vCPUs);
+}
+
 export const PoolCreationPage: React.FC<PoolCreationPageProps> = ({
     orchestrator,
 }) => {
@@ -122,6 +149,8 @@ export const PoolCreationPage: React.FC<PoolCreationPageProps> = ({
         '/bin/bash -c "echo Hello"'
     );
     const [envVars, setEnvVars] = React.useState<EnvVar[]>([]);
+    const [maxRetryCount, setMaxRetryCount] = React.useState(3);
+    const [waitForSuccess, setWaitForSuccess] = React.useState(true);
 
     // Load last pool config from preferences on mount
     React.useEffect(() => {
@@ -192,9 +221,40 @@ export const PoolCreationPage: React.FC<PoolCreationPageProps> = ({
         []
     );
 
+    // Compute estimated total LP nodes across selected accounts (smart mode)
+    const estimatedTotalNodes = React.useMemo(() => {
+        if (!smartMode || selectedVmSizes.length === 0) return 0;
+        const primaryVm = selectedVmSizes[0];
+        let total = 0;
+        for (const accountId of selectedAccountIds) {
+            total += computeLpNodeCount(
+                accountId,
+                primaryVm,
+                state.quotaRequests as any
+            );
+        }
+        return total;
+    }, [smartMode, selectedVmSizes, selectedAccountIds, state.quotaRequests]);
+
+    // Check if any pool is currently resizing
+    const resizingPools = state.pools.filter(
+        (p) =>
+            p.provisioningState === "resizing" ||
+            p.provisioningState === "allocating"
+    );
+
     const handleCreate = React.useCallback(async () => {
         try {
             setConfigError(null);
+
+            // In smart mode, block if any pool is currently resizing
+            if (smartMode && resizingPools.length > 0) {
+                setConfigError(
+                    `Cannot create pools while ${resizingPools.length} pool(s) are still resizing. Wait for them to finish or stop them first.`
+                );
+                return;
+            }
+
             setIsRunning(true);
 
             if (smartMode && selectedVmSizes.length > 0) {
@@ -203,7 +263,7 @@ export const PoolCreationPage: React.FC<PoolCreationPageProps> = ({
                     .filter((ev) => ev.name.trim() !== "")
                     .map((ev) => ({ name: ev.name, value: ev.value }));
 
-                // Build pool config from simple fields — no JSON editing needed
+                // Build pool config from simple fields -- no JSON editing needed
                 const poolConfig = {
                     id: "pool",
                     vmSize: selectedVmSizes[0].toLowerCase(),
@@ -226,7 +286,7 @@ export const PoolCreationPage: React.FC<PoolCreationPageProps> = ({
                     startTask: {
                         commandLine: startTaskCmd,
                         environmentSettings,
-                        maxTaskRetryCount: 3,
+                        maxTaskRetryCount: maxRetryCount,
                         resourceFiles: [],
                         userIdentity: {
                             autoUser: {
@@ -234,7 +294,7 @@ export const PoolCreationPage: React.FC<PoolCreationPageProps> = ({
                                 elevationLevel: "admin",
                             },
                         },
-                        waitForSuccess: true,
+                        waitForSuccess,
                     },
                     certificateReferences: [],
                     metadata: [],
@@ -250,7 +310,9 @@ export const PoolCreationPage: React.FC<PoolCreationPageProps> = ({
                     },
                 });
             } else {
+                // Manual JSON mode -- force targetDedicatedNodes=0
                 const poolConfig = JSON.parse(poolConfigJson);
+                poolConfig.targetDedicatedNodes = 0;
                 await orchestrator.execute({
                     action: "create_pools",
                     payload: {
@@ -274,6 +336,9 @@ export const PoolCreationPage: React.FC<PoolCreationPageProps> = ({
         selectedVmSizes,
         startTaskCmd,
         envVars,
+        maxRetryCount,
+        waitForSuccess,
+        resizingPools.length,
     ]);
 
     const handleRetryFailedPools = React.useCallback(() => {
@@ -328,6 +393,24 @@ export const PoolCreationPage: React.FC<PoolCreationPageProps> = ({
                     <StatusBadge status={quota.status} />
                 ) : (
                     <span style={{ color: "#605e5c" }}>-</span>
+                );
+            },
+        },
+        {
+            key: "estimatedNodes",
+            name: "Est. LP Nodes",
+            minWidth: 100,
+            onRender: (item) => {
+                if (!smartMode || selectedVmSizes.length === 0) return "-";
+                const count = computeLpNodeCount(
+                    item.id,
+                    selectedVmSizes[0],
+                    state.quotaRequests as any
+                );
+                return (
+                    <span style={{ fontWeight: 600 }}>
+                        {count > 0 ? count : "-"}
+                    </span>
                 );
             },
         },
@@ -405,6 +488,17 @@ export const PoolCreationPage: React.FC<PoolCreationPageProps> = ({
                     />
                 )}
 
+                {/* Summary: selected account count and estimated nodes */}
+                {selectedAccountIds.size > 0 && (
+                    <MessageBar messageBarType={MessageBarType.info}>
+                        <strong>{selectedAccountIds.size}</strong> account(s)
+                        selected
+                        {smartMode &&
+                            selectedVmSizes.length > 0 &&
+                            ` | Estimated total LP nodes: ${estimatedTotalNodes}`}
+                    </MessageBar>
+                )}
+
                 <Toggle
                     label="Smart Mode (recommended)"
                     inlineLabel
@@ -419,10 +513,18 @@ export const PoolCreationPage: React.FC<PoolCreationPageProps> = ({
                         <MessageBar messageBarType={MessageBarType.info}>
                             Smart Mode auto-calculates node counts from
                             available LP quota. Select VM sizes in priority
-                            order — if one fails (capacity/quota), it falls back
-                            to the next. targetDedicatedNodes is always 0; only
-                            low-priority/spot nodes are used.
+                            order -- if one fails (capacity/quota), it falls
+                            back to the next. targetDedicatedNodes is always 0;
+                            only low-priority/spot nodes are used.
                         </MessageBar>
+
+                        {resizingPools.length > 0 && (
+                            <MessageBar messageBarType={MessageBarType.warning}>
+                                {resizingPools.length} pool(s) are currently
+                                resizing. Pool creation is blocked until they
+                                finish.
+                            </MessageBar>
+                        )}
 
                         <Dropdown
                             label="GPU VM Sizes (select up to 5, in priority order)"
@@ -460,6 +562,13 @@ export const PoolCreationPage: React.FC<PoolCreationPageProps> = ({
                                             : ""}
                                     </span>
                                 ))}
+                                {selectedVmSizes.length > 1 && (
+                                    <span>
+                                        {" "}
+                                        (falls back in order if capacity
+                                        unavailable)
+                                    </span>
+                                )}
                             </div>
                         )}
 
@@ -550,31 +659,69 @@ export const PoolCreationPage: React.FC<PoolCreationPageProps> = ({
                                 }}
                             />
                         </div>
+
+                        <Stack
+                            horizontal
+                            tokens={{ childrenGap: 24 }}
+                            verticalAlign="end"
+                        >
+                            <SpinButton
+                                label="Max Task Retry Count"
+                                min={0}
+                                max={100}
+                                step={1}
+                                value={String(maxRetryCount)}
+                                onIncrement={(value) => {
+                                    const n = Math.min(
+                                        100,
+                                        (parseInt(value, 10) || 0) + 1
+                                    );
+                                    setMaxRetryCount(n);
+                                    return String(n);
+                                }}
+                                onDecrement={(value) => {
+                                    const n = Math.max(
+                                        0,
+                                        (parseInt(value, 10) || 0) - 1
+                                    );
+                                    setMaxRetryCount(n);
+                                    return String(n);
+                                }}
+                                onValidate={(value) => {
+                                    const n = parseInt(value, 10);
+                                    if (isNaN(n) || n < 0) {
+                                        setMaxRetryCount(0);
+                                        return "0";
+                                    }
+                                    if (n > 100) {
+                                        setMaxRetryCount(100);
+                                        return "100";
+                                    }
+                                    setMaxRetryCount(n);
+                                    return String(n);
+                                }}
+                                styles={{ root: { width: 180 } }}
+                            />
+
+                            <Toggle
+                                label="Wait for Success"
+                                inlineLabel
+                                checked={waitForSuccess}
+                                onChange={(_e, checked) =>
+                                    setWaitForSuccess(!!checked)
+                                }
+                                onText="Yes"
+                                offText="No"
+                            />
+                        </Stack>
                     </>
                 ) : (
                     <>
-                        <Dropdown
-                            label="GPU VM Sizes (optional, select up to 5)"
-                            placeholder="Select VM sizes..."
-                            multiSelect
-                            options={VM_DROPDOWN_OPTIONS}
-                            selectedKeys={selectedVmSizes}
-                            onChange={(_e, option) => {
-                                if (!option) return;
-                                setSelectedVmSizes((prev) => {
-                                    if (option.selected) {
-                                        if (prev.length >= MAX_VM_SELECTIONS)
-                                            return prev;
-                                        return [...prev, option.key as string];
-                                    } else {
-                                        return prev.filter(
-                                            (k) => k !== option.key
-                                        );
-                                    }
-                                });
-                            }}
-                            styles={{ root: { maxWidth: 500 } }}
-                        />
+                        <MessageBar messageBarType={MessageBarType.warning}>
+                            Manual JSON mode. Note: targetDedicatedNodes will be
+                            forced to 0 on submission. Only low-priority/spot
+                            nodes are used.
+                        </MessageBar>
 
                         <div>
                             <label
@@ -621,7 +768,11 @@ export const PoolCreationPage: React.FC<PoolCreationPageProps> = ({
                                 ? "Creating Pools..."
                                 : `Create Pools on ${selectedAccountIds.size} Accounts`
                         }
-                        disabled={isRunning || selectedAccountIds.size === 0}
+                        disabled={
+                            isRunning ||
+                            selectedAccountIds.size === 0 ||
+                            (smartMode && resizingPools.length > 0)
+                        }
                         onClick={handleCreate}
                         styles={{ root: { maxWidth: 300 } }}
                     />

@@ -9,6 +9,7 @@ import {
     SelectionMode,
 } from "@fluentui/react/lib/DetailsList";
 import { ProgressIndicator } from "@fluentui/react/lib/ProgressIndicator";
+import { MessageBar, MessageBarType } from "@fluentui/react/lib/MessageBar";
 import { Checkbox } from "@fluentui/react/lib/Checkbox";
 import { Stack, IStackTokens } from "@fluentui/react/lib/Stack";
 import {
@@ -17,6 +18,7 @@ import {
 } from "../../store/store-context";
 import { StatusBadge } from "../shared/status-badge";
 import { OrchestratorAgent } from "../../agents/orchestrator-agent";
+import { DEFAULT_CONFIG } from "../shared/constants";
 
 const stackTokens: IStackTokens = { childrenGap: 12 };
 
@@ -32,17 +34,23 @@ export const QuotaRequestsPage: React.FC<QuotaRequestsPageProps> = ({
 
     // Pre-fill from user preferences on mount
     const prefsLoaded = React.useRef(false);
-    const [quotaType, setQuotaType] = React.useState<string>("LowPriority");
-    const [newLimit, setNewLimit] = React.useState("680");
+    const [quotaType, setQuotaType] = React.useState<string>(
+        DEFAULT_CONFIG.defaultQuotaType
+    );
+    const [newLimit, setNewLimit] = React.useState(
+        String(DEFAULT_CONFIG.defaultQuotaLimit)
+    );
     const [email, setEmail] = React.useState("");
     const [supportPlanId, setSupportPlanId] = React.useState("");
     const [selectedAccountIds, setSelectedAccountIds] = React.useState<
         Set<string>
     >(new Set());
     const [customToken, setCustomToken] = React.useState("");
-    const [ticketSubscriptionId, setTicketSubscriptionId] = React.useState("");
     const [selectAll, setSelectAll] = React.useState(false);
     const [isRunning, setIsRunning] = React.useState(false);
+    const [validationError, setValidationError] = React.useState<string | null>(
+        null
+    );
 
     React.useEffect(() => {
         if (prefsLoaded.current) return;
@@ -66,6 +74,7 @@ export const QuotaRequestsPage: React.FC<QuotaRequestsPageProps> = ({
     const handleEmailChange = React.useCallback(
         (value: string) => {
             setEmail(value);
+            setValidationError(null);
             store.saveUserPreferences({ lastEmail: value });
         },
         [store]
@@ -74,6 +83,7 @@ export const QuotaRequestsPage: React.FC<QuotaRequestsPageProps> = ({
     const handleNewLimitChange = React.useCallback(
         (value: string) => {
             setNewLimit(value);
+            setValidationError(null);
             const parsed = parseInt(value, 10);
             if (!isNaN(parsed)) {
                 store.saveUserPreferences({ lastQuotaLimit: parsed });
@@ -112,12 +122,38 @@ export const QuotaRequestsPage: React.FC<QuotaRequestsPageProps> = ({
 
     const quotaTypeOptions: IDropdownOption[] = [
         { key: "LowPriority", text: "Low Priority" },
-        { key: "Dedicated", text: "Dedicated" },
-        { key: "Spot", text: "Spot" },
     ];
 
+    const validateInputs = React.useCallback((): boolean => {
+        if (selectedAccountIds.size === 0) {
+            setValidationError("Select at least one account.");
+            return false;
+        }
+        if (!email.trim()) {
+            setValidationError("Contact email is required.");
+            return false;
+        }
+        if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email.trim())) {
+            setValidationError("Please enter a valid email address.");
+            return false;
+        }
+        const parsedLimit = parseInt(newLimit, 10);
+        if (isNaN(parsedLimit) || parsedLimit <= 0) {
+            setValidationError("New limit must be a positive number.");
+            return false;
+        }
+        if (parsedLimit > 100000) {
+            setValidationError(
+                "New limit seems too high. Maximum recommended is 100,000 vCPUs."
+            );
+            return false;
+        }
+        setValidationError(null);
+        return true;
+    }, [selectedAccountIds.size, email, newLimit]);
+
     const handleSubmit = React.useCallback(async () => {
-        if (selectedAccountIds.size === 0 || !email) return;
+        if (!validateInputs()) return;
         setIsRunning(true);
         try {
             await orchestrator.execute({
@@ -127,15 +163,13 @@ export const QuotaRequestsPage: React.FC<QuotaRequestsPageProps> = ({
                     quotaType,
                     newLimit: parseInt(newLimit, 10),
                     contactConfig: {
-                        email,
-                        timezone: "Russian Standard Time",
-                        country: "MEX",
-                        language: "en-us",
+                        email: email.trim(),
+                        timezone: DEFAULT_CONFIG.contactDefaults.timezone,
+                        country: DEFAULT_CONFIG.contactDefaults.country,
+                        language: DEFAULT_CONFIG.contactDefaults.language,
                     },
                     supportPlanId,
                     customToken: customToken.trim() || undefined,
-                    ticketSubscriptionId:
-                        ticketSubscriptionId.trim() || undefined,
                 },
             });
         } finally {
@@ -148,6 +182,8 @@ export const QuotaRequestsPage: React.FC<QuotaRequestsPageProps> = ({
         newLimit,
         email,
         supportPlanId,
+        customToken,
+        validateInputs,
     ]);
 
     const accountColumns: IColumn[] = [
@@ -177,6 +213,15 @@ export const QuotaRequestsPage: React.FC<QuotaRequestsPageProps> = ({
             minWidth: 160,
         },
         { key: "region", name: "Region", fieldName: "region", minWidth: 120 },
+        {
+            key: "subscription",
+            name: "Subscription",
+            minWidth: 180,
+            onRender: (item) => {
+                const subId = item.subscriptionId ?? "";
+                return subId ? `${subId.substring(0, 8)}...` : "-";
+            },
+        },
     ];
 
     const requestColumns: IColumn[] = [
@@ -218,8 +263,18 @@ export const QuotaRequestsPage: React.FC<QuotaRequestsPageProps> = ({
     return (
         <div style={{ padding: "16px" }}>
             <h2 style={{ margin: "0 0 16px", fontSize: "20px" }}>
-                Quota Requests
+                Quota Requests (Low Priority vCPU)
             </h2>
+
+            {validationError && (
+                <MessageBar
+                    messageBarType={MessageBarType.error}
+                    onDismiss={() => setValidationError(null)}
+                    styles={{ root: { marginBottom: 12 } }}
+                >
+                    {validationError}
+                </MessageBar>
+            )}
 
             <Stack tokens={stackTokens}>
                 <Checkbox
@@ -251,8 +306,13 @@ export const QuotaRequestsPage: React.FC<QuotaRequestsPageProps> = ({
                     <TextField
                         label="New Limit (vCPUs)"
                         value={newLimit}
-                        onChange={(_e, v) => handleNewLimitChange(v ?? "680")}
+                        onChange={(_e, v) =>
+                            handleNewLimitChange(
+                                v ?? String(DEFAULT_CONFIG.defaultQuotaLimit)
+                            )
+                        }
                         type="number"
+                        min={1}
                         styles={{ root: { width: 130 } }}
                     />
                 </Stack>
@@ -262,6 +322,7 @@ export const QuotaRequestsPage: React.FC<QuotaRequestsPageProps> = ({
                     value={email}
                     onChange={(_e, v) => handleEmailChange(v ?? "")}
                     placeholder="your@email.com"
+                    required
                     styles={{ root: { maxWidth: 350 } }}
                 />
                 <TextField
@@ -272,7 +333,7 @@ export const QuotaRequestsPage: React.FC<QuotaRequestsPageProps> = ({
                     styles={{ root: { maxWidth: 450 } }}
                 />
                 <TextField
-                    label="Bearer Token (optional — leave empty to use Azure CLI token)"
+                    label="Bearer Token (optional -- leave empty to use Azure CLI token)"
                     value={customToken}
                     onChange={(_e, v) => setCustomToken(v ?? "")}
                     placeholder="Paste Bearer token here, or leave empty for auto"
@@ -286,6 +347,12 @@ export const QuotaRequestsPage: React.FC<QuotaRequestsPageProps> = ({
                     }
                 />
 
+                <MessageBar messageBarType={MessageBarType.info}>
+                    Each quota request uses the account's own subscription.
+                    Tickets are filed against the subscription that owns the
+                    Batch account.
+                </MessageBar>
+
                 <Stack horizontal tokens={{ childrenGap: 8 }}>
                     <PrimaryButton
                         text={
@@ -294,7 +361,9 @@ export const QuotaRequestsPage: React.FC<QuotaRequestsPageProps> = ({
                                 : `Submit ${selectedAccountIds.size} Quota Requests`
                         }
                         disabled={
-                            isRunning || selectedAccountIds.size === 0 || !email
+                            isRunning ||
+                            selectedAccountIds.size === 0 ||
+                            !email.trim()
                         }
                         onClick={handleSubmit}
                         styles={{ root: { maxWidth: 300 } }}

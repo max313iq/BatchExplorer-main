@@ -6,8 +6,8 @@ export interface AgentContext {
     store: MultiRegionStore;
     scheduler: RequestScheduler;
     armUrl: string;
-    getAccessToken: () => Promise<string>;
-    getBatchAccessToken: () => Promise<string>;
+    getAccessToken: (tenantId?: string) => Promise<string>;
+    getBatchAccessToken: (tenantId?: string) => Promise<string>;
 }
 
 export interface AgentResult {
@@ -57,7 +57,8 @@ export interface QuotaInput {
         country: string;
         language: string;
     };
-    supportPlanId: string;
+    /** Optional — auto-detected per subscription if omitted */
+    supportPlanId?: string;
     config?: {
         concurrency?: number;
         delayMs?: number;

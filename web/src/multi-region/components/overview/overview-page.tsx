@@ -31,7 +31,10 @@ const StatCard: React.FC<StatCardProps> = ({
     items,
     onClick,
 }) => {
-    const total = items.reduce((s, i) => s + i.value, 0);
+    const total =
+        items.length > 0 && items[0].label === "Total"
+            ? items[0].value
+            : items.reduce((s, i) => s + i.value, 0);
     return (
         <div
             onClick={onClick}
@@ -766,6 +769,11 @@ export const OverviewPage: React.FC<OverviewPageProps> = ({
                     onClick={() => onNavigate("accounts")}
                     items={[
                         {
+                            label: "Total",
+                            value: stats.totalAccounts,
+                            color: "#0078d4",
+                        },
+                        {
                             label: "Created",
                             value: stats.createdAccounts,
                             color: "#107c10",
@@ -807,6 +815,11 @@ export const OverviewPage: React.FC<OverviewPageProps> = ({
                     onClick={() => onNavigate("pools")}
                     items={[
                         {
+                            label: "Total",
+                            value: stats.totalPools,
+                            color: "#00b7c3",
+                        },
+                        {
                             label: "Created",
                             value: stats.createdPools,
                             color: "#107c10",
@@ -824,7 +837,16 @@ export const OverviewPage: React.FC<OverviewPageProps> = ({
                     color="#e3a400"
                     onClick={() => onNavigate("nodes")}
                     items={[
-                        { label: "Total", value: stats.totalNodes },
+                        {
+                            label: "Total",
+                            value: stats.totalNodes,
+                            color: "#e3a400",
+                        },
+                        {
+                            label: "Running",
+                            value: stats.runningNodes,
+                            color: "#107c10",
+                        },
                         {
                             label: "Issues",
                             value: stats.nonWorkingNodes,

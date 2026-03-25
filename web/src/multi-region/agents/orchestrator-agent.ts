@@ -9,9 +9,9 @@ import { WorkflowAgent, WorkflowConfig } from "./workflow-agent";
 import { RequestDeduplicator } from "../scheduling/request-deduplicator";
 import { PoolInfo, AccountInfo, QuotaSuggestion } from "../store/store-types";
 
-/** Bounded-concurrency Promise.all — runs `fn` on each item with at most `concurrency` in flight */
-// High concurrency for read-only GET operations (ARM/Batch GETs don't have strict 429 limits)
-const READ_CONCURRENCY = 20;
+/** Bounded-concurrency Promise.allSettled — runs `fn` on each item with at most `concurrency` in flight */
+// Concurrency limit of 10 for read-only GET operations
+const READ_CONCURRENCY = 10;
 // Lower concurrency for write operations (PUT/POST/DELETE hit 429 more easily)
 const WRITE_CONCURRENCY = 3;
 
@@ -19,19 +19,42 @@ async function pMap<T, R>(
     items: T[],
     fn: (item: T) => Promise<R>,
     concurrency = READ_CONCURRENCY
-): Promise<R[]> {
-    const results: R[] = new Array(items.length);
+): Promise<PromiseSettledResult<R>[]> {
+    const results: PromiseSettledResult<R>[] = new Array(items.length);
     let idx = 0;
     const run = async () => {
         while (idx < items.length) {
             const i = idx++;
-            results[i] = await fn(items[i]);
+            try {
+                const value = await fn(items[i]);
+                results[i] = { status: "fulfilled", value };
+            } catch (reason: any) {
+                results[i] = { status: "rejected", reason };
+            }
         }
     };
     await Promise.all(
         Array.from({ length: Math.min(concurrency, items.length) }, () => run())
     );
     return results;
+}
+
+/** Extract fulfilled values from settled results, returning both values and errors */
+function collectSettled<R>(settled: PromiseSettledResult<R>[]): {
+    values: R[];
+    errors: Array<{ index: number; error: any }>;
+} {
+    const values: R[] = [];
+    const errors: Array<{ index: number; error: any }> = [];
+    for (let i = 0; i < settled.length; i++) {
+        const r = settled[i];
+        if (r.status === "fulfilled") {
+            values.push(r.value);
+        } else {
+            errors.push({ index: i, error: r.reason });
+        }
+    }
+    return { values, errors };
 }
 
 function generateCorrelationId(): string {
@@ -51,6 +74,12 @@ function getVCpus(vmSize: string): number {
         standard_nc6s_v3: 6,
     };
     return map[vmSize.toLowerCase().replace(/\s/g, "")] || 1;
+}
+
+/** Optional token provider interface for overriding default token resolution */
+export interface TokenProvider {
+    getAccessToken(tenantId?: string): Promise<string>;
+    getBatchAccessToken?(tenantId?: string): Promise<string>;
 }
 
 export type OrchestratorAction =
@@ -86,8 +115,13 @@ export class OrchestratorAgent implements Agent {
     private readonly _node: NodeAgent;
     private readonly _deduplicator: RequestDeduplicator;
     private _workflowAgent: WorkflowAgent | null = null;
+    private readonly _tokenProvider: TokenProvider | undefined;
 
-    constructor(private readonly _ctx: AgentContext) {
+    constructor(
+        private readonly _ctx: AgentContext,
+        tokenProvider?: TokenProvider
+    ) {
+        this._tokenProvider = tokenProvider;
         this._deduplicator = new RequestDeduplicator();
         this._provisioner = new ProvisionerAgent(_ctx);
         this._quota = new QuotaAgent(_ctx);
@@ -95,6 +129,40 @@ export class OrchestratorAgent implements Agent {
         this._filter = new FilterAgent(_ctx.store);
         this._pool = new PoolAgent(_ctx);
         this._node = new NodeAgent(_ctx);
+
+        // AUTO-DISCOVER on init: trigger discover_accounts for all subscriptions
+        this._autoDiscoverOnInit();
+    }
+
+    /** Fire-and-forget auto-discovery at construction time */
+    private _autoDiscoverOnInit(): void {
+        // Run asynchronously — do not block construction
+        this.execute({
+            action: "discover_accounts",
+            payload: {},
+        }).catch((err) => {
+            this._ctx.store.addLog({
+                agent: "orchestrator",
+                level: "warn",
+                message: `Auto-discovery on init failed: ${err?.message ?? String(err)}`,
+            });
+        });
+    }
+
+    /** Resolve ARM access token, preferring injected TokenProvider */
+    private async _getAccessToken(tenantId?: string): Promise<string> {
+        if (this._tokenProvider) {
+            return this._tokenProvider.getAccessToken(tenantId);
+        }
+        return this._ctx.getAccessToken(tenantId);
+    }
+
+    /** Resolve Batch access token, preferring injected TokenProvider */
+    private async _getBatchAccessToken(tenantId?: string): Promise<string> {
+        if (this._tokenProvider?.getBatchAccessToken) {
+            return this._tokenProvider.getBatchAccessToken(tenantId);
+        }
+        return this._ctx.getBatchAccessToken(tenantId);
     }
 
     cancel(): void {
@@ -312,7 +380,7 @@ export class OrchestratorAgent implements Agent {
                         filteredAccountIds.push(accountId);
                     }
 
-                    // Ensure targetDedicatedNodes = 0 in pool config
+                    // SAFETY: Ensure targetDedicatedNodes = 0 in pool config
                     const smartPoolConfig =
                         (smartPayload.poolConfig as Record<string, unknown>) ??
                         {};
@@ -566,27 +634,29 @@ export class OrchestratorAgent implements Agent {
     private async _discoverAccounts(
         payload: Record<string, unknown>
     ): Promise<AgentResult> {
-        const { store, getAccessToken, armUrl } = this._ctx;
+        const { store, armUrl } = this._ctx;
         const subscriptionId = payload.subscriptionId as string | undefined;
 
         store.setAgentStatus("provisioner", "running");
 
         try {
-            const token = await getAccessToken();
+            const token = await this._getAccessToken();
 
             // Determine which subscriptions to discover
-            let subscriptionIds: string[];
+            let subscriptions: Array<{
+                subscriptionId: string;
+                tenantId?: string;
+            }>;
 
             if (subscriptionId) {
-                // Single subscription mode
-                subscriptionIds = [subscriptionId];
+                subscriptions = [{ subscriptionId }];
                 store.addLog({
                     agent: "provisioner",
                     level: "info",
                     message: `Discovering Batch accounts in subscription ${subscriptionId.substring(0, 8)}...`,
                 });
             } else {
-                // Cross-subscription mode: fetch ALL subscriptions
+                // Cross-subscription mode: use store subscriptions (populated from MSAL)
                 store.addLog({
                     agent: "provisioner",
                     level: "info",
@@ -594,65 +664,74 @@ export class OrchestratorAgent implements Agent {
                         "Fetching all subscriptions for cross-subscription discovery...",
                 });
 
-                const subsResponse = await fetch("/api/subscriptions");
-                if (!subsResponse.ok) {
-                    throw new Error(
-                        `Failed to list subscriptions: ${subsResponse.status}`
-                    );
+                const stateSubs = store.getState().subscriptions;
+                if (stateSubs.length > 0) {
+                    subscriptions = stateSubs.map((s) => ({
+                        subscriptionId: s.subscriptionId,
+                        tenantId: s.tenantId,
+                    }));
+                } else {
+                    // Fallback: list via ARM (uses the home tenant token)
+                    const url = `${armUrl}/subscriptions?api-version=2022-12-01`;
+                    const resp = await fetch(url, {
+                        headers: { Authorization: `Bearer ${token}` },
+                    });
+                    if (!resp.ok)
+                        throw new Error(
+                            `Failed to list subscriptions: ${resp.status}`
+                        );
+                    const data = await resp.json();
+                    subscriptions = (data.value ?? []).map((s: any) => ({
+                        subscriptionId: s.subscriptionId as string,
+                        tenantId: s.tenantId as string | undefined,
+                    }));
                 }
-                const subs = await subsResponse.json();
-                subscriptionIds = (subs as any[]).map(
-                    (s: any) => s.subscriptionId as string
-                );
 
                 store.addLog({
                     agent: "provisioner",
                     level: "info",
-                    message: `Found ${subscriptionIds.length} subscriptions to discover`,
+                    message: `Found ${subscriptions.length} subscriptions to discover`,
                 });
             }
 
             const allAccounts: Array<{ acct: any; subId: string }> = [];
             let failedSubs = 0;
 
-            // Parallel discovery across ALL subscriptions — ARM GETs have no strict 429
+            // Parallel discovery with Promise.allSettled via pMap (concurrency=10)
             const subResults = await pMap(
-                subscriptionIds,
-                async (subId) => {
-                    try {
-                        const accounts =
-                            await this._discoverAccountsForSubscription(
-                                subId,
-                                token,
-                                armUrl
-                            );
-                        return {
-                            subId,
-                            accounts,
-                            error: null as string | null,
-                        };
-                    } catch (error: any) {
-                        return {
-                            subId,
-                            accounts: [] as any[],
-                            error: error?.message ?? String(error),
-                        };
-                    }
+                subscriptions,
+                async (sub) => {
+                    const accounts =
+                        await this._discoverAccountsForSubscription(
+                            sub.subscriptionId,
+                            token,
+                            armUrl
+                        );
+                    return {
+                        subId: sub.subscriptionId,
+                        accounts,
+                    };
                 },
                 READ_CONCURRENCY
             );
 
-            for (const result of subResults) {
-                if (result.error) {
+            for (let i = 0; i < subResults.length; i++) {
+                const settled = subResults[i];
+                if (settled.status === "rejected") {
+                    const errMsg =
+                        settled.reason?.message ?? String(settled.reason);
                     store.addLog({
                         agent: "provisioner",
                         level: "error",
-                        message: `Discovery failed for subscription ${result.subId.substring(0, 8)}: ${result.error}`,
+                        message: `Discovery failed for subscription ${subscriptions[i].subscriptionId.substring(0, 8)}: ${errMsg}`,
                     });
                     failedSubs++;
                 } else {
-                    for (const acct of result.accounts) {
-                        allAccounts.push({ acct, subId: result.subId });
+                    for (const acct of settled.value.accounts) {
+                        allAccounts.push({
+                            acct,
+                            subId: settled.value.subId,
+                        });
                     }
                 }
             }
@@ -690,21 +769,21 @@ export class OrchestratorAgent implements Agent {
             store.addLog({
                 agent: "provisioner",
                 level: "info",
-                message: `Discovered ${allAccounts.length} accounts across ${subscriptionIds.length} subscriptions, imported ${imported} new (${allAccounts.length - imported} already tracked, ${failedSubs} subscriptions failed)`,
+                message: `Discovered ${allAccounts.length} accounts across ${subscriptions.length} subscriptions, imported ${imported} new (${allAccounts.length - imported} already tracked, ${failedSubs} subscriptions failed)`,
             });
 
             return {
                 status:
                     failedSubs === 0
                         ? "completed"
-                        : failedSubs === subscriptionIds.length
+                        : failedSubs === subscriptions.length
                           ? "failed"
                           : "partial",
                 summary: {
                     total: allAccounts.length,
                     imported,
                     skipped: allAccounts.length - imported,
-                    subscriptionsQueried: subscriptionIds.length,
+                    subscriptionsQueried: subscriptions.length,
                     subscriptionsFailed: failedSubs,
                 },
             };
@@ -721,7 +800,7 @@ export class OrchestratorAgent implements Agent {
     }
 
     private async _refreshPoolInfo(): Promise<AgentResult> {
-        const { store, getBatchAccessToken } = this._ctx;
+        const { store } = this._ctx;
         const state = store.getState();
         const accounts = state.accounts.filter(
             (a) => a.provisioningState === "created"
@@ -734,85 +813,77 @@ export class OrchestratorAgent implements Agent {
         });
 
         let failedCount = 0;
-        const token = await getBatchAccessToken();
+        const token = await this._getBatchAccessToken();
 
-        // Parallel pool fetch — Batch GETs have no strict 429
+        // Parallel pool fetch with Promise.allSettled via pMap (concurrency=10)
         const poolResults = await pMap(
             accounts,
             async (account) => {
-                try {
-                    const pools: PoolInfo[] = [];
-                    let url: string | null =
-                        `https://${account.accountName}.${account.region}.batch.azure.com/pools?api-version=2024-07-01.20.0`;
-                    while (url) {
-                        const resp = await fetch(url, {
-                            headers: { Authorization: `Bearer ${token}` },
-                        });
-                        if (!resp.ok) {
-                            const e = await resp.json().catch(() => ({}));
-                            throw new Error(
-                                e?.error?.message ?? `${resp.status}`
-                            );
-                        }
-                        const data = await resp.json();
-                        for (const p of (data.value ?? []) as Record<
-                            string,
-                            any
-                        >[]) {
-                            const re: string[] = [];
-                            if (Array.isArray(p.resizeErrors))
-                                for (const r of p.resizeErrors)
-                                    re.push(r.message ?? r.code ?? String(r));
-                            pools.push({
-                                id: `${account.id}/pools/${p.id}`,
-                                accountId: account.id,
-                                accountName: account.accountName,
-                                region: account.region,
-                                poolId: p.id ?? "",
-                                vmSize: p.vmSize ?? "",
-                                state: p.state ?? "unknown",
-                                allocationState: p.allocationState ?? "unknown",
-                                targetDedicatedNodes:
-                                    p.targetDedicatedNodes ?? 0,
-                                currentDedicatedNodes:
-                                    p.currentDedicatedNodes ?? 0,
-                                targetLowPriorityNodes:
-                                    p.targetLowPriorityNodes ?? 0,
-                                currentLowPriorityNodes:
-                                    p.currentLowPriorityNodes ?? 0,
-                                taskSlotsPerNode: p.taskSlotsPerNode ?? 1,
-                                enableAutoScale: p.enableAutoScale ?? false,
-                                autoScaleFormula: p.autoScaleFormula,
-                                resizeErrors: re.length > 0 ? re : undefined,
-                                lastModified: p.lastModified,
-                                creationTime: p.creationTime,
-                                startTask: p.startTask ?? undefined,
-                            });
-                        }
-                        url = data["odata.nextLink"] ?? null;
+                const pools: PoolInfo[] = [];
+                let url: string | null =
+                    `https://${account.accountName}.${account.region}.batch.azure.com/pools?api-version=2024-07-01.20.0`;
+                while (url) {
+                    const resp = await fetch(url, {
+                        headers: { Authorization: `Bearer ${token}` },
+                    });
+                    if (!resp.ok) {
+                        const e = await resp.json().catch(() => ({}));
+                        throw new Error(e?.error?.message ?? `${resp.status}`);
                     }
-                    return { account, pools, error: null as string | null };
-                } catch (error: any) {
-                    return {
-                        account,
-                        pools: [] as PoolInfo[],
-                        error: error?.message ?? String(error),
-                    };
+                    const data = await resp.json();
+                    for (const p of (data.value ?? []) as Record<
+                        string,
+                        any
+                    >[]) {
+                        const re: string[] = [];
+                        if (Array.isArray(p.resizeErrors))
+                            for (const r of p.resizeErrors)
+                                re.push(r.message ?? r.code ?? String(r));
+                        pools.push({
+                            id: `${account.id}/pools/${p.id}`,
+                            accountId: account.id,
+                            accountName: account.accountName,
+                            region: account.region,
+                            poolId: p.id ?? "",
+                            vmSize: p.vmSize ?? "",
+                            state: p.state ?? "unknown",
+                            allocationState: p.allocationState ?? "unknown",
+                            targetDedicatedNodes: p.targetDedicatedNodes ?? 0,
+                            currentDedicatedNodes: p.currentDedicatedNodes ?? 0,
+                            targetLowPriorityNodes:
+                                p.targetLowPriorityNodes ?? 0,
+                            currentLowPriorityNodes:
+                                p.currentLowPriorityNodes ?? 0,
+                            taskSlotsPerNode: p.taskSlotsPerNode ?? 1,
+                            enableAutoScale: p.enableAutoScale ?? false,
+                            autoScaleFormula: p.autoScaleFormula,
+                            resizeErrors: re.length > 0 ? re : undefined,
+                            lastModified: p.lastModified,
+                            creationTime: p.creationTime,
+                            startTask: p.startTask ?? undefined,
+                        });
+                    }
+                    url = data["odata.nextLink"] ?? null;
                 }
+                return { account, pools };
             },
             READ_CONCURRENCY
         );
 
         const allPools: PoolInfo[] = [];
-        for (const r of poolResults) {
-            if (r.error) {
+        for (let i = 0; i < poolResults.length; i++) {
+            const r = poolResults[i];
+            if (r.status === "rejected") {
+                const errMsg = r.reason?.message ?? String(r.reason);
                 store.addLog({
                     agent: "orchestrator",
                     level: "error",
-                    message: `Failed pools for ${r.account.accountName}: ${r.error}`,
+                    message: `Failed pools for ${accounts[i].accountName}: ${errMsg}`,
                 });
                 failedCount++;
-            } else allPools.push(...r.pools);
+            } else {
+                allPools.push(...r.value.pools);
+            }
         }
 
         store.setPoolInfos(allPools);
@@ -839,8 +910,7 @@ export class OrchestratorAgent implements Agent {
     }
 
     private async _refreshAccountInfo(): Promise<AgentResult> {
-        const { store, getAccessToken, getBatchAccessToken, armUrl } =
-            this._ctx;
+        const { store, armUrl } = this._ctx;
         const state = store.getState();
         const accounts = state.accounts.filter(
             (a) => a.provisioningState === "created"
@@ -854,162 +924,156 @@ export class OrchestratorAgent implements Agent {
 
         let failedCount = 0;
         const [armToken, batchToken] = await Promise.all([
-            getAccessToken(),
-            getBatchAccessToken(),
+            this._getAccessToken(),
+            this._getBatchAccessToken(),
         ]);
 
-        // Single parallel pass: fetch pools + ARM quota simultaneously per account — no 429 on reads
+        // Parallel account info refresh with Promise.allSettled via pMap (concurrency=10)
         const acctResults = await pMap(
             accounts,
             async (account) => {
-                try {
-                    const rgMatch = account.id.match(
-                        /resourceGroups\/([^/]+)/i
-                    );
-                    const resourceGroup = rgMatch
-                        ? rgMatch[1]
-                        : account.resourceGroup;
+                const rgMatch = account.id.match(/resourceGroups\/([^/]+)/i);
+                const resourceGroup = rgMatch
+                    ? rgMatch[1]
+                    : account.resourceGroup;
 
-                    // Fetch pools (Batch API) and quota (ARM API) in parallel for this account
-                    const [poolsData, armData] = await Promise.all([
-                        (async () => {
-                            const pools: {
-                                vmSize: string;
-                                lpNodes: number;
-                                dedNodes: number;
-                            }[] = [];
-                            let url: string | null =
-                                `https://${account.accountName}.${account.region}.batch.azure.com/pools?api-version=2024-07-01.20.0`;
-                            while (url) {
-                                const r = await fetch(url, {
-                                    headers: {
-                                        Authorization: `Bearer ${batchToken}`,
-                                    },
-                                });
-                                if (!r.ok) break;
-                                const d = await r.json();
-                                for (const p of (d.value ?? []) as any[])
-                                    pools.push({
-                                        vmSize: p.vmSize ?? "",
-                                        lpNodes: p.currentLowPriorityNodes ?? 0,
-                                        dedNodes: p.currentDedicatedNodes ?? 0,
-                                    });
-                                url = d["odata.nextLink"] ?? null;
-                            }
-                            return pools;
-                        })(),
-                        (async () => {
-                            const url = `${armUrl}/subscriptions/${account.subscriptionId}/resourceGroups/${resourceGroup}/providers/Microsoft.Batch/batchAccounts/${account.accountName}?api-version=2024-02-01`;
+                // Fetch pools (Batch API) and quota (ARM API) in parallel for this account
+                const [poolsData, armData] = await Promise.all([
+                    (async () => {
+                        const pools: {
+                            vmSize: string;
+                            lpNodes: number;
+                            dedNodes: number;
+                        }[] = [];
+                        let url: string | null =
+                            `https://${account.accountName}.${account.region}.batch.azure.com/pools?api-version=2024-07-01.20.0`;
+                        while (url) {
                             const r = await fetch(url, {
                                 headers: {
-                                    Authorization: `Bearer ${armToken}`,
+                                    Authorization: `Bearer ${batchToken}`,
                                 },
                             });
-                            if (!r.ok) {
-                                const e = await r.json().catch(() => ({}));
-                                throw new Error(
-                                    e?.error?.message ?? `${r.status}`
-                                );
-                            }
-                            return await r.json();
-                        })(),
-                    ]);
+                            if (!r.ok) break;
+                            const d = await r.json();
+                            for (const p of (d.value ?? []) as any[])
+                                pools.push({
+                                    vmSize: p.vmSize ?? "",
+                                    lpNodes: p.currentLowPriorityNodes ?? 0,
+                                    dedNodes: p.currentDedicatedNodes ?? 0,
+                                });
+                            url = d["odata.nextLink"] ?? null;
+                        }
+                        return pools;
+                    })(),
+                    (async () => {
+                        const url = `${armUrl}/subscriptions/${account.subscriptionId}/resourceGroups/${resourceGroup}/providers/Microsoft.Batch/batchAccounts/${account.accountName}?api-version=2024-02-01`;
+                        const r = await fetch(url, {
+                            headers: {
+                                Authorization: `Bearer ${armToken}`,
+                            },
+                        });
+                        if (!r.ok) {
+                            const e = await r.json().catch(() => ({}));
+                            throw new Error(e?.error?.message ?? `${r.status}`);
+                        }
+                        return await r.json();
+                    })(),
+                ]);
 
-                    const props = armData.properties ?? {};
-                    const toNum = (v: unknown) =>
-                        typeof v === "number" ? v : Number(v) || 0;
-                    const lowPriorityCoreQuota = toNum(
-                        props.lowPriorityCoreQuota
-                    );
-                    const poolQuota = toNum(props.poolQuota);
-                    const activeJobAndJobScheduleQuota = toNum(
-                        props.activeJobAndJobScheduleQuota
-                    );
-                    const dedicatedCoreQuotaPerVMFamilyEnforced: boolean =
-                        props.dedicatedCoreQuotaPerVMFamilyEnforced ?? false;
-                    const poolCount = poolsData.length;
-                    const lowPriorityCoresUsed = poolsData.reduce(
-                        (s, p) => s + p.lpNodes * getVCpus(p.vmSize),
+                const props = armData.properties ?? {};
+                const toNum = (v: unknown) =>
+                    typeof v === "number" ? v : Number(v) || 0;
+                const lowPriorityCoreQuota = toNum(props.lowPriorityCoreQuota);
+                const poolQuota = toNum(props.poolQuota);
+                const activeJobAndJobScheduleQuota = toNum(
+                    props.activeJobAndJobScheduleQuota
+                );
+                const dedicatedCoreQuotaPerVMFamilyEnforced: boolean =
+                    props.dedicatedCoreQuotaPerVMFamilyEnforced ?? false;
+                const poolCount = poolsData.length;
+
+                // QUOTA ACCURACY: LP cores used = sum(currentLowPriorityNodes * getVCpus(vmSize))
+                const lowPriorityCoresUsed = poolsData.reduce(
+                    (s, p) => s + p.lpNodes * getVCpus(p.vmSize),
+                    0
+                );
+
+                // Dedicated always 0 (we never create dedicated nodes)
+                const dedicatedCoresUsed = 0;
+
+                let dedicatedCoreQuota: number;
+                let dedicatedCoreQuotaPerVMFamily:
+                    | Array<{
+                          name: string;
+                          coreQuota: number;
+                          coresUsed: number;
+                          coresFree: number;
+                      }>
+                    | undefined;
+                if (
+                    dedicatedCoreQuotaPerVMFamilyEnforced &&
+                    Array.isArray(props.dedicatedCoreQuotaPerVMFamily)
+                ) {
+                    const fqs = props.dedicatedCoreQuotaPerVMFamily as Array<{
+                        name: string;
+                        coreQuota: number;
+                    }>;
+                    dedicatedCoreQuotaPerVMFamily = fqs.map((fq) => {
+                        const q = toNum(fq.coreQuota);
+                        return {
+                            name: fq.name,
+                            coreQuota: q,
+                            coresUsed: 0,
+                            coresFree: q,
+                        };
+                    });
+                    dedicatedCoreQuota = fqs.reduce(
+                        (s, fq) => s + toNum(fq.coreQuota),
                         0
                     );
-
-                    let dedicatedCoreQuota: number;
-                    let dedicatedCoreQuotaPerVMFamily:
-                        | Array<{
-                              name: string;
-                              coreQuota: number;
-                              coresUsed: number;
-                              coresFree: number;
-                          }>
-                        | undefined;
-                    if (
-                        dedicatedCoreQuotaPerVMFamilyEnforced &&
-                        Array.isArray(props.dedicatedCoreQuotaPerVMFamily)
-                    ) {
-                        const fqs =
-                            props.dedicatedCoreQuotaPerVMFamily as Array<{
-                                name: string;
-                                coreQuota: number;
-                            }>;
-                        dedicatedCoreQuotaPerVMFamily = fqs.map((fq) => {
-                            const q = toNum(fq.coreQuota);
-                            return {
-                                name: fq.name,
-                                coreQuota: q,
-                                coresUsed: 0,
-                                coresFree: q,
-                            };
-                        });
-                        dedicatedCoreQuota = fqs.reduce(
-                            (s, fq) => s + toNum(fq.coreQuota),
-                            0
-                        );
-                    } else {
-                        dedicatedCoreQuota = toNum(props.dedicatedCoreQuota);
-                    }
-
-                    const info: AccountInfo = {
-                        id: account.id,
-                        accountName: account.accountName,
-                        subscriptionId: account.subscriptionId,
-                        region: account.region,
-                        resourceGroup,
-                        dedicatedCoreQuota,
-                        lowPriorityCoreQuota,
-                        poolQuota,
-                        activeJobAndJobScheduleQuota,
-                        dedicatedCoresUsed: 0,
-                        lowPriorityCoresUsed,
-                        poolCount,
-                        dedicatedCoresFree: dedicatedCoreQuota,
-                        lowPriorityCoresFree:
-                            lowPriorityCoreQuota - lowPriorityCoresUsed,
-                        poolsFree: poolQuota - poolCount,
-                        dedicatedCoreQuotaPerVMFamilyEnforced,
-                        dedicatedCoreQuotaPerVMFamily,
-                    };
-                    return { info, error: null as string | null };
-                } catch (error: any) {
-                    return {
-                        info: null as AccountInfo | null,
-                        error: error?.message ?? String(error),
-                    };
+                } else {
+                    dedicatedCoreQuota = toNum(props.dedicatedCoreQuota);
                 }
+
+                const info: AccountInfo = {
+                    id: account.id,
+                    accountName: account.accountName,
+                    subscriptionId: account.subscriptionId,
+                    region: account.region,
+                    resourceGroup,
+                    dedicatedCoreQuota,
+                    lowPriorityCoreQuota,
+                    poolQuota,
+                    activeJobAndJobScheduleQuota,
+                    dedicatedCoresUsed,
+                    lowPriorityCoresUsed,
+                    poolCount,
+                    dedicatedCoresFree: dedicatedCoreQuota - dedicatedCoresUsed,
+                    lowPriorityCoresFree:
+                        lowPriorityCoreQuota - lowPriorityCoresUsed,
+                    poolsFree: poolQuota - poolCount,
+                    dedicatedCoreQuotaPerVMFamilyEnforced,
+                    dedicatedCoreQuotaPerVMFamily,
+                };
+                return info;
             },
-            10
+            READ_CONCURRENCY
         );
 
         const allAccountInfos: AccountInfo[] = [];
         for (let i = 0; i < acctResults.length; i++) {
             const r = acctResults[i];
-            if (r.error || !r.info) {
+            if (r.status === "rejected") {
+                const errMsg = r.reason?.message ?? String(r.reason);
                 store.addLog({
                     agent: "orchestrator",
                     level: "error",
-                    message: `Failed account info for ${accounts[i].accountName}: ${r.error}`,
+                    message: `Failed account info for ${accounts[i].accountName}: ${errMsg}`,
                 });
                 failedCount++;
-            } else allAccountInfos.push(r.info);
+            } else {
+                allAccountInfos.push(r.value);
+            }
         }
 
         store.setAccountInfos(allAccountInfos);
@@ -1107,7 +1171,7 @@ export class OrchestratorAgent implements Agent {
     private async _autoCreatePoolsFromQuota(
         payload: Record<string, unknown>
     ): Promise<AgentResult> {
-        const { store, getBatchAccessToken } = this._ctx;
+        const { store } = this._ctx;
         const suggestions = payload.suggestions as QuotaSuggestion[];
 
         if (!suggestions || suggestions.length === 0) {
@@ -1130,9 +1194,10 @@ export class OrchestratorAgent implements Agent {
         let created = 0;
         let failed = 0;
 
+        // Sequential write operations with rate limiting
         for (const suggestion of suggestions) {
             try {
-                const token = await getBatchAccessToken();
+                const token = await this._getBatchAccessToken();
                 const vmSizeShort = suggestion.vmSize
                     .replace(/^Standard_/i, "")
                     .replace(/_/g, "")
@@ -1149,14 +1214,12 @@ export class OrchestratorAgent implements Agent {
                     );
                 }
 
-                const useLp = suggestion.maxLpNodes >= 1;
+                // SAFETY: Never create dedicated nodes — always LP only
                 const poolBody: Record<string, unknown> = {
                     id: poolId,
                     vmSize: suggestion.vmSize,
-                    targetDedicatedNodes: useLp
-                        ? 0
-                        : suggestion.maxDedicatedNodes,
-                    targetLowPriorityNodes: useLp ? suggestion.maxLpNodes : 0,
+                    targetDedicatedNodes: 0,
+                    targetLowPriorityNodes: suggestion.maxLpNodes,
                     virtualMachineConfiguration: {
                         imageReference: {
                             publisher: "microsoft-azure-batch",
@@ -1191,7 +1254,7 @@ export class OrchestratorAgent implements Agent {
                 store.addLog({
                     agent: "orchestrator",
                     level: "info",
-                    message: `Created pool ${poolId} in ${account.accountName} (${suggestion.vmSize}, ${useLp ? suggestion.maxLpNodes + " LP" : suggestion.maxDedicatedNodes + " dedicated"} nodes)`,
+                    message: `Created pool ${poolId} in ${account.accountName} (${suggestion.vmSize}, ${suggestion.maxLpNodes} LP nodes)`,
                 });
                 created++;
             } catch (error: any) {
@@ -1224,7 +1287,7 @@ export class OrchestratorAgent implements Agent {
     private async _deleteNodes(
         payload: Record<string, unknown>
     ): Promise<AgentResult> {
-        const { store, getBatchAccessToken } = this._ctx;
+        const { store } = this._ctx;
         const nodeIds = payload.nodeIds as string[];
 
         store.setAgentStatus("node", "running");
@@ -1265,9 +1328,10 @@ export class OrchestratorAgent implements Agent {
         let succeeded = 0;
         let failed = 0;
 
+        // Sequential write operations
         for (const [, group] of groups) {
             try {
-                const token = await getBatchAccessToken();
+                const token = await this._getBatchAccessToken();
                 const url = `https://${group.accountName}.${group.region}.batch.azure.com/pools/${group.poolId}/removenodes?api-version=2024-07-01.20.0`;
                 const response = await fetch(url, {
                     method: "POST",
@@ -1331,7 +1395,7 @@ export class OrchestratorAgent implements Agent {
     private async _recreateNodes(
         payload: Record<string, unknown>
     ): Promise<AgentResult> {
-        const { store, getBatchAccessToken } = this._ctx;
+        const { store } = this._ctx;
         const nodeIds = payload.nodeIds as string[];
 
         store.setAgentStatus("node", "running");
@@ -1374,9 +1438,10 @@ export class OrchestratorAgent implements Agent {
         let succeeded = 0;
         let failed = 0;
 
+        // Sequential write operations
         for (const [, group] of groups) {
             try {
-                const token = await getBatchAccessToken();
+                const token = await this._getBatchAccessToken();
                 const baseUrl = `https://${group.accountName}.${group.region}.batch.azure.com`;
 
                 const poolInfoUrl = `${baseUrl}/pools/${group.poolId}?api-version=2024-07-01.20.0`;
@@ -1389,8 +1454,6 @@ export class OrchestratorAgent implements Agent {
                     );
                 }
                 const poolData = await poolRes.json();
-                const originalTargetDedicated =
-                    poolData.targetDedicatedNodes ?? 0;
                 const originalTargetLowPriority =
                     poolData.targetLowPriorityNodes ?? 0;
 
@@ -1416,6 +1479,7 @@ export class OrchestratorAgent implements Agent {
                     );
                 }
 
+                // SAFETY: Always force targetDedicatedNodes=0 when restoring pool targets
                 const patchUrl = `${baseUrl}/pools/${group.poolId}?api-version=2024-07-01.20.0`;
                 const patchRes = await fetch(patchUrl, {
                     method: "PATCH",
@@ -1425,7 +1489,7 @@ export class OrchestratorAgent implements Agent {
                             "application/json; odata=minimalmetadata",
                     },
                     body: JSON.stringify({
-                        targetDedicatedNodes: originalTargetDedicated,
+                        targetDedicatedNodes: 0,
                         targetLowPriorityNodes: originalTargetLowPriority,
                     }),
                 });
@@ -1446,7 +1510,7 @@ export class OrchestratorAgent implements Agent {
                 store.addLog({
                     agent: "node",
                     level: "info",
-                    message: `Recreating ${group.nodeIds.length} nodes in pool ${group.poolId} (targets restored: dedicated=${originalTargetDedicated}, lowPriority=${originalTargetLowPriority})`,
+                    message: `Recreating ${group.nodeIds.length} nodes in pool ${group.poolId} (targets restored: dedicated=0, lowPriority=${originalTargetLowPriority})`,
                 });
             } catch (error: any) {
                 const errorMsg = error?.message ?? String(error);
@@ -1479,7 +1543,7 @@ export class OrchestratorAgent implements Agent {
     private async _recoverPreempted(
         payload: Record<string, unknown>
     ): Promise<AgentResult> {
-        const { store, getBatchAccessToken } = this._ctx;
+        const { store } = this._ctx;
         const nodeIds = (payload.nodeIds as string[] | undefined) ?? [];
 
         store.setAgentStatus("node", "running");
@@ -1534,9 +1598,10 @@ export class OrchestratorAgent implements Agent {
         let succeeded = 0;
         let failed = 0;
 
+        // Sequential write operations
         for (const [, group] of poolGroups) {
             try {
-                const token = await getBatchAccessToken();
+                const token = await this._getBatchAccessToken();
                 const baseUrl = `https://${group.accountName}.${group.region}.batch.azure.com`;
 
                 const poolUrl = `${baseUrl}/pools/${group.poolId}?api-version=2024-07-01.20.0`;
@@ -1647,7 +1712,7 @@ export class OrchestratorAgent implements Agent {
     private async _resizePool(
         payload: Record<string, unknown>
     ): Promise<AgentResult> {
-        const { store, getBatchAccessToken } = this._ctx;
+        const { store } = this._ctx;
         const account = store
             .getState()
             .accounts.find((a) => a.id === payload.accountId);
@@ -1655,13 +1720,13 @@ export class OrchestratorAgent implements Agent {
             throw new Error(`Account not found: ${payload.accountId}`);
         }
 
-        const token = await getBatchAccessToken();
+        const token = await this._getBatchAccessToken();
         const url = `https://${account.accountName}.${account.region}.batch.azure.com/pools/${payload.poolId}?api-version=2024-07-01.20.0`;
 
-        const body: Record<string, unknown> = {};
-        if (payload.targetDedicatedNodes !== undefined) {
-            body.targetDedicatedNodes = payload.targetDedicatedNodes;
-        }
+        // SAFETY: Always force targetDedicatedNodes=0
+        const body: Record<string, unknown> = {
+            targetDedicatedNodes: 0,
+        };
         if (payload.targetLowPriorityNodes !== undefined) {
             body.targetLowPriorityNodes = payload.targetLowPriorityNodes;
         }
@@ -1692,7 +1757,7 @@ export class OrchestratorAgent implements Agent {
             summary: {
                 poolId: payload.poolId,
                 accountId: payload.accountId,
-                targetDedicatedNodes: payload.targetDedicatedNodes,
+                targetDedicatedNodes: 0,
                 targetLowPriorityNodes: payload.targetLowPriorityNodes,
             },
         };
@@ -1701,7 +1766,7 @@ export class OrchestratorAgent implements Agent {
     private async _updateStartTask(
         payload: Record<string, unknown>
     ): Promise<AgentResult> {
-        const { store, getBatchAccessToken } = this._ctx;
+        const { store } = this._ctx;
         const account = store
             .getState()
             .accounts.find((a) => a.id === payload.accountId);
@@ -1709,7 +1774,7 @@ export class OrchestratorAgent implements Agent {
             throw new Error(`Account not found: ${payload.accountId}`);
         }
 
-        const token = await getBatchAccessToken();
+        const token = await this._getBatchAccessToken();
         const url = `https://${account.accountName}.${account.region}.batch.azure.com/pools/${payload.poolId}?api-version=2024-07-01.20.0`;
 
         const response = await fetch(url, {

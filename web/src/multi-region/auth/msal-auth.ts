@@ -4,6 +4,14 @@
  * Uses the same Azure CLI client ID as Batch Explorer desktop,
  * forcing an interactive Entra ID login to get ARM and Batch tokens.
  * No Azure CLI or proxy server needed.
+ *
+ * Key design decisions:
+ * - Popup flow only (no redirect flow) to avoid CORS issues with token exchange
+ * - redirectUri is just the origin (e.g. "http://localhost:9000/") so the popup
+ *   can close itself without needing a registered auth-redirect.html
+ * - cacheLocation: "localStorage" so accounts persist across page reloads
+ * - At startup, if we detect we're inside a popup (window.opener exists),
+ *   we handle the redirect promise and close immediately — don't render the app
  */
 import {
     PublicClientApplication,
@@ -15,6 +23,16 @@ import {
     PopupRequest,
 } from "@azure/msal-browser";
 
+// ---------------------------------------------------------------------------
+// TokenProvider interface — usable by both web and desktop
+// ---------------------------------------------------------------------------
+export interface TokenProvider {
+    getAccessToken: () => Promise<string>;
+    getBatchAccessToken: () => Promise<string>;
+    checkHealth: () => Promise<{ healthy: boolean; error: string | null }>;
+    loadSubscriptions?: (store: any) => Promise<void>;
+}
+
 // Azure CLI's well-known client ID (same as Batch Explorer desktop uses)
 const AZURE_CLI_CLIENT_ID = "04b07795-8ddb-461a-bbee-02f9e1bf7b46";
 
@@ -25,14 +43,16 @@ const BATCH_SCOPE = "https://batch.core.windows.net/.default";
 const msalConfig: Configuration = {
     auth: {
         clientId: AZURE_CLI_CLIENT_ID,
-        authority: "https://login.microsoftonline.com/organizations",
-        // Must match a redirect URI registered on the Azure CLI app registration
+        authority: "https://login.microsoftonline.com/common",
+        // redirectUri MUST be just the origin so the popup can close itself.
+        // Using a path like /auth-redirect.html would require it to be
+        // registered on the Azure CLI app registration, which we don't control.
         redirectUri: window.location.origin + "/",
         navigateToLoginRequestUrl: false,
     },
     cache: {
-        cacheLocation: "sessionStorage",
-        storeAuthStateInCookie: true,
+        cacheLocation: "localStorage",
+        storeAuthStateInCookie: false,
     },
     system: {
         allowNativeBroker: false,
@@ -43,37 +63,68 @@ const msalConfig: Configuration = {
 };
 
 let _msalInstance: PublicClientApplication | null = null;
-let _initPromise: Promise<void> | null = null;
+let _initComplete: Promise<PublicClientApplication> | null = null;
 let _activeAccount: AccountInfo | null = null;
 
+// ---------------------------------------------------------------------------
+// Popup detection — if we are inside an MSAL popup, handle the redirect
+// promise and close immediately so the full app never renders in the popup.
+// ---------------------------------------------------------------------------
+export function handlePopupIfNeeded(): boolean {
+    if (window.opener && window.opener !== window) {
+        // We are inside a popup. Let MSAL handle the auth response.
+        const msalApp = new PublicClientApplication(msalConfig);
+        msalApp.initialize().then(() => {
+            msalApp.handleRedirectPromise().finally(() => {
+                window.close();
+            });
+        });
+        return true; // caller should stop rendering
+    }
+    return false;
+}
+
 async function getMsalInstance(): Promise<PublicClientApplication> {
-    if (_msalInstance && _initPromise) {
-        await _initPromise;
-        return _msalInstance;
-    }
-    _msalInstance = new PublicClientApplication(msalConfig);
-    _initPromise = _msalInstance.initialize();
-    await _initPromise;
+    if (_initComplete) return _initComplete;
 
-    // Handle redirect response (if coming back from auth redirect)
-    try {
-        const response = await _msalInstance.handleRedirectPromise();
-        if (response?.account) {
-            _activeAccount = response.account;
-            _msalInstance.setActiveAccount(response.account);
+    _initComplete = (async () => {
+        const msalApp = new PublicClientApplication(msalConfig);
+        await msalApp.initialize();
+        _msalInstance = msalApp;
+
+        // Check for any pending redirect (in case redirect was used previously)
+        try {
+            const response = await msalApp.handleRedirectPromise();
+            if (response?.account) {
+                _activeAccount = response.account;
+                msalApp.setActiveAccount(response.account);
+                console.log(
+                    "[MSAL] Account from redirect:",
+                    response.account.username
+                );
+            }
+        } catch {
+            // Ignore redirect errors — we use popup flow
         }
-    } catch {
-        // Ignore redirect errors
-    }
 
-    // Check for existing accounts
-    const accounts = _msalInstance.getAllAccounts();
-    if (accounts.length > 0) {
-        _activeAccount = accounts[0];
-        _msalInstance.setActiveAccount(accounts[0]);
-    }
+        // Check for cached accounts (from previous sessions via localStorage)
+        if (!_activeAccount) {
+            const accounts = msalApp.getAllAccounts();
+            console.log(
+                "[MSAL] Cached accounts:",
+                accounts.length,
+                accounts.map((a) => a.username)
+            );
+            if (accounts.length > 0) {
+                _activeAccount = accounts[0];
+                msalApp.setActiveAccount(accounts[0]);
+            }
+        }
 
-    return _msalInstance;
+        return msalApp;
+    })();
+
+    return _initComplete;
 }
 
 /**
@@ -81,15 +132,38 @@ async function getMsalInstance(): Promise<PublicClientApplication> {
  * Serialized — only one login popup can be open at a time.
  */
 export async function login(): Promise<AccountInfo | null> {
-    // If a login is already in progress, wait for it
-    // Always use redirect flow — most reliable, works everywhere
     const msalApp = await getMsalInstance();
-    await msalApp.loginRedirect({
-        scopes: [ARM_SCOPE],
-        prompt: "select_account",
-    });
-    // Page redirects to Microsoft login — won't return here
-    return null;
+    try {
+        const result = await msalApp.loginPopup({
+            scopes: [ARM_SCOPE],
+            prompt: "select_account",
+        });
+        if (result?.account) {
+            // IMMEDIATELY persist the account so getAllAccounts() returns it
+            _activeAccount = result.account;
+            msalApp.setActiveAccount(result.account);
+            console.log(
+                "[MSAL] Popup login successful:",
+                result.account.username
+            );
+            console.log(
+                "[MSAL] Accounts after login:",
+                msalApp.getAllAccounts().length
+            );
+            return result.account;
+        }
+        return null;
+    } catch (e: any) {
+        if (
+            e?.errorCode === "popup_window_error" ||
+            e?.errorCode === "empty_window_error"
+        ) {
+            throw new Error(
+                "Popup blocked! Allow popups for this site in your browser, then try again."
+            );
+        }
+        throw e;
+    }
 }
 
 /**
@@ -98,20 +172,28 @@ export async function login(): Promise<AccountInfo | null> {
 export async function logout(): Promise<void> {
     const msalApp = await getMsalInstance();
     _activeAccount = null;
-    await msalApp.logoutRedirect();
+    try {
+        await msalApp.logoutPopup();
+    } catch {
+        // Clear local state even if popup fails
+        msalApp.getAllAccounts().forEach((a) => msalApp.removeAccount(a));
+    }
 }
 
 /**
  * Check if user is currently authenticated.
+ * Returns true if getCurrentUser() finds an account (checks _activeAccount
+ * first, then falls back to getAllAccounts()).
  */
 export async function isAuthenticated(): Promise<boolean> {
-    const msalApp = await getMsalInstance();
-    const accounts = msalApp.getAllAccounts();
-    return accounts.length > 0;
+    const user = await getCurrentUser();
+    return user != null;
 }
 
 /**
  * Get the current user info.
+ * Checks the in-memory _activeAccount first, then falls back to
+ * getAllAccounts() from the MSAL cache (localStorage).
  */
 export async function getCurrentUser(): Promise<AccountInfo | null> {
     if (_activeAccount) return _activeAccount;
@@ -129,10 +211,13 @@ export async function getCurrentUser(): Promise<AccountInfo | null> {
 let _loginInProgress: Promise<AccountInfo | null> | null = null;
 
 /**
- * Acquire a token silently. Does NOT auto-trigger popup —
- * user must click "Sign in with Azure" first.
+ * Acquire a token silently. Optionally target a specific tenant.
+ * Does NOT auto-trigger popup — user must click "Sign in with Azure" first.
  */
-async function acquireToken(scopes: string[]): Promise<AuthenticationResult> {
+async function acquireToken(
+    scopes: string[],
+    tenantId?: string
+): Promise<AuthenticationResult> {
     const msalApp = await getMsalInstance();
 
     if (!_activeAccount) {
@@ -150,19 +235,28 @@ async function acquireToken(scopes: string[]): Promise<AuthenticationResult> {
         scopes,
         account: _activeAccount!,
         forceRefresh: false,
+        // If a tenantId is provided, override the authority to target that tenant
+        ...(tenantId
+            ? { authority: `https://login.microsoftonline.com/${tenantId}` }
+            : {}),
     };
 
     try {
         return await msalApp.acquireTokenSilent(silentRequest);
     } catch (error) {
         if (error instanceof InteractionRequiredAuthError) {
-            // Token expired — try popup, but serialize to prevent concurrent popups
             if (_loginInProgress) {
                 await _loginInProgress;
-                // After login completes, retry silent
                 return await msalApp.acquireTokenSilent(silentRequest);
             }
-            return await msalApp.acquireTokenPopup({ scopes });
+            return await msalApp.acquireTokenPopup({
+                scopes,
+                ...(tenantId
+                    ? {
+                          authority: `https://login.microsoftonline.com/${tenantId}`,
+                      }
+                    : {}),
+            });
         }
         throw error;
     }
@@ -170,17 +264,19 @@ async function acquireToken(scopes: string[]): Promise<AuthenticationResult> {
 
 /**
  * Get ARM access token (for management.azure.com).
+ * Pass tenantId to get a token for a specific tenant (cross-tenant access).
  */
-export async function getArmToken(): Promise<string> {
-    const result = await acquireToken([ARM_SCOPE]);
+export async function getArmToken(tenantId?: string): Promise<string> {
+    const result = await acquireToken([ARM_SCOPE], tenantId);
     return result.accessToken;
 }
 
 /**
  * Get Batch data-plane access token (for {account}.{region}.batch.azure.com).
+ * Pass tenantId to get a token for a specific tenant.
  */
-export async function getBatchToken(): Promise<string> {
-    const result = await acquireToken([BATCH_SCOPE]);
+export async function getBatchToken(tenantId?: string): Promise<string> {
+    const result = await acquireToken([BATCH_SCOPE], tenantId);
     return result.accessToken;
 }
 
@@ -188,7 +284,7 @@ export async function getBatchToken(): Promise<string> {
  * List all Azure subscriptions using the ARM token.
  */
 export async function listSubscriptions(): Promise<
-    Array<{ subscriptionId: string; displayName: string }>
+    Array<{ subscriptionId: string; displayName: string; tenantId?: string }>
 > {
     const token = await getArmToken();
     const url =
@@ -203,6 +299,7 @@ export async function listSubscriptions(): Promise<
     return (data.value ?? []).map((s: any) => ({
         subscriptionId: s.subscriptionId,
         displayName: s.displayName,
+        tenantId: s.tenantId,
     }));
 }
 
@@ -212,10 +309,63 @@ export async function listSubscriptions(): Promise<
  */
 export async function getAuthMode(): Promise<"msal" | "cli"> {
     try {
-        const msalApp = await getMsalInstance();
-        const accounts = msalApp.getAllAccounts();
-        return accounts.length > 0 ? "msal" : "cli";
+        const authed = await isAuthenticated();
+        return authed ? "msal" : "cli";
     } catch {
         return "cli";
     }
 }
+
+// ---------------------------------------------------------------------------
+// Default TokenProvider backed by MSAL — used when no external provider is
+// injected (e.g. in the standalone web app, as opposed to the desktop app
+// which may supply its own token provider).
+// ---------------------------------------------------------------------------
+
+let _externalProvider: TokenProvider | null = null;
+
+/**
+ * Optionally set an external token provider (e.g. from the desktop app).
+ * When set, getAccessToken / getBatchAccessToken delegate to it.
+ */
+export function setTokenProvider(provider: TokenProvider): void {
+    _externalProvider = provider;
+}
+
+/**
+ * The built-in MSAL-backed token provider, also exported so callers can
+ * reference it as a concrete TokenProvider.
+ */
+export const msalAuth: TokenProvider = {
+    async getAccessToken(): Promise<string> {
+        if (_externalProvider) return _externalProvider.getAccessToken();
+        return getArmToken();
+    },
+    async getBatchAccessToken(): Promise<string> {
+        if (_externalProvider) return _externalProvider.getBatchAccessToken();
+        return getBatchToken();
+    },
+    async checkHealth(): Promise<{ healthy: boolean; error: string | null }> {
+        if (_externalProvider) return _externalProvider.checkHealth();
+        try {
+            const user = await getCurrentUser();
+            if (!user) {
+                return { healthy: false, error: "Not signed in" };
+            }
+            // Try a silent ARM token to verify the session is still valid
+            await getArmToken();
+            return { healthy: true, error: null };
+        } catch (e: any) {
+            return { healthy: false, error: e?.message ?? String(e) };
+        }
+    },
+    async loadSubscriptions(store: any): Promise<void> {
+        if (_externalProvider?.loadSubscriptions) {
+            return _externalProvider.loadSubscriptions(store);
+        }
+        const subs = await listSubscriptions();
+        if (store && typeof store.setSubscriptions === "function") {
+            store.setSubscriptions(subs);
+        }
+    },
+};

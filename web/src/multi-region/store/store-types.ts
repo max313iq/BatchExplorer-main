@@ -44,6 +44,7 @@ export type QuotaType = "LowPriority" | "Dedicated" | "Spot";
 export interface Subscription {
     subscriptionId: string;
     displayName: string;
+    tenantId?: string;
 }
 
 export interface ManagedAccount {
@@ -87,7 +88,9 @@ export interface ManagedNode {
     totalTasksRun?: number;
     runningTasksCount?: number;
     schedulingState?: string;
+    startTaskExitCode?: number;
     subscriptionId?: string;
+    errors?: string[];
     error?: string | null;
 }
 

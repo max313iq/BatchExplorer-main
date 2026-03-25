@@ -1,5 +1,11 @@
 import { Agent, AgentContext, AgentResult, PoolInput } from "./agent-types";
-import { ManagedPool, AccountInfo } from "../store/store-types";
+import { ManagedPool, AccountInfo, PoolInfo } from "../store/store-types";
+
+/**
+ * A TokenProvider resolves an access token, optionally scoped to a tenant.
+ * This decouples the agent from a specific auth implementation.
+ */
+export type TokenProvider = (tenantId?: string) => Promise<string>;
 
 function uuidV4(): string {
     return "xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx".replace(/[xy]/g, (c) => {
@@ -41,11 +47,105 @@ function isCapacityOrQuotaError(errorMsg: string): boolean {
     );
 }
 
+/** Returns true for HTTP status codes that should never be retried. */
+function isNonRetryableStatus(status: number): boolean {
+    return status === 400 || status === 403 || status === 404;
+}
+
+/** Returns true for HTTP status codes eligible for retry (429 / 5xx). */
+function isRetryableStatus(status: number): boolean {
+    return status === 429 || (status >= 500 && status <= 599);
+}
+
+/** Sleep helper. */
+function sleep(ms: number): Promise<void> {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * Perform a fetch with exponential backoff retry for 429 / 5xx.
+ * Non-retryable errors (400, 403, 404) fail immediately.
+ */
+async function fetchWithRetry(
+    url: string,
+    init: RequestInit,
+    maxRetries = 4,
+    baseDelayMs = 1000
+): Promise<Response> {
+    let lastError: unknown;
+
+    for (let attempt = 0; attempt <= maxRetries; attempt++) {
+        const response = await fetch(url, init);
+
+        if (response.ok) {
+            return response;
+        }
+
+        // Parse error body once
+        const errBody = await response.json().catch(() => ({}));
+        const errorMessage =
+            errBody?.error?.message ??
+            errBody?.message?.value ??
+            `Pool creation failed: ${response.status}`;
+
+        // Non-retryable: fail immediately
+        if (isNonRetryableStatus(response.status)) {
+            throw {
+                status: response.status,
+                message: errorMessage,
+                headers: response.headers,
+                retryable: false,
+            };
+        }
+
+        // Retryable but exhausted retries
+        if (!isRetryableStatus(response.status) || attempt === maxRetries) {
+            throw {
+                status: response.status,
+                message: errorMessage,
+                headers: response.headers,
+                retryable: false,
+            };
+        }
+
+        // Exponential backoff with jitter
+        const retryAfterHeader = response.headers.get("Retry-After");
+        let delayMs: number;
+        if (retryAfterHeader && !isNaN(Number(retryAfterHeader))) {
+            delayMs = Number(retryAfterHeader) * 1000;
+        } else {
+            delayMs = baseDelayMs * Math.pow(2, attempt);
+        }
+        // Add jitter: 0–25% of the delay
+        delayMs += Math.random() * delayMs * 0.25;
+
+        lastError = {
+            status: response.status,
+            message: errorMessage,
+            headers: response.headers,
+            retryable: true,
+        };
+
+        await sleep(delayMs);
+    }
+
+    // Should not reach here, but safety net
+    throw lastError;
+}
+
 export class PoolAgent implements Agent {
     readonly name = "pool" as const;
     private _cancelled = false;
+    private readonly _tokenProvider: TokenProvider;
 
-    constructor(private readonly _ctx: AgentContext) {}
+    constructor(
+        private readonly _ctx: AgentContext,
+        tokenProvider?: TokenProvider
+    ) {
+        // Accept an explicit TokenProvider; fall back to context method.
+        this._tokenProvider =
+            tokenProvider ?? _ctx.getBatchAccessToken.bind(_ctx);
+    }
 
     cancel(): void {
         this._cancelled = true;
@@ -53,7 +153,7 @@ export class PoolAgent implements Agent {
 
     async execute(params: Record<string, unknown>): Promise<AgentResult> {
         const input = params as unknown as PoolInput;
-        const { store, scheduler, getBatchAccessToken } = this._ctx;
+        const { store, scheduler } = this._ctx;
         this._cancelled = false;
 
         store.setAgentStatus("pool", "running");
@@ -89,7 +189,8 @@ export class PoolAgent implements Agent {
 
             const internalId = uuidV4();
 
-            // Always force targetDedicatedNodes = 0
+            // SAFETY: Always force targetDedicatedNodes = 0.
+            // Never allow dedicated nodes regardless of what the caller passes.
             const poolConfig = {
                 ...input.poolConfig,
                 targetDedicatedNodes: 0,
@@ -112,10 +213,10 @@ export class PoolAgent implements Agent {
                 });
 
                 await scheduler.run(accountId, async () => {
-                    const token = await getBatchAccessToken();
+                    const token = await this._tokenProvider();
                     const batchUrl = `https://${account.accountName}.${account.region}.batch.azure.com/pools?api-version=2024-07-01.20.0`;
 
-                    const response = await fetch(batchUrl, {
+                    await fetchWithRetry(batchUrl, {
                         method: "POST",
                         headers: {
                             "Content-Type":
@@ -124,23 +225,15 @@ export class PoolAgent implements Agent {
                         },
                         body: JSON.stringify(poolConfig),
                     });
-
-                    if (!response.ok) {
-                        const err = await response.json().catch(() => ({}));
-                        throw {
-                            status: response.status,
-                            message:
-                                err?.error?.message ??
-                                err?.message?.value ??
-                                `Pool creation failed: ${response.status}`,
-                            headers: response.headers,
-                        };
-                    }
                 });
 
                 store.updatePool(internalId, {
                     provisioningState: "created",
                 });
+
+                // Update store.poolInfos with newly created pool
+                this._addPoolInfoToStore(account, poolId, poolConfig);
+
                 store.addLog({
                     agent: "pool",
                     level: "info",
@@ -188,12 +281,14 @@ export class PoolAgent implements Agent {
     /**
      * Smart pool creation with VM size fallback.
      *
-     * Per account, tries VM sizes in order. If a VM size fails with a
-     * capacity/quota error, falls back to the next. If a pool is created
-     * but doesn't use all available quota, a second pool may be created
-     * with the next VM size for the remaining quota.
+     * Per account, tries VM sizes in priority order. If a VM size fails with
+     * a capacity/quota error, falls back to the next. Calculates maxNodes
+     * from LP quota (floor(freeLpCores / vCPUs per VM)).
      *
-     * ALWAYS uses targetDedicatedNodes = 0 and only LP quota.
+     * If a pool is created but doesn't consume all available quota, a second
+     * pool may be created with the next VM size for the remaining quota.
+     *
+     * SAFETY: ALWAYS sets targetDedicatedNodes = 0 and only uses LP quota.
      */
     async executeWithFallback(params: {
         accountIds: string[];
@@ -202,7 +297,7 @@ export class PoolAgent implements Agent {
         quotaType: "lowPriority" | "dedicated";
     }): Promise<AgentResult> {
         const { accountIds, vmSizes, poolConfig } = params;
-        const { store, scheduler, getBatchAccessToken } = this._ctx;
+        const { store, scheduler } = this._ctx;
         this._cancelled = false;
 
         store.setAgentStatus("pool", "running");
@@ -279,10 +374,11 @@ export class PoolAgent implements Agent {
                     continue;
                 }
 
+                // Pool ID format: gpu-{vmSizeShort}-{random4}
                 const shortName = vmShortName(vmSize);
                 const currentPoolId = `gpu-${shortName}-${random4()}`;
 
-                // ALWAYS set targetDedicatedNodes = 0, only use LP nodes
+                // SAFETY: ALWAYS set targetDedicatedNodes = 0, only use LP nodes
                 const currentConfig: Record<string, unknown> = {
                     ...poolConfig,
                     id: currentPoolId,
@@ -314,10 +410,10 @@ export class PoolAgent implements Agent {
                     });
 
                     await scheduler.run(accountId, async () => {
-                        const token = await getBatchAccessToken();
+                        const token = await this._tokenProvider();
                         const batchUrl = `https://${account.accountName}.${account.region}.batch.azure.com/pools?api-version=2024-07-01.20.0`;
 
-                        const response = await fetch(batchUrl, {
+                        await fetchWithRetry(batchUrl, {
                             method: "POST",
                             headers: {
                                 "Content-Type":
@@ -326,23 +422,19 @@ export class PoolAgent implements Agent {
                             },
                             body: JSON.stringify(currentConfig),
                         });
-
-                        if (!response.ok) {
-                            const err = await response.json().catch(() => ({}));
-                            throw {
-                                status: response.status,
-                                message:
-                                    err?.error?.message ??
-                                    err?.message?.value ??
-                                    `Pool creation failed: ${response.status}`,
-                                headers: response.headers,
-                            };
-                        }
                     });
 
                     store.updatePool(internalId, {
                         provisioningState: "created",
                     });
+
+                    // Update store.poolInfos with newly created pool
+                    this._addPoolInfoToStore(
+                        account,
+                        currentPoolId,
+                        currentConfig
+                    );
+
                     store.addLog({
                         agent: "pool",
                         level: "info",
@@ -369,10 +461,32 @@ export class PoolAgent implements Agent {
                     break;
                 } catch (error: any) {
                     const errorMsg = error?.message ?? String(error);
+                    const errorStatus = error?.status as number | undefined;
+
                     store.updatePool(internalId, {
                         provisioningState: "failed",
                         error: errorMsg,
                     });
+
+                    // Non-retryable errors (400, 403, 404): fail immediately,
+                    // do not try fallback VM sizes
+                    if (
+                        errorStatus !== undefined &&
+                        isNonRetryableStatus(errorStatus)
+                    ) {
+                        store.addLog({
+                            agent: "pool",
+                            level: "error",
+                            message: `${account.accountName}: non-retryable error ${errorStatus} — ${errorMsg}`,
+                        });
+                        failures.push({
+                            accountName: account.accountName,
+                            region: account.region,
+                            error: errorMsg,
+                        });
+                        totalFailed++;
+                        break;
+                    }
 
                     if (isCapacityOrQuotaError(errorMsg)) {
                         store.addLog({
@@ -384,7 +498,7 @@ export class PoolAgent implements Agent {
                         continue;
                     }
 
-                    // Non-capacity error — don't fallback
+                    // Other errors — don't fallback
                     store.addLog({
                         agent: "pool",
                         level: "error",
@@ -436,5 +550,40 @@ export class PoolAgent implements Agent {
                 failures,
             },
         };
+    }
+
+    /**
+     * Append a PoolInfo entry to store.poolInfos after successful creation.
+     */
+    private _addPoolInfoToStore(
+        account: { id: string; accountName: string; region: string },
+        poolId: string,
+        config: Record<string, unknown>
+    ): void {
+        const { store } = this._ctx;
+        const state = store.getState();
+
+        const newPoolInfo: PoolInfo = {
+            id: uuidV4(),
+            accountId: account.id,
+            accountName: account.accountName,
+            region: account.region,
+            poolId,
+            vmSize: (config.vmSize as string) ?? "",
+            state: "active",
+            allocationState: "resizing",
+            targetDedicatedNodes: 0, // SAFETY: always 0
+            currentDedicatedNodes: 0,
+            targetLowPriorityNodes:
+                (config.targetLowPriorityNodes as number) ?? 0,
+            currentLowPriorityNodes: 0,
+            taskSlotsPerNode: (config.taskSlotsPerNode as number) ?? 1,
+            enableAutoScale: (config.enableAutoScale as boolean) ?? false,
+            autoScaleFormula: config.autoScaleFormula as string | undefined,
+            creationTime: new Date().toISOString(),
+            startTask: config.startTask as Record<string, unknown> | undefined,
+        };
+
+        store.setPoolInfos([...state.poolInfos, newPoolInfo]);
     }
 }
