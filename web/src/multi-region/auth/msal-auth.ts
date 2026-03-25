@@ -52,11 +52,7 @@ const msalConfig: Configuration = {
     cache: {
         cacheLocation: "localStorage",
     },
-    system: {
-        windowHashTimeout: 60000,
-        iframeHashTimeout: 10000,
-        loadFrameTimeout: 10000,
-    },
+    system: {} as any,
 };
 
 let _msalInstance: PublicClientApplication | null = null;
