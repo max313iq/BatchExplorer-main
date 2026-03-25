@@ -483,15 +483,31 @@ const DashboardContent: React.FC<{ tokenProvider?: TokenProvider }> = ({
                 setMsalUserName(
                     account.username ?? account.name ?? "Azure User"
                 );
-                // Immediately re-run the full health check pipeline
-                await checkLogin();
             }
         } catch (e: any) {
-            console.error("Azure login failed:", e);
-            setHealthCheck({
-                healthy: false,
-                error: `Login failed: ${e?.message ?? "Unknown error"}`,
-            });
+            // Popup might have closed or timed out, but the auth code
+            // may still have been processed and stored in localStorage.
+            // Don't show error yet — try health check first.
+            console.warn(
+                "[MSAL] Popup closed/error, checking if auth succeeded anyway:",
+                e?.message
+            );
+        }
+        // ALWAYS re-check auth after popup attempt — even if popup threw.
+        // The account may have been stored in localStorage by handlePopupIfNeeded
+        // or by the popup's MSAL instance before the popup closed.
+        await new Promise((r) => setTimeout(r, 1000)); // wait for localStorage sync
+        const result = await checkLogin();
+        if (!result?.healthy) {
+            // Only show error if auth truly failed
+            const user = await msalAuth.getCurrentUser();
+            if (user) {
+                // User IS in cache but health check failed for another reason
+                _authMode = "msal";
+                setCurrentAuthMode("msal");
+                setMsalUserName(user.username ?? user.name ?? "Azure User");
+                await checkLogin(); // retry
+            }
         }
     }, [checkLogin]);
 

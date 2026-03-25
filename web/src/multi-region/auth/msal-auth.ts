@@ -70,16 +70,60 @@ let _activeAccount: AccountInfo | null = null;
 // Popup detection — if we are inside an MSAL popup, handle the redirect
 // promise and close immediately so the full app never renders in the popup.
 // ---------------------------------------------------------------------------
+/**
+ * Detect if we're inside an MSAL popup window that received an auth response.
+ * If so, DON'T render the app — just initialize MSAL so it can relay the
+ * auth code back to the parent window, then close.
+ *
+ * MSAL popup flow works like this:
+ * 1. Parent calls loginPopup() which opens a popup to login.microsoftonline.com
+ * 2. After auth, Microsoft redirects back to redirectUri (localhost:9000/)
+ * 3. The popup loads our app — but we DON'T want the full app to render
+ * 4. MSAL needs to initialize in the popup to process the code and
+ *    relay the result back to the parent via window.opener
+ * 5. Once MSAL processes it, we close the popup
+ *
+ * Detection: we check if the URL contains auth response parameters
+ * (code= or error=) AND we have a window.opener (we're in a popup).
+ */
 export function handlePopupIfNeeded(): boolean {
-    if (window.opener && window.opener !== window) {
-        // We are inside a popup. Let MSAL handle the auth response.
+    const hash = window.location.hash;
+    const search = window.location.search;
+    const hasAuthCode =
+        hash.includes("code=") ||
+        hash.includes("error=") ||
+        search.includes("code=") ||
+        search.includes("error=");
+    const isPopup = !!window.opener && window.opener !== window;
+
+    if (isPopup || hasAuthCode) {
+        // We are inside a popup OR have an auth code in the URL.
+        // Initialize MSAL to let it process the response and relay to parent.
         const msalApp = new PublicClientApplication(msalConfig);
-        msalApp.initialize().then(() => {
-            msalApp.handleRedirectPromise().finally(() => {
-                window.close();
+        msalApp
+            .initialize()
+            .then(() => msalApp.handleRedirectPromise())
+            .then((result) => {
+                if (result?.account) {
+                    // Store in localStorage so parent can find it
+                    _activeAccount = result.account;
+                    msalApp.setActiveAccount(result.account);
+                    console.log(
+                        "[MSAL Popup] Auth success:",
+                        result.account.username
+                    );
+                }
+            })
+            .catch((e) => console.error("[MSAL Popup] Error:", e))
+            .finally(() => {
+                // If we're in a popup, close it after a short delay
+                // to ensure the parent has time to receive the message
+                if (isPopup) {
+                    setTimeout(() => window.close(), 500);
+                }
             });
-        });
-        return true; // caller should stop rendering
+        // Only block rendering if we're actually in a popup
+        return isPopup;
     }
     return false;
 }
