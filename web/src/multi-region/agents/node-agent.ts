@@ -1,5 +1,12 @@
 import { Agent, AgentContext, AgentResult } from "./agent-types";
 import { ManagedNode, NodeState } from "../store/store-types";
+import {
+    listPools,
+    listNodes,
+    performNodeAction,
+    removeNodes,
+} from "../services";
+import type { BatchPool, BatchNode } from "../services";
 
 function uuidV4(): string {
     return "xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx".replace(/[xy]/g, (c) => {
@@ -8,8 +15,6 @@ function uuidV4(): string {
         return v.toString(16);
     });
 }
-
-const BATCH_API_VERSION = "2024-07-01.20.0";
 
 /**
  * Optional token provider interface. When supplied, the agent calls
@@ -33,56 +38,6 @@ export interface NodeActionInput {
         | "enableScheduling";
     nodeIds: string[]; // internal ManagedNode ids
     tokenProvider?: TokenProvider;
-}
-
-/**
- * Batch data-plane response shape for a pool (used to correlate node
- * dedication and vmSize).
- */
-interface BatchPoolResponse {
-    id: string;
-    vmSize?: string;
-    targetDedicatedNodes?: number;
-    currentDedicatedNodes?: number;
-    targetLowPriorityNodes?: number;
-    currentLowPriorityNodes?: number;
-    "odata.nextLink"?: string;
-}
-
-/**
- * Full node response from the Batch data-plane API:
- *   GET /pools/{poolId}/nodes?api-version=2024-07-01.20.0
- */
-interface BatchNodeResponse {
-    id: string;
-    state?: string;
-    schedulingState?: string;
-    vmSize?: string;
-    isDedicated?: boolean;
-    runningTasksCount?: number;
-    totalTasksCount?: number;
-    totalTasksRun?: number;
-    lastBootTime?: string;
-    startTaskInfo?: {
-        exitCode?: number;
-        result?: string;
-        startTime?: string;
-        endTime?: string;
-        retryCount?: number;
-        failureInfo?: {
-            category?: string;
-            code?: string;
-            message?: string;
-            details?: Array<{ name?: string; value?: string }>;
-        };
-    };
-    errors?: Array<{
-        code?: string;
-        message?: string;
-        errorDetails?: Array<{ name?: string; value?: string }>;
-    }>;
-    ipAddress?: string;
-    affinityId?: string;
 }
 
 export class NodeAgent implements Agent {
@@ -122,47 +77,6 @@ export class NodeAgent implements Agent {
             return provider.getToken();
         }
         return this._ctx.getBatchAccessToken();
-    }
-
-    /**
-     * Fetch all pages from a paginated Batch data-plane endpoint.
-     * Follows `odata.nextLink` until exhausted.
-     */
-    private async _fetchAllPages<T>(
-        initialUrl: string,
-        token: string
-    ): Promise<T[]> {
-        const results: T[] = [];
-        let url: string | undefined = initialUrl;
-
-        while (url) {
-            if (this._cancelled) break;
-
-            const response = await fetch(url, {
-                headers: {
-                    Authorization: `Bearer ${token}`,
-                    Accept: "application/json; odata=minimalmetadata",
-                },
-            });
-
-            if (!response.ok) {
-                const err = await response.json().catch(() => ({}));
-                throw new Error(
-                    err?.error?.message ??
-                        err?.message?.value ??
-                        `Batch API request failed: ${response.status}`
-                );
-            }
-
-            const data = await response.json();
-            const items: T[] = data.value ?? [];
-            results.push(...items);
-
-            // Follow pagination via odata.nextLink
-            url = data["odata.nextLink"] ?? undefined;
-        }
-
-        return results;
     }
 
     // -----------------------------------------------------------------
@@ -211,17 +125,12 @@ export class NodeAgent implements Agent {
                     };
 
                 try {
-                    const baseUrl = `https://${account.accountName}.${account.region}.batch.azure.com`;
+                    const accountEndpoint = `https://${account.accountName}.${account.region}.batch.azure.com`;
 
-                    // 1) Fetch pools — GET /pools?api-version=...
-                    const poolsUrl = `${baseUrl}/pools?api-version=${BATCH_API_VERSION}`;
-                    const pools = await this._fetchAllPages<BatchPoolResponse>(
-                        poolsUrl,
-                        token
-                    );
+                    // 1) Fetch pools via SDK service
+                    const pools = await listPools(accountEndpoint, token);
 
                     // 2) Parallel-fetch nodes across ALL pools in this account
-                    //    GET /pools/{poolId}/nodes?api-version=...
                     const poolNodeResults = await this._parallelMap(
                         pools,
                         async (pool) => {
@@ -231,13 +140,12 @@ export class NodeAgent implements Agent {
                                     preempted: 0,
                                 };
 
-                            const nodesUrl = `${baseUrl}/pools/${encodeURIComponent(pool.id)}/nodes?api-version=${BATCH_API_VERSION}`;
                             try {
-                                const rawNodes =
-                                    await this._fetchAllPages<BatchNodeResponse>(
-                                        nodesUrl,
-                                        token
-                                    );
+                                const rawNodes = await listNodes(
+                                    accountEndpoint,
+                                    pool.id,
+                                    token
+                                );
 
                                 let preemptedCount = 0;
                                 const mapped = rawNodes.map((n, idx) => {
@@ -375,65 +283,22 @@ export class NodeAgent implements Agent {
             try {
                 await scheduler.run(node.accountId, async () => {
                     const token = await this._resolveToken(input.tokenProvider);
-                    const baseUrl = `https://${account.accountName}.${account.region}.batch.azure.com`;
+                    const accountEndpoint = `https://${account.accountName}.${account.region}.batch.azure.com`;
 
-                    let url: string;
-                    let body: string | undefined;
-
-                    // All node actions are POST to
-                    //   /pools/{poolId}/nodes/{nodeId}/{action}
-                    // except "delete" which uses /pools/{poolId}/removenodes
-                    switch (action) {
-                        case "reboot":
-                            url = `${baseUrl}/pools/${encodeURIComponent(node.poolId)}/nodes/${encodeURIComponent(node.nodeId)}/reboot?api-version=${BATCH_API_VERSION}`;
-                            body = JSON.stringify({
-                                nodeRebootOption: "requeue",
-                            });
-                            break;
-                        case "delete":
-                            url = `${baseUrl}/pools/${encodeURIComponent(node.poolId)}/removenodes?api-version=${BATCH_API_VERSION}`;
-                            body = JSON.stringify({
-                                nodeList: [node.nodeId],
-                                nodeDeallocationOption: "requeue",
-                            });
-                            break;
-                        case "reimage":
-                            url = `${baseUrl}/pools/${encodeURIComponent(node.poolId)}/nodes/${encodeURIComponent(node.nodeId)}/reimage?api-version=${BATCH_API_VERSION}`;
-                            body = JSON.stringify({
-                                nodeReimageOption: "requeue",
-                            });
-                            break;
-                        case "disableScheduling":
-                            url = `${baseUrl}/pools/${encodeURIComponent(node.poolId)}/nodes/${encodeURIComponent(node.nodeId)}/disablescheduling?api-version=${BATCH_API_VERSION}`;
-                            body = undefined;
-                            break;
-                        case "enableScheduling":
-                            url = `${baseUrl}/pools/${encodeURIComponent(node.poolId)}/nodes/${encodeURIComponent(node.nodeId)}/enablescheduling?api-version=${BATCH_API_VERSION}`;
-                            body = undefined;
-                            break;
-                        default:
-                            throw new Error(`Unknown action: ${action}`);
-                    }
-
-                    const headers: Record<string, string> = {
-                        Authorization: `Bearer ${token}`,
-                    };
-                    if (body) {
-                        headers["Content-Type"] =
-                            "application/json; odata=minimalmetadata";
-                    }
-
-                    const response = await fetch(url, {
-                        method: "POST",
-                        headers,
-                        body,
-                    });
-
-                    if (!response.ok && response.status !== 202) {
-                        const err = await response.json().catch(() => ({}));
-                        throw new Error(
-                            err?.error?.message ??
-                                `${action} failed: ${response.status}`
+                    if (action === "delete") {
+                        await removeNodes(
+                            accountEndpoint,
+                            node.poolId,
+                            [node.nodeId],
+                            token
+                        );
+                    } else {
+                        await performNodeAction(
+                            accountEndpoint,
+                            node.poolId,
+                            node.nodeId,
+                            action,
+                            token
                         );
                     }
                 });
@@ -505,14 +370,14 @@ export class NodeAgent implements Agent {
      * `currentDedicatedNodes`, it is dedicated; otherwise low-priority.
      */
     private _toBatchNode(
-        n: BatchNodeResponse,
+        n: BatchNode,
         account: {
             id: string;
             accountName: string;
             region: string;
             subscriptionId: string;
         },
-        pool: BatchPoolResponse,
+        pool: BatchPool,
         nodeIndex: number
     ): ManagedNode {
         const nodeState = (n.state ?? "unknown").toLowerCase() as NodeState;
@@ -535,13 +400,7 @@ export class NodeAgent implements Agent {
         if (n.errors && n.errors.length > 0) {
             errorMsg = n.errors
                 .map((e) => {
-                    let msg = `${e.code ?? "Error"}: ${e.message ?? "Unknown error"}`;
-                    if (e.errorDetails && e.errorDetails.length > 0) {
-                        const details = e.errorDetails
-                            .map((d) => `${d.name}=${d.value}`)
-                            .join(", ");
-                        msg += ` (${details})`;
-                    }
+                    const msg = `${e.code ?? "Error"}: ${e.message ?? "Unknown error"}`;
                     return msg;
                 })
                 .join("; ");
@@ -570,7 +429,7 @@ export class NodeAgent implements Agent {
             ipAddress: n.ipAddress,
             isDedicated,
             lastBootTime: n.lastBootTime,
-            totalTasksRun: n.totalTasksRun ?? n.totalTasksCount,
+            totalTasksRun: n.totalTasksRun,
             runningTasksCount: n.runningTasksCount,
             schedulingState: n.schedulingState,
             subscriptionId: account.subscriptionId,

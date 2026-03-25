@@ -8,13 +8,20 @@ import { NodeAgent } from "./node-agent";
 import { WorkflowAgent, WorkflowConfig } from "./workflow-agent";
 import { RequestDeduplicator } from "../scheduling/request-deduplicator";
 import { PoolInfo, AccountInfo, QuotaSuggestion } from "../store/store-types";
+import {
+    listSubscriptions,
+    listBatchAccounts,
+    getBatchAccount,
+    listPools,
+    createPool,
+    patchPool,
+    removeNodes,
+} from "../services";
+import type { BatchPool as SdkBatchPool } from "../services";
 
 /** Bounded-concurrency Promise.allSettled — runs `fn` on each item with at most `concurrency` in flight */
 // Concurrency limit of 10 for read-only GET operations
 const READ_CONCURRENCY = 10;
-// Lower concurrency for write operations (PUT/POST/DELETE hit 429 more easily)
-const WRITE_CONCURRENCY = 3;
-
 async function pMap<T, R>(
     items: T[],
     fn: (item: T) => Promise<R>,
@@ -39,24 +46,6 @@ async function pMap<T, R>(
     return results;
 }
 
-/** Extract fulfilled values from settled results, returning both values and errors */
-function collectSettled<R>(settled: PromiseSettledResult<R>[]): {
-    values: R[];
-    errors: Array<{ index: number; error: any }>;
-} {
-    const values: R[] = [];
-    const errors: Array<{ index: number; error: any }> = [];
-    for (let i = 0; i < settled.length; i++) {
-        const r = settled[i];
-        if (r.status === "fulfilled") {
-            values.push(r.value);
-        } else {
-            errors.push({ index: i, error: r.reason });
-        }
-    }
-    return { values, errors };
-}
-
 function generateCorrelationId(): string {
     return "xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx".replace(/[xy]/g, (c) => {
         const r = (Math.random() * 16) | 0;
@@ -74,6 +63,11 @@ function getVCpus(vmSize: string): number {
         standard_nc6s_v3: 6,
     };
     return map[vmSize.toLowerCase().replace(/\s/g, "")] || 1;
+}
+
+/** Build the Batch account endpoint from account name + region */
+function accountEndpoint(accountName: string, region: string): string {
+    return `${accountName}.${region}.batch.azure.com`;
 }
 
 /** Optional token provider interface for overriding default token resolution */
@@ -604,37 +598,16 @@ export class OrchestratorAgent implements Agent {
 
     private async _discoverAccountsForSubscription(
         subscriptionId: string,
-        token: string,
-        armUrl: string
+        token: string
     ): Promise<any[]> {
-        let url: string | null =
-            `${armUrl}/subscriptions/${subscriptionId}/providers/Microsoft.Batch/batchAccounts?api-version=2024-02-01`;
-        const allAccounts: any[] = [];
-
-        // Handle pagination
-        while (url) {
-            const response = await fetch(url, {
-                headers: { Authorization: `Bearer ${token}` },
-            });
-            if (!response.ok) {
-                const err = await response.json().catch(() => ({}));
-                throw new Error(
-                    err?.error?.message ??
-                        `Discovery failed for subscription ${subscriptionId.substring(0, 8)}: ${response.status}`
-                );
-            }
-            const data = await response.json();
-            allAccounts.push(...(data.value ?? []));
-            url = data.nextLink ?? null;
-        }
-
-        return allAccounts;
+        const accounts = await listBatchAccounts(subscriptionId, token);
+        return accounts;
     }
 
     private async _discoverAccounts(
         payload: Record<string, unknown>
     ): Promise<AgentResult> {
-        const { store, armUrl } = this._ctx;
+        const { store } = this._ctx;
         const subscriptionId = payload.subscriptionId as string | undefined;
 
         store.setAgentStatus("provisioner", "running");
@@ -671,19 +644,11 @@ export class OrchestratorAgent implements Agent {
                         tenantId: s.tenantId,
                     }));
                 } else {
-                    // Fallback: list via ARM (uses the home tenant token)
-                    const url = `${armUrl}/subscriptions?api-version=2022-12-01`;
-                    const resp = await fetch(url, {
-                        headers: { Authorization: `Bearer ${token}` },
-                    });
-                    if (!resp.ok)
-                        throw new Error(
-                            `Failed to list subscriptions: ${resp.status}`
-                        );
-                    const data = await resp.json();
-                    subscriptions = (data.value ?? []).map((s: any) => ({
-                        subscriptionId: s.subscriptionId as string,
-                        tenantId: s.tenantId as string | undefined,
+                    // Fallback: list via ARM SDK (uses the home tenant token)
+                    const armSubs = await listSubscriptions(token);
+                    subscriptions = armSubs.map((s) => ({
+                        subscriptionId: s.subscriptionId,
+                        tenantId: s.tenantId,
                     }));
                 }
 
@@ -704,8 +669,7 @@ export class OrchestratorAgent implements Agent {
                     const accounts =
                         await this._discoverAccountsForSubscription(
                             sub.subscriptionId,
-                            token,
-                            armUrl
+                            token
                         );
                     return {
                         subId: sub.subscriptionId,
@@ -819,52 +783,40 @@ export class OrchestratorAgent implements Agent {
         const poolResults = await pMap(
             accounts,
             async (account) => {
-                const pools: PoolInfo[] = [];
-                let url: string | null =
-                    `https://${account.accountName}.${account.region}.batch.azure.com/pools?api-version=2024-07-01.20.0`;
-                while (url) {
-                    const resp = await fetch(url, {
-                        headers: { Authorization: `Bearer ${token}` },
-                    });
-                    if (!resp.ok) {
-                        const e = await resp.json().catch(() => ({}));
-                        throw new Error(e?.error?.message ?? `${resp.status}`);
-                    }
-                    const data = await resp.json();
-                    for (const p of (data.value ?? []) as Record<
-                        string,
-                        any
-                    >[]) {
-                        const re: string[] = [];
-                        if (Array.isArray(p.resizeErrors))
-                            for (const r of p.resizeErrors)
-                                re.push(r.message ?? r.code ?? String(r));
-                        pools.push({
-                            id: `${account.id}/pools/${p.id}`,
-                            accountId: account.id,
-                            accountName: account.accountName,
-                            region: account.region,
-                            poolId: p.id ?? "",
-                            vmSize: p.vmSize ?? "",
-                            state: p.state ?? "unknown",
-                            allocationState: p.allocationState ?? "unknown",
-                            targetDedicatedNodes: p.targetDedicatedNodes ?? 0,
-                            currentDedicatedNodes: p.currentDedicatedNodes ?? 0,
-                            targetLowPriorityNodes:
-                                p.targetLowPriorityNodes ?? 0,
-                            currentLowPriorityNodes:
-                                p.currentLowPriorityNodes ?? 0,
-                            taskSlotsPerNode: p.taskSlotsPerNode ?? 1,
-                            enableAutoScale: p.enableAutoScale ?? false,
-                            autoScaleFormula: p.autoScaleFormula,
-                            resizeErrors: re.length > 0 ? re : undefined,
-                            lastModified: p.lastModified,
-                            creationTime: p.creationTime,
-                            startTask: p.startTask ?? undefined,
-                        });
-                    }
-                    url = data["odata.nextLink"] ?? null;
-                }
+                const endpoint = accountEndpoint(
+                    account.accountName,
+                    account.region
+                );
+                const sdkPools = await listPools(endpoint, token);
+
+                const pools: PoolInfo[] = sdkPools.map((p: SdkBatchPool) => {
+                    const re: string[] = [];
+                    if (Array.isArray(p.resizeErrors))
+                        for (const r of p.resizeErrors)
+                            re.push(r.message ?? r.code ?? String(r));
+                    return {
+                        id: `${account.id}/pools/${p.id}`,
+                        accountId: account.id,
+                        accountName: account.accountName,
+                        region: account.region,
+                        poolId: p.id ?? "",
+                        vmSize: p.vmSize ?? "",
+                        state: p.state ?? "unknown",
+                        allocationState: p.allocationState ?? "unknown",
+                        targetDedicatedNodes: p.targetDedicatedNodes ?? 0,
+                        currentDedicatedNodes: p.currentDedicatedNodes ?? 0,
+                        targetLowPriorityNodes: p.targetLowPriorityNodes ?? 0,
+                        currentLowPriorityNodes: p.currentLowPriorityNodes ?? 0,
+                        taskSlotsPerNode: p.taskSlotsPerNode ?? 1,
+                        enableAutoScale: p.enableAutoScale ?? false,
+                        autoScaleFormula: p.autoScaleFormula,
+                        resizeErrors: re.length > 0 ? re : undefined,
+                        lastModified: p.lastModified,
+                        creationTime: p.creationTime,
+                        startTask: p.startTask ?? undefined,
+                    };
+                });
+
                 return { account, pools };
             },
             READ_CONCURRENCY
@@ -910,7 +862,7 @@ export class OrchestratorAgent implements Agent {
     }
 
     private async _refreshAccountInfo(): Promise<AgentResult> {
-        const { store, armUrl } = this._ctx;
+        const { store } = this._ctx;
         const state = store.getState();
         const accounts = state.accounts.filter(
             (a) => a.provisioningState === "created"
@@ -937,48 +889,27 @@ export class OrchestratorAgent implements Agent {
                     ? rgMatch[1]
                     : account.resourceGroup;
 
-                // Fetch pools (Batch API) and quota (ARM API) in parallel for this account
-                const [poolsData, armData] = await Promise.all([
-                    (async () => {
-                        const pools: {
-                            vmSize: string;
-                            lpNodes: number;
-                            dedNodes: number;
-                        }[] = [];
-                        let url: string | null =
-                            `https://${account.accountName}.${account.region}.batch.azure.com/pools?api-version=2024-07-01.20.0`;
-                        while (url) {
-                            const r = await fetch(url, {
-                                headers: {
-                                    Authorization: `Bearer ${batchToken}`,
-                                },
-                            });
-                            if (!r.ok) break;
-                            const d = await r.json();
-                            for (const p of (d.value ?? []) as any[])
-                                pools.push({
-                                    vmSize: p.vmSize ?? "",
-                                    lpNodes: p.currentLowPriorityNodes ?? 0,
-                                    dedNodes: p.currentDedicatedNodes ?? 0,
-                                });
-                            url = d["odata.nextLink"] ?? null;
-                        }
-                        return pools;
-                    })(),
-                    (async () => {
-                        const url = `${armUrl}/subscriptions/${account.subscriptionId}/resourceGroups/${resourceGroup}/providers/Microsoft.Batch/batchAccounts/${account.accountName}?api-version=2024-02-01`;
-                        const r = await fetch(url, {
-                            headers: {
-                                Authorization: `Bearer ${armToken}`,
-                            },
-                        });
-                        if (!r.ok) {
-                            const e = await r.json().catch(() => ({}));
-                            throw new Error(e?.error?.message ?? `${r.status}`);
-                        }
-                        return await r.json();
-                    })(),
+                const endpoint = accountEndpoint(
+                    account.accountName,
+                    account.region
+                );
+
+                // Fetch pools (Batch SDK) and quota (ARM SDK) in parallel for this account
+                const [sdkPools, armData] = await Promise.all([
+                    listPools(endpoint, batchToken),
+                    getBatchAccount(
+                        account.subscriptionId,
+                        resourceGroup,
+                        account.accountName,
+                        armToken
+                    ),
                 ]);
+
+                const poolsData = sdkPools.map((p: SdkBatchPool) => ({
+                    vmSize: p.vmSize ?? "",
+                    lpNodes: p.currentLowPriorityNodes ?? 0,
+                    dedNodes: p.currentDedicatedNodes ?? 0,
+                }));
 
                 const props = armData.properties ?? {};
                 const toNum = (v: unknown) =>
@@ -1232,24 +1163,11 @@ export class OrchestratorAgent implements Agent {
                     taskSlotsPerNode: suggestion.vmSizeVCpus,
                 };
 
-                const url = `https://${account.accountName}.${account.region}.batch.azure.com/pools?api-version=2024-07-01.20.0`;
-                const response = await fetch(url, {
-                    method: "POST",
-                    headers: {
-                        Authorization: `Bearer ${token}`,
-                        "Content-Type":
-                            "application/json; odata=minimalmetadata",
-                    },
-                    body: JSON.stringify(poolBody),
-                });
-
-                if (!response.ok) {
-                    const err = await response.json().catch(() => ({}));
-                    throw new Error(
-                        err?.error?.message ??
-                            `Pool creation failed: ${response.status}`
-                    );
-                }
+                const endpoint = accountEndpoint(
+                    account.accountName,
+                    account.region
+                );
+                await createPool(endpoint, poolBody, token);
 
                 store.addLog({
                     agent: "orchestrator",
@@ -1332,27 +1250,11 @@ export class OrchestratorAgent implements Agent {
         for (const [, group] of groups) {
             try {
                 const token = await this._getBatchAccessToken();
-                const url = `https://${group.accountName}.${group.region}.batch.azure.com/pools/${group.poolId}/removenodes?api-version=2024-07-01.20.0`;
-                const response = await fetch(url, {
-                    method: "POST",
-                    headers: {
-                        Authorization: `Bearer ${token}`,
-                        "Content-Type":
-                            "application/json; odata=minimalmetadata",
-                    },
-                    body: JSON.stringify({
-                        nodeList: group.nodeIds,
-                        nodeDeallocationOption: "requeue",
-                    }),
-                });
-
-                if (!response.ok && response.status !== 202) {
-                    const err = await response.json().catch(() => ({}));
-                    throw new Error(
-                        err?.error?.message ??
-                            `Remove nodes failed: ${response.status}`
-                    );
-                }
+                const endpoint = accountEndpoint(
+                    group.accountName,
+                    group.region
+                );
+                await removeNodes(endpoint, group.poolId, group.nodeIds, token);
 
                 for (const internalId of group.internalIds) {
                     store.removeNode(internalId);
@@ -1442,63 +1344,36 @@ export class OrchestratorAgent implements Agent {
         for (const [, group] of groups) {
             try {
                 const token = await this._getBatchAccessToken();
-                const baseUrl = `https://${group.accountName}.${group.region}.batch.azure.com`;
+                const endpoint = accountEndpoint(
+                    group.accountName,
+                    group.region
+                );
 
-                const poolInfoUrl = `${baseUrl}/pools/${group.poolId}?api-version=2024-07-01.20.0`;
-                const poolRes = await fetch(poolInfoUrl, {
-                    headers: { Authorization: `Bearer ${token}` },
-                });
-                if (!poolRes.ok) {
-                    throw new Error(
-                        `Failed to get pool info: ${poolRes.status}`
-                    );
-                }
-                const poolData = await poolRes.json();
+                // Get current pool targets before removing nodes
+                const sdkPools = await listPools(endpoint, token);
+                const poolData = sdkPools.find((p) => p.id === group.poolId);
                 const originalTargetLowPriority =
-                    poolData.targetLowPriorityNodes ?? 0;
+                    poolData?.targetLowPriorityNodes ?? 0;
 
-                const removeUrl = `${baseUrl}/pools/${group.poolId}/removenodes?api-version=2024-07-01.20.0`;
-                const removeRes = await fetch(removeUrl, {
-                    method: "POST",
-                    headers: {
-                        Authorization: `Bearer ${token}`,
-                        "Content-Type":
-                            "application/json; odata=minimalmetadata",
-                    },
-                    body: JSON.stringify({
-                        nodeList: group.nodeIds,
-                        nodeDeallocationOption: "requeue",
-                    }),
-                });
-
-                if (!removeRes.ok && removeRes.status !== 202) {
-                    const err = await removeRes.json().catch(() => ({}));
-                    throw new Error(
-                        err?.error?.message ??
-                            `Remove nodes failed: ${removeRes.status}`
-                    );
-                }
+                // Remove the nodes
+                await removeNodes(endpoint, group.poolId, group.nodeIds, token);
 
                 // SAFETY: Always force targetDedicatedNodes=0 when restoring pool targets
-                const patchUrl = `${baseUrl}/pools/${group.poolId}?api-version=2024-07-01.20.0`;
-                const patchRes = await fetch(patchUrl, {
-                    method: "PATCH",
-                    headers: {
-                        Authorization: `Bearer ${token}`,
-                        "Content-Type":
-                            "application/json; odata=minimalmetadata",
-                    },
-                    body: JSON.stringify({
-                        targetDedicatedNodes: 0,
-                        targetLowPriorityNodes: originalTargetLowPriority,
-                    }),
-                });
-
-                if (!patchRes.ok && patchRes.status !== 200) {
+                try {
+                    await patchPool(
+                        endpoint,
+                        group.poolId,
+                        {
+                            targetDedicatedNodes: 0,
+                            targetLowPriorityNodes: originalTargetLowPriority,
+                        },
+                        token
+                    );
+                } catch (patchErr: any) {
                     store.addLog({
                         agent: "node",
                         level: "warn",
-                        message: `Nodes removed but failed to restore pool targets for ${group.poolId}: ${patchRes.status}`,
+                        message: `Nodes removed but failed to restore pool targets for ${group.poolId}: ${patchErr?.message ?? patchErr}`,
                     });
                 }
 
@@ -1602,40 +1477,25 @@ export class OrchestratorAgent implements Agent {
         for (const [, group] of poolGroups) {
             try {
                 const token = await this._getBatchAccessToken();
-                const baseUrl = `https://${group.accountName}.${group.region}.batch.azure.com`;
+                const endpoint = accountEndpoint(
+                    group.accountName,
+                    group.region
+                );
 
-                const poolUrl = `${baseUrl}/pools/${group.poolId}?api-version=2024-07-01.20.0`;
-                const poolRes = await fetch(poolUrl, {
-                    headers: { Authorization: `Bearer ${token}` },
-                });
-                if (!poolRes.ok) {
-                    throw new Error(
-                        `Failed to get pool info: ${poolRes.status}`
-                    );
-                }
-                const poolData = await poolRes.json();
-                const targetLowPriority = poolData.targetLowPriorityNodes ?? 0;
+                // Get current pool targets
+                const sdkPools = await listPools(endpoint, token);
+                const poolData = sdkPools.find((p) => p.id === group.poolId);
+                const targetLowPriority = poolData?.targetLowPriorityNodes ?? 0;
 
-                const patchUrl = `${baseUrl}/pools/${group.poolId}?api-version=2024-07-01.20.0`;
-                const patchRes = await fetch(patchUrl, {
-                    method: "PATCH",
-                    headers: {
-                        Authorization: `Bearer ${token}`,
-                        "Content-Type":
-                            "application/json; odata=minimalmetadata",
-                    },
-                    body: JSON.stringify({
+                // Re-apply the same target to trigger re-allocation of preempted nodes
+                await patchPool(
+                    endpoint,
+                    group.poolId,
+                    {
                         targetLowPriorityNodes: targetLowPriority,
-                    }),
-                });
-
-                if (!patchRes.ok && patchRes.status !== 200) {
-                    const err = await patchRes.json().catch(() => ({}));
-                    throw new Error(
-                        err?.error?.message ??
-                            `Pool resize failed: ${patchRes.status}`
-                    );
-                }
+                    },
+                    token
+                );
 
                 succeeded += group.count;
                 store.addLog({
@@ -1721,7 +1581,7 @@ export class OrchestratorAgent implements Agent {
         }
 
         const token = await this._getBatchAccessToken();
-        const url = `https://${account.accountName}.${account.region}.batch.azure.com/pools/${payload.poolId}?api-version=2024-07-01.20.0`;
+        const endpoint = accountEndpoint(account.accountName, account.region);
 
         // SAFETY: Always force targetDedicatedNodes=0
         const body: Record<string, unknown> = {
@@ -1731,21 +1591,7 @@ export class OrchestratorAgent implements Agent {
             body.targetLowPriorityNodes = payload.targetLowPriorityNodes;
         }
 
-        const response = await fetch(url, {
-            method: "PATCH",
-            headers: {
-                "Content-Type": "application/json; odata=minimalmetadata",
-                Authorization: `Bearer ${token}`,
-            },
-            body: JSON.stringify(body),
-        });
-
-        if (!response.ok) {
-            const err = await response.json().catch(() => ({}));
-            throw new Error(
-                err?.error?.message ?? `Resize pool failed: ${response.status}`
-            );
-        }
+        await patchPool(endpoint, payload.poolId as string, body, token);
 
         store.addNotification({
             type: "success",
@@ -1775,26 +1621,16 @@ export class OrchestratorAgent implements Agent {
         }
 
         const token = await this._getBatchAccessToken();
-        const url = `https://${account.accountName}.${account.region}.batch.azure.com/pools/${payload.poolId}?api-version=2024-07-01.20.0`;
+        const endpoint = accountEndpoint(account.accountName, account.region);
 
-        const response = await fetch(url, {
-            method: "PATCH",
-            headers: {
-                "Content-Type": "application/json; odata=minimalmetadata",
-                Authorization: `Bearer ${token}`,
-            },
-            body: JSON.stringify({
+        await patchPool(
+            endpoint,
+            payload.poolId as string,
+            {
                 startTask: payload.startTask,
-            }),
-        });
-
-        if (!response.ok) {
-            const err = await response.json().catch(() => ({}));
-            throw new Error(
-                err?.error?.message ??
-                    `Update start task failed: ${response.status}`
-            );
-        }
+            },
+            token
+        );
 
         store.addNotification({
             type: "success",

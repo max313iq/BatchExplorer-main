@@ -52,7 +52,6 @@ const msalConfig: Configuration = {
     cache: {
         cacheLocation: "localStorage",
     },
-    system: {} as any,
 };
 
 let _msalInstance: PublicClientApplication | null = null;

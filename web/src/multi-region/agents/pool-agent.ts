@@ -1,5 +1,7 @@
 import { Agent, AgentContext, AgentResult, PoolInput } from "./agent-types";
 import { ManagedPool, AccountInfo, PoolInfo } from "../store/store-types";
+import { createPool } from "../services/batch-service";
+import { AzureRequestError } from "../services/types";
 
 /**
  * A TokenProvider resolves an access token, optionally scoped to a tenant.
@@ -50,87 +52,6 @@ function isCapacityOrQuotaError(errorMsg: string): boolean {
 /** Returns true for HTTP status codes that should never be retried. */
 function isNonRetryableStatus(status: number): boolean {
     return status === 400 || status === 403 || status === 404;
-}
-
-/** Returns true for HTTP status codes eligible for retry (429 / 5xx). */
-function isRetryableStatus(status: number): boolean {
-    return status === 429 || (status >= 500 && status <= 599);
-}
-
-/** Sleep helper. */
-function sleep(ms: number): Promise<void> {
-    return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-/**
- * Perform a fetch with exponential backoff retry for 429 / 5xx.
- * Non-retryable errors (400, 403, 404) fail immediately.
- */
-async function fetchWithRetry(
-    url: string,
-    init: RequestInit,
-    maxRetries = 4,
-    baseDelayMs = 1000
-): Promise<Response> {
-    let lastError: unknown;
-
-    for (let attempt = 0; attempt <= maxRetries; attempt++) {
-        const response = await fetch(url, init);
-
-        if (response.ok) {
-            return response;
-        }
-
-        // Parse error body once
-        const errBody = await response.json().catch(() => ({}));
-        const errorMessage =
-            errBody?.error?.message ??
-            errBody?.message?.value ??
-            `Pool creation failed: ${response.status}`;
-
-        // Non-retryable: fail immediately
-        if (isNonRetryableStatus(response.status)) {
-            throw {
-                status: response.status,
-                message: errorMessage,
-                headers: response.headers,
-                retryable: false,
-            };
-        }
-
-        // Retryable but exhausted retries
-        if (!isRetryableStatus(response.status) || attempt === maxRetries) {
-            throw {
-                status: response.status,
-                message: errorMessage,
-                headers: response.headers,
-                retryable: false,
-            };
-        }
-
-        // Exponential backoff with jitter
-        const retryAfterHeader = response.headers.get("Retry-After");
-        let delayMs: number;
-        if (retryAfterHeader && !isNaN(Number(retryAfterHeader))) {
-            delayMs = Number(retryAfterHeader) * 1000;
-        } else {
-            delayMs = baseDelayMs * Math.pow(2, attempt);
-        }
-        // Add jitter: 0–25% of the delay
-        delayMs += Math.random() * delayMs * 0.25;
-
-        lastError = {
-            status: response.status,
-            message: errorMessage,
-            headers: response.headers,
-            retryable: true,
-        };
-
-        await sleep(delayMs);
-    }
-
-    // Should not reach here, but safety net
-    throw lastError;
 }
 
 export class PoolAgent implements Agent {
@@ -214,17 +135,8 @@ export class PoolAgent implements Agent {
 
                 await scheduler.run(accountId, async () => {
                     const token = await this._tokenProvider();
-                    const batchUrl = `https://${account.accountName}.${account.region}.batch.azure.com/pools?api-version=2024-07-01.20.0`;
-
-                    await fetchWithRetry(batchUrl, {
-                        method: "POST",
-                        headers: {
-                            "Content-Type":
-                                "application/json; odata=minimalmetadata",
-                            Authorization: `Bearer ${token}`,
-                        },
-                        body: JSON.stringify(poolConfig),
-                    });
+                    const accountEndpoint = `https://${account.accountName}.${account.region}.batch.azure.com`;
+                    await createPool(accountEndpoint, poolConfig, token);
                 });
 
                 store.updatePool(internalId, {
@@ -241,7 +153,10 @@ export class PoolAgent implements Agent {
                 });
                 created++;
             } catch (error: any) {
-                const errorMsg = error?.message ?? String(error);
+                const errorMsg =
+                    error instanceof AzureRequestError
+                        ? error.message
+                        : error?.message ?? String(error);
                 store.updatePool(internalId, {
                     provisioningState: "failed",
                     error: errorMsg,
@@ -411,17 +326,8 @@ export class PoolAgent implements Agent {
 
                     await scheduler.run(accountId, async () => {
                         const token = await this._tokenProvider();
-                        const batchUrl = `https://${account.accountName}.${account.region}.batch.azure.com/pools?api-version=2024-07-01.20.0`;
-
-                        await fetchWithRetry(batchUrl, {
-                            method: "POST",
-                            headers: {
-                                "Content-Type":
-                                    "application/json; odata=minimalmetadata",
-                                Authorization: `Bearer ${token}`,
-                            },
-                            body: JSON.stringify(currentConfig),
-                        });
+                        const accountEndpoint = `https://${account.accountName}.${account.region}.batch.azure.com`;
+                        await createPool(accountEndpoint, currentConfig, token);
                     });
 
                     store.updatePool(internalId, {
@@ -460,8 +366,14 @@ export class PoolAgent implements Agent {
                     // Done with this account
                     break;
                 } catch (error: any) {
-                    const errorMsg = error?.message ?? String(error);
-                    const errorStatus = error?.status as number | undefined;
+                    const errorMsg =
+                        error instanceof AzureRequestError
+                            ? error.message
+                            : error?.message ?? String(error);
+                    const errorStatus =
+                        error instanceof AzureRequestError
+                            ? error.status
+                            : (error?.status as number | undefined);
 
                     store.updatePool(internalId, {
                         provisioningState: "failed",

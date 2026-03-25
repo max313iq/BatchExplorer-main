@@ -5,6 +5,11 @@ import {
     ProvisionerInput,
 } from "./agent-types";
 import { ManagedAccount } from "../store/store-types";
+import {
+    createResourceGroup,
+    createBatchAccount,
+} from "../services/arm-service";
+import { AzureRequestError } from "../services/types";
 
 function randomAlphanumeric(length: number): string {
     const chars = "abcdefghijklmnopqrstuvwxyz0123456789";
@@ -152,52 +157,24 @@ export class ProvisionerAgent implements Agent {
                 // Step 1: Create resource group
                 await scheduler.run(input.subscriptionId, async () => {
                     const token = await getAccessToken();
-                    const rgUrl = `${armUrl}/subscriptions/${input.subscriptionId}/resourcegroups/${resourceGroup}?api-version=2021-04-01`;
-                    const response = await fetch(rgUrl, {
-                        method: "PUT",
-                        headers: {
-                            "Content-Type": "application/json",
-                            Authorization: `Bearer ${token}`,
-                        },
-                        body: JSON.stringify({ location: region }),
-                    });
-                    if (!response.ok) {
-                        const err = await response.json().catch(() => ({}));
-                        throw {
-                            status: response.status,
-                            message:
-                                err?.error?.message ??
-                                `RG creation failed: ${response.status}`,
-                            headers: response.headers,
-                        };
-                    }
+                    await createResourceGroup(
+                        input.subscriptionId,
+                        resourceGroup,
+                        region,
+                        token
+                    );
                 });
 
                 // Step 2: Create Batch account
                 await scheduler.run(input.subscriptionId, async () => {
                     const token = await getAccessToken();
-                    const accountUrl = `${armUrl}/subscriptions/${input.subscriptionId}/resourceGroups/${resourceGroup}/providers/Microsoft.Batch/batchAccounts/${accountName}?api-version=2024-02-01`;
-                    const response = await fetch(accountUrl, {
-                        method: "PUT",
-                        headers: {
-                            "Content-Type": "application/json",
-                            Authorization: `Bearer ${token}`,
-                        },
-                        body: JSON.stringify({
-                            location: region,
-                            properties: { autoStorage: null },
-                        }),
-                    });
-                    if (!response.ok) {
-                        const err = await response.json().catch(() => ({}));
-                        throw {
-                            status: response.status,
-                            message:
-                                err?.error?.message ??
-                                `Account creation failed: ${response.status}`,
-                            headers: response.headers,
-                        };
-                    }
+                    await createBatchAccount(
+                        input.subscriptionId,
+                        resourceGroup,
+                        accountName,
+                        region,
+                        token
+                    );
                 });
 
                 lastWriteTime = Date.now();
@@ -212,7 +189,10 @@ export class ProvisionerAgent implements Agent {
                 });
                 created++;
             } catch (error: any) {
-                const errorMsg = error?.message ?? String(error);
+                const errorMsg =
+                    error instanceof AzureRequestError
+                        ? error.message
+                        : error?.message ?? String(error);
                 store.updateAccount(accountId, {
                     provisioningState: "failed",
                     error: errorMsg,
