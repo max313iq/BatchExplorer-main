@@ -237,10 +237,9 @@ export const PoolCreationPage: React.FC<PoolCreationPageProps> = ({
     }, [smartMode, selectedVmSizes, selectedAccountIds, state.quotaRequests]);
 
     // Check if any pool is currently resizing
-    const resizingPools = state.pools.filter(
+    const resizingPools = (state.poolInfos ?? []).filter(
         (p) =>
-            p.provisioningState === "resizing" ||
-            p.provisioningState === "allocating"
+            p.allocationState === "resizing" || p.allocationState === "stopping"
     );
 
     const handleCreate = React.useCallback(async () => {

@@ -48,14 +48,11 @@ const msalConfig: Configuration = {
         // Using a path like /auth-redirect.html would require it to be
         // registered on the Azure CLI app registration, which we don't control.
         redirectUri: window.location.origin + "/",
-        navigateToLoginRequestUrl: false,
     },
     cache: {
         cacheLocation: "localStorage",
-        storeAuthStateInCookie: false,
     },
     system: {
-        allowNativeBroker: false,
         windowHashTimeout: 60000,
         iframeHashTimeout: 10000,
         loadFrameTimeout: 10000,
@@ -220,7 +217,8 @@ export async function logout(): Promise<void> {
         await msalApp.logoutPopup();
     } catch {
         // Clear local state even if popup fails
-        msalApp.getAllAccounts().forEach((a) => msalApp.removeAccount(a));
+        // Clear cached accounts from localStorage
+        localStorage.clear();
     }
 }
 
