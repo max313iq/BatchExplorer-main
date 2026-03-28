@@ -221,6 +221,61 @@ module.exports = (env) => {
                     }
                 });
 
+                // MSAL token exchange proxy — Azure CLI client ID is a public app;
+                // Azure AD does NOT return CORS headers for direct browser POSTs
+                // to its token endpoint.  Route through Node.js server-side.
+                devServer.app.post("/api/auth/proxy-token", (req, res) => {
+                    const targetUrl = req.headers["x-proxy-target"];
+                    if (
+                        !targetUrl ||
+                        !targetUrl.startsWith(
+                            "https://login.microsoftonline.com"
+                        )
+                    ) {
+                        return res
+                            .status(400)
+                            .json({ error: "Invalid proxy target" });
+                    }
+                    let body = "";
+                    req.on("data", (chunk) => {
+                        body += chunk.toString();
+                    });
+                    req.on("end", () => {
+                        const forwardHeaders = {
+                            "content-type":
+                                req.headers["content-type"] ||
+                                "application/x-www-form-urlencoded",
+                        };
+                        for (const h of [
+                            "client-request-id",
+                            "x-client-sku",
+                            "x-client-ver",
+                            "x-client-os",
+                            "x-client-cpu",
+                            "x-ms-lib-capability",
+                        ]) {
+                            if (req.headers[h])
+                                forwardHeaders[h] = req.headers[h];
+                        }
+                        fetch(targetUrl, {
+                            method: "POST",
+                            headers: forwardHeaders,
+                            body,
+                        })
+                            .then(async (r) => {
+                                const data = await r.json();
+                                res.status(r.status).json(data);
+                            })
+                            .catch((err) => {
+                                console.error(
+                                    "[auth-proxy] error:",
+                                    err.message
+                                );
+                                res.status(502).json({ error: err.message });
+                            });
+                    });
+                });
+
                 return middlewares;
             },
             compress: true,

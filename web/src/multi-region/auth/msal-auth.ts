@@ -1,17 +1,14 @@
 /**
  * MSAL Browser Authentication for Azure Batch Manager
  *
- * Uses the same Azure CLI client ID as Batch Explorer desktop,
- * forcing an interactive Entra ID login to get ARM and Batch tokens.
- * No Azure CLI or proxy server needed.
- *
  * Key design decisions:
- * - Popup flow only (no redirect flow) to avoid CORS issues with token exchange
- * - redirectUri is just the origin (e.g. "http://localhost:9000/") so the popup
- *   can close itself without needing a registered auth-redirect.html
- * - cacheLocation: "localStorage" so accounts persist across page reloads
- * - At startup, if we detect we're inside a popup (window.opener exists),
- *   we handle the redirect promise and close immediately — don't render the app
+ * - Popup flow only (no redirect flow)
+ * - broadcastResponseToMainFrame() in popup: relays auth code to parent via
+ *   BroadcastChannel so the parent completes token exchange with its PKCE verifier
+ * - cacheLocation: "sessionStorage" — avoids localStorage quota exhaustion
+ * - msalNetworkClient: proxies token POSTs through /api/auth/proxy-token to
+ *   bypass CORS (Azure CLI client ID is a public app — Azure AD blocks direct
+ *   browser token POSTs)
  *
  * Multi-account support:
  * - Multiple Azure AD accounts can be logged in simultaneously
@@ -27,7 +24,11 @@ import {
     AuthenticationResult,
     Configuration,
     SilentRequest,
+    INetworkModule,
+    NetworkRequestOptions,
+    NetworkResponse,
 } from "@azure/msal-browser";
+import { broadcastResponseToMainFrame } from "@azure/msal-browser/redirect-bridge";
 import { ArmSubscription } from "../services/types";
 
 // ---------------------------------------------------------------------------
@@ -47,17 +48,86 @@ const AZURE_CLI_CLIENT_ID = "04b07795-8ddb-461a-bbee-02f9e1bf7b46";
 const ARM_SCOPE = "https://management.azure.com/.default";
 const BATCH_SCOPE = "https://batch.core.windows.net/.default";
 
+// ---------------------------------------------------------------------------
+// Custom MSAL network client — proxies token POST requests through the local
+// dev server to bypass CORS.  Azure CLI's client ID is a native/public app:
+// Azure AD does NOT return Access-Control-Allow-Origin for direct browser
+// POSTs to its token endpoint.  The proxy forwards server-side where CORS
+// is not enforced by the browser.
+// ---------------------------------------------------------------------------
+const msalNetworkClient: INetworkModule = {
+    async sendGetRequestAsync<T>(
+        url: string,
+        options?: NetworkRequestOptions
+    ): Promise<NetworkResponse<T>> {
+        const response = await fetch(url, {
+            method: "GET",
+            headers: options?.headers as Record<string, string> | undefined,
+        });
+        const headers: Record<string, string> = {};
+        response.headers.forEach((v, k) => {
+            headers[k] = v;
+        });
+        return {
+            headers,
+            body: (await response.json()) as T,
+            status: response.status,
+        };
+    },
+
+    async sendPostRequestAsync<T>(
+        url: string,
+        options?: NetworkRequestOptions
+    ): Promise<NetworkResponse<T>> {
+        const isTokenEndpoint =
+            url.includes("login.microsoftonline.com") && url.includes("/token");
+        const fetchUrl = isTokenEndpoint ? "/api/auth/proxy-token" : url;
+        const extraHeaders: Record<string, string> = isTokenEndpoint
+            ? { "x-proxy-target": url }
+            : {};
+        const response = await fetch(fetchUrl, {
+            method: "POST",
+            headers: {
+                ...(options?.headers as Record<string, string> | undefined),
+                ...extraHeaders,
+            },
+            body: options?.body,
+        });
+        const headers: Record<string, string> = {};
+        response.headers.forEach((v, k) => {
+            headers[k] = v;
+        });
+        return {
+            headers,
+            body: (await response.json()) as T,
+            status: response.status,
+        };
+    },
+};
+
 const msalConfig: Configuration = {
     auth: {
         clientId: AZURE_CLI_CLIENT_ID,
         authority: "https://login.microsoftonline.com/common",
-        // redirectUri MUST be just the origin so the popup can close itself.
-        // Using a path like /auth-redirect.html would require it to be
-        // registered on the Azure CLI app registration, which we don't control.
         redirectUri: window.location.origin + "/",
     },
     cache: {
-        cacheLocation: "localStorage",
+        // sessionStorage avoids localStorage quota exhaustion (cache_quota_exceeded).
+        // broadcastResponseToMainFrame() relays the auth code to the parent via
+        // BroadcastChannel — the popup never needs to read the parent's PKCE
+        // verifier, so separate sessionStorages per window are fine.
+        cacheLocation: "sessionStorage",
+    },
+    system: {
+        networkClient: msalNetworkClient,
+        loggerOptions: {
+            logLevel: 1, // Warn only
+            loggerCallback: (level: number, message: string) => {
+                if (level === 0) console.error("[MSAL]", message);
+                else if (level === 1) console.warn("[MSAL]", message);
+            },
+            piiLoggingEnabled: false,
+        },
     },
 };
 
@@ -117,63 +187,58 @@ export function purgeMsalCache(): void {
 }
 
 // ---------------------------------------------------------------------------
-// Popup detection — if we are inside an MSAL popup, handle the redirect
-// promise and close immediately so the full app never renders in the popup.
+// Popup relay — if the current page is a loginPopup() redirect callback,
+// broadcast the auth code back to the parent and close without rendering.
 // ---------------------------------------------------------------------------
 /**
- * Detect if we're inside an MSAL popup window that received an auth response.
- * If so, DON'T render the app — just initialize MSAL so it can relay the
- * auth code back to the parent window, then close.
+ * Detect whether this page load is an MSAL popup callback and, if so,
+ * relay the auth code to the parent window via BroadcastChannel.
  *
- * MSAL popup flow works like this:
- * 1. Parent calls loginPopup() which opens a popup to login.microsoftonline.com
- * 2. After auth, Microsoft redirects back to redirectUri (localhost:9000/)
- * 3. The popup loads our app — but we DON'T want the full app to render
- * 4. MSAL needs to initialize in the popup to process the code and
- *    relay the result back to the parent via window.opener
- * 5. Once MSAL processes it, we close the popup
- *
- * Detection: we check if the URL contains auth response parameters
- * (code= or error=) AND we have a window.opener (we're in a popup).
+ * WHY broadcastResponseToMainFrame instead of handleRedirectPromise:
+ *   The PKCE code verifier is stored in the PARENT window's sessionStorage.
+ *   A fresh MSAL instance in the popup cannot exchange the auth code without it.
+ *   broadcastResponseToMainFrame() relays the raw code to the parent, which
+ *   completes the token exchange using its own verifier. No token exchange
+ *   happens in the popup.
  */
 export function handlePopupIfNeeded(): boolean {
-    const hash = window.location.hash;
-    const search = window.location.search;
-    const hasAuthCode =
-        hash.includes("code=") ||
-        hash.includes("error=") ||
-        search.includes("code=") ||
-        search.includes("error=");
-    const isPopup = !!window.opener && window.opener !== window;
+    const urlParams = new URLSearchParams(window.location.search);
+    const hashParams = new URLSearchParams(window.location.hash.substring(1));
+    const stateParam = urlParams.get("state") || hashParams.get("state");
+    const hasCode =
+        urlParams.has("code") ||
+        urlParams.has("error") ||
+        hashParams.has("code") ||
+        hashParams.has("error");
 
-    if (isPopup || hasAuthCode) {
-        // We are inside a popup OR have an auth code in the URL.
-        // Initialize MSAL to let it process the response and relay to parent.
-        const msalApp = new PublicClientApplication(msalConfig);
-        msalApp
-            .initialize()
-            .then(() => msalApp.handleRedirectPromise())
-            .then((result) => {
-                if (result?.account) {
-                    // Store in localStorage so parent can find it
-                    _activeAccount = result.account;
-                    msalApp.setActiveAccount(result.account);
-                    console.log(
-                        "[MSAL Popup] Auth success:",
-                        result.account.username
-                    );
-                }
-            })
-            .catch((e) => console.error("[MSAL Popup] Error:", e))
-            .finally(() => {
-                // If we're in a popup, close it after a short delay
-                // to ensure the parent has time to receive the message
-                if (isPopup) {
-                    setTimeout(() => window.close(), 500);
+    if (!stateParam || !hasCode) return false;
+
+    try {
+        // MSAL state = base64url(JSON) | userState
+        const [libraryStateEncoded] = stateParam.split("|");
+        const padding = "=".repeat((4 - (libraryStateEncoded.length % 4)) % 4);
+        const base64 = (libraryStateEncoded + padding)
+            .replace(/-/g, "+")
+            .replace(/_/g, "/");
+        const libraryState = JSON.parse(atob(base64));
+
+        if (libraryState?.meta?.interactionType === "popup") {
+            console.log("[MSAL Popup] Callback detected — relaying to parent");
+            broadcastResponseToMainFrame().catch((e) => {
+                console.error(
+                    "[MSAL Popup] broadcastResponseToMainFrame error:",
+                    e
+                );
+                try {
+                    window.close();
+                } catch {
+                    /* ignore */
                 }
             });
-        // Only block rendering if we're actually in a popup
-        return isPopup;
+            return true; // suppress full app render
+        }
+    } catch {
+        // Not a valid MSAL popup state — render normally
     }
     return false;
 }
