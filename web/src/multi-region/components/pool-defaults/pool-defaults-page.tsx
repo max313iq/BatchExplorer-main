@@ -6,10 +6,6 @@ import { SpinButton } from "@fluentui/react/lib/SpinButton";
 import { Dropdown, IDropdownOption } from "@fluentui/react/lib/Dropdown";
 import { Toggle } from "@fluentui/react/lib/Toggle";
 import {
-    ChoiceGroup,
-    IChoiceGroupOption,
-} from "@fluentui/react/lib/ChoiceGroup";
-import {
     PrimaryButton,
     DefaultButton,
     IconButton,
@@ -22,7 +18,6 @@ import {
 } from "../../store/store-context";
 import type {
     PoolDefaults,
-    ScaleType,
     TaskSchedulingPolicy,
     OsCategory,
     EnvSetting,
@@ -38,39 +33,6 @@ import {
 /* ------------------------------------------------------------------ */
 /*  Constants                                                          */
 /* ------------------------------------------------------------------ */
-
-const GPU_VMS = [
-    {
-        key: "Standard_ND40rs_v2",
-        text: "ND40rs_v2 (40 vCPUs, 8\u00d7V100, 672 GB)",
-        vCPUs: 40,
-    },
-    {
-        key: "Standard_ND96isr_H100_v5",
-        text: "ND96isr_H100_v5 (96 vCPUs, 8\u00d7H100, 1900 GB)",
-        vCPUs: 96,
-    },
-    {
-        key: "Standard_NC24s_v3",
-        text: "NC24s_v3 (24 vCPUs, 4\u00d7V100, 448 GB)",
-        vCPUs: 24,
-    },
-    {
-        key: "Standard_NC12s_v3",
-        text: "NC12s_v3 (12 vCPUs, 2\u00d7V100, 224 GB)",
-        vCPUs: 12,
-    },
-    {
-        key: "Standard_NC6s_v3",
-        text: "NC6s_v3 (6 vCPUs, 1\u00d7V100, 112 GB)",
-        vCPUs: 6,
-    },
-];
-
-const VM_DROPDOWN_OPTIONS: IDropdownOption[] = GPU_VMS.map((vm) => ({
-    key: vm.key,
-    text: vm.text,
-}));
 
 const OS_PRESETS: Record<
     OsCategory,
@@ -97,18 +59,6 @@ const OS_PRESETS: Record<
         nodeAgentSKUId: "batch.node.windows amd64",
     },
 };
-
-const SCALE_OPTIONS: IChoiceGroupOption[] = [
-    { key: "fixed", text: "Fixed size" },
-    { key: "autoscale", text: "Autoscale" },
-];
-
-const AUTOSCALE_INTERVAL_OPTIONS: IDropdownOption[] = [
-    { key: "PT5M", text: "PT5M (5 minutes)" },
-    { key: "PT10M", text: "PT10M (10 minutes)" },
-    { key: "PT15M", text: "PT15M (15 minutes)" },
-    { key: "PT30M", text: "PT30M (30 minutes)" },
-];
 
 const SCHEDULING_POLICY_OPTIONS: IDropdownOption[] = [
     { key: "Pack", text: "Pack" },
@@ -172,11 +122,6 @@ const darkSpinStyles = {
 const darkToggleStyles = {
     root: { marginBottom: 0 },
     label: { color: "#ccc" },
-};
-
-const darkChoiceStyles = {
-    label: { color: "#ccc" },
-    flexContainer: { display: "flex", gap: 24 },
 };
 
 /* ------------------------------------------------------------------ */
@@ -315,7 +260,7 @@ export const PoolDefaultsPage: React.FC = () => {
 
     // Track which sections are expanded
     const [expandedSections, setExpandedSections] = React.useState<Set<number>>(
-        new Set([1, 2, 3, 4, 5, 6, 7, 8])
+        new Set([1, 2, 3, 4, 5])
     );
 
     // "Saved!" toast
@@ -527,161 +472,18 @@ export const PoolDefaultsPage: React.FC = () => {
                     Pool Default Settings
                 </Text>
                 <Text variant="small" styles={{ root: { color: "#888" } }}>
-                    These defaults are used by Smart Create, Unused Quota, and
-                    manual pool creation
+                    OS, start task, and network defaults used by all pool
+                    creation modes. Pool names, VM sizes, and node counts are
+                    calculated automatically.
                 </Text>
             </Stack>
 
-            {/* ============ SECTION 1: Pool Details ============ */}
+            {/* ============ SECTION 1: OS Configuration ============ */}
             <SectionCard
                 number={1}
-                title="Pool Details"
-                subtitle="Basic information about the pool"
+                title="Select an Operating System"
                 expanded={expandedSections.has(1)}
                 onToggle={() => toggleSection(1)}
-            >
-                <Stack tokens={{ childrenGap: 12 }}>
-                    <TextField
-                        label="ID Prefix"
-                        value={defaults.poolIdPrefix}
-                        maxLength={64}
-                        onChange={(_e, v) => update({ poolIdPrefix: v ?? "" })}
-                        description={`${defaults.poolIdPrefix.length}/64`}
-                        aria-label="Pool ID prefix"
-                        styles={darkFieldStyles}
-                    />
-                    <TextField
-                        label="Display Name"
-                        value={defaults.displayName}
-                        onChange={(_e, v) => update({ displayName: v ?? "" })}
-                        aria-label="Pool display name"
-                        styles={darkFieldStyles}
-                    />
-                </Stack>
-            </SectionCard>
-
-            {/* ============ SECTION 2: Scale ============ */}
-            <SectionCard
-                number={2}
-                title="Scale"
-                subtitle="Number of nodes using fixed or autoscale"
-                expanded={expandedSections.has(2)}
-                onToggle={() => toggleSection(2)}
-            >
-                <Stack tokens={{ childrenGap: 12 }}>
-                    <ChoiceGroup
-                        selectedKey={defaults.scaleType}
-                        options={SCALE_OPTIONS}
-                        onChange={(_e, option) => {
-                            if (option) {
-                                update({
-                                    scaleType: option.key as ScaleType,
-                                });
-                            }
-                        }}
-                        aria-label="Scale type"
-                        styles={darkChoiceStyles}
-                    />
-                    {defaults.scaleType === "fixed" ? (
-                        <>
-                            <SpinButton
-                                label="Dedicated nodes"
-                                min={0}
-                                max={10000}
-                                step={1}
-                                value={String(defaults.targetDedicatedNodes)}
-                                {...makeSpinHandlers(
-                                    (n) => update({ targetDedicatedNodes: n }),
-                                    0,
-                                    10000
-                                )}
-                                aria-label="Target dedicated nodes"
-                                styles={darkSpinStyles}
-                            />
-                            <SpinButton
-                                label="Spot/low-priority nodes"
-                                min={0}
-                                max={10000}
-                                step={1}
-                                value={String(defaults.targetLowPriorityNodes)}
-                                {...makeSpinHandlers(
-                                    (n) =>
-                                        update({
-                                            targetLowPriorityNodes: n,
-                                        }),
-                                    0,
-                                    10000
-                                )}
-                                aria-label="Target low-priority nodes"
-                                styles={darkSpinStyles}
-                            />
-                            <SpinButton
-                                label="Resize timeout (minutes)"
-                                min={1}
-                                max={180}
-                                step={1}
-                                value={String(defaults.resizeTimeoutMinutes)}
-                                {...makeSpinHandlers(
-                                    (n) =>
-                                        update({
-                                            resizeTimeoutMinutes: n,
-                                        }),
-                                    1,
-                                    180
-                                )}
-                                aria-label="Resize timeout in minutes"
-                                styles={darkSpinStyles}
-                            />
-                        </>
-                    ) : (
-                        <>
-                            <TextField
-                                label="Autoscale Formula"
-                                multiline
-                                rows={6}
-                                value={defaults.autoScaleFormula}
-                                onChange={(_e, v) =>
-                                    update({ autoScaleFormula: v ?? "" })
-                                }
-                                aria-label="Autoscale formula"
-                                styles={{
-                                    ...darkFieldStyles,
-                                    field: {
-                                        ...darkFieldStyles.field,
-                                        fontFamily: "Consolas, monospace",
-                                        fontSize: 13,
-                                        minHeight: 120,
-                                    },
-                                }}
-                            />
-                            <Dropdown
-                                label="Evaluation Interval"
-                                selectedKey={
-                                    defaults.autoScaleEvaluationInterval
-                                }
-                                options={AUTOSCALE_INTERVAL_OPTIONS}
-                                onChange={(_e, option) => {
-                                    if (option) {
-                                        update({
-                                            autoScaleEvaluationInterval:
-                                                option.key as string,
-                                        });
-                                    }
-                                }}
-                                aria-label="Autoscale evaluation interval"
-                                styles={darkDropdownStyles}
-                            />
-                        </>
-                    )}
-                </Stack>
-            </SectionCard>
-
-            {/* ============ SECTION 3: OS Configuration ============ */}
-            <SectionCard
-                number={3}
-                title="Select an Operating System"
-                expanded={expandedSections.has(3)}
-                onToggle={() => toggleSection(3)}
             >
                 <Stack tokens={{ childrenGap: 12 }}>
                     <Dropdown
@@ -801,112 +603,12 @@ export const PoolDefaultsPage: React.FC = () => {
                 </Stack>
             </SectionCard>
 
-            {/* ============ SECTION 4: VM Size ============ */}
+            {/* ============ SECTION 2: Optional Settings ============ */}
             <SectionCard
-                number={4}
-                title="Virtual Machine Size"
-                expanded={expandedSections.has(4)}
-                onToggle={() => toggleSection(4)}
-            >
-                <Stack tokens={{ childrenGap: 12 }}>
-                    <Dropdown
-                        label="VM Size"
-                        selectedKey={
-                            GPU_VMS.find(
-                                (vm) =>
-                                    vm.key.toLowerCase() ===
-                                    defaults.vmSize.toLowerCase()
-                            )?.key
-                        }
-                        options={VM_DROPDOWN_OPTIONS}
-                        onChange={(_e, option) => {
-                            if (option) {
-                                update({
-                                    vmSize: (
-                                        option.key as string
-                                    ).toLowerCase(),
-                                });
-                            }
-                        }}
-                        aria-label="Select VM size"
-                        styles={darkDropdownStyles}
-                    />
-
-                    <Text
-                        variant="small"
-                        styles={{
-                            root: {
-                                color: "#888",
-                                fontWeight: 600,
-                                marginTop: 8,
-                            },
-                        }}
-                    >
-                        Quick picks:
-                    </Text>
-                    <div
-                        style={{
-                            display: "flex",
-                            flexWrap: "wrap",
-                            gap: 8,
-                        }}
-                    >
-                        {GPU_VMS.map((vm) => (
-                            <button
-                                key={vm.key}
-                                onClick={() =>
-                                    update({
-                                        vmSize: vm.key.toLowerCase(),
-                                    })
-                                }
-                                aria-label={`Select ${vm.text}`}
-                                style={{
-                                    padding: "8px 14px",
-                                    borderRadius: 6,
-                                    border:
-                                        defaults.vmSize.toLowerCase() ===
-                                        vm.key.toLowerCase()
-                                            ? "2px solid #0078d4"
-                                            : "1px solid #444",
-                                    background:
-                                        defaults.vmSize.toLowerCase() ===
-                                        vm.key.toLowerCase()
-                                            ? "#0a3d6e"
-                                            : "#2a2a2a",
-                                    color: "#eee",
-                                    cursor: "pointer",
-                                    fontSize: 12,
-                                    textAlign: "left",
-                                }}
-                            >
-                                <strong>
-                                    {vm.key.replace("Standard_", "")}
-                                </strong>
-                                <br />
-                                <span style={{ color: "#999" }}>
-                                    {vm.vCPUs} vCPUs
-                                </span>
-                            </button>
-                        ))}
-                    </div>
-
-                    <TextField
-                        label="Or type custom VM size"
-                        value={defaults.vmSize}
-                        onChange={(_e, v) => update({ vmSize: v ?? "" })}
-                        placeholder="e.g. standard_d16s_v3"
-                        aria-label="Custom VM size"
-                        styles={darkFieldStyles}
-                    />
-                </Stack>
-            </SectionCard>
-
-            {/* ============ SECTION 5: Optional Settings ============ */}
-            <SectionCard
-                number={5}
+                number={2}
                 title="Optional Settings"
-                expanded={expandedSections.has(5)}
-                onToggle={() => toggleSection(5)}
+                expanded={expandedSections.has(2)}
+                onToggle={() => toggleSection(2)}
             >
                 <Stack tokens={{ childrenGap: 16 }}>
                     <SpinButton
@@ -1140,13 +842,13 @@ export const PoolDefaultsPage: React.FC = () => {
                 </Stack>
             </SectionCard>
 
-            {/* ============ SECTION 6: Start Task ============ */}
+            {/* ============ SECTION 3: Start Task ============ */}
             <SectionCard
-                number={6}
+                number={3}
                 title="Start Task"
                 subtitle="Startup configuration on each node"
-                expanded={expandedSections.has(6)}
-                onToggle={() => toggleSection(6)}
+                expanded={expandedSections.has(3)}
+                onToggle={() => toggleSection(3)}
             >
                 <Stack tokens={{ childrenGap: 12 }}>
                     <TextField
@@ -1436,12 +1138,12 @@ export const PoolDefaultsPage: React.FC = () => {
                 </Stack>
             </SectionCard>
 
-            {/* ============ SECTION 7: Network Configuration ============ */}
+            {/* ============ SECTION 4: Network Configuration ============ */}
             <SectionCard
-                number={7}
+                number={4}
                 title="Network Configuration"
-                expanded={expandedSections.has(7)}
-                onToggle={() => toggleSection(7)}
+                expanded={expandedSections.has(4)}
+                onToggle={() => toggleSection(4)}
             >
                 <Stack tokens={{ childrenGap: 8 }}>
                     <TextField
@@ -1458,12 +1160,12 @@ export const PoolDefaultsPage: React.FC = () => {
                 </Stack>
             </SectionCard>
 
-            {/* ============ SECTION 8: Preview & Save ============ */}
+            {/* ============ SECTION 5: Preview & Save ============ */}
             <SectionCard
-                number={8}
+                number={5}
                 title="Preview & Save"
-                expanded={expandedSections.has(8)}
-                onToggle={() => toggleSection(8)}
+                expanded={expandedSections.has(5)}
+                onToggle={() => toggleSection(5)}
             >
                 <Stack tokens={{ childrenGap: 12 }}>
                     <pre

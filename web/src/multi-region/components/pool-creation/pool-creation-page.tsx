@@ -7,13 +7,13 @@ import {
     IColumn,
     SelectionMode,
 } from "@fluentui/react/lib/DetailsList";
-import { Dropdown, IDropdownOption } from "@fluentui/react/lib/Dropdown";
 import { TextField } from "@fluentui/react/lib/TextField";
 import { Toggle } from "@fluentui/react/lib/Toggle";
 import { SpinButton } from "@fluentui/react/lib/SpinButton";
 import { ProgressIndicator } from "@fluentui/react/lib/ProgressIndicator";
 import { MessageBar, MessageBarType } from "@fluentui/react/lib/MessageBar";
 import { Stack, IStackTokens } from "@fluentui/react/lib/Stack";
+import { Text } from "@fluentui/react/lib/Text";
 import { MonacoEditor } from "@azure/bonito-ui/lib/components";
 import {
     useMultiRegionState,
@@ -23,43 +23,9 @@ import { StatusBadge } from "../shared/status-badge";
 import { OrchestratorAgent } from "../../agents/orchestrator-agent";
 import { IconButton } from "@fluentui/react/lib/Button";
 import { buildPoolConfigFromDefaults } from "../../store/pool-defaults";
+import { getAllVmSizes } from "../shared/vm-sizes";
 
 const stackTokens: IStackTokens = { childrenGap: 12 };
-
-const GPU_VMS = [
-    {
-        key: "Standard_ND40rs_v2",
-        text: "ND40rs_v2 (40 vCPUs, 8\u00d7V100, 672 GB)",
-        vCPUs: 40,
-    },
-    {
-        key: "Standard_ND96isr_H100_v5",
-        text: "ND96isr_H100_v5 (96 vCPUs, 8\u00d7H100, 1900 GB)",
-        vCPUs: 96,
-    },
-    {
-        key: "Standard_NC24s_v3",
-        text: "NC24s_v3 (24 vCPUs, 4\u00d7V100, 448 GB)",
-        vCPUs: 24,
-    },
-    {
-        key: "Standard_NC12s_v3",
-        text: "NC12s_v3 (12 vCPUs, 2\u00d7V100, 224 GB)",
-        vCPUs: 12,
-    },
-    {
-        key: "Standard_NC6s_v3",
-        text: "NC6s_v3 (6 vCPUs, 1\u00d7V100, 112 GB)",
-        vCPUs: 6,
-    },
-];
-
-const VM_DROPDOWN_OPTIONS: IDropdownOption[] = GPU_VMS.map((vm) => ({
-    key: vm.key,
-    text: vm.text,
-}));
-
-const MAX_VM_SELECTIONS = 5;
 
 const DEFAULT_POOL_CONFIG = {
     id: "pool",
@@ -104,32 +70,6 @@ interface PoolCreationPageProps {
     orchestrator: OrchestratorAgent;
 }
 
-/**
- * Compute the LP node count for a given account based on its approved
- * quota and the vCPU requirement of the chosen VM size.
- * Returns 0 when there is no approved quota or the VM lookup fails.
- */
-function computeLpNodeCount(
-    accountId: string,
-    vmSizeKey: string,
-    quotaRequests: Array<{
-        accountId: string;
-        status: string;
-        approvedLimit?: number;
-        currentUsage?: number;
-    }>
-): number {
-    const vm = GPU_VMS.find((v) => v.key === vmSizeKey);
-    if (!vm) return 0;
-    const quota = quotaRequests.find(
-        (q) => q.accountId === accountId && q.status === "approved"
-    );
-    if (!quota || !quota.approvedLimit) return 0;
-    const freeQuota = (quota.approvedLimit ?? 0) - (quota.currentUsage ?? 0);
-    if (freeQuota <= 0) return 0;
-    return Math.floor(freeQuota / vm.vCPUs);
-}
-
 export const PoolCreationPage: React.FC<PoolCreationPageProps> = ({
     orchestrator,
 }) => {
@@ -149,7 +89,6 @@ export const PoolCreationPage: React.FC<PoolCreationPageProps> = ({
     const [selectAll, setSelectAll] = React.useState(false);
     const [isRunning, setIsRunning] = React.useState(false);
     const [smartMode, setSmartMode] = React.useState(true);
-    const [selectedVmSizes, setSelectedVmSizes] = React.useState<string[]>([]);
     const [startTaskCmd, setStartTaskCmd] = React.useState(
         poolDefaults?.startTask?.commandLine ??
             DEFAULT_POOL_CONFIG.startTask.commandLine
@@ -227,21 +166,6 @@ export const PoolCreationPage: React.FC<PoolCreationPageProps> = ({
         []
     );
 
-    // Compute estimated total LP nodes across selected accounts (smart mode)
-    const estimatedTotalNodes = React.useMemo(() => {
-        if (!smartMode || selectedVmSizes.length === 0) return 0;
-        const primaryVm = selectedVmSizes[0];
-        let total = 0;
-        for (const accountId of selectedAccountIds) {
-            total += computeLpNodeCount(
-                accountId,
-                primaryVm,
-                state.quotaRequests as any
-            );
-        }
-        return total;
-    }, [smartMode, selectedVmSizes, selectedAccountIds, state.quotaRequests]);
-
     // Check if any pool is currently resizing
     const resizingPools = (state.poolInfos ?? []).filter(
         (p) =>
@@ -262,7 +186,10 @@ export const PoolCreationPage: React.FC<PoolCreationPageProps> = ({
 
             setIsRunning(true);
 
-            if (smartMode && selectedVmSizes.length > 0) {
+            if (smartMode) {
+                // Always use all VM sizes in priority order
+                const allVmNames = getAllVmSizes().map((v) => v.name);
+
                 // Build environment settings from the env var UI
                 const environmentSettings = envVars
                     .filter((ev) => ev.name.trim() !== "")
@@ -274,7 +201,7 @@ export const PoolCreationPage: React.FC<PoolCreationPageProps> = ({
                     poolConfig = buildPoolConfigFromDefaults(poolDefaults, {
                         id: "pool",
                         targetLowPriorityNodes: 0,
-                        vmSize: selectedVmSizes[0].toLowerCase(),
+                        vmSize: allVmNames[0].toLowerCase(),
                     });
                     // Force dedicated=0 for LP-only mode
                     poolConfig.targetDedicatedNodes = 0;
@@ -283,7 +210,7 @@ export const PoolCreationPage: React.FC<PoolCreationPageProps> = ({
                 } else {
                     poolConfig = {
                         id: "pool",
-                        vmSize: selectedVmSizes[0].toLowerCase(),
+                        vmSize: allVmNames[0].toLowerCase(),
                         virtualMachineConfiguration: {
                             nodeAgentSKUId: "batch.node.ubuntu 22.04",
                             imageReference: {
@@ -323,7 +250,7 @@ export const PoolCreationPage: React.FC<PoolCreationPageProps> = ({
                     action: "create_pools_smart",
                     payload: {
                         accountIds: Array.from(selectedAccountIds),
-                        vmSizes: selectedVmSizes,
+                        vmSizes: allVmNames,
                         poolConfig,
                         quotaType: "lowPriority",
                     },
@@ -352,12 +279,12 @@ export const PoolCreationPage: React.FC<PoolCreationPageProps> = ({
         selectedAccountIds,
         poolConfigJson,
         smartMode,
-        selectedVmSizes,
         startTaskCmd,
         envVars,
         maxRetryCount,
         waitForSuccess,
         resizingPools.length,
+        poolDefaults,
     ]);
 
     const handleRetryFailedPools = React.useCallback(() => {
@@ -412,24 +339,6 @@ export const PoolCreationPage: React.FC<PoolCreationPageProps> = ({
                     <StatusBadge status={quota.status} />
                 ) : (
                     <span style={{ color: "#605e5c" }}>-</span>
-                );
-            },
-        },
-        {
-            key: "estimatedNodes",
-            name: "Est. LP Nodes",
-            minWidth: 100,
-            onRender: (item) => {
-                if (!smartMode || selectedVmSizes.length === 0) return "-";
-                const count = computeLpNodeCount(
-                    item.id,
-                    selectedVmSizes[0],
-                    state.quotaRequests as any
-                );
-                return (
-                    <span style={{ fontWeight: 600 }}>
-                        {count > 0 ? count : "-"}
-                    </span>
                 );
             },
         },
@@ -508,14 +417,11 @@ export const PoolCreationPage: React.FC<PoolCreationPageProps> = ({
                     />
                 )}
 
-                {/* Summary: selected account count and estimated nodes */}
+                {/* Summary: selected account count */}
                 {selectedAccountIds.size > 0 && (
                     <MessageBar messageBarType={MessageBarType.info}>
                         <strong>{selectedAccountIds.size}</strong> account(s)
                         selected
-                        {smartMode &&
-                            selectedVmSizes.length > 0 &&
-                            ` | Estimated total LP nodes: ${estimatedTotalNodes}`}
                     </MessageBar>
                 )}
 
@@ -538,12 +444,16 @@ export const PoolCreationPage: React.FC<PoolCreationPageProps> = ({
 
                 {smartMode ? (
                     <>
-                        <MessageBar messageBarType={MessageBarType.info}>
-                            Smart Mode auto-calculates node counts from
-                            available LP quota. Select VM sizes in priority
-                            order -- if one fails (capacity/quota), it falls
-                            back to the next. targetDedicatedNodes is always 0;
-                            only low-priority/spot nodes are used.
+                        <MessageBar
+                            messageBarType={MessageBarType.info}
+                            styles={{ root: { marginBottom: 12 } }}
+                        >
+                            <strong>Smart Mode:</strong> Automatically fills all
+                            free LP quota across selected accounts. Creates
+                            pools starting with ND40rs_v2, then NC24s_v3,
+                            NC12s_v3, NC6s_v3. Waits for each pool to finish
+                            resizing, counts actual nodes, then fills remaining
+                            quota with the next VM size.
                         </MessageBar>
 
                         {resizingPools.length > 0 && (
@@ -552,53 +462,6 @@ export const PoolCreationPage: React.FC<PoolCreationPageProps> = ({
                                 resizing. Pool creation is blocked until they
                                 finish.
                             </MessageBar>
-                        )}
-
-                        <Dropdown
-                            label="GPU VM Sizes (select up to 5, in priority order)"
-                            placeholder="Select VM sizes..."
-                            required
-                            multiSelect
-                            aria-label="Select GPU VM sizes in priority order"
-                            options={VM_DROPDOWN_OPTIONS}
-                            selectedKeys={selectedVmSizes}
-                            onChange={(_e, option) => {
-                                if (!option) return;
-                                setSelectedVmSizes((prev) => {
-                                    if (option.selected) {
-                                        if (prev.length >= MAX_VM_SELECTIONS)
-                                            return prev;
-                                        return [...prev, option.key as string];
-                                    } else {
-                                        return prev.filter(
-                                            (k) => k !== option.key
-                                        );
-                                    }
-                                });
-                            }}
-                            styles={{ root: { maxWidth: 500 } }}
-                        />
-
-                        {selectedVmSizes.length > 0 && (
-                            <div style={{ fontSize: 12, color: "#605e5c" }}>
-                                Priority order:{" "}
-                                {selectedVmSizes.map((v, i) => (
-                                    <span key={v}>
-                                        <strong>{i + 1}.</strong>{" "}
-                                        {v.replace("Standard_", "")}
-                                        {i < selectedVmSizes.length - 1
-                                            ? " \u2192 "
-                                            : ""}
-                                    </span>
-                                ))}
-                                {selectedVmSizes.length > 1 && (
-                                    <span>
-                                        {" "}
-                                        (falls back in order if capacity
-                                        unavailable)
-                                    </span>
-                                )}
-                            </div>
                         )}
 
                         <TextField
@@ -794,8 +657,12 @@ export const PoolCreationPage: React.FC<PoolCreationPageProps> = ({
                     <PrimaryButton
                         text={
                             isRunning
-                                ? "Creating Pools..."
-                                : `Create Pools on ${selectedAccountIds.size} Accounts`
+                                ? smartMode
+                                    ? "Creating pools (waiting for resize)..."
+                                    : "Creating Pools..."
+                                : smartMode
+                                  ? "Create Pools (Smart Fill)"
+                                  : `Create Pools on ${selectedAccountIds.size} Accounts`
                         }
                         disabled={
                             isRunning ||
@@ -832,6 +699,54 @@ export const PoolCreationPage: React.FC<PoolCreationPageProps> = ({
                     label="Creating pools..."
                     styles={{ root: { marginTop: 16 } }}
                 />
+            )}
+
+            {isRunning && (
+                <div
+                    style={{
+                        background: "#1a1a1a",
+                        border: "1px solid #333",
+                        borderRadius: 6,
+                        padding: 12,
+                        marginTop: 16,
+                        maxHeight: 300,
+                        overflowY: "auto",
+                        fontFamily: "monospace",
+                        fontSize: 12,
+                    }}
+                >
+                    <Text
+                        variant="small"
+                        styles={{
+                            root: {
+                                color: "#888",
+                                marginBottom: 8,
+                                display: "block",
+                            },
+                        }}
+                    >
+                        Smart Creation Progress
+                    </Text>
+                    {state.agentLogs
+                        .filter((log) => log.agent === "pool")
+                        .slice(-20)
+                        .map((log, i) => (
+                            <div
+                                key={i}
+                                style={{
+                                    color:
+                                        log.level === "error"
+                                            ? "#d13438"
+                                            : log.level === "warn"
+                                              ? "#e3a400"
+                                              : "#8b8",
+                                    marginBottom: 2,
+                                }}
+                            >
+                                {log.message}
+                            </div>
+                        ))}
+                </div>
             )}
 
             {state.pools.length > 0 && (

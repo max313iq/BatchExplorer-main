@@ -1,6 +1,6 @@
 import { Agent, AgentContext, AgentResult, PoolInput } from "./agent-types";
 import { ManagedPool, AccountInfo, PoolInfo } from "../store/store-types";
-import { createPool } from "../services/batch-service";
+import { createPool, listPools } from "../services/batch-service";
 import { AzureRequestError } from "../services/types";
 
 /**
@@ -349,21 +349,49 @@ export class PoolAgent implements Agent {
                     totalCreated++;
                     accountCreated = true;
 
-                    // Subtract used quota and potentially create a second
-                    // pool with remaining quota using the next VM size
-                    remainingQuota -= maxNodes * vCPUs;
+                    // Wait for pool to finish resizing to get ACTUAL node count
+                    store.addLog({
+                        agent: "pool",
+                        level: "info",
+                        message: `${account.accountName}: Waiting for pool "${currentPoolId}" to finish resizing...`,
+                    });
 
-                    if (remainingQuota > 0 && vmIdx + 1 < vmSizes.length) {
+                    const accountEndpointStr = `https://${account.accountName}.${account.region}.batch.azure.com`;
+                    const resizeResult = await this._waitForPoolSteady(
+                        accountEndpointStr,
+                        currentPoolId,
+                        await this._tokenProvider()
+                    );
+
+                    const actualNodes = resizeResult.actualLpNodes;
+                    const actualCoresUsed = actualNodes * vCPUs;
+                    remainingQuota -= actualCoresUsed;
+
+                    store.addLog({
+                        agent: "pool",
+                        level: "info",
+                        message: `${account.accountName}: Pool "${currentPoolId}" (${vmSize}): ${actualNodes}/${maxNodes} nodes allocated (${actualCoresUsed} cores used, ${remainingQuota} cores remaining)`,
+                    });
+
+                    if (resizeResult.resizeErrors > 0) {
+                        store.addLog({
+                            agent: "pool",
+                            level: "warn",
+                            message: `${account.accountName}: Pool "${currentPoolId}" had ${resizeResult.resizeErrors} resize error(s)`,
+                        });
+                    }
+
+                    // ALWAYS continue to next VM if quota remains (waterfall fill)
+                    if (remainingQuota > 0) {
                         store.addLog({
                             agent: "pool",
                             level: "info",
-                            message: `${account.accountName}: ${remainingQuota} LP cores remaining, trying next VM size for partial fill`,
+                            message: `${account.accountName}: ${remainingQuota} LP cores remaining — trying next VM size`,
                         });
-                        // Continue the loop — next iteration picks next VM
-                        continue;
+                        continue; // next VM in the loop
                     }
 
-                    // Done with this account
+                    // No quota left — done with this account
                     break;
                 } catch (error: any) {
                     const errorMsg =
@@ -461,6 +489,97 @@ export class PoolAgent implements Agent {
                 failed: totalFailed,
                 failures,
             },
+        };
+    }
+
+    /**
+     * Poll until a pool's allocationState becomes "steady" or timeout.
+     * Returns the actual node counts so we can calculate real quota usage.
+     */
+    private async _waitForPoolSteady(
+        endpoint: string,
+        poolId: string,
+        _token: string,
+        timeoutMs: number = 600000 // 10 minutes
+    ): Promise<{
+        actualLpNodes: number;
+        targetLpNodes: number;
+        actualDedicatedNodes: number;
+        allocationState: string;
+        resizeErrors: number;
+    }> {
+        const { store } = this._ctx;
+        const pollIntervalMs = 15000; // 15 seconds
+        const maxPolls = Math.ceil(timeoutMs / pollIntervalMs);
+
+        for (let i = 0; i < maxPolls; i++) {
+            if (this._cancelled) break;
+
+            await new Promise((resolve) => setTimeout(resolve, pollIntervalMs));
+
+            try {
+                // Need a fresh token for each poll since tokens can expire
+                const freshToken = await this._tokenProvider();
+                const pools = await listPools(endpoint, freshToken);
+                const pool = pools.find(
+                    (p) => p.id?.toLowerCase() === poolId.toLowerCase()
+                );
+
+                if (!pool) {
+                    store.addLog({
+                        agent: "pool",
+                        level: "warn",
+                        message: `Pool ${poolId} not found during resize poll (poll ${i + 1}/${maxPolls})`,
+                    });
+                    continue;
+                }
+
+                const state = (pool as any).allocationState ?? "unknown";
+                const currentLp = (pool as any).currentLowPriorityNodes ?? 0;
+                const targetLp = (pool as any).targetLowPriorityNodes ?? 0;
+                const currentDedicated =
+                    (pool as any).currentDedicatedNodes ?? 0;
+                const errors = Array.isArray((pool as any).resizeErrors)
+                    ? (pool as any).resizeErrors.length
+                    : 0;
+
+                store.addLog({
+                    agent: "pool",
+                    level: "info",
+                    message: `Pool ${poolId}: ${state} — ${currentLp}/${targetLp} LP nodes (poll ${i + 1})`,
+                });
+
+                if (state === "steady" || state === "stopping") {
+                    return {
+                        actualLpNodes: currentLp,
+                        targetLpNodes: targetLp,
+                        actualDedicatedNodes: currentDedicated,
+                        allocationState: state,
+                        resizeErrors: errors,
+                    };
+                }
+            } catch (err) {
+                store.addLog({
+                    agent: "pool",
+                    level: "warn",
+                    message: `Poll error for ${poolId}: ${err instanceof Error ? err.message : String(err)}`,
+                });
+            }
+        }
+
+        // Timeout — return last known state
+        store.addLog({
+            agent: "pool",
+            level: "warn",
+            message: `Pool ${poolId}: resize timeout after ${timeoutMs / 1000}s, proceeding with partial data`,
+        });
+
+        return {
+            actualLpNodes: 0,
+            targetLpNodes: 0,
+            actualDedicatedNodes: 0,
+            allocationState: "timeout",
+            resizeErrors: 0,
         };
     }
 
