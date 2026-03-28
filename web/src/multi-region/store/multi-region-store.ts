@@ -4,6 +4,7 @@ import {
     AgentLogEntry,
     AgentName,
     AgentStatus,
+    AuditEntry,
     AzureLoginAccount,
     createInitialState,
     DEFAULT_AGENT_STATUSES,
@@ -219,6 +220,21 @@ export class MultiRegionStore {
 
     clearLogs(): void {
         this._state = { ...this._state, agentLogs: [] };
+        this._notify();
+    }
+
+    // --- Audit Entries ---
+
+    /** Prepend an audit entry (newest first), capped at 500 entries. */
+    addAuditEntry(entry: AuditEntry): void {
+        const auditEntries = [entry, ...this._state.auditEntries].slice(0, 500);
+        this._state = { ...this._state, auditEntries };
+        this._notify();
+    }
+
+    /** Clear all audit entries. */
+    clearAuditEntries(): void {
+        this._state = { ...this._state, auditEntries: [] };
         this._notify();
     }
 

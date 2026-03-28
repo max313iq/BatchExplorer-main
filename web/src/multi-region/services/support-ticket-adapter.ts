@@ -20,6 +20,34 @@
 
 const API_VERSION = "2025-06-01-preview";
 
+const ALLOWED_ARM_HOSTS = new Set([
+    "management.azure.com",
+    "management.chinacloudapi.cn",
+    "management.usgovcloudapi.net",
+    "management.microsoftazure.de",
+]);
+
+/**
+ * Validate that `armUrl` points to a known Azure management endpoint.
+ * Prevents SSRF by restricting the target to legitimate ARM hosts.
+ */
+function validateArmUrl(armUrl: string): void {
+    try {
+        const { hostname, protocol } = new URL(armUrl);
+        if (protocol !== "https:") {
+            throw new Error("armUrl must use HTTPS.");
+        }
+        if (!ALLOWED_ARM_HOSTS.has(hostname)) {
+            throw new Error(
+                `armUrl hostname "${hostname}" is not a known Azure management endpoint.`
+            );
+        }
+    } catch (e) {
+        if (e instanceof Error && e.message.startsWith("armUrl")) throw e;
+        throw new Error("Invalid armUrl: must be a valid HTTPS URL.");
+    }
+}
+
 /** Parameters for creating a quota support ticket. */
 export interface SubmitQuotaTicketParams {
     armUrl: string;
@@ -65,7 +93,8 @@ export class SupportTicketAdapter {
     ): Promise<SupportTicketResponse> {
         const { armUrl, subscriptionId, ticketId, token, body, extraHeaders } =
             params;
-        const url = `${armUrl}/subscriptions/${subscriptionId}/providers/Microsoft.Support/supportTickets/${ticketId}?api-version=${API_VERSION}`;
+        validateArmUrl(armUrl);
+        const url = `${armUrl}/subscriptions/${encodeURIComponent(subscriptionId)}/providers/Microsoft.Support/supportTickets/${encodeURIComponent(ticketId)}?api-version=${API_VERSION}`;
 
         const headers: Record<string, string> = {
             "Content-Type": "application/json",
@@ -104,7 +133,8 @@ export class SupportTicketAdapter {
         token: string,
         armUrl = "https://management.azure.com"
     ): Promise<SupportTicketResponse> {
-        const url = `${armUrl}/subscriptions/${subscriptionId}/providers/Microsoft.Support/supportTickets/${ticketId}?api-version=${API_VERSION}`;
+        validateArmUrl(armUrl);
+        const url = `${armUrl}/subscriptions/${encodeURIComponent(subscriptionId)}/providers/Microsoft.Support/supportTickets/${encodeURIComponent(ticketId)}?api-version=${API_VERSION}`;
 
         const response = await fetch(url, {
             method: "GET",
@@ -135,7 +165,8 @@ export class SupportTicketAdapter {
         subscriptionId: string,
         token: string
     ): Promise<SupportPlan[]> {
-        const url = `${armUrl}/subscriptions/${subscriptionId}/providers/Microsoft.Support/supportPlanTypes?api-version=${API_VERSION}`;
+        validateArmUrl(armUrl);
+        const url = `${armUrl}/subscriptions/${encodeURIComponent(subscriptionId)}/providers/Microsoft.Support/supportPlanTypes?api-version=${API_VERSION}`;
 
         const response = await fetch(url, {
             headers: { Authorization: `Bearer ${token}` },

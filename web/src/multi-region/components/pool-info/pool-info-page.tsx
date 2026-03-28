@@ -109,15 +109,31 @@ export const PoolInfoPage: React.FC<PoolInfoPageProps> = ({ orchestrator }) => {
     );
     const [startTaskSubmitting, setStartTaskSubmitting] = React.useState(false);
 
+    // Remove empty pools dialog state
+    const [showDeleteEmptyDialog, setShowDeleteEmptyDialog] =
+        React.useState(false);
+    const [deleteEmptySubmitting, setDeleteEmptySubmitting] =
+        React.useState(false);
+
+    // Pagination state
+    const [page, setPage] = React.useState(0);
+    const [pageSize, setPageSize] = React.useState(25);
+
+    // Error state
+    const [error, setError] = React.useState<Error | null>(null);
+
     const refresh = React.useCallback(async () => {
         setLoading(true);
+        setError(null);
         try {
             await orchestrator.execute({
                 action: "refresh_pool_info",
                 payload: {},
             });
-        } catch {
-            /* handled by orchestrator */
+        } catch (err) {
+            setError(
+                err instanceof Error ? err : new Error("Unknown error occurred")
+            );
         } finally {
             setLoading(false);
         }
@@ -297,6 +313,59 @@ export const PoolInfoPage: React.FC<PoolInfoPageProps> = ({ orchestrator }) => {
 
         return sorted;
     }, [filteredPools, sortKey, sortDescending]);
+
+    // Reset page when filters/sort change
+    React.useEffect(() => {
+        setPage(0);
+    }, [
+        searchText,
+        filterRegions,
+        filterVmSizes,
+        filterAllocationState,
+        filterState,
+        sortKey,
+        sortDescending,
+    ]);
+
+    // Paginated pools
+    const totalPages = Math.max(1, Math.ceil(sortedPools.length / pageSize));
+    const paginatedPools = React.useMemo(
+        () => sortedPools.slice(page * pageSize, (page + 1) * pageSize),
+        [sortedPools, page, pageSize]
+    );
+
+    // Empty pools for removal
+    const emptyPools = React.useMemo(
+        () =>
+            pools.filter(
+                (p) =>
+                    p.currentDedicatedNodes === 0 &&
+                    p.currentLowPriorityNodes === 0
+            ),
+        [pools]
+    );
+
+    const submitDeleteEmptyPools = async () => {
+        setDeleteEmptySubmitting(true);
+        try {
+            await Promise.allSettled(
+                emptyPools.map((pool) =>
+                    orchestrator.execute({
+                        action: "delete_pool",
+                        payload: {
+                            accountId: pool.accountId,
+                            poolId: pool.poolId,
+                        },
+                    })
+                )
+            );
+            setShowDeleteEmptyDialog(false);
+        } catch {
+            /* handled by orchestrator */
+        } finally {
+            setDeleteEmptySubmitting(false);
+        }
+    };
 
     // Summary stats
     const totalPools = pools.length;
@@ -485,7 +554,6 @@ export const PoolInfoPage: React.FC<PoolInfoPageProps> = ({ orchestrator }) => {
             {
                 key: "poolId",
                 name: "Pool ID",
-                fieldName: "poolId",
                 minWidth: 120,
                 maxWidth: 200,
                 isResizable: true,
@@ -493,11 +561,23 @@ export const PoolInfoPage: React.FC<PoolInfoPageProps> = ({ orchestrator }) => {
                 isSortedDescending: sortKey === "poolId" && sortDescending,
                 onColumnClick: handleColumnClick,
                 data: { sortKey: "poolId" },
+                ariaLabel: "Pool ID, sortable column",
+                onRender: (item: PoolInfo) => (
+                    <span
+                        title={item.poolId}
+                        style={{
+                            overflow: "hidden",
+                            textOverflow: "ellipsis",
+                            whiteSpace: "nowrap",
+                        }}
+                    >
+                        {item.poolId}
+                    </span>
+                ),
             },
             {
                 key: "accountName",
                 name: "Account",
-                fieldName: "accountName",
                 minWidth: 100,
                 maxWidth: 160,
                 isResizable: true,
@@ -505,6 +585,19 @@ export const PoolInfoPage: React.FC<PoolInfoPageProps> = ({ orchestrator }) => {
                 isSortedDescending: sortKey === "accountName" && sortDescending,
                 onColumnClick: handleColumnClick,
                 data: { sortKey: "accountName" },
+                ariaLabel: "Account name, sortable column",
+                onRender: (item: PoolInfo) => (
+                    <span
+                        title={item.accountName}
+                        style={{
+                            overflow: "hidden",
+                            textOverflow: "ellipsis",
+                            whiteSpace: "nowrap",
+                        }}
+                    >
+                        {item.accountName}
+                    </span>
+                ),
             },
             {
                 key: "region",
@@ -517,11 +610,11 @@ export const PoolInfoPage: React.FC<PoolInfoPageProps> = ({ orchestrator }) => {
                 isSortedDescending: sortKey === "region" && sortDescending,
                 onColumnClick: handleColumnClick,
                 data: { sortKey: "region" },
+                ariaLabel: "Region, sortable column",
             },
             {
                 key: "vmSize",
                 name: "VM Size",
-                fieldName: "vmSize",
                 minWidth: 100,
                 maxWidth: 160,
                 isResizable: true,
@@ -529,6 +622,19 @@ export const PoolInfoPage: React.FC<PoolInfoPageProps> = ({ orchestrator }) => {
                 isSortedDescending: sortKey === "vmSize" && sortDescending,
                 onColumnClick: handleColumnClick,
                 data: { sortKey: "vmSize" },
+                ariaLabel: "VM Size, sortable column",
+                onRender: (item: PoolInfo) => (
+                    <span
+                        title={item.vmSize}
+                        style={{
+                            overflow: "hidden",
+                            textOverflow: "ellipsis",
+                            whiteSpace: "nowrap",
+                        }}
+                    >
+                        {item.vmSize}
+                    </span>
+                ),
             },
             {
                 key: "state",
@@ -540,6 +646,7 @@ export const PoolInfoPage: React.FC<PoolInfoPageProps> = ({ orchestrator }) => {
                 isSortedDescending: sortKey === "state" && sortDescending,
                 onColumnClick: handleColumnClick,
                 data: { sortKey: "state" },
+                ariaLabel: "State, sortable column",
                 onRender: (item: PoolInfo) => (
                     <StatusBadge status={item.state} />
                 ),
@@ -556,6 +663,7 @@ export const PoolInfoPage: React.FC<PoolInfoPageProps> = ({ orchestrator }) => {
                     sortKey === "allocationState" && sortDescending,
                 onColumnClick: handleColumnClick,
                 data: { sortKey: "allocationState" },
+                ariaLabel: "Allocation state, sortable column",
             },
             {
                 key: "dedicated",
@@ -567,6 +675,7 @@ export const PoolInfoPage: React.FC<PoolInfoPageProps> = ({ orchestrator }) => {
                 isSortedDescending: sortKey === "dedicated" && sortDescending,
                 onColumnClick: handleColumnClick,
                 data: { sortKey: "dedicated" },
+                ariaLabel: "Dedicated nodes, sortable column",
                 onRender: (item: PoolInfo) => (
                     <span>
                         {item.currentDedicatedNodes} /{" "}
@@ -584,6 +693,7 @@ export const PoolInfoPage: React.FC<PoolInfoPageProps> = ({ orchestrator }) => {
                 isSortedDescending: sortKey === "lowPriority" && sortDescending,
                 onColumnClick: handleColumnClick,
                 data: { sortKey: "lowPriority" },
+                ariaLabel: "Low priority nodes, sortable column",
                 onRender: (item: PoolInfo) => (
                     <span>
                         {item.currentLowPriorityNodes} /{" "}
@@ -602,6 +712,7 @@ export const PoolInfoPage: React.FC<PoolInfoPageProps> = ({ orchestrator }) => {
                 isSortedDescending: sortKey === "taskSlots" && sortDescending,
                 onColumnClick: handleColumnClick,
                 data: { sortKey: "taskSlots" },
+                ariaLabel: "Task slots per node, sortable column",
             },
             {
                 key: "autoScale",
@@ -613,6 +724,7 @@ export const PoolInfoPage: React.FC<PoolInfoPageProps> = ({ orchestrator }) => {
                 isSortedDescending: sortKey === "autoScale" && sortDescending,
                 onColumnClick: handleColumnClick,
                 data: { sortKey: "autoScale" },
+                ariaLabel: "Auto scale enabled, sortable column",
                 onRender: (item: PoolInfo) => (
                     <span>{item.enableAutoScale ? "Yes" : "No"}</span>
                 ),
@@ -628,6 +740,7 @@ export const PoolInfoPage: React.FC<PoolInfoPageProps> = ({ orchestrator }) => {
                     sortKey === "resizeErrors" && sortDescending,
                 onColumnClick: handleColumnClick,
                 data: { sortKey: "resizeErrors" },
+                ariaLabel: "Resize errors count, sortable column",
                 onRender: (item: PoolInfo) => {
                     const count = item.resizeErrors?.length ?? 0;
                     return (
@@ -652,6 +765,7 @@ export const PoolInfoPage: React.FC<PoolInfoPageProps> = ({ orchestrator }) => {
                 isSortedDescending: sortKey === "created" && sortDescending,
                 onColumnClick: handleColumnClick,
                 data: { sortKey: "created" },
+                ariaLabel: "Creation time, sortable column",
                 onRender: (item: PoolInfo) =>
                     item.creationTime
                         ? new Date(item.creationTime).toLocaleString()
@@ -683,34 +797,57 @@ export const PoolInfoPage: React.FC<PoolInfoPageProps> = ({ orchestrator }) => {
                     iconProps={{ iconName: "Refresh" }}
                     onClick={refresh}
                     disabled={loading}
+                    aria-label="Refresh pools"
                 />
                 {loading && (
-                    <>
-                        <Spinner size={SpinnerSize.small} />
-                        <DefaultButton
-                            text="Stop"
-                            iconProps={{ iconName: "Stop" }}
-                            onClick={stop}
-                            styles={{
-                                root: {
-                                    borderColor: "#d13438",
-                                    color: "#d13438",
-                                },
-                            }}
-                        />
-                    </>
+                    <span role="status" aria-live="polite">
+                        <Stack
+                            horizontal
+                            verticalAlign="center"
+                            tokens={{ childrenGap: 8 }}
+                        >
+                            <Spinner size={SpinnerSize.small} />
+                            <DefaultButton
+                                text="Stop"
+                                iconProps={{ iconName: "Stop" }}
+                                onClick={stop}
+                                aria-label="Stop refreshing"
+                                styles={{
+                                    root: {
+                                        borderColor: "#d13438",
+                                        color: "#d13438",
+                                    },
+                                }}
+                            />
+                        </Stack>
+                    </span>
                 )}
                 <PrimaryButton
                     text="Resize Pool"
                     iconProps={{ iconName: "ScaleVolume" }}
                     onClick={openResizeDialog}
                     disabled={!selectedPool}
+                    aria-label="Resize selected pools"
                 />
                 <DefaultButton
                     text="Update Start Task"
                     iconProps={{ iconName: "Play" }}
                     onClick={openStartTaskDialog}
                     disabled={!selectedPool}
+                    aria-label="Update start task for selected pools"
+                />
+                <DefaultButton
+                    text="Remove Empty Pools"
+                    iconProps={{ iconName: "Delete" }}
+                    onClick={() => setShowDeleteEmptyDialog(true)}
+                    disabled={emptyPools.length === 0 || loading}
+                    aria-label="Remove empty pools"
+                    styles={{
+                        root: {
+                            borderColor: "#d13438",
+                            color: "#d13438",
+                        },
+                    }}
                 />
                 <Toggle
                     label="Auto-refresh (30s)"
@@ -819,6 +956,7 @@ export const PoolInfoPage: React.FC<PoolInfoPageProps> = ({ orchestrator }) => {
                     <DefaultButton
                         text="Clear Filters"
                         iconProps={{ iconName: "ClearFilter" }}
+                        aria-label="Clear all filters"
                         onClick={() => {
                             setSearchText("");
                             setFilterRegions([]);
@@ -835,6 +973,8 @@ export const PoolInfoPage: React.FC<PoolInfoPageProps> = ({ orchestrator }) => {
             <Stack
                 horizontal
                 tokens={{ childrenGap: 24 }}
+                role="status"
+                aria-live="polite"
                 styles={{
                     root: {
                         padding: "12px 16px",
@@ -884,13 +1024,88 @@ export const PoolInfoPage: React.FC<PoolInfoPageProps> = ({ orchestrator }) => {
                 )}
             </Stack>
 
+            {/* Error state */}
+            {error && (
+                <MessageBar messageBarType={MessageBarType.error} isMultiline>
+                    Failed to load pool information: {error.message}
+                    <DefaultButton
+                        text="Retry"
+                        onClick={refresh}
+                        aria-label="Retry loading pools"
+                        styles={{ root: { marginLeft: 8 } }}
+                    />
+                </MessageBar>
+            )}
+
+            {/* Skeleton loader */}
+            {loading && pools.length === 0 && !error && (
+                <div
+                    style={{
+                        background: "#1e1e1e",
+                        borderRadius: 6,
+                        padding: 8,
+                    }}
+                >
+                    <style>{`
+                        @keyframes pulse {
+                            0%, 100% { opacity: 0.4; }
+                            50% { opacity: 1; }
+                        }
+                    `}</style>
+                    {[0, 1, 2, 3, 4].map((row) => (
+                        <div
+                            key={row}
+                            style={{
+                                display: "flex",
+                                gap: 12,
+                                padding: "10px 8px",
+                                borderBottom: "1px solid #2a2a2a",
+                            }}
+                        >
+                            {[
+                                120, 100, 80, 100, 70, 90, 80, 80, 60, 60, 80,
+                                120,
+                            ].map((width, col) => (
+                                <div
+                                    key={col}
+                                    style={{
+                                        width,
+                                        height: 16,
+                                        borderRadius: 4,
+                                        background: "#333",
+                                        animation:
+                                            "pulse 1.5s ease-in-out infinite",
+                                        animationDelay: `${row * 0.1 + col * 0.05}s`,
+                                    }}
+                                />
+                            ))}
+                        </div>
+                    ))}
+                </div>
+            )}
+
+            {/* Empty state */}
+            {!loading && !error && pools.length === 0 && (
+                <Stack
+                    horizontalAlign="center"
+                    tokens={{ childrenGap: 12 }}
+                    styles={{ root: { padding: 40 } }}
+                >
+                    <Icon
+                        iconName="BuildQueue"
+                        styles={{ root: { fontSize: 48, color: "#555" } }}
+                    />
+                    <Text variant="large" styles={{ root: { color: "#888" } }}>
+                        No pools found
+                    </Text>
+                    <Text variant="small" styles={{ root: { color: "#666" } }}>
+                        Pools will appear here after discovery
+                    </Text>
+                </Stack>
+            )}
+
             {/* Select All + DetailsList */}
-            {pools.length === 0 ? (
-                <Text variant="medium" styles={{ root: { color: "#666" } }}>
-                    No pool info available. Click &quot;Refresh Pool Info&quot;
-                    to load data.
-                </Text>
-            ) : (
+            {pools.length > 0 && (
                 <div
                     style={{
                         background: "#1e1e1e",
@@ -925,7 +1140,7 @@ export const PoolInfoPage: React.FC<PoolInfoPageProps> = ({ orchestrator }) => {
                         )}
                     </Stack>
                     <DetailsList
-                        items={sortedPools}
+                        items={paginatedPools}
                         columns={columns}
                         layoutMode={DetailsListLayoutMode.fixedColumns}
                         selectionMode={SelectionMode.multiple}
@@ -955,8 +1170,164 @@ export const PoolInfoPage: React.FC<PoolInfoPageProps> = ({ orchestrator }) => {
                             },
                         }}
                     />
+
+                    {/* Pagination */}
+                    <Stack
+                        horizontal
+                        verticalAlign="center"
+                        horizontalAlign="space-between"
+                        tokens={{ childrenGap: 12 }}
+                        styles={{
+                            root: {
+                                padding: "8px 8px 4px",
+                                borderTop: "1px solid #2a2a2a",
+                                marginTop: 4,
+                            },
+                        }}
+                    >
+                        <Stack
+                            horizontal
+                            verticalAlign="center"
+                            tokens={{ childrenGap: 8 }}
+                        >
+                            <Text
+                                variant="small"
+                                styles={{ root: { color: "#999" } }}
+                            >
+                                Page size:
+                            </Text>
+                            <Dropdown
+                                selectedKey={pageSize}
+                                options={[
+                                    { key: 10, text: "10" },
+                                    { key: 25, text: "25" },
+                                    { key: 50, text: "50" },
+                                    { key: 100, text: "100" },
+                                ]}
+                                onChange={(_e, option) => {
+                                    if (option) {
+                                        setPageSize(option.key as number);
+                                        setPage(0);
+                                    }
+                                }}
+                                styles={{
+                                    root: { width: 70 },
+                                    dropdown: { fontSize: 12 },
+                                }}
+                            />
+                        </Stack>
+                        <Stack
+                            horizontal
+                            verticalAlign="center"
+                            tokens={{ childrenGap: 8 }}
+                        >
+                            <DefaultButton
+                                text="< Prev"
+                                onClick={() =>
+                                    setPage((p) => Math.max(0, p - 1))
+                                }
+                                disabled={page === 0}
+                                aria-label="Previous page"
+                                styles={{
+                                    root: { minWidth: 60, fontSize: 12 },
+                                }}
+                            />
+                            <Text
+                                variant="small"
+                                styles={{ root: { color: "#ccc" } }}
+                                role="status"
+                                aria-live="polite"
+                            >
+                                Page {page + 1} of {totalPages}
+                            </Text>
+                            <DefaultButton
+                                text="Next >"
+                                onClick={() =>
+                                    setPage((p) =>
+                                        Math.min(totalPages - 1, p + 1)
+                                    )
+                                }
+                                disabled={page >= totalPages - 1}
+                                aria-label="Next page"
+                                styles={{
+                                    root: { minWidth: 60, fontSize: 12 },
+                                }}
+                            />
+                        </Stack>
+                        <Text
+                            variant="tiny"
+                            styles={{ root: { color: "#888" } }}
+                            role="status"
+                            aria-live="polite"
+                        >
+                            {sortedPools.length} total items
+                        </Text>
+                    </Stack>
                 </div>
             )}
+
+            {/* Remove Empty Pools Dialog */}
+            <Dialog
+                hidden={!showDeleteEmptyDialog}
+                onDismiss={() => setShowDeleteEmptyDialog(false)}
+                dialogContentProps={{
+                    type: DialogType.normal,
+                    title: `Remove ${emptyPools.length} empty pools?`,
+                    subText: "This action cannot be undone.",
+                }}
+                modalProps={{
+                    isBlocking: true,
+                    styles: { main: { minWidth: 480 } },
+                }}
+            >
+                <Stack
+                    tokens={{ childrenGap: 4 }}
+                    styles={{ root: { maxHeight: 200, overflowY: "auto" } }}
+                >
+                    {emptyPools.slice(0, 10).map((pool) => (
+                        <Text
+                            key={pool.id}
+                            variant="small"
+                            styles={{ root: { color: "#ccc" } }}
+                        >
+                            {pool.poolId} ({pool.accountName} / {pool.region})
+                        </Text>
+                    ))}
+                    {emptyPools.length > 10 && (
+                        <Text
+                            variant="small"
+                            styles={{
+                                root: { color: "#888", fontStyle: "italic" },
+                            }}
+                        >
+                            and {emptyPools.length - 10} more...
+                        </Text>
+                    )}
+                </Stack>
+                <DialogFooter>
+                    <PrimaryButton
+                        text={deleteEmptySubmitting ? "Deleting..." : "Remove"}
+                        onClick={submitDeleteEmptyPools}
+                        disabled={deleteEmptySubmitting}
+                        aria-label="Confirm remove empty pools"
+                        styles={{
+                            root: {
+                                backgroundColor: "#d13438",
+                                borderColor: "#d13438",
+                            },
+                            rootHovered: {
+                                backgroundColor: "#a4262c",
+                                borderColor: "#a4262c",
+                            },
+                        }}
+                    />
+                    <DefaultButton
+                        text="Cancel"
+                        onClick={() => setShowDeleteEmptyDialog(false)}
+                        disabled={deleteEmptySubmitting}
+                    />
+                </DialogFooter>
+            </Dialog>
 
             {/* Resize Pool Dialog */}
             <Dialog

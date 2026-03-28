@@ -12,9 +12,173 @@ import { Toggle } from "@fluentui/react/lib/Toggle";
 import { Spinner, SpinnerSize } from "@fluentui/react/lib/Spinner";
 import { Icon } from "@fluentui/react/lib/Icon";
 import { Checkbox } from "@fluentui/react/lib/Checkbox";
+import { Dropdown, IDropdownOption } from "@fluentui/react/lib/Dropdown";
+import { MessageBar, MessageBarType } from "@fluentui/react/lib/MessageBar";
 import { useMultiRegionState } from "../../store/store-context";
 import { OrchestratorAgent } from "../../agents/orchestrator-agent";
 import { AccountInfo } from "../../store/store-types";
+
+/* ------------------------------------------------------------------ */
+/*  Skeleton                                                           */
+/* ------------------------------------------------------------------ */
+
+const SKELETON_KEYFRAMES = `
+@keyframes skeletonPulse {
+  0% { opacity: 0.6; }
+  50% { opacity: 1; }
+  100% { opacity: 0.6; }
+}`;
+
+const TableSkeleton: React.FC = () => (
+    <div
+        style={{
+            background: "#1e1e1e",
+            borderRadius: 6,
+            padding: 16,
+        }}
+        aria-label="Loading account data"
+        role="status"
+        aria-hidden="true"
+    >
+        {/* Header row */}
+        <div
+            style={{
+                display: "flex",
+                gap: 12,
+                marginBottom: 12,
+                borderBottom: "1px solid #333",
+                paddingBottom: 8,
+            }}
+        >
+            {[80, 120, 80, 70, 70, 70, 70, 70, 70, 70].map((w, i) => (
+                <div
+                    key={i}
+                    style={{
+                        width: w,
+                        height: 12,
+                        background: "#333",
+                        borderRadius: 4,
+                        animation: "skeletonPulse 1.5s ease-in-out infinite",
+                    }}
+                />
+            ))}
+        </div>
+        {/* Data rows */}
+        {Array.from({ length: 6 }).map((_, row) => (
+            <div
+                key={row}
+                style={{
+                    display: "flex",
+                    gap: 12,
+                    padding: "8px 0",
+                    borderBottom: "1px solid #2a2a2a",
+                }}
+            >
+                {[80, 120, 80, 70, 70, 70, 70, 70, 70, 70].map((w, i) => (
+                    <div
+                        key={i}
+                        style={{
+                            width: w,
+                            height: 10,
+                            background: "#333",
+                            borderRadius: 4,
+                            animation:
+                                "skeletonPulse 1.5s ease-in-out infinite",
+                            animationDelay: `${row * 0.1}s`,
+                        }}
+                    />
+                ))}
+            </div>
+        ))}
+    </div>
+);
+
+/* ------------------------------------------------------------------ */
+/*  Pagination                                                         */
+/* ------------------------------------------------------------------ */
+
+const PAGE_SIZE_OPTIONS: IDropdownOption[] = [
+    { key: 10, text: "10" },
+    { key: 25, text: "25" },
+    { key: 50, text: "50" },
+    { key: 100, text: "100" },
+];
+
+const Pagination: React.FC<{
+    page: number;
+    pageSize: number;
+    totalItems: number;
+    onPageChange: (page: number) => void;
+    onPageSizeChange: (size: number) => void;
+}> = ({ page, pageSize, totalItems, onPageChange, onPageSizeChange }) => {
+    const totalPages = Math.max(1, Math.ceil(totalItems / pageSize));
+    return (
+        <Stack
+            horizontal
+            verticalAlign="center"
+            tokens={{ childrenGap: 12 }}
+            styles={{
+                root: {
+                    padding: "8px 0",
+                    justifyContent: "space-between",
+                },
+            }}
+        >
+            <Stack
+                horizontal
+                verticalAlign="center"
+                tokens={{ childrenGap: 8 }}
+            >
+                <DefaultButton
+                    text="Prev"
+                    onClick={() => onPageChange(page - 1)}
+                    disabled={page <= 1}
+                    aria-label="Previous page"
+                    styles={{ root: { minWidth: 60 } }}
+                />
+                <Text
+                    styles={{ root: { color: "#999", fontSize: 13 } }}
+                    role="status"
+                    aria-live="polite"
+                >
+                    Page {page} of {totalPages}
+                </Text>
+                <DefaultButton
+                    text="Next"
+                    onClick={() => onPageChange(page + 1)}
+                    disabled={page >= totalPages}
+                    aria-label="Next page"
+                    styles={{ root: { minWidth: 60 } }}
+                />
+            </Stack>
+            <Stack
+                horizontal
+                verticalAlign="center"
+                tokens={{ childrenGap: 8 }}
+            >
+                <Text styles={{ root: { color: "#888", fontSize: 12 } }}>
+                    Rows:
+                </Text>
+                <Dropdown
+                    options={PAGE_SIZE_OPTIONS}
+                    selectedKey={pageSize}
+                    onChange={(_e, o) => {
+                        if (o) onPageSizeChange(o.key as number);
+                    }}
+                    styles={{ dropdown: { width: 70 } }}
+                    aria-label="Rows per page"
+                />
+                <Text styles={{ root: { color: "#666", fontSize: 11 } }}>
+                    ({totalItems} total)
+                </Text>
+            </Stack>
+        </Stack>
+    );
+};
+
+/* ------------------------------------------------------------------ */
+/*  Helpers                                                            */
+/* ------------------------------------------------------------------ */
 
 export interface AccountInfoPageProps {
     orchestrator: OrchestratorAgent;
@@ -58,6 +222,11 @@ const UsageBar: React.FC<{ used: number; quota: number }> = ({
                     background: "#333",
                     borderRadius: 2,
                 }}
+                role="progressbar"
+                aria-valuenow={pct}
+                aria-valuemin={0}
+                aria-valuemax={100}
+                aria-label={`Usage: ${used} of ${quota}`}
             >
                 <div
                     style={{
@@ -125,6 +294,51 @@ function sortAccounts(
     return sorted;
 }
 
+function ariaSort(
+    sortConfig: SortConfig | null,
+    key: string
+): "ascending" | "descending" | "none" {
+    if (!sortConfig || sortConfig.key !== key) return "none";
+    return sortConfig.direction === "asc" ? "ascending" : "descending";
+}
+
+/* ------------------------------------------------------------------ */
+/*  Empty state                                                        */
+/* ------------------------------------------------------------------ */
+
+const EmptyState: React.FC = () => (
+    <Stack
+        horizontalAlign="center"
+        tokens={{ childrenGap: 12 }}
+        styles={{
+            root: {
+                padding: "48px 16px",
+                background: "#1e1e1e",
+                borderRadius: 6,
+            },
+        }}
+        role="status"
+    >
+        <Icon
+            iconName="AccountManagement"
+            styles={{ root: { fontSize: 40, color: "#555" } }}
+        />
+        <Text
+            variant="large"
+            styles={{ root: { color: "#888", fontWeight: 600 } }}
+        >
+            No account info found
+        </Text>
+        <Text styles={{ root: { color: "#666", fontSize: 13 } }}>
+            Click &quot;Refresh&quot; to load account data from Azure.
+        </Text>
+    </Stack>
+);
+
+/* ------------------------------------------------------------------ */
+/*  Main component                                                     */
+/* ------------------------------------------------------------------ */
+
 export const AccountInfoPage: React.FC<AccountInfoPageProps> = ({
     orchestrator,
 }) => {
@@ -135,19 +349,24 @@ export const AccountInfoPage: React.FC<AccountInfoPageProps> = ({
     const [selectedIds, setSelectedIds] = React.useState<Set<string>>(
         new Set()
     );
+    const [error, setError] = React.useState<string | null>(null);
+    const [page, setPage] = React.useState(1);
+    const [pageSize, setPageSize] = React.useState(25);
     const intervalRef = React.useRef<ReturnType<typeof setInterval> | null>(
         null
     );
 
     const refresh = React.useCallback(async () => {
         setLoading(true);
+        setError(null);
         try {
             await orchestrator.execute({
                 action: "refresh_account_info",
                 payload: {},
             });
-        } catch {
-            /* handled by orchestrator */
+        } catch (e: unknown) {
+            const msg = e instanceof Error ? e.message : String(e);
+            setError(msg);
         } finally {
             setLoading(false);
         }
@@ -185,22 +404,36 @@ export const AccountInfoPage: React.FC<AccountInfoPageProps> = ({
 
     const accountInfos = state.accountInfos ?? [];
 
-    const accounts = React.useMemo(
+    const sortedAccounts = React.useMemo(
         () => sortAccounts(accountInfos, sortConfig),
         [accountInfos, sortConfig]
     );
 
+    // Reset page when data or sort changes
+    React.useEffect(() => {
+        setPage(1);
+    }, [accountInfos.length, sortConfig]);
+
+    // Paginate
+    const totalItems = sortedAccounts.length;
+    const paginatedAccounts = React.useMemo(() => {
+        const start = (page - 1) * pageSize;
+        return sortedAccounts.slice(start, start + pageSize);
+    }, [sortedAccounts, page, pageSize]);
+
     const allSelected =
-        accounts.length > 0 && selectedIds.size === accounts.length;
-    const someSelected = selectedIds.size > 0 && !allSelected;
+        paginatedAccounts.length > 0 &&
+        paginatedAccounts.every((a) => selectedIds.has(a.id));
+    const someSelected =
+        paginatedAccounts.some((a) => selectedIds.has(a.id)) && !allSelected;
 
     const toggleSelectAll = React.useCallback(() => {
         if (allSelected) {
             setSelectedIds(new Set());
         } else {
-            setSelectedIds(new Set(accounts.map((a) => a.id)));
+            setSelectedIds(new Set(paginatedAccounts.map((a) => a.id)));
         }
-    }, [allSelected, accounts]);
+    }, [allSelected, paginatedAccounts]);
 
     const toggleSelect = React.useCallback((id: string) => {
         setSelectedIds((prev) => {
@@ -215,21 +448,24 @@ export const AccountInfoPage: React.FC<AccountInfoPageProps> = ({
     }, []);
 
     // Summary stats with null-safe access
-    const totalAccounts = accounts.length;
-    const totalDedicatedQuota = accounts.reduce(
+    const totalAccounts = sortedAccounts.length;
+    const totalDedicatedQuota = sortedAccounts.reduce(
         (s, a) => s + safeNum(a.dedicatedCoreQuota),
         0
     );
-    const totalLpUsed = accounts.reduce(
+    const totalLpUsed = sortedAccounts.reduce(
         (s, a) => s + safeNum(a.lowPriorityCoresUsed),
         0
     );
-    const totalLpQuota = accounts.reduce(
+    const totalLpQuota = sortedAccounts.reduce(
         (s, a) => s + safeNum(a.lowPriorityCoreQuota),
         0
     );
     const totalLpFree = totalLpQuota - totalLpUsed;
-    const totalPools = accounts.reduce((s, a) => s + safeNum(a.poolCount), 0);
+    const totalPools = sortedAccounts.reduce(
+        (s, a) => s + safeNum(a.poolCount),
+        0
+    );
 
     const handleColumnClick = React.useCallback(
         (_ev?: React.MouseEvent<HTMLElement>, column?: IColumn) => {
@@ -259,6 +495,7 @@ export const AccountInfoPage: React.FC<AccountInfoPageProps> = ({
                         checked={selectedIds.has(item.id)}
                         onChange={() => toggleSelect(item.id)}
                         styles={{ root: { marginTop: 2 } }}
+                        aria-label={`Select ${item.accountName}`}
                     />
                 ),
                 onRenderHeader: () => (
@@ -267,6 +504,7 @@ export const AccountInfoPage: React.FC<AccountInfoPageProps> = ({
                         indeterminate={someSelected}
                         onChange={toggleSelectAll}
                         styles={{ root: { marginTop: 2 } }}
+                        aria-label="Select all accounts"
                     />
                 ),
             },
@@ -282,6 +520,7 @@ export const AccountInfoPage: React.FC<AccountInfoPageProps> = ({
                     sortConfig?.key === "accountName" &&
                     sortConfig?.direction === "desc",
                 onColumnClick: handleColumnClick,
+                ariaLabel: `Account Name, ${ariaSort(sortConfig, "accountName")}`,
                 onRender: (item: AccountInfo) => (
                     <span style={{ color: "#ccc" }}>
                         {item.accountName ?? ""}
@@ -300,6 +539,7 @@ export const AccountInfoPage: React.FC<AccountInfoPageProps> = ({
                     sortConfig?.key === "region" &&
                     sortConfig?.direction === "desc",
                 onColumnClick: handleColumnClick,
+                ariaLabel: `Region, ${ariaSort(sortConfig, "region")}`,
                 onRender: (item: AccountInfo) => (
                     <span style={{ color: "#ccc" }}>{item.region ?? ""}</span>
                 ),
@@ -315,6 +555,7 @@ export const AccountInfoPage: React.FC<AccountInfoPageProps> = ({
                     sortConfig?.key === "subscription" &&
                     sortConfig?.direction === "desc",
                 onColumnClick: handleColumnClick,
+                ariaLabel: `Subscription ID, ${ariaSort(sortConfig, "subscription")}`,
                 onRender: (item: AccountInfo) => {
                     const subId = item.subscriptionId ?? "";
                     return (
@@ -340,6 +581,7 @@ export const AccountInfoPage: React.FC<AccountInfoPageProps> = ({
                     sortConfig?.key === "lpQuota" &&
                     sortConfig?.direction === "desc",
                 onColumnClick: handleColumnClick,
+                ariaLabel: `LP Quota, ${ariaSort(sortConfig, "lpQuota")}`,
                 onRender: (item: AccountInfo) => (
                     <span style={{ color: "#ccc" }}>
                         {safeNum(item.lowPriorityCoreQuota)}
@@ -357,6 +599,7 @@ export const AccountInfoPage: React.FC<AccountInfoPageProps> = ({
                     sortConfig?.key === "lpUsed" &&
                     sortConfig?.direction === "desc",
                 onColumnClick: handleColumnClick,
+                ariaLabel: `LP Used, ${ariaSort(sortConfig, "lpUsed")}`,
                 onRender: (item: AccountInfo) => (
                     <UsageBar
                         used={safeNum(item.lowPriorityCoresUsed)}
@@ -375,6 +618,7 @@ export const AccountInfoPage: React.FC<AccountInfoPageProps> = ({
                     sortConfig?.key === "lpFree" &&
                     sortConfig?.direction === "desc",
                 onColumnClick: handleColumnClick,
+                ariaLabel: `LP Free, ${ariaSort(sortConfig, "lpFree")}`,
                 onRender: (item: AccountInfo) => {
                     const free = safeNum(item.lowPriorityCoresFree);
                     return (
@@ -400,6 +644,7 @@ export const AccountInfoPage: React.FC<AccountInfoPageProps> = ({
                     sortConfig?.key === "dedicatedQuota" &&
                     sortConfig?.direction === "desc",
                 onColumnClick: handleColumnClick,
+                ariaLabel: `Dedicated quota, ${ariaSort(sortConfig, "dedicatedQuota")}`,
                 onRender: (item: AccountInfo) => (
                     <span style={{ color: "#888" }}>
                         {safeNum(item.dedicatedCoreQuota)}
@@ -417,6 +662,7 @@ export const AccountInfoPage: React.FC<AccountInfoPageProps> = ({
                     sortConfig?.key === "poolCount" &&
                     sortConfig?.direction === "desc",
                 onColumnClick: handleColumnClick,
+                ariaLabel: `Pool Count, ${ariaSort(sortConfig, "poolCount")}`,
                 onRender: (item: AccountInfo) => (
                     <span style={{ color: "#ccc" }}>
                         {safeNum(item.poolCount)}
@@ -434,6 +680,7 @@ export const AccountInfoPage: React.FC<AccountInfoPageProps> = ({
                     sortConfig?.key === "poolQuota" &&
                     sortConfig?.direction === "desc",
                 onColumnClick: handleColumnClick,
+                ariaLabel: `Pool Quota, ${ariaSort(sortConfig, "poolQuota")}`,
                 onRender: (item: AccountInfo) => (
                     <span style={{ color: "#ccc" }}>
                         {safeNum(item.poolQuota)}
@@ -451,6 +698,7 @@ export const AccountInfoPage: React.FC<AccountInfoPageProps> = ({
                     sortConfig?.key === "poolsFree" &&
                     sortConfig?.direction === "desc",
                 onColumnClick: handleColumnClick,
+                ariaLabel: `Pools Free, ${ariaSort(sortConfig, "poolsFree")}`,
                 onRender: (item: AccountInfo) => {
                     const free = safeNum(item.poolsFree);
                     return (
@@ -479,6 +727,8 @@ export const AccountInfoPage: React.FC<AccountInfoPageProps> = ({
 
     return (
         <div style={{ padding: "16px 0" }}>
+            <style>{SKELETON_KEYFRAMES}</style>
+
             <Stack
                 horizontal
                 verticalAlign="center"
@@ -498,14 +748,19 @@ export const AccountInfoPage: React.FC<AccountInfoPageProps> = ({
                     iconProps={{ iconName: "Refresh" }}
                     onClick={refresh}
                     disabled={loading}
+                    aria-label="Refresh account info"
                 />
                 {loading && (
                     <>
-                        <Spinner size={SpinnerSize.small} />
+                        <Spinner
+                            size={SpinnerSize.small}
+                            aria-label="Loading"
+                        />
                         <DefaultButton
                             text="Stop"
                             iconProps={{ iconName: "Stop" }}
                             onClick={stop}
+                            aria-label="Stop refresh"
                             styles={{
                                 root: {
                                     borderColor: "#d13438",
@@ -520,12 +775,31 @@ export const AccountInfoPage: React.FC<AccountInfoPageProps> = ({
                     inlineLabel
                     checked={autoRefresh}
                     onChange={(_e, checked) => setAutoRefresh(checked ?? false)}
+                    aria-label="Toggle auto-refresh every 30 seconds"
                     styles={{
                         root: { marginBottom: 0, marginLeft: 16 },
                         label: { color: "#999", fontSize: 12 },
                     }}
                 />
             </Stack>
+
+            {/* Error state */}
+            {error && (
+                <MessageBar
+                    messageBarType={MessageBarType.error}
+                    onDismiss={() => setError(null)}
+                    styles={{ root: { marginBottom: 12 } }}
+                    actions={
+                        <DefaultButton
+                            text="Retry"
+                            onClick={refresh}
+                            aria-label="Retry loading account info"
+                        />
+                    }
+                >
+                    {error}
+                </MessageBar>
+            )}
 
             {/* Summary Stats */}
             <Stack
@@ -539,6 +813,8 @@ export const AccountInfoPage: React.FC<AccountInfoPageProps> = ({
                         marginBottom: 16,
                     },
                 }}
+                role="status"
+                aria-live="polite"
             >
                 <SummaryStatItem
                     icon="AccountManagement"
@@ -573,50 +849,63 @@ export const AccountInfoPage: React.FC<AccountInfoPageProps> = ({
                 />
             </Stack>
 
-            {/* DetailsList */}
-            {accounts.length === 0 ? (
-                <Text variant="medium" styles={{ root: { color: "#666" } }}>
-                    No account info available. Click &quot;Refresh&quot; to load
-                    data.
-                </Text>
+            {/* DetailsList or skeleton or empty */}
+            {loading && accountInfos.length === 0 ? (
+                <TableSkeleton />
+            ) : accountInfos.length === 0 ? (
+                <EmptyState />
             ) : (
-                <div
-                    style={{
-                        background: "#1e1e1e",
-                        borderRadius: 6,
-                        padding: 8,
-                    }}
-                >
-                    <DetailsList
-                        items={accounts}
-                        columns={columns}
-                        layoutMode={DetailsListLayoutMode.fixedColumns}
-                        selectionMode={SelectionMode.none}
-                        compact
-                        styles={{
-                            root: { color: "#ccc" },
-                            headerWrapper: {
-                                "& .ms-DetailsHeader": {
-                                    background: "#252525",
-                                    borderBottom: "1px solid #333",
-                                },
-                                "& .ms-DetailsHeader-cell": {
-                                    color: "#999",
-                                },
-                            },
-                            contentWrapper: {
-                                "& .ms-DetailsRow": {
-                                    background: "#1e1e1e",
-                                    borderBottom: "1px solid #2a2a2a",
-                                    color: "#ccc",
-                                },
-                                "& .ms-DetailsRow:hover": {
-                                    background: "#252525",
-                                },
-                            },
+                <>
+                    <div
+                        style={{
+                            background: "#1e1e1e",
+                            borderRadius: 6,
+                            padding: 8,
                         }}
-                    />
-                </div>
+                    >
+                        <DetailsList
+                            items={paginatedAccounts}
+                            columns={columns}
+                            layoutMode={DetailsListLayoutMode.fixedColumns}
+                            selectionMode={SelectionMode.none}
+                            compact
+                            styles={{
+                                root: { color: "#ccc" },
+                                headerWrapper: {
+                                    "& .ms-DetailsHeader": {
+                                        background: "#252525",
+                                        borderBottom: "1px solid #333",
+                                    },
+                                    "& .ms-DetailsHeader-cell": {
+                                        color: "#999",
+                                    },
+                                },
+                                contentWrapper: {
+                                    "& .ms-DetailsRow": {
+                                        background: "#1e1e1e",
+                                        borderBottom: "1px solid #2a2a2a",
+                                        color: "#ccc",
+                                    },
+                                    "& .ms-DetailsRow:hover": {
+                                        background: "#252525",
+                                    },
+                                },
+                            }}
+                        />
+                    </div>
+                    {totalItems > 10 && (
+                        <Pagination
+                            page={page}
+                            pageSize={pageSize}
+                            totalItems={totalItems}
+                            onPageChange={setPage}
+                            onPageSizeChange={(size) => {
+                                setPageSize(size);
+                                setPage(1);
+                            }}
+                        />
+                    )}
+                </>
             )}
         </div>
     );

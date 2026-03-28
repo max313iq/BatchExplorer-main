@@ -33,6 +33,7 @@ import { SupportTicketPage } from "./support-ticket/support-ticket-page";
 import { AgentLogPanel } from "./shared/agent-log-panel";
 import { ActivityPanel } from "./shared/activity-panel";
 import * as msalAuth from "../auth/msal-auth";
+import { auditLog, AuditEntry } from "../services/audit-log";
 
 // Auth mode: always MSAL (Entra ID) — no CLI proxy fallback
 let _authMode: "msal" | "cli" = "msal";
@@ -410,6 +411,8 @@ const PageContent: React.FC<{
             return <SupportTicketPage orchestrator={orchestrator} />;
         case "nodes":
             return <NodesPage orchestrator={orchestrator} />;
+        case "audit-log":
+            return <AuditLogPage />;
         default:
             return null;
     }
@@ -430,6 +433,7 @@ const DashboardContent: React.FC<{ tokenProvider?: TokenProvider }> = ({
     );
     const [autoRefreshEnabled, setAutoRefreshEnabled] = React.useState(true);
     const autoRefreshRunningRef = React.useRef(false);
+    const [darkMode, setDarkMode] = React.useState(true);
     const [currentAuthMode, setCurrentAuthMode] = React.useState<
         "msal" | "cli"
     >(_authMode);
@@ -684,6 +688,23 @@ const DashboardContent: React.FC<{ tokenProvider?: TokenProvider }> = ({
                         label: { color: "#999", fontSize: 11 },
                     }}
                 />
+                <div style={{ marginLeft: "auto" }}>
+                    <IconButton
+                        iconProps={{
+                            iconName: darkMode ? "ClearNight" : "Brightness",
+                        }}
+                        title={
+                            darkMode
+                                ? "Switch to light mode"
+                                : "Switch to dark mode"
+                        }
+                        onClick={() => setDarkMode((prev) => !prev)}
+                        styles={{
+                            root: { height: 28, width: 28 },
+                            icon: { color: darkMode ? "#e3a400" : "#0078d4" },
+                        }}
+                    />
+                </div>
             </Stack>
             <AuthBanner
                 healthCheck={healthCheck}
@@ -728,6 +749,207 @@ const DashboardContent: React.FC<{ tokenProvider?: TokenProvider }> = ({
             <ActivityPanel />
             <AgentLogPanel />
             <ToastContainer />
+        </div>
+    );
+};
+
+// --- Audit Log Page ---
+
+const AuditLogPage: React.FC = () => {
+    const [entries, setEntries] = React.useState<AuditEntry[]>(() =>
+        auditLog.getEntries()
+    );
+    const [searchText, setSearchText] = React.useState("");
+
+    React.useEffect(() => {
+        const unsubscribe = auditLog.onChange(() => {
+            setEntries(auditLog.getEntries());
+        });
+        return unsubscribe;
+    }, []);
+
+    const filtered = React.useMemo(() => {
+        if (!searchText.trim()) return entries;
+        const lower = searchText.toLowerCase();
+        return entries.filter(
+            (e) =>
+                e.actor.toLowerCase().includes(lower) ||
+                e.action.toLowerCase().includes(lower) ||
+                e.target.toLowerCase().includes(lower) ||
+                e.status.toLowerCase().includes(lower)
+        );
+    }, [entries, searchText]);
+
+    const handleClear = React.useCallback(() => {
+        if (window.confirm("Clear all audit log entries?")) {
+            auditLog.clear();
+        }
+    }, []);
+
+    return (
+        <div style={{ padding: "16px 0" }}>
+            <Stack
+                horizontal
+                verticalAlign="center"
+                tokens={{ childrenGap: 12 }}
+                styles={{ root: { marginBottom: 16 } }}
+            >
+                <Text
+                    variant="xLarge"
+                    styles={{ root: { fontWeight: 600, color: "#eee" } }}
+                >
+                    Audit Log
+                </Text>
+                <input
+                    type="text"
+                    placeholder="Search entries..."
+                    value={searchText}
+                    onChange={(e) => setSearchText(e.target.value)}
+                    style={{
+                        background: "#2a2a2a",
+                        border: "1px solid #444",
+                        borderRadius: 4,
+                        color: "#eee",
+                        padding: "6px 12px",
+                        fontSize: 13,
+                        width: 260,
+                    }}
+                />
+                <DefaultButton
+                    text="Clear Log"
+                    iconProps={{ iconName: "Delete" }}
+                    onClick={handleClear}
+                    disabled={entries.length === 0}
+                    styles={{
+                        root: { marginLeft: "auto" },
+                    }}
+                />
+            </Stack>
+            {filtered.length === 0 ? (
+                <Text variant="small" styles={{ root: { color: "#666" } }}>
+                    {entries.length === 0
+                        ? "No audit entries recorded yet."
+                        : "No entries match the search filter."}
+                </Text>
+            ) : (
+                <div style={{ overflowX: "auto" }}>
+                    <table
+                        style={{
+                            width: "100%",
+                            borderCollapse: "collapse",
+                            fontSize: 12,
+                        }}
+                    >
+                        <thead>
+                            <tr style={{ borderBottom: "1px solid #333" }}>
+                                <th
+                                    style={{
+                                        padding: "8px",
+                                        textAlign: "left",
+                                        color: "#888",
+                                    }}
+                                >
+                                    Timestamp
+                                </th>
+                                <th
+                                    style={{
+                                        padding: "8px",
+                                        textAlign: "left",
+                                        color: "#888",
+                                    }}
+                                >
+                                    Actor
+                                </th>
+                                <th
+                                    style={{
+                                        padding: "8px",
+                                        textAlign: "left",
+                                        color: "#888",
+                                    }}
+                                >
+                                    Action
+                                </th>
+                                <th
+                                    style={{
+                                        padding: "8px",
+                                        textAlign: "left",
+                                        color: "#888",
+                                    }}
+                                >
+                                    Target
+                                </th>
+                                <th
+                                    style={{
+                                        padding: "8px",
+                                        textAlign: "left",
+                                        color: "#888",
+                                    }}
+                                >
+                                    Status
+                                </th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            {filtered.map((entry) => (
+                                <tr
+                                    key={entry.id}
+                                    style={{
+                                        borderBottom: "1px solid #2a2a2a",
+                                    }}
+                                >
+                                    <td
+                                        style={{
+                                            padding: "8px",
+                                            color: "#999",
+                                            whiteSpace: "nowrap",
+                                        }}
+                                    >
+                                        {new Date(
+                                            entry.timestamp
+                                        ).toLocaleString()}
+                                    </td>
+                                    <td
+                                        style={{
+                                            padding: "8px",
+                                            color: "#ccc",
+                                        }}
+                                    >
+                                        {entry.actor}
+                                    </td>
+                                    <td
+                                        style={{
+                                            padding: "8px",
+                                            color: "#0078d4",
+                                        }}
+                                    >
+                                        {entry.action}
+                                    </td>
+                                    <td
+                                        style={{
+                                            padding: "8px",
+                                            color: "#ccc",
+                                        }}
+                                    >
+                                        {entry.target}
+                                    </td>
+                                    <td
+                                        style={{
+                                            padding: "8px",
+                                            color:
+                                                entry.status === "success"
+                                                    ? "#107c10"
+                                                    : "#d13438",
+                                            fontWeight: 600,
+                                        }}
+                                    >
+                                        {entry.status}
+                                    </td>
+                                </tr>
+                            ))}
+                        </tbody>
+                    </table>
+                </div>
+            )}
         </div>
     );
 };

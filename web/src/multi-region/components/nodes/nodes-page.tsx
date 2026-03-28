@@ -15,6 +15,8 @@ import { Checkbox } from "@fluentui/react/lib/Checkbox";
 import { Toggle } from "@fluentui/react/lib/Toggle";
 import { Text } from "@fluentui/react/lib/Text";
 import { Dropdown, IDropdownOption } from "@fluentui/react/lib/Dropdown";
+import { Dialog, DialogType, DialogFooter } from "@fluentui/react/lib/Dialog";
+import { Icon } from "@fluentui/react/lib/Icon";
 import { useMultiRegionState } from "../../store/store-context";
 import { OrchestratorAgent } from "../../agents/orchestrator-agent";
 import { StatusBadge } from "../shared/status-badge";
@@ -63,10 +65,32 @@ type NodeActionType =
 const AUTO_REFRESH_INTERVAL_MS = 30_000;
 const AUTO_RECOVERY_INTERVAL_MS = 60_000;
 
+const PAGE_SIZE_OPTIONS: IDropdownOption[] = [
+    { key: 25, text: "25" },
+    { key: 50, text: "50" },
+    { key: 100, text: "100" },
+    { key: 200, text: "200" },
+];
+
 interface SortConfig {
     key: string;
     isSortedDescending: boolean;
 }
+
+interface ConfirmDialogState {
+    hidden: boolean;
+    title: string;
+    message: string;
+    onConfirm: () => void;
+}
+
+const SKELETON_PULSE_KEYFRAMES = `
+@keyframes skeleton-pulse {
+    0% { opacity: 0.6; }
+    50% { opacity: 1; }
+    100% { opacity: 0.6; }
+}
+`;
 
 function compareValues(a: unknown, b: unknown, desc: boolean): number {
     const aVal = a ?? "";
@@ -84,6 +108,63 @@ function compareValues(a: unknown, b: unknown, desc: boolean): number {
     return desc ? -result : result;
 }
 
+function SkeletonLoader(): React.ReactElement {
+    const colWidths = [180, 100, 160, 110, 120, 100];
+    return (
+        <>
+            <style>{SKELETON_PULSE_KEYFRAMES}</style>
+            <div role="status" aria-label="Loading nodes">
+                {Array.from({ length: 8 }).map((_, rowIdx) => (
+                    <div
+                        key={rowIdx}
+                        style={{
+                            display: "flex",
+                            gap: 16,
+                            padding: "10px 0",
+                            borderBottom: "1px solid #292929",
+                        }}
+                    >
+                        {colWidths.map((w, colIdx) => (
+                            <div
+                                key={colIdx}
+                                style={{
+                                    width: w,
+                                    height: 16,
+                                    background: "#333",
+                                    borderRadius: 4,
+                                    animation:
+                                        "skeleton-pulse 1.5s ease-in-out infinite",
+                                    animationDelay: `${rowIdx * 0.05 + colIdx * 0.03}s`,
+                                }}
+                            />
+                        ))}
+                    </div>
+                ))}
+            </div>
+        </>
+    );
+}
+
+const DESTRUCTIVE_ACTIONS: Set<NodeActionType | "deleteNodes" | "recreate"> =
+    new Set([
+        "reboot",
+        "reimage",
+        "delete",
+        "disableScheduling",
+        "deleteNodes",
+        "recreate",
+    ]);
+
+const ACTION_LABELS: Record<string, string> = {
+    reboot: "reboot",
+    reimage: "reimage",
+    delete: "delete",
+    disableScheduling: "disable scheduling on",
+    enableScheduling: "enable scheduling on",
+    deleteNodes: "delete",
+    recreate: "recreate",
+};
+
 export const NodesPage: React.FC<NodesPageProps> = ({ orchestrator }) => {
     const state = useMultiRegionState();
     const [isLoading, setIsLoading] = React.useState(false);
@@ -93,6 +174,7 @@ export const NodesPage: React.FC<NodesPageProps> = ({ orchestrator }) => {
         new Set()
     );
     const [selectAll, setSelectAll] = React.useState(false);
+    const [selectAllResults, setSelectAllResults] = React.useState(false);
     const [selectedStates, setSelectedStates] = React.useState<string[]>(
         ALL_NODE_STATES.slice()
     );
@@ -100,6 +182,19 @@ export const NodesPage: React.FC<NodesPageProps> = ({ orchestrator }) => {
     const [autoRefresh, setAutoRefresh] = React.useState(false);
     const [autoRecovery, setAutoRecovery] = React.useState(false);
     const [sortConfig, setSortConfig] = React.useState<SortConfig | null>(null);
+
+    // Pagination state
+    const [page, setPage] = React.useState(0);
+    const [pageSize, setPageSize] = React.useState(50);
+
+    // Confirmation dialog state
+    const [confirmDialog, setConfirmDialog] =
+        React.useState<ConfirmDialogState>({
+            hidden: true,
+            title: "",
+            message: "",
+            onConfirm: () => {},
+        });
 
     const createdAccounts = state.accounts.filter(
         (a) => a.provisioningState === "created"
@@ -121,8 +216,10 @@ export const NodesPage: React.FC<NodesPageProps> = ({ orchestrator }) => {
                             accountIds: createdAccounts.map((a) => a.id),
                         },
                     });
-                } catch (err: any) {
-                    setError(err?.message ?? String(err));
+                } catch (err: unknown) {
+                    const message =
+                        err instanceof Error ? err.message : String(err);
+                    setError(message);
                 } finally {
                     setIsLoading(false);
                 }
@@ -172,19 +269,35 @@ export const NodesPage: React.FC<NodesPageProps> = ({ orchestrator }) => {
         return nodes;
     }, [state.nodes, selectedStates, filterLowPriority]);
 
-    // --- Sorted display nodes ---
-    const displayNodes = React.useMemo(() => {
+    // --- Sorted display nodes (before pagination) ---
+    const sortedNodes = React.useMemo(() => {
         if (!sortConfig) return filteredNodes;
 
         const { key, isSortedDescending } = sortConfig;
         const sorted = [...filteredNodes];
         sorted.sort((a, b) => {
-            const aVal = (a as any)[key];
-            const bVal = (b as any)[key];
+            const aVal = (a as unknown as Record<string, unknown>)[key];
+            const bVal = (b as unknown as Record<string, unknown>)[key];
             return compareValues(aVal, bVal, isSortedDescending);
         });
         return sorted;
     }, [filteredNodes, sortConfig]);
+
+    // Reset page when filter/sort changes
+    React.useEffect(() => {
+        setPage(0);
+        setSelectAll(false);
+        setSelectAllResults(false);
+        setSelectedNodeIds(new Set());
+    }, [selectedStates, filterLowPriority, sortConfig]);
+
+    // --- Pagination ---
+    const totalPages = Math.max(1, Math.ceil(sortedNodes.length / pageSize));
+    const clampedPage = Math.min(page, totalPages - 1);
+    const displayNodes = React.useMemo(() => {
+        const start = clampedPage * pageSize;
+        return sortedNodes.slice(start, start + pageSize);
+    }, [sortedNodes, clampedPage, pageSize]);
 
     const selection = React.useMemo(() => {
         const sel = new Selection({
@@ -207,8 +320,9 @@ export const NodesPage: React.FC<NodesPageProps> = ({ orchestrator }) => {
                     accountIds: createdAccounts.map((a) => a.id),
                 },
             });
-        } catch (err: any) {
-            setError(err?.message ?? String(err));
+        } catch (err: unknown) {
+            const message = err instanceof Error ? err.message : String(err);
+            setError(message);
         } finally {
             setIsLoading(false);
         }
@@ -243,51 +357,90 @@ export const NodesPage: React.FC<NodesPageProps> = ({ orchestrator }) => {
         return () => clearInterval(interval);
     }, [autoRecovery, orchestrator, state.nodes]);
 
+    // --- Helper to get selected IDs, honoring selectAllResults ---
+    const getSelectedIds = React.useCallback((): string[] => {
+        if (selectAllResults) {
+            return sortedNodes.map((n) => n.id);
+        }
+        if (selectAll) {
+            return displayNodes.map((n) => n.id);
+        }
+        return Array.from(selectedNodeIds);
+    }, [
+        selectAll,
+        selectAllResults,
+        displayNodes,
+        sortedNodes,
+        selectedNodeIds,
+    ]);
+
+    // --- Show confirmation dialog ---
+    const showConfirmation = React.useCallback(
+        (
+            actionLabel: string,
+            count: number,
+            onConfirm: () => void,
+            extraMessage?: string
+        ) => {
+            setConfirmDialog({
+                hidden: false,
+                title: `Confirm ${actionLabel}`,
+                message: `Are you sure you want to ${actionLabel} ${count} node${count === 1 ? "" : "s"}?${extraMessage ? " " + extraMessage : ""}`,
+                onConfirm,
+            });
+        },
+        []
+    );
+
+    const dismissConfirmDialog = React.useCallback(() => {
+        setConfirmDialog((prev) => ({ ...prev, hidden: true }));
+    }, []);
+
     const handleNodeAction = React.useCallback(
         async (action: NodeActionType) => {
-            const ids = selectAll
-                ? displayNodes.map((n) => n.id)
-                : Array.from(selectedNodeIds);
+            const ids = getSelectedIds();
             if (ids.length === 0) return;
 
-            if (action === "delete") {
-                const confirmed = window.confirm(
-                    `Are you sure you want to delete ${ids.length} node(s)? This action cannot be undone.`
-                );
-                if (!confirmed) return;
-            }
+            const label = ACTION_LABELS[action] ?? action;
 
-            if (action === "reimage") {
-                const confirmed = window.confirm(
-                    `Are you sure you want to reimage ${ids.length} node(s)? Running tasks will be requeued.`
-                );
-                if (!confirmed) return;
-            }
+            const executeAction = async () => {
+                setIsActing(true);
+                setError(null);
+                try {
+                    await orchestrator.execute({
+                        action: "node_action",
+                        payload: {
+                            actionType: action,
+                            nodeIds: ids,
+                        },
+                    });
+                } catch (err: unknown) {
+                    const message =
+                        err instanceof Error ? err.message : String(err);
+                    setError(message);
+                } finally {
+                    setIsActing(false);
+                }
+            };
 
-            setIsActing(true);
-            setError(null);
-            try {
-                await orchestrator.execute({
-                    action: "node_action",
-                    payload: {
-                        actionType: action,
-                        nodeIds: ids,
-                    },
-                });
-            } catch (err: any) {
-                setError(err?.message ?? String(err));
-            } finally {
-                setIsActing(false);
+            if (DESTRUCTIVE_ACTIONS.has(action)) {
+                const extra =
+                    action === "delete"
+                        ? "This action cannot be undone."
+                        : action === "reimage"
+                          ? "Running tasks will be requeued."
+                          : undefined;
+                showConfirmation(label, ids.length, executeAction, extra);
+            } else {
+                await executeAction();
             }
         },
-        [orchestrator, selectedNodeIds, selectAll, displayNodes]
+        [orchestrator, getSelectedIds, showConfirmation]
     );
 
     // --- Bulk delete (grouped by pool) ---
     const handleDeleteNodes = React.useCallback(async () => {
-        const ids = selectAll
-            ? displayNodes.map((n) => n.id)
-            : Array.from(selectedNodeIds);
+        const ids = getSelectedIds();
         if (ids.length === 0) return;
 
         // Count unique pools
@@ -297,50 +450,60 @@ export const NodesPage: React.FC<NodesPageProps> = ({ orchestrator }) => {
             if (node) poolSet.add(`${node.accountName}/${node.poolId}`);
         }
 
-        const confirmed = window.confirm(
-            `Delete ${ids.length} nodes from ${poolSet.size} pool(s)?`
-        );
-        if (!confirmed) return;
+        const executeDelete = async () => {
+            setIsActing(true);
+            setError(null);
+            try {
+                await orchestrator.execute({
+                    action: "delete_nodes",
+                    payload: { nodeIds: ids },
+                });
+            } catch (err: unknown) {
+                const message =
+                    err instanceof Error ? err.message : String(err);
+                setError(message);
+            } finally {
+                setIsActing(false);
+            }
+        };
 
-        setIsActing(true);
-        setError(null);
-        try {
-            await orchestrator.execute({
-                action: "delete_nodes",
-                payload: { nodeIds: ids },
-            });
-        } catch (err: any) {
-            setError(err?.message ?? String(err));
-        } finally {
-            setIsActing(false);
-        }
-    }, [orchestrator, selectedNodeIds, selectAll, displayNodes, state.nodes]);
+        showConfirmation(
+            "delete",
+            ids.length,
+            executeDelete,
+            `This will affect ${poolSet.size} pool(s). This action cannot be undone.`
+        );
+    }, [orchestrator, getSelectedIds, state.nodes, showConfirmation]);
 
     // --- Recreate nodes ---
     const handleRecreateNodes = React.useCallback(async () => {
-        const ids = selectAll
-            ? displayNodes.map((n) => n.id)
-            : Array.from(selectedNodeIds);
+        const ids = getSelectedIds();
         if (ids.length === 0) return;
 
-        const confirmed = window.confirm(
-            `Recreate ${ids.length} node(s)? Nodes will be removed and pool targets restored to trigger fresh allocation.`
-        );
-        if (!confirmed) return;
+        const executeRecreate = async () => {
+            setIsActing(true);
+            setError(null);
+            try {
+                await orchestrator.execute({
+                    action: "recreate_nodes",
+                    payload: { nodeIds: ids },
+                });
+            } catch (err: unknown) {
+                const message =
+                    err instanceof Error ? err.message : String(err);
+                setError(message);
+            } finally {
+                setIsActing(false);
+            }
+        };
 
-        setIsActing(true);
-        setError(null);
-        try {
-            await orchestrator.execute({
-                action: "recreate_nodes",
-                payload: { nodeIds: ids },
-            });
-        } catch (err: any) {
-            setError(err?.message ?? String(err));
-        } finally {
-            setIsActing(false);
-        }
-    }, [orchestrator, selectedNodeIds, selectAll, displayNodes]);
+        showConfirmation(
+            "recreate",
+            ids.length,
+            executeRecreate,
+            "Nodes will be removed and pool targets restored to trigger fresh allocation."
+        );
+    }, [orchestrator, getSelectedIds, showConfirmation]);
 
     // --- Recover preempted ---
     const handleRecoverPreempted = React.useCallback(async () => {
@@ -352,24 +515,30 @@ export const NodesPage: React.FC<NodesPageProps> = ({ orchestrator }) => {
             return;
         }
 
-        const confirmed = window.confirm(
-            `Recover ${preemptedCount} preempted node(s)? This will re-request low-priority capacity for affected pools.`
-        );
-        if (!confirmed) return;
+        const executeRecover = async () => {
+            setIsActing(true);
+            setError(null);
+            try {
+                await orchestrator.execute({
+                    action: "recover_preempted",
+                    payload: {},
+                });
+            } catch (err: unknown) {
+                const message =
+                    err instanceof Error ? err.message : String(err);
+                setError(message);
+            } finally {
+                setIsActing(false);
+            }
+        };
 
-        setIsActing(true);
-        setError(null);
-        try {
-            await orchestrator.execute({
-                action: "recover_preempted",
-                payload: {},
-            });
-        } catch (err: any) {
-            setError(err?.message ?? String(err));
-        } finally {
-            setIsActing(false);
-        }
-    }, [orchestrator, state.nodes]);
+        showConfirmation(
+            "recover",
+            preemptedCount,
+            executeRecover,
+            "This will re-request low-priority capacity for affected pools."
+        );
+    }, [orchestrator, state.nodes, showConfirmation]);
 
     // --- Handle state filter dropdown ---
     const handleStateFilterChange = React.useCallback(
@@ -403,7 +572,7 @@ export const NodesPage: React.FC<NodesPageProps> = ({ orchestrator }) => {
         []
     );
 
-    // --- Columns with sorting ---
+    // --- Columns with sorting and aria-sort ---
     const columns: IColumn[] = React.useMemo(() => {
         const defs: IColumn[] = [
             {
@@ -582,11 +751,68 @@ export const NodesPage: React.FC<NodesPageProps> = ({ orchestrator }) => {
                     ? sortConfig!.isSortedDescending
                     : false,
                 onColumnClick: handleColumnClick,
+                ariaLabel: isSorted
+                    ? `${col.name}, sorted ${sortConfig!.isSortedDescending ? "descending" : "ascending"}`
+                    : `${col.name}, click to sort`,
             };
         });
     }, [sortConfig, handleColumnClick]);
 
-    const actionCount = selectAll ? displayNodes.length : selectedNodeIds.size;
+    const actionCount = selectAllResults
+        ? sortedNodes.length
+        : selectAll
+          ? displayNodes.length
+          : selectedNodeIds.size;
+
+    // --- Handle select-all checkbox ---
+    const handleSelectAllChange = React.useCallback(
+        (
+            _ev?: React.FormEvent<HTMLElement | HTMLInputElement>,
+            checked?: boolean
+        ) => {
+            setSelectAll(!!checked);
+            setSelectAllResults(false);
+            if (checked) {
+                setSelectedNodeIds(new Set(displayNodes.map((n) => n.id)));
+            } else {
+                setSelectedNodeIds(new Set());
+            }
+        },
+        [displayNodes]
+    );
+
+    // --- Handle page size change ---
+    const handlePageSizeChange = React.useCallback(
+        (_event: React.FormEvent<HTMLDivElement>, option?: IDropdownOption) => {
+            if (!option) return;
+            setPageSize(option.key as number);
+            setPage(0);
+            setSelectAll(false);
+            setSelectAllResults(false);
+            setSelectedNodeIds(new Set());
+        },
+        []
+    );
+
+    // --- Keyboard handler for rows ---
+    const handleRowKeyDown = React.useCallback(
+        (ev: React.KeyboardEvent<HTMLDivElement>) => {
+            if (ev.key === "Enter") {
+                const target = ev.target as HTMLElement;
+                const row = target.closest("[data-selection-index]");
+                if (row) {
+                    const idx = parseInt(
+                        row.getAttribute("data-selection-index") ?? "-1",
+                        10
+                    );
+                    if (idx >= 0) {
+                        selection.toggleIndexSelected(idx);
+                    }
+                }
+            }
+        },
+        [selection]
+    );
 
     // --- Summary stat card style ---
     const statCardStyle: React.CSSProperties = {
@@ -596,6 +822,115 @@ export const NodesPage: React.FC<NodesPageProps> = ({ orchestrator }) => {
         padding: "8px 14px",
         minWidth: 100,
         textAlign: "center",
+    };
+
+    // --- Determine what to render in the list area ---
+    const renderContent = () => {
+        // Skeleton loader: loading and no nodes at all yet
+        if (isLoading && state.nodes.length === 0) {
+            return <SkeletonLoader />;
+        }
+
+        // Empty state: not loading and no nodes exist
+        if (!isLoading && state.nodes.length === 0) {
+            return (
+                <Stack
+                    horizontalAlign="center"
+                    tokens={{ childrenGap: 12 }}
+                    styles={{ root: { padding: 40 } }}
+                >
+                    <Icon
+                        iconName="Server"
+                        styles={{
+                            root: { fontSize: 48, color: "#555" },
+                        }}
+                    />
+                    <Text variant="large" styles={{ root: { color: "#888" } }}>
+                        No nodes found
+                    </Text>
+                    <Text variant="small" styles={{ root: { color: "#666" } }}>
+                        Nodes will appear after pool discovery
+                    </Text>
+                </Stack>
+            );
+        }
+
+        // Filtered empty state
+        if (displayNodes.length === 0) {
+            return (
+                <MessageBar messageBarType={MessageBarType.info}>
+                    No nodes match the current filter.
+                </MessageBar>
+            );
+        }
+
+        // Node list with pagination
+        return (
+            <>
+                <div onKeyDown={handleRowKeyDown} role="presentation">
+                    <DetailsList
+                        items={displayNodes}
+                        columns={columns}
+                        selectionMode={SelectionMode.multiple}
+                        selection={selection}
+                        checkboxVisibility={CheckboxVisibility.always}
+                        layoutMode={DetailsListLayoutMode.fixedColumns}
+                        getKey={(item: ManagedNode) => item.id}
+                        onRenderRow={(props, defaultRender) => {
+                            if (!props || !defaultRender) return null;
+                            const item = props.item as ManagedNode;
+                            const isSelected = selectedNodeIds.has(item.id);
+                            return (
+                                <div aria-selected={isSelected} role="row">
+                                    {defaultRender(props)}
+                                </div>
+                            );
+                        }}
+                    />
+                </div>
+
+                {/* Pagination controls */}
+                <Stack
+                    horizontal
+                    verticalAlign="center"
+                    horizontalAlign="center"
+                    tokens={{ childrenGap: 16 }}
+                    styles={{ root: { padding: "12px 0" } }}
+                >
+                    <DefaultButton
+                        text="< Prev"
+                        onClick={() => setPage((p) => Math.max(0, p - 1))}
+                        disabled={clampedPage === 0}
+                        aria-label="Previous page"
+                    />
+                    <Text
+                        variant="medium"
+                        styles={{ root: { fontWeight: 600 } }}
+                    >
+                        Page {clampedPage + 1} of {totalPages} (
+                        {sortedNodes.length} items)
+                    </Text>
+                    <DefaultButton
+                        text="Next >"
+                        onClick={() =>
+                            setPage((p) => Math.min(totalPages - 1, p + 1))
+                        }
+                        disabled={clampedPage >= totalPages - 1}
+                        aria-label="Next page"
+                    />
+                    <Dropdown
+                        label="Page size"
+                        selectedKey={pageSize}
+                        options={PAGE_SIZE_OPTIONS}
+                        onChange={handlePageSizeChange}
+                        styles={{
+                            root: { minWidth: 80 },
+                            dropdown: { minWidth: 80 },
+                        }}
+                    />
+                </Stack>
+            </>
+        );
     };
 
     return (
@@ -627,6 +962,7 @@ export const NodesPage: React.FC<NodesPageProps> = ({ orchestrator }) => {
                     <MessageBar
                         messageBarType={MessageBarType.error}
                         onDismiss={() => setError(null)}
+                        aria-live="polite"
                     >
                         {error}
                     </MessageBar>
@@ -798,19 +1134,71 @@ export const NodesPage: React.FC<NodesPageProps> = ({ orchestrator }) => {
                     <Checkbox
                         label={`Select all (${displayNodes.length})`}
                         checked={selectAll}
-                        onChange={(_, checked) => {
-                            setSelectAll(!!checked);
-                            if (checked) {
-                                setSelectedNodeIds(
-                                    new Set(displayNodes.map((n) => n.id))
-                                );
-                            } else {
-                                setSelectedNodeIds(new Set());
-                            }
-                        }}
+                        onChange={handleSelectAllChange}
                         styles={{ root: { marginTop: 24 } }}
                     />
                 </Stack>
+
+                {/* "Select All N Results" link */}
+                {selectAll &&
+                    !selectAllResults &&
+                    sortedNodes.length > displayNodes.length && (
+                        <div
+                            style={{ fontSize: 13, color: "#0078d4" }}
+                            aria-live="polite"
+                        >
+                            All {displayNodes.length} nodes on this page are
+                            selected.{" "}
+                            <button
+                                onClick={() => {
+                                    setSelectAllResults(true);
+                                    setSelectedNodeIds(
+                                        new Set(sortedNodes.map((n) => n.id))
+                                    );
+                                }}
+                                style={{
+                                    background: "none",
+                                    border: "none",
+                                    color: "#0078d4",
+                                    cursor: "pointer",
+                                    textDecoration: "underline",
+                                    padding: 0,
+                                    fontSize: 13,
+                                }}
+                                aria-label={`Select all ${sortedNodes.length} results`}
+                            >
+                                Select All {sortedNodes.length} Results
+                            </button>
+                        </div>
+                    )}
+
+                {selectAllResults && (
+                    <div
+                        style={{ fontSize: 13, color: "#0078d4" }}
+                        aria-live="polite"
+                    >
+                        All {sortedNodes.length} nodes are selected.{" "}
+                        <button
+                            onClick={() => {
+                                setSelectAllResults(false);
+                                setSelectAll(false);
+                                setSelectedNodeIds(new Set());
+                            }}
+                            style={{
+                                background: "none",
+                                border: "none",
+                                color: "#0078d4",
+                                cursor: "pointer",
+                                textDecoration: "underline",
+                                padding: 0,
+                                fontSize: 13,
+                            }}
+                            aria-label="Clear selection"
+                        >
+                            Clear selection
+                        </button>
+                    </div>
+                )}
 
                 {/* Node Actions */}
                 <Stack horizontal tokens={{ childrenGap: 8 }} wrap>
@@ -819,24 +1207,28 @@ export const NodesPage: React.FC<NodesPageProps> = ({ orchestrator }) => {
                         onClick={() => handleNodeAction("reboot")}
                         disabled={isActing || actionCount === 0}
                         iconProps={{ iconName: "Refresh" }}
+                        aria-label={`Reboot ${actionCount} selected nodes`}
                     />
                     <DefaultButton
                         text={`Reimage (${actionCount})`}
                         onClick={() => handleNodeAction("reimage")}
                         disabled={isActing || actionCount === 0}
                         iconProps={{ iconName: "Rebuild" }}
+                        aria-label={`Reimage ${actionCount} selected nodes`}
                     />
                     <DefaultButton
                         text={`Disable Scheduling (${actionCount})`}
                         onClick={() => handleNodeAction("disableScheduling")}
                         disabled={isActing || actionCount === 0}
                         iconProps={{ iconName: "CirclePause" }}
+                        aria-label={`Disable scheduling on ${actionCount} selected nodes`}
                     />
                     <DefaultButton
                         text={`Enable Scheduling (${actionCount})`}
                         onClick={() => handleNodeAction("enableScheduling")}
                         disabled={isActing || actionCount === 0}
                         iconProps={{ iconName: "Play" }}
+                        aria-label={`Enable scheduling on ${actionCount} selected nodes`}
                     />
                     <DefaultButton
                         text={`Delete Nodes (${actionCount})`}
@@ -849,6 +1241,7 @@ export const NodesPage: React.FC<NodesPageProps> = ({ orchestrator }) => {
                                 color: "#a80000",
                             },
                         }}
+                        aria-label={`Delete ${actionCount} selected nodes`}
                     />
                     <DefaultButton
                         text={`Recreate Nodes (${actionCount})`}
@@ -861,6 +1254,7 @@ export const NodesPage: React.FC<NodesPageProps> = ({ orchestrator }) => {
                                 color: "#8764b8",
                             },
                         }}
+                        aria-label={`Recreate ${actionCount} selected nodes`}
                     />
                     <DefaultButton
                         text={`Recover Preempted (${summaryStats.preemptedCount})`}
@@ -873,6 +1267,7 @@ export const NodesPage: React.FC<NodesPageProps> = ({ orchestrator }) => {
                                 color: "#d13438",
                             },
                         }}
+                        aria-label={`Recover ${summaryStats.preemptedCount} preempted nodes`}
                     />
                 </Stack>
 
@@ -883,11 +1278,16 @@ export const NodesPage: React.FC<NodesPageProps> = ({ orchestrator }) => {
                                 ? "Loading nodes..."
                                 : "Performing action..."
                         }
+                        aria-live="polite"
                     />
                 )}
 
-                <div style={{ fontSize: 13, color: "#605e5c" }}>
-                    {displayNodes.length} nodes
+                <div
+                    style={{ fontSize: 13, color: "#605e5c" }}
+                    role="status"
+                    aria-live="polite"
+                >
+                    {sortedNodes.length} nodes
                     {selectedStates.length < ALL_NODE_STATES.length
                         ? ` (filtered: ${selectedStates.join(", ")})`
                         : ""}
@@ -897,24 +1297,34 @@ export const NodesPage: React.FC<NodesPageProps> = ({ orchestrator }) => {
                     {autoRecovery ? " | Auto-recovery ON" : ""}
                 </div>
 
-                {displayNodes.length > 0 ? (
-                    <DetailsList
-                        items={displayNodes}
-                        columns={columns}
-                        selectionMode={SelectionMode.multiple}
-                        selection={selection}
-                        checkboxVisibility={CheckboxVisibility.always}
-                        layoutMode={DetailsListLayoutMode.fixedColumns}
-                        getKey={(item: any) => item.id}
-                    />
-                ) : (
-                    <MessageBar messageBarType={MessageBarType.info}>
-                        {state.nodes.length === 0
-                            ? "No nodes found. Refresh pool info first."
-                            : "No nodes match the current filter."}
-                    </MessageBar>
-                )}
+                {renderContent()}
             </Stack>
+
+            {/* Confirmation Dialog */}
+            <Dialog
+                hidden={confirmDialog.hidden}
+                onDismiss={dismissConfirmDialog}
+                dialogContentProps={{
+                    type: DialogType.normal,
+                    title: confirmDialog.title,
+                    subText: confirmDialog.message,
+                }}
+                modalProps={{ isBlocking: true }}
+            >
+                <DialogFooter>
+                    <PrimaryButton
+                        text="Confirm"
+                        onClick={() => {
+                            dismissConfirmDialog();
+                            confirmDialog.onConfirm();
+                        }}
+                    />
+                    <DefaultButton
+                        text="Cancel"
+                        onClick={dismissConfirmDialog}
+                    />
+                </DialogFooter>
+            </Dialog>
         </div>
     );
 };

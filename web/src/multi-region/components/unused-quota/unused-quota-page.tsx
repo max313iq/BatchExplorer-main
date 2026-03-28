@@ -23,10 +23,134 @@ import { SpinButton } from "@fluentui/react/lib/SpinButton";
 import { Label } from "@fluentui/react/lib/Label";
 import { Checkbox } from "@fluentui/react/lib/Checkbox";
 import { MessageBar, MessageBarType } from "@fluentui/react/lib/MessageBar";
+import { Dropdown, IDropdownOption } from "@fluentui/react/lib/Dropdown";
 import { useMultiRegionState } from "../../store/store-context";
 import { OrchestratorAgent } from "../../agents/orchestrator-agent";
 import { AccountInfo } from "../../store/store-types";
 import { getVCpus, getAllVmSizes, VmSizeInfo } from "../shared/vm-sizes";
+
+/* ---- Skeleton ---- */
+const SKELETON_KEYFRAMES = `
+@keyframes skeletonPulse {
+  0% { opacity: 0.6; }
+  50% { opacity: 1; }
+  100% { opacity: 0.6; }
+}`;
+
+const TableSkeletonUQ: React.FC = () => (
+    <div
+        style={{
+            background: "#1e1e1e",
+            borderRadius: 6,
+            padding: 16,
+        }}
+        aria-hidden="true"
+    >
+        {Array.from({ length: 5 }).map((_, row) => (
+            <div
+                key={row}
+                style={{
+                    display: "flex",
+                    gap: 12,
+                    padding: "8px 0",
+                    borderBottom: "1px solid #2a2a2a",
+                }}
+            >
+                {[120, 80, 80, 70, 70, 70, 60, 140, 70].map((w, i) => (
+                    <div
+                        key={i}
+                        style={{
+                            width: w,
+                            height: 10,
+                            background: "#333",
+                            borderRadius: 4,
+                            animation:
+                                "skeletonPulse 1.5s ease-in-out infinite",
+                            animationDelay: `${row * 0.1}s`,
+                        }}
+                    />
+                ))}
+            </div>
+        ))}
+    </div>
+);
+
+/* ---- Pagination ---- */
+const PAGE_SIZE_OPTIONS_UQ: IDropdownOption[] = [
+    { key: 10, text: "10" },
+    { key: 25, text: "25" },
+    { key: 50, text: "50" },
+    { key: 100, text: "100" },
+];
+
+const PaginationUQ: React.FC<{
+    page: number;
+    pageSize: number;
+    totalItems: number;
+    onPageChange: (page: number) => void;
+    onPageSizeChange: (size: number) => void;
+}> = ({ page, pageSize, totalItems, onPageChange, onPageSizeChange }) => {
+    const totalPages = Math.max(1, Math.ceil(totalItems / pageSize));
+    return (
+        <Stack
+            horizontal
+            verticalAlign="center"
+            tokens={{ childrenGap: 12 }}
+            styles={{
+                root: { padding: "8px 0", justifyContent: "space-between" },
+            }}
+        >
+            <Stack
+                horizontal
+                verticalAlign="center"
+                tokens={{ childrenGap: 8 }}
+            >
+                <DefaultButton
+                    text="Prev"
+                    onClick={() => onPageChange(page - 1)}
+                    disabled={page <= 1}
+                    aria-label="Previous page"
+                    styles={{ root: { minWidth: 60 } }}
+                />
+                <Text
+                    styles={{ root: { color: "#999", fontSize: 13 } }}
+                    role="status"
+                    aria-live="polite"
+                >
+                    Page {page} of {totalPages}
+                </Text>
+                <DefaultButton
+                    text="Next"
+                    onClick={() => onPageChange(page + 1)}
+                    disabled={page >= totalPages}
+                    aria-label="Next page"
+                    styles={{ root: { minWidth: 60 } }}
+                />
+            </Stack>
+            <Stack
+                horizontal
+                verticalAlign="center"
+                tokens={{ childrenGap: 8 }}
+            >
+                <Text styles={{ root: { color: "#888", fontSize: 12 } }}>
+                    Rows:
+                </Text>
+                <Dropdown
+                    options={PAGE_SIZE_OPTIONS_UQ}
+                    selectedKey={pageSize}
+                    onChange={(_e, o) => {
+                        if (o) onPageSizeChange(o.key as number);
+                    }}
+                    styles={{ dropdown: { width: 70 } }}
+                    aria-label="Rows per page"
+                />
+                <Text styles={{ root: { color: "#666", fontSize: 11 } }}>
+                    ({totalItems} total)
+                </Text>
+            </Stack>
+        </Stack>
+    );
+};
 
 // Priority list for suggesting VM sizes
 const VM_PRIORITY_LIST = [
@@ -101,6 +225,9 @@ export const UnusedQuotaPage: React.FC<UnusedQuotaPageProps> = ({
 }) => {
     const state = useMultiRegionState();
     const [loading, setLoading] = React.useState(false);
+    const [error, setError] = React.useState<string | null>(null);
+    const [uqPage, setUqPage] = React.useState(1);
+    const [uqPageSize, setUqPageSize] = React.useState(25);
     const [showOnlyFree, setShowOnlyFree] = React.useState(false);
     const [sortKey, setSortKey] = React.useState<SortKey | null>(null);
     const [sortDescending, setSortDescending] = React.useState(false);
@@ -265,8 +392,20 @@ export const UnusedQuotaPage: React.FC<UnusedQuotaPageProps> = ({
         // eslint-disable-next-line react-hooks/exhaustive-deps
     }, []);
 
+    // Reset page when data changes
+    React.useEffect(() => {
+        setUqPage(1);
+    }, [sortedRows.length]);
+
+    // Paginate
+    const paginatedRows = React.useMemo(() => {
+        const start = (uqPage - 1) * uqPageSize;
+        return sortedRows.slice(start, start + uqPageSize);
+    }, [sortedRows, uqPage, uqPageSize]);
+
     const handleRefresh = async () => {
         setLoading(true);
+        setError(null);
         try {
             await orchestrator.execute({
                 action: "refresh_account_info",
@@ -276,8 +415,9 @@ export const UnusedQuotaPage: React.FC<UnusedQuotaPageProps> = ({
                 action: "refresh_pool_info",
                 payload: {},
             });
-        } catch {
-            /* handled by orchestrator */
+        } catch (e: unknown) {
+            const msg = e instanceof Error ? e.message : String(e);
+            setError(msg);
         } finally {
             setLoading(false);
         }
@@ -543,6 +683,26 @@ export const UnusedQuotaPage: React.FC<UnusedQuotaPageProps> = ({
 
     return (
         <div style={{ padding: "16px 0" }}>
+            <style>{SKELETON_KEYFRAMES}</style>
+
+            {/* Error state */}
+            {error && (
+                <MessageBar
+                    messageBarType={MessageBarType.error}
+                    onDismiss={() => setError(null)}
+                    styles={{ root: { marginBottom: 12 } }}
+                    actions={
+                        <DefaultButton
+                            text="Retry"
+                            onClick={handleRefresh}
+                            aria-label="Retry loading unused quota data"
+                        />
+                    }
+                >
+                    {error}
+                </MessageBar>
+            )}
+
             {/* Header */}
             <Stack
                 horizontal
@@ -563,13 +723,17 @@ export const UnusedQuotaPage: React.FC<UnusedQuotaPageProps> = ({
                     iconProps={{ iconName: "Refresh" }}
                     onClick={handleRefresh}
                     disabled={loading}
+                    aria-label="Refresh unused quota data"
                 />
-                {loading && <Spinner size={SpinnerSize.small} />}
+                {loading && (
+                    <Spinner size={SpinnerSize.small} aria-label="Loading" />
+                )}
                 <PrimaryButton
                     text="Use in Smart Mode"
                     iconProps={{ iconName: "Rocket" }}
                     onClick={handleUseInSmartMode}
                     disabled={selectedRows.length === 0}
+                    aria-label="Use selected accounts in smart pool creation mode"
                 />
                 <PrimaryButton
                     text="Auto-Create Pools"
@@ -579,6 +743,7 @@ export const UnusedQuotaPage: React.FC<UnusedQuotaPageProps> = ({
                         selectedRows.length === 0 ||
                         selectedRows.every((r) => r.maxNodes <= 0)
                     }
+                    aria-label="Auto-create pools for selected accounts"
                 />
                 <Toggle
                     label="Only accounts with free LP quota"
@@ -587,6 +752,7 @@ export const UnusedQuotaPage: React.FC<UnusedQuotaPageProps> = ({
                     onChange={(_e, checked) =>
                         setShowOnlyFree(checked ?? false)
                     }
+                    aria-label="Toggle to show only accounts with free LP quota"
                     styles={{
                         root: { marginBottom: 0, marginLeft: 16 },
                         label: { color: "#999", fontSize: 12 },
@@ -748,11 +914,36 @@ export const UnusedQuotaPage: React.FC<UnusedQuotaPageProps> = ({
             </Stack>
 
             {/* Table */}
-            {allRows.length === 0 ? (
-                <Text variant="medium" styles={{ root: { color: "#666" } }}>
-                    No account info available. Click &quot;Refresh&quot; to load
-                    data.
-                </Text>
+            {loading && allRows.length === 0 ? (
+                <TableSkeletonUQ />
+            ) : allRows.length === 0 ? (
+                <Stack
+                    horizontalAlign="center"
+                    tokens={{ childrenGap: 12 }}
+                    styles={{
+                        root: {
+                            padding: "48px 16px",
+                            background: "#1e1e1e",
+                            borderRadius: 6,
+                        },
+                    }}
+                    role="status"
+                >
+                    <Icon
+                        iconName="Savings"
+                        styles={{ root: { fontSize: 40, color: "#555" } }}
+                    />
+                    <Text
+                        variant="large"
+                        styles={{ root: { color: "#888", fontWeight: 600 } }}
+                    >
+                        No account info found
+                    </Text>
+                    <Text styles={{ root: { color: "#666", fontSize: 13 } }}>
+                        Click &quot;Refresh&quot; to load account data and see
+                        unused quota.
+                    </Text>
+                </Stack>
             ) : (
                 <div
                     style={{
@@ -774,6 +965,7 @@ export const UnusedQuotaPage: React.FC<UnusedQuotaPageProps> = ({
                                 filteredRows.length > 0 &&
                                 selectedRows.length === filteredRows.length
                             }
+                            aria-label={`Select all ${filteredRows.length} rows`}
                             styles={{
                                 label: {
                                     color: "#999",
@@ -787,13 +979,15 @@ export const UnusedQuotaPage: React.FC<UnusedQuotaPageProps> = ({
                                 styles={{
                                     root: { color: "#0078d4" },
                                 }}
+                                role="status"
+                                aria-live="polite"
                             >
                                 {selectedRows.length} selected
                             </Text>
                         )}
                     </Stack>
                     <DetailsList
-                        items={sortedRows}
+                        items={paginatedRows}
                         columns={columns}
                         layoutMode={DetailsListLayoutMode.fixedColumns}
                         selectionMode={SelectionMode.multiple}
@@ -823,6 +1017,18 @@ export const UnusedQuotaPage: React.FC<UnusedQuotaPageProps> = ({
                             },
                         }}
                     />
+                    {sortedRows.length > 10 && (
+                        <PaginationUQ
+                            page={uqPage}
+                            pageSize={uqPageSize}
+                            totalItems={sortedRows.length}
+                            onPageChange={setUqPage}
+                            onPageSizeChange={(s) => {
+                                setUqPageSize(s);
+                                setUqPage(1);
+                            }}
+                        />
+                    )}
                 </div>
             )}
 

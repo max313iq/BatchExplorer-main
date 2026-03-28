@@ -11,6 +11,8 @@ import {
 import { ProgressIndicator } from "@fluentui/react/lib/ProgressIndicator";
 import { MessageBar, MessageBarType } from "@fluentui/react/lib/MessageBar";
 import { Stack, IStackTokens } from "@fluentui/react/lib/Stack";
+import { Text } from "@fluentui/react/lib/Text";
+import { Icon } from "@fluentui/react/lib/Icon";
 import { Pivot, PivotItem } from "@fluentui/react/lib/Pivot";
 import {
     useMultiRegionState,
@@ -25,6 +27,45 @@ import {
 } from "../shared/constants";
 
 const stackTokens: IStackTokens = { childrenGap: 12 };
+
+/* ---- Skeleton ---- */
+const SKELETON_KEYFRAMES = `
+@keyframes skeletonPulse {
+  0% { opacity: 0.6; }
+  50% { opacity: 1; }
+  100% { opacity: 0.6; }
+}`;
+
+const AccountTableSkeleton: React.FC = () => (
+    <div aria-hidden="true" style={{ marginTop: 8 }}>
+        {Array.from({ length: 4 }).map((_, row) => (
+            <div
+                key={row}
+                style={{
+                    display: "flex",
+                    gap: 12,
+                    padding: "8px 0",
+                    borderBottom: "1px solid #2a2a2a",
+                }}
+            >
+                {[120, 160, 200, 100, 200].map((w, i) => (
+                    <div
+                        key={i}
+                        style={{
+                            width: w,
+                            height: 10,
+                            background: "#333",
+                            borderRadius: 4,
+                            animation:
+                                "skeletonPulse 1.5s ease-in-out infinite",
+                            animationDelay: `${row * 0.1}s`,
+                        }}
+                    />
+                ))}
+            </div>
+        ))}
+    </div>
+);
 
 interface AccountProvisioningPageProps {
     orchestrator: OrchestratorAgent;
@@ -242,6 +283,7 @@ export const AccountProvisioningPage: React.FC<
 
     return (
         <div style={{ padding: "16px" }}>
+            <style>{SKELETON_KEYFRAMES}</style>
             <h2 style={{ margin: "0 0 16px", fontSize: "20px" }}>
                 Account Provisioning
             </h2>
@@ -256,7 +298,10 @@ export const AccountProvisioningPage: React.FC<
                 </MessageBar>
             )}
 
-            <Pivot styles={{ root: { marginBottom: 16 } }}>
+            <Pivot
+                styles={{ root: { marginBottom: 16 } }}
+                aria-label="Account provisioning tabs"
+            >
                 <PivotItem headerText="Create New" itemIcon="Add">
                     <div style={{ paddingTop: 12 }}>
                         <Stack tokens={stackTokens}>
@@ -307,6 +352,7 @@ export const AccountProvisioningPage: React.FC<
                                     }
                                     onClick={handleCreate}
                                     styles={{ root: { maxWidth: 250 } }}
+                                    aria-label={`Create ${selectedRegions.length} Batch accounts`}
                                 />
                                 {isRunning && (
                                     <DefaultButton
@@ -397,6 +443,10 @@ export const AccountProvisioningPage: React.FC<
                 </PivotItem>
             </Pivot>
 
+            {(isRunning || isDiscovering) && state.accounts.length === 0 && (
+                <AccountTableSkeleton />
+            )}
+
             {state.accounts.length > 0 && (
                 <div style={{ marginTop: 8 }}>
                     <div
@@ -405,6 +455,8 @@ export const AccountProvisioningPage: React.FC<
                             marginBottom: 8,
                             color: "#605e5c",
                         }}
+                        role="status"
+                        aria-live="polite"
                     >
                         {totalCount} accounts ({createdCount} ready,{" "}
                         {failedCount} failed)
@@ -417,6 +469,45 @@ export const AccountProvisioningPage: React.FC<
                         compact
                     />
                 </div>
+            )}
+
+            {!isRunning && !isDiscovering && state.accounts.length === 0 && (
+                <Stack
+                    horizontalAlign="center"
+                    tokens={{ childrenGap: 12 }}
+                    styles={{
+                        root: {
+                            padding: "48px 16px",
+                            background: "#1e1e1e",
+                            borderRadius: 6,
+                            marginTop: 16,
+                        },
+                    }}
+                    role="status"
+                >
+                    <Icon
+                        iconName="AccountManagement"
+                        styles={{
+                            root: { fontSize: 40, color: "#555" },
+                        }}
+                    />
+                    <Text
+                        variant="large"
+                        styles={{
+                            root: { color: "#888", fontWeight: 600 },
+                        }}
+                    >
+                        No accounts provisioned
+                    </Text>
+                    <Text
+                        styles={{
+                            root: { color: "#666", fontSize: 13 },
+                        }}
+                    >
+                        Create new Batch accounts or discover existing ones from
+                        a subscription.
+                    </Text>
+                </Stack>
             )}
         </div>
     );

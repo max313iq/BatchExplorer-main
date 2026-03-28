@@ -15,6 +15,31 @@ const BATCH_API_VERSION = "2024-07-01.20.0";
 const BATCH_CONTENT_TYPE = "application/json; odata=minimalmetadata";
 
 // ---------------------------------------------------------------------------
+// Input validation
+// ---------------------------------------------------------------------------
+
+/**
+ * Validate that an account endpoint looks like a legitimate Batch endpoint.
+ * Prevents SSRF by ensuring the endpoint points to a *.batch.azure.com host.
+ */
+function validateAccountEndpoint(endpoint: string): void {
+    const normalized = endpoint.startsWith("https://")
+        ? endpoint
+        : `https://${endpoint}`;
+    let hostname: string;
+    try {
+        hostname = new URL(normalized).hostname;
+    } catch {
+        throw new Error("Invalid accountEndpoint: must be a valid hostname.");
+    }
+    if (!hostname.endsWith(".batch.azure.com")) {
+        throw new Error(
+            "Invalid accountEndpoint: must be a *.batch.azure.com hostname."
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
@@ -113,7 +138,10 @@ async function fetchAllPages<T>(
  *
  * Handles pagination via `odata.nextLink` automatically.
  *
- * @param accountEndpoint - The Batch account endpoint.
+ * **Security**: `accountEndpoint` is validated to be a `*.batch.azure.com`
+ * hostname to prevent SSRF. The token is sent only to the validated endpoint.
+ *
+ * @param accountEndpoint - The Batch account endpoint (must be *.batch.azure.com).
  * @param token - Bearer token with `https://batch.core.windows.net/.default` scope.
  * @returns Array of pool objects.
  */
@@ -121,6 +149,7 @@ export async function listPools(
     accountEndpoint: string,
     token: string
 ): Promise<BatchPool[]> {
+    validateAccountEndpoint(accountEndpoint);
     const url = batchUrl(accountEndpoint, "/pools");
     return fetchAllPages<BatchPool>(url, token);
 }
@@ -128,7 +157,10 @@ export async function listPools(
 /**
  * Create a pool in a Batch account.
  *
- * @param accountEndpoint - The Batch account endpoint.
+ * **Security**: `accountEndpoint` is validated against `*.batch.azure.com`.
+ * `poolConfig` is serialized via `JSON.stringify` (no raw interpolation).
+ *
+ * @param accountEndpoint - The Batch account endpoint (must be *.batch.azure.com).
  * @param poolConfig - Full pool creation body (id, vmSize, etc.).
  * @param token - Bearer token with Batch scope.
  */
@@ -137,6 +169,7 @@ export async function createPool(
     poolConfig: Record<string, unknown>,
     token: string
 ): Promise<void> {
+    validateAccountEndpoint(accountEndpoint);
     const url = batchUrl(accountEndpoint, "/pools");
 
     const response = await fetch(url, {
@@ -157,7 +190,9 @@ export async function createPool(
  * include changing `targetDedicatedNodes`, `targetLowPriorityNodes`,
  * `startTask`, or `applicationPackageReferences`.
  *
- * @param accountEndpoint - The Batch account endpoint.
+ * **Security**: `accountEndpoint` is validated. `poolId` is URI-encoded.
+ *
+ * @param accountEndpoint - The Batch account endpoint (must be *.batch.azure.com).
  * @param poolId - ID of the pool to patch.
  * @param patch - Partial pool body with properties to update.
  * @param token - Bearer token with Batch scope.
@@ -168,6 +203,7 @@ export async function patchPool(
     patch: Record<string, unknown>,
     token: string
 ): Promise<void> {
+    validateAccountEndpoint(accountEndpoint);
     const url = batchUrl(
         accountEndpoint,
         `/pools/${encodeURIComponent(poolId)}`
@@ -187,7 +223,9 @@ export async function patchPool(
 /**
  * Delete a pool from a Batch account.
  *
- * @param accountEndpoint - The Batch account endpoint.
+ * **Security**: `accountEndpoint` is validated. `poolId` is URI-encoded.
+ *
+ * @param accountEndpoint - The Batch account endpoint (must be *.batch.azure.com).
  * @param poolId - ID of the pool to delete.
  * @param token - Bearer token with Batch scope.
  */
@@ -196,6 +234,7 @@ export async function deletePool(
     poolId: string,
     token: string
 ): Promise<void> {
+    validateAccountEndpoint(accountEndpoint);
     const url = batchUrl(
         accountEndpoint,
         `/pools/${encodeURIComponent(poolId)}`
@@ -220,7 +259,9 @@ export async function deletePool(
  *
  * Handles pagination via `odata.nextLink` automatically.
  *
- * @param accountEndpoint - The Batch account endpoint.
+ * **Security**: `accountEndpoint` is validated. `poolId` is URI-encoded.
+ *
+ * @param accountEndpoint - The Batch account endpoint (must be *.batch.azure.com).
  * @param poolId - ID of the pool to list nodes from.
  * @param token - Bearer token with Batch scope.
  * @returns Array of compute node objects.
@@ -230,6 +271,7 @@ export async function listNodes(
     poolId: string,
     token: string
 ): Promise<BatchNode[]> {
+    validateAccountEndpoint(accountEndpoint);
     const url = batchUrl(
         accountEndpoint,
         `/pools/${encodeURIComponent(poolId)}/nodes`
@@ -246,7 +288,11 @@ export async function listNodes(
  * - disableScheduling: POST /pools/{poolId}/nodes/{nodeId}/disablescheduling
  * - enableScheduling:  POST /pools/{poolId}/nodes/{nodeId}/enablescheduling
  *
- * @param accountEndpoint - The Batch account endpoint.
+ * **Security**: `accountEndpoint` is validated. `poolId` and `nodeId` are
+ * URI-encoded. The `action` parameter is constrained to the `NodeAction` union
+ * type and mapped through a fixed lookup -- no arbitrary path injection is possible.
+ *
+ * @param accountEndpoint - The Batch account endpoint (must be *.batch.azure.com).
  * @param poolId - ID of the pool.
  * @param nodeId - ID of the compute node.
  * @param action - The action to perform.
@@ -259,6 +305,7 @@ export async function performNodeAction(
     action: NodeAction,
     token: string
 ): Promise<void> {
+    validateAccountEndpoint(accountEndpoint);
     const actionPath: Record<NodeAction, string> = {
         reboot: "reboot",
         reimage: "reimage",
@@ -288,7 +335,10 @@ export async function performNodeAction(
  *
  * Maps to POST /pools/{poolId}/removenodes.
  *
- * @param accountEndpoint - The Batch account endpoint.
+ * **Security**: `accountEndpoint` is validated. `poolId` is URI-encoded.
+ * `nodeIds` are sent in the JSON body (not interpolated into the URL).
+ *
+ * @param accountEndpoint - The Batch account endpoint (must be *.batch.azure.com).
  * @param poolId - ID of the pool.
  * @param nodeIds - Array of node IDs to remove.
  * @param token - Bearer token with Batch scope.
@@ -299,6 +349,7 @@ export async function removeNodes(
     nodeIds: string[],
     token: string
 ): Promise<void> {
+    validateAccountEndpoint(accountEndpoint);
     const url = batchUrl(
         accountEndpoint,
         `/pools/${encodeURIComponent(poolId)}/removenodes`

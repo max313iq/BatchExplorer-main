@@ -23,6 +23,81 @@ interface StatCardProps {
     onClick?: () => void;
 }
 
+const SkeletonCard: React.FC = () => (
+    <div
+        style={{
+            background: "#252525",
+            borderRadius: 8,
+            padding: 20,
+            flex: "1 1 200px",
+            minWidth: 200,
+            borderTop: "3px solid #444",
+        }}
+        aria-busy="true"
+        aria-label="Loading stat card"
+    >
+        <Stack horizontal verticalAlign="center" tokens={{ childrenGap: 10 }}>
+            <div
+                style={{
+                    width: 20,
+                    height: 20,
+                    borderRadius: 4,
+                    background: "#333",
+                    animation: "pulse 1.5s ease-in-out infinite",
+                }}
+            />
+            <div
+                style={{
+                    width: 80,
+                    height: 16,
+                    borderRadius: 4,
+                    background: "#333",
+                    animation: "pulse 1.5s ease-in-out infinite",
+                }}
+            />
+            <div
+                style={{
+                    marginLeft: "auto",
+                    width: 40,
+                    height: 28,
+                    borderRadius: 4,
+                    background: "#333",
+                    animation: "pulse 1.5s ease-in-out infinite",
+                }}
+            />
+        </Stack>
+        <Stack
+            horizontal
+            tokens={{ childrenGap: 16 }}
+            styles={{ root: { marginTop: 12 } }}
+        >
+            {[1, 2, 3].map((n) => (
+                <div key={n}>
+                    <div
+                        style={{
+                            width: 50,
+                            height: 12,
+                            borderRadius: 3,
+                            background: "#333",
+                            marginBottom: 4,
+                            animation: "pulse 1.5s ease-in-out infinite",
+                        }}
+                    />
+                    <div
+                        style={{
+                            width: 30,
+                            height: 18,
+                            borderRadius: 3,
+                            background: "#333",
+                            animation: "pulse 1.5s ease-in-out infinite",
+                        }}
+                    />
+                </div>
+            ))}
+        </Stack>
+    </div>
+);
+
 const StatCard: React.FC<StatCardProps> = ({
     icon,
     title,
@@ -37,6 +112,7 @@ const StatCard: React.FC<StatCardProps> = ({
     return (
         <div
             onClick={onClick}
+            aria-label={`${title}: ${total}`}
             style={{
                 background: "#252525",
                 borderRadius: 8,
@@ -724,6 +800,14 @@ export const OverviewPage: React.FC<OverviewPageProps> = ({
         }
     }, [orchestrator]);
 
+    const isLoading = refreshing || state.accounts.length === 0;
+    const isEmptyState =
+        !refreshing &&
+        state.accounts.length === 0 &&
+        stats.totalAccounts === 0 &&
+        stats.totalPools === 0 &&
+        stats.totalNodes === 0;
+
     return (
         <div style={{ padding: "16px 0" }}>
             <Stack
@@ -752,8 +836,46 @@ export const OverviewPage: React.FC<OverviewPageProps> = ({
                 {refreshing && <Spinner size={SpinnerSize.small} />}
             </Stack>
 
+            {isEmptyState && (
+                <div
+                    role="status"
+                    style={{
+                        background: "#1e1e1e",
+                        borderRadius: 6,
+                        padding: 32,
+                        textAlign: "center",
+                        marginBottom: 16,
+                    }}
+                >
+                    <Icon
+                        iconName="AuthenticatorApp"
+                        styles={{
+                            root: {
+                                fontSize: 40,
+                                color: "#555",
+                                marginBottom: 12,
+                            },
+                        }}
+                    />
+                    <Text
+                        variant="large"
+                        styles={{
+                            root: {
+                                display: "block",
+                                color: "#999",
+                                marginBottom: 8,
+                            },
+                        }}
+                    >
+                        No data available. Sign in to load accounts.
+                    </Text>
+                </div>
+            )}
+
             {/* Stats Cards */}
             <div
+                role="region"
+                aria-label="Dashboard statistics"
                 style={{
                     display: "flex",
                     gap: 16,
@@ -761,6 +883,10 @@ export const OverviewPage: React.FC<OverviewPageProps> = ({
                     marginBottom: 16,
                 }}
             >
+                {isLoading &&
+                    stats.totalAccounts === 0 &&
+                    stats.totalPools === 0 &&
+                    [1, 2, 3, 4].map((n) => <SkeletonCard key={n} />)}
                 <StatCard
                     icon="ServerProcesses"
                     title="Accounts"
@@ -896,13 +1022,21 @@ export const OverviewPage: React.FC<OverviewPageProps> = ({
             </div>
 
             {/* Unused Quota */}
-            <UnusedQuotaSection orchestrator={orchestrator} />
+            <div role="region" aria-label="Unused quota">
+                <UnusedQuotaSection orchestrator={orchestrator} />
+            </div>
 
             {/* Agent Status */}
-            <AgentStatusStrip />
+            <div role="region" aria-label="Agent status">
+                <AgentStatusStrip />
+            </div>
 
             {/* Quick Actions */}
-            <div style={{ marginTop: 16 }}>
+            <div
+                role="region"
+                aria-label="Quick actions"
+                style={{ marginTop: 16 }}
+            >
                 <Text
                     variant="mediumPlus"
                     styles={{
@@ -920,7 +1054,11 @@ export const OverviewPage: React.FC<OverviewPageProps> = ({
             </div>
 
             {/* Recent Activity */}
-            <div style={{ marginTop: 16 }}>
+            <div
+                role="region"
+                aria-label="Recent activity"
+                style={{ marginTop: 16 }}
+            >
                 <RecentActivity />
             </div>
         </div>

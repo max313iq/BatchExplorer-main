@@ -4,8 +4,30 @@ import {
     useMultiRegionState,
     useMultiRegionStore,
 } from "../../store/store-context";
+import { MultiRegionStore } from "../../store/multi-region-store";
 import { ToastNotification } from "../../store/store-types";
 import { DEFAULT_CONFIG } from "./constants";
+
+/**
+ * Programmatic toast helper that can be called from anywhere with a store reference.
+ *
+ * @param store - The MultiRegionStore instance.
+ * @param message - Text to display in the toast.
+ * @param type - Toast severity: "success", "error", "warning", or "info" (default: "info").
+ * @param durationMs - Optional auto-dismiss duration in ms. Uses default if omitted.
+ */
+export function showToast(
+    store: MultiRegionStore,
+    message: string,
+    type: "success" | "error" | "warning" | "info" = "info",
+    durationMs?: number
+): void {
+    store.addNotification({
+        type,
+        message,
+        autoDismissMs: durationMs,
+    });
+}
 
 const TYPE_MAP: Record<ToastNotification["type"], MessageBarType> = {
     success: MessageBarType.success,

@@ -10,6 +10,9 @@ import {
     SelectionMode,
 } from "@fluentui/react/lib/DetailsList";
 import { Stack, IStackTokens } from "@fluentui/react/lib/Stack";
+import { Text } from "@fluentui/react/lib/Text";
+import { Icon } from "@fluentui/react/lib/Icon";
+import { MessageBar, MessageBarType } from "@fluentui/react/lib/MessageBar";
 import { useMultiRegionState } from "../../store/store-context";
 import { StatusBadge } from "../shared/status-badge";
 import { OrchestratorAgent } from "../../agents/orchestrator-agent";
@@ -17,6 +20,119 @@ import { QuotaRequest } from "../../store/store-types";
 import { DEFAULT_CONFIG } from "../shared/constants";
 
 const stackTokens: IStackTokens = { childrenGap: 12 };
+
+/* ---- Skeleton ---- */
+const SKELETON_KEYFRAMES = `
+@keyframes skeletonPulse {
+  0% { opacity: 0.6; }
+  50% { opacity: 1; }
+  100% { opacity: 0.6; }
+}`;
+
+const TableSkeleton: React.FC = () => (
+    <div aria-hidden="true" style={{ padding: 16 }}>
+        {Array.from({ length: 4 }).map((_, row) => (
+            <div
+                key={row}
+                style={{
+                    display: "flex",
+                    gap: 12,
+                    padding: "8px 0",
+                    borderBottom: "1px solid #2a2a2a",
+                }}
+            >
+                {[140, 120, 100, 110, 100, 160, 160].map((w, i) => (
+                    <div
+                        key={i}
+                        style={{
+                            width: w,
+                            height: 10,
+                            background: "#333",
+                            borderRadius: 4,
+                            animation:
+                                "skeletonPulse 1.5s ease-in-out infinite",
+                            animationDelay: `${row * 0.1}s`,
+                        }}
+                    />
+                ))}
+            </div>
+        ))}
+    </div>
+);
+
+/* ---- Pagination ---- */
+const PAGE_SIZE_OPTIONS_QS: IDropdownOption[] = [
+    { key: 10, text: "10" },
+    { key: 25, text: "25" },
+    { key: 50, text: "50" },
+    { key: 100, text: "100" },
+];
+
+const PaginationControls: React.FC<{
+    page: number;
+    pageSize: number;
+    totalItems: number;
+    onPageChange: (page: number) => void;
+    onPageSizeChange: (size: number) => void;
+}> = ({ page, pageSize, totalItems, onPageChange, onPageSizeChange }) => {
+    const totalPages = Math.max(1, Math.ceil(totalItems / pageSize));
+    return (
+        <Stack
+            horizontal
+            verticalAlign="center"
+            tokens={{ childrenGap: 12 }}
+            styles={{
+                root: { padding: "8px 0", justifyContent: "space-between" },
+            }}
+        >
+            <Stack
+                horizontal
+                verticalAlign="center"
+                tokens={{ childrenGap: 8 }}
+            >
+                <DefaultButton
+                    text="Prev"
+                    onClick={() => onPageChange(page - 1)}
+                    disabled={page <= 1}
+                    aria-label="Previous page"
+                    styles={{ root: { minWidth: 60 } }}
+                />
+                <Text
+                    styles={{ root: { color: "#999", fontSize: 13 } }}
+                    role="status"
+                    aria-live="polite"
+                >
+                    Page {page} of {totalPages}
+                </Text>
+                <DefaultButton
+                    text="Next"
+                    onClick={() => onPageChange(page + 1)}
+                    disabled={page >= totalPages}
+                    aria-label="Next page"
+                    styles={{ root: { minWidth: 60 } }}
+                />
+            </Stack>
+            <Stack
+                horizontal
+                verticalAlign="center"
+                tokens={{ childrenGap: 8 }}
+            >
+                <Text styles={{ root: { color: "#888", fontSize: 12 } }}>
+                    Rows:
+                </Text>
+                <Dropdown
+                    options={PAGE_SIZE_OPTIONS_QS}
+                    selectedKey={pageSize}
+                    onChange={(_e, o) => {
+                        if (o) onPageSizeChange(o.key as number);
+                    }}
+                    styles={{ dropdown: { width: 70 } }}
+                    aria-label="Rows per page"
+                />
+            </Stack>
+        </Stack>
+    );
+};
 
 const INTERVAL_OPTIONS: IDropdownOption[] = [
     { key: "30", text: "30 seconds" },
@@ -38,6 +154,9 @@ export const QuotaStatusPage: React.FC<QuotaStatusPageProps> = ({
         DEFAULT_CONFIG.defaultRefreshIntervalSec
     );
     const [isRefreshing, setIsRefreshing] = React.useState(false);
+    const [error, setError] = React.useState<string | null>(null);
+    const [qsPage, setQsPage] = React.useState(1);
+    const [qsPageSize, setQsPageSize] = React.useState(25);
     const intervalRef = React.useRef<ReturnType<typeof setInterval> | null>(
         null
     );
@@ -64,11 +183,15 @@ export const QuotaStatusPage: React.FC<QuotaStatusPageProps> = ({
 
     const handleRefresh = React.useCallback(async () => {
         setIsRefreshing(true);
+        setError(null);
         try {
             await orchestrator.execute({
                 action: "check_quota_status",
                 payload: { mode: "one-shot" },
             });
+        } catch (e: unknown) {
+            const msg = e instanceof Error ? e.message : String(e);
+            setError(msg);
         } finally {
             setIsRefreshing(false);
         }
@@ -159,21 +282,92 @@ export const QuotaStatusPage: React.FC<QuotaStatusPageProps> = ({
         },
     ];
 
-    const renderTable = (items: QuotaRequest[]) => (
-        <DetailsList
-            items={items}
-            columns={columns}
-            layoutMode={DetailsListLayoutMode.justified}
-            selectionMode={SelectionMode.none}
-            compact
-        />
+    // Reset page when data changes
+    React.useEffect(() => {
+        setQsPage(1);
+    }, [state.quotaRequests.length]);
+
+    const renderPaginatedTable = (items: QuotaRequest[]) => {
+        const paged = items.slice(
+            (qsPage - 1) * qsPageSize,
+            qsPage * qsPageSize
+        );
+        return (
+            <>
+                <DetailsList
+                    items={paged}
+                    columns={columns}
+                    layoutMode={DetailsListLayoutMode.justified}
+                    selectionMode={SelectionMode.none}
+                    compact
+                />
+                {items.length > 10 && (
+                    <PaginationControls
+                        page={qsPage}
+                        pageSize={qsPageSize}
+                        totalItems={items.length}
+                        onPageChange={setQsPage}
+                        onPageSizeChange={(s) => {
+                            setQsPageSize(s);
+                            setQsPage(1);
+                        }}
+                    />
+                )}
+            </>
+        );
+    };
+
+    const renderEmpty = (label: string, icon: string) => (
+        <Stack
+            horizontalAlign="center"
+            tokens={{ childrenGap: 8 }}
+            styles={{ root: { padding: "32px 16px" } }}
+            role="status"
+        >
+            <Icon
+                iconName={icon}
+                styles={{ root: { fontSize: 32, color: "#555" } }}
+            />
+            <Text
+                variant="medium"
+                styles={{ root: { color: "#888", fontWeight: 600 } }}
+            >
+                No {label} requests
+            </Text>
+            <Text styles={{ root: { color: "#666", fontSize: 12 } }}>
+                {label === "pending"
+                    ? "No requests are currently waiting for approval."
+                    : label === "approved"
+                      ? "No requests have been approved yet."
+                      : "No requests have been denied."}
+            </Text>
+        </Stack>
     );
 
     return (
         <div style={{ padding: "16px" }}>
+            <style>{SKELETON_KEYFRAMES}</style>
             <h2 style={{ margin: "0 0 16px", fontSize: "20px" }}>
                 Quota Status Dashboard
             </h2>
+
+            {/* Error state */}
+            {error && (
+                <MessageBar
+                    messageBarType={MessageBarType.error}
+                    onDismiss={() => setError(null)}
+                    styles={{ root: { marginBottom: 12 } }}
+                    actions={
+                        <DefaultButton
+                            text="Retry"
+                            onClick={handleRefresh}
+                            aria-label="Retry checking quota status"
+                        />
+                    }
+                >
+                    {error}
+                </MessageBar>
+            )}
 
             <Stack horizontal tokens={stackTokens} verticalAlign="end">
                 <DefaultButton
@@ -181,12 +375,14 @@ export const QuotaStatusPage: React.FC<QuotaStatusPageProps> = ({
                     disabled={isRefreshing}
                     onClick={handleRefresh}
                     iconProps={{ iconName: "Refresh" }}
+                    aria-label="Refresh quota status"
                 />
                 <Toggle
                     label="Auto-refresh"
                     checked={autoRefresh}
                     onChange={(_e, checked) => setAutoRefresh(!!checked)}
                     inlineLabel
+                    aria-label="Toggle auto-refresh"
                 />
                 <Dropdown
                     label="Interval"
@@ -201,62 +397,69 @@ export const QuotaStatusPage: React.FC<QuotaStatusPageProps> = ({
                     }}
                     styles={{ dropdown: { width: 130 } }}
                     disabled={!autoRefresh}
+                    aria-label="Refresh interval"
                 />
             </Stack>
 
-            <div style={{ marginTop: 16 }}>
-                <Pivot>
-                    <PivotItem
-                        headerText={`Pending (${pendingRequests.length})`}
+            {/* Skeleton when loading with no data */}
+            {isRefreshing && state.quotaRequests.length === 0 ? (
+                <TableSkeleton />
+            ) : state.quotaRequests.length === 0 ? (
+                <Stack
+                    horizontalAlign="center"
+                    tokens={{ childrenGap: 12 }}
+                    styles={{
+                        root: {
+                            padding: "48px 16px",
+                            background: "#1e1e1e",
+                            borderRadius: 6,
+                            marginTop: 16,
+                        },
+                    }}
+                    role="status"
+                >
+                    <Icon
+                        iconName="Clock"
+                        styles={{ root: { fontSize: 40, color: "#555" } }}
+                    />
+                    <Text
+                        variant="large"
+                        styles={{ root: { color: "#888", fontWeight: 600 } }}
                     >
-                        {pendingRequests.length > 0 ? (
-                            renderTable(pendingRequests)
-                        ) : (
-                            <div
-                                style={{
-                                    padding: "24px",
-                                    color: "#605e5c",
-                                    textAlign: "center",
-                                }}
-                            >
-                                No pending requests
-                            </div>
-                        )}
-                    </PivotItem>
-                    <PivotItem
-                        headerText={`Approved (${approvedRequests.length})`}
-                    >
-                        {approvedRequests.length > 0 ? (
-                            renderTable(approvedRequests)
-                        ) : (
-                            <div
-                                style={{
-                                    padding: "24px",
-                                    color: "#605e5c",
-                                    textAlign: "center",
-                                }}
-                            >
-                                No approved requests
-                            </div>
-                        )}
-                    </PivotItem>
-                    <PivotItem headerText={`Denied (${deniedRequests.length})`}>
-                        {deniedRequests.length > 0 ? (
-                            renderTable(deniedRequests)
-                        ) : (
-                            <div
-                                style={{
-                                    padding: "24px",
-                                    color: "#605e5c",
-                                    textAlign: "center",
-                                }}
-                            >
-                                No denied requests
-                            </div>
-                        )}
-                    </PivotItem>
-                </Pivot>
-            </div>
+                        No quota requests found
+                    </Text>
+                    <Text styles={{ root: { color: "#666", fontSize: 13 } }}>
+                        Submit quota increase requests first, then monitor their
+                        status here.
+                    </Text>
+                </Stack>
+            ) : (
+                <div style={{ marginTop: 16 }}>
+                    <Pivot aria-label="Quota request status tabs">
+                        <PivotItem
+                            headerText={`Pending (${pendingRequests.length})`}
+                        >
+                            {pendingRequests.length > 0
+                                ? renderPaginatedTable(pendingRequests)
+                                : renderEmpty("pending", "Clock")}
+                        </PivotItem>
+                        <PivotItem
+                            headerText={`Approved (${approvedRequests.length})`}
+                        >
+                            {approvedRequests.length > 0
+                                ? renderPaginatedTable(approvedRequests)
+                                : renderEmpty("approved", "Checkmark")}
+                        </PivotItem>
+                        <PivotItem
+                            headerText={`Denied (${deniedRequests.length})`}
+                        >
+                            {deniedRequests.length > 0
+                                ? renderPaginatedTable(deniedRequests)
+                                : renderEmpty("denied", "Cancel")}
+                        </PivotItem>
+                    </Pivot>
+                </div>
+            )}
         </div>
     );
 };

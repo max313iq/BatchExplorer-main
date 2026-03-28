@@ -14,7 +14,8 @@ export type PageKey =
     | "account-info"
     | "unused-quota"
     | "monitoring"
-    | "nodes";
+    | "nodes"
+    | "audit-log";
 
 interface NavItem {
     key: PageKey;
@@ -121,6 +122,11 @@ export const SidebarNav: React.FC<SidebarNavProps> = ({
                 icon: "Server",
                 badge: state.nodes.length,
             },
+            {
+                key: "audit-log",
+                label: "Audit Log",
+                icon: "TimelineProgress",
+            },
         ],
         [state]
     );
@@ -129,6 +135,8 @@ export const SidebarNav: React.FC<SidebarNavProps> = ({
 
     return (
         <nav
+            role="navigation"
+            aria-label="Main navigation"
             style={{
                 width,
                 minWidth: width,
@@ -192,6 +200,8 @@ export const SidebarNav: React.FC<SidebarNavProps> = ({
                     return (
                         <button
                             key={item.key}
+                            role="menuitem"
+                            aria-current={isActive ? "page" : undefined}
                             onClick={() => onNavigate(item.key)}
                             title={collapsed ? item.label : undefined}
                             style={{

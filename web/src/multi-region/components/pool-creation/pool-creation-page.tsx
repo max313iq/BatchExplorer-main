@@ -475,6 +475,7 @@ export const PoolCreationPage: React.FC<PoolCreationPageProps> = ({
                     label={`Select all eligible accounts (${eligibleAccounts.length})`}
                     checked={selectAll}
                     onChange={(_e, checked) => setSelectAll(!!checked)}
+                    aria-label={`Select all ${eligibleAccounts.length} eligible accounts`}
                 />
 
                 {!selectAll && eligibleAccounts.length > 0 && (
@@ -498,6 +499,13 @@ export const PoolCreationPage: React.FC<PoolCreationPageProps> = ({
                     </MessageBar>
                 )}
 
+                {eligibleAccounts.length === 0 && !isRunning && (
+                    <MessageBar messageBarType={MessageBarType.info}>
+                        No eligible accounts available. Provision accounts and
+                        get quota approved before creating pools.
+                    </MessageBar>
+                )}
+
                 <Toggle
                     label="Smart Mode (recommended)"
                     inlineLabel
@@ -505,6 +513,7 @@ export const PoolCreationPage: React.FC<PoolCreationPageProps> = ({
                     onChange={(_e, checked) => setSmartMode(!!checked)}
                     onText="On"
                     offText="Off"
+                    aria-label="Toggle smart mode for pool creation"
                 />
 
                 {smartMode ? (
@@ -530,6 +539,7 @@ export const PoolCreationPage: React.FC<PoolCreationPageProps> = ({
                             placeholder="Select VM sizes..."
                             required
                             multiSelect
+                            aria-label="Select GPU VM sizes in priority order"
                             options={VM_DROPDOWN_OPTIONS}
                             selectedKeys={selectedVmSizes}
                             onChange={(_e, option) => {

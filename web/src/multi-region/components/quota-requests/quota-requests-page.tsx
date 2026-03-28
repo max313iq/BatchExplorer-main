@@ -12,6 +12,8 @@ import { ProgressIndicator } from "@fluentui/react/lib/ProgressIndicator";
 import { MessageBar, MessageBarType } from "@fluentui/react/lib/MessageBar";
 import { Checkbox } from "@fluentui/react/lib/Checkbox";
 import { Stack, IStackTokens } from "@fluentui/react/lib/Stack";
+import { Text } from "@fluentui/react/lib/Text";
+import { Icon } from "@fluentui/react/lib/Icon";
 import {
     useMultiRegionState,
     useMultiRegionStore,
@@ -21,6 +23,119 @@ import { OrchestratorAgent } from "../../agents/orchestrator-agent";
 import { DEFAULT_CONFIG } from "../shared/constants";
 
 const stackTokens: IStackTokens = { childrenGap: 12 };
+
+/* ---- Skeleton ---- */
+const SKELETON_KEYFRAMES = `
+@keyframes skeletonPulse {
+  0% { opacity: 0.6; }
+  50% { opacity: 1; }
+  100% { opacity: 0.6; }
+}`;
+
+const TableSkeleton: React.FC = () => (
+    <div aria-hidden="true" style={{ marginTop: 16 }}>
+        {Array.from({ length: 4 }).map((_, row) => (
+            <div
+                key={row}
+                style={{
+                    display: "flex",
+                    gap: 12,
+                    padding: "8px 0",
+                    borderBottom: "1px solid #2a2a2a",
+                }}
+            >
+                {[140, 120, 200, 100, 160].map((w, i) => (
+                    <div
+                        key={i}
+                        style={{
+                            width: w,
+                            height: 10,
+                            background: "#333",
+                            borderRadius: 4,
+                            animation:
+                                "skeletonPulse 1.5s ease-in-out infinite",
+                            animationDelay: `${row * 0.1}s`,
+                        }}
+                    />
+                ))}
+            </div>
+        ))}
+    </div>
+);
+
+/* ---- Pagination ---- */
+const PAGE_SIZE_OPTIONS: IDropdownOption[] = [
+    { key: 10, text: "10" },
+    { key: 25, text: "25" },
+    { key: 50, text: "50" },
+    { key: 100, text: "100" },
+];
+
+const Pagination: React.FC<{
+    page: number;
+    pageSize: number;
+    totalItems: number;
+    onPageChange: (page: number) => void;
+    onPageSizeChange: (size: number) => void;
+}> = ({ page, pageSize, totalItems, onPageChange, onPageSizeChange }) => {
+    const totalPages = Math.max(1, Math.ceil(totalItems / pageSize));
+    return (
+        <Stack
+            horizontal
+            verticalAlign="center"
+            tokens={{ childrenGap: 12 }}
+            styles={{
+                root: { padding: "8px 0", justifyContent: "space-between" },
+            }}
+        >
+            <Stack
+                horizontal
+                verticalAlign="center"
+                tokens={{ childrenGap: 8 }}
+            >
+                <DefaultButton
+                    text="Prev"
+                    onClick={() => onPageChange(page - 1)}
+                    disabled={page <= 1}
+                    aria-label="Previous page"
+                    styles={{ root: { minWidth: 60 } }}
+                />
+                <Text
+                    styles={{ root: { color: "#999", fontSize: 13 } }}
+                    role="status"
+                    aria-live="polite"
+                >
+                    Page {page} of {totalPages}
+                </Text>
+                <DefaultButton
+                    text="Next"
+                    onClick={() => onPageChange(page + 1)}
+                    disabled={page >= totalPages}
+                    aria-label="Next page"
+                    styles={{ root: { minWidth: 60 } }}
+                />
+            </Stack>
+            <Stack
+                horizontal
+                verticalAlign="center"
+                tokens={{ childrenGap: 8 }}
+            >
+                <Text styles={{ root: { color: "#888", fontSize: 12 } }}>
+                    Rows:
+                </Text>
+                <Dropdown
+                    options={PAGE_SIZE_OPTIONS}
+                    selectedKey={pageSize}
+                    onChange={(_e, o) => {
+                        if (o) onPageSizeChange(o.key as number);
+                    }}
+                    styles={{ dropdown: { width: 70 } }}
+                    aria-label="Rows per page"
+                />
+            </Stack>
+        </Stack>
+    );
+};
 
 interface QuotaRequestsPageProps {
     orchestrator: OrchestratorAgent;
@@ -51,6 +166,8 @@ export const QuotaRequestsPage: React.FC<QuotaRequestsPageProps> = ({
     const [validationError, setValidationError] = React.useState<string | null>(
         null
     );
+    const [reqPage, setReqPage] = React.useState(1);
+    const [reqPageSize, setReqPageSize] = React.useState(25);
 
     React.useEffect(() => {
         if (prefsLoaded.current) return;
@@ -260,8 +377,19 @@ export const QuotaRequestsPage: React.FC<QuotaRequestsPageProps> = ({
         },
     ];
 
+    // Reset page when submitted requests change
+    React.useEffect(() => {
+        setReqPage(1);
+    }, [state.quotaRequests.length]);
+
+    const paginatedRequests = React.useMemo(() => {
+        const start = (reqPage - 1) * reqPageSize;
+        return state.quotaRequests.slice(start, start + reqPageSize);
+    }, [state.quotaRequests, reqPage, reqPageSize]);
+
     return (
         <div style={{ padding: "16px" }}>
+            <style>{SKELETON_KEYFRAMES}</style>
             <h2 style={{ margin: "0 0 16px", fontSize: "20px" }}>
                 Quota Requests (Low Priority vCPU)
             </h2>
@@ -281,6 +409,7 @@ export const QuotaRequestsPage: React.FC<QuotaRequestsPageProps> = ({
                     label={`Select all created accounts (${createdAccounts.length})`}
                     checked={selectAll}
                     onChange={(_e, checked) => setSelectAll(!!checked)}
+                    aria-label={`Select all ${createdAccounts.length} created accounts`}
                 />
 
                 {!selectAll && createdAccounts.length > 0 && (
@@ -390,20 +519,87 @@ export const QuotaRequestsPage: React.FC<QuotaRequestsPageProps> = ({
                 />
             )}
 
+            {isRunning && state.quotaRequests.length === 0 && <TableSkeleton />}
+
             {state.quotaRequests.length > 0 && (
                 <div style={{ marginTop: 16 }}>
                     <h3 style={{ fontSize: "16px", margin: "0 0 8px" }}>
                         Submitted Requests
+                        <span
+                            style={{
+                                color: "#888",
+                                fontSize: 12,
+                                fontWeight: 400,
+                                marginLeft: 8,
+                            }}
+                            role="status"
+                            aria-live="polite"
+                        >
+                            ({state.quotaRequests.length})
+                        </span>
                     </h3>
                     <DetailsList
-                        items={state.quotaRequests}
+                        items={paginatedRequests}
                         columns={requestColumns}
                         layoutMode={DetailsListLayoutMode.justified}
                         selectionMode={SelectionMode.none}
                         compact
                     />
+                    {state.quotaRequests.length > 10 && (
+                        <Pagination
+                            page={reqPage}
+                            pageSize={reqPageSize}
+                            totalItems={state.quotaRequests.length}
+                            onPageChange={setReqPage}
+                            onPageSizeChange={(s) => {
+                                setReqPageSize(s);
+                                setReqPage(1);
+                            }}
+                        />
+                    )}
                 </div>
             )}
+
+            {!isRunning &&
+                state.quotaRequests.length === 0 &&
+                createdAccounts.length === 0 && (
+                    <Stack
+                        horizontalAlign="center"
+                        tokens={{ childrenGap: 12 }}
+                        styles={{
+                            root: {
+                                padding: "48px 16px",
+                                background: "#1e1e1e",
+                                borderRadius: 6,
+                                marginTop: 16,
+                            },
+                        }}
+                        role="status"
+                    >
+                        <Icon
+                            iconName="Ticket"
+                            styles={{
+                                root: { fontSize: 40, color: "#555" },
+                            }}
+                        />
+                        <Text
+                            variant="large"
+                            styles={{
+                                root: { color: "#888", fontWeight: 600 },
+                            }}
+                        >
+                            No accounts available
+                        </Text>
+                        <Text
+                            styles={{
+                                root: { color: "#666", fontSize: 13 },
+                            }}
+                        >
+                            Provision accounts first, then submit quota requests
+                            here.
+                        </Text>
+                    </Stack>
+                )}
         </div>
     );
 };

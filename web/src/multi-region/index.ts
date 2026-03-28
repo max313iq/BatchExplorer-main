@@ -75,3 +75,29 @@ export {
     getVmFamilyName,
     getAllVmSizes,
 } from "./components/shared/vm-sizes";
+
+// Audit log
+export { auditLog } from "./services/audit-log";
+export type { AuditEntry } from "./services/audit-log";
+
+// Theme
+export { ThemeProvider, useTheme } from "./components/shared/theme-provider";
+export type {
+    ThemeMode,
+    ThemeContextValue,
+} from "./components/shared/theme-provider";
+
+// Skeleton
+export { SkeletonLoader } from "./components/shared/skeleton-loader";
+export type {
+    SkeletonVariant,
+    SkeletonLoaderProps,
+} from "./components/shared/skeleton-loader";
+
+// Confirmation
+export { ConfirmationDialog } from "./components/shared/confirmation-dialog";
+export type { ConfirmationDialogProps } from "./components/shared/confirmation-dialog";
+
+// Hooks
+export { usePagination } from "./hooks/use-pagination";
+export { useSearch } from "./hooks/use-search";

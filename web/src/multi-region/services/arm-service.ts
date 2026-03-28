@@ -22,6 +22,37 @@ const ARM_RESOURCE_GROUP_API = "2021-04-01";
 const ARM_BATCH_API = "2024-02-01";
 
 // ---------------------------------------------------------------------------
+// Input validation
+// ---------------------------------------------------------------------------
+
+const UUID_REGEX =
+    /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+const ACCOUNT_NAME_REGEX = /^[a-z0-9]{3,24}$/;
+
+/**
+ * Validate that a subscription ID matches the expected UUID format.
+ * Prevents injection of path-traversal or unexpected segments into ARM URLs.
+ */
+function validateSubscriptionId(subscriptionId: string): void {
+    if (!UUID_REGEX.test(subscriptionId)) {
+        throw new Error("Invalid subscriptionId format: must be a valid UUID.");
+    }
+}
+
+/**
+ * Validate that a Batch account name is alphanumeric, 3-24 characters.
+ * Azure Batch account names only allow lowercase letters and digits.
+ */
+function validateAccountName(accountName: string): void {
+    if (!ACCOUNT_NAME_REGEX.test(accountName)) {
+        throw new Error(
+            "Invalid accountName: must be 3-24 lowercase alphanumeric characters."
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
@@ -94,6 +125,9 @@ async function fetchAllPages<T>(
 /**
  * List all Azure subscriptions accessible with the provided token.
  *
+ * **Security**: The token is sent as a Bearer header only to the hardcoded
+ * ARM endpoint. No user input is interpolated into the URL.
+ *
  * @param token - Bearer token with `https://management.azure.com/.default` scope.
  * @returns Array of subscriptions with id, displayName, state, and tenantId.
  */
@@ -109,7 +143,10 @@ export async function listSubscriptions(
  *
  * Handles pagination via `nextLink` automatically.
  *
- * @param subscriptionId - Azure subscription ID.
+ * **Security**: `subscriptionId` is validated as a UUID and URI-encoded
+ * before interpolation. No secrets are stored or logged.
+ *
+ * @param subscriptionId - Azure subscription ID (must be a valid UUID).
  * @param token - Bearer token with ARM scope.
  * @returns Array of Batch account resources.
  */
@@ -117,6 +154,7 @@ export async function listBatchAccounts(
     subscriptionId: string,
     token: string
 ): Promise<ArmBatchAccount[]> {
+    validateSubscriptionId(subscriptionId);
     const url =
         `${ARM_BASE}/subscriptions/${encodeURIComponent(subscriptionId)}` +
         `/providers/Microsoft.Batch/batchAccounts` +
@@ -127,9 +165,15 @@ export async function listBatchAccounts(
 /**
  * Get a single Batch account with full details including quota information.
  *
- * @param subscriptionId - Azure subscription ID.
+ * **Security**: All path segments (`subscriptionId`, `resourceGroup`,
+ * `accountName`) are validated and URI-encoded before interpolation.
+ * Error responses are wrapped in `AzureRequestError` — internal
+ * details from the body are preserved only for programmatic handling,
+ * not for display to end-users.
+ *
+ * @param subscriptionId - Azure subscription ID (must be a valid UUID).
  * @param resourceGroup - Resource group containing the account.
- * @param accountName - Batch account name.
+ * @param accountName - Batch account name (3-24 lowercase alphanumeric chars).
  * @param token - Bearer token with ARM scope.
  * @returns The Batch account resource.
  */
@@ -139,6 +183,8 @@ export async function getBatchAccount(
     accountName: string,
     token: string
 ): Promise<ArmBatchAccount> {
+    validateSubscriptionId(subscriptionId);
+    validateAccountName(accountName);
     const url =
         `${ARM_BASE}/subscriptions/${encodeURIComponent(subscriptionId)}` +
         `/resourceGroups/${encodeURIComponent(resourceGroup)}` +
@@ -159,10 +205,14 @@ export async function getBatchAccount(
 /**
  * Create (or update) a resource group.
  *
- * Uses PUT semantics — the call is idempotent. If the resource group
+ * Uses PUT semantics -- the call is idempotent. If the resource group
  * already exists in the same location, this is a no-op.
  *
- * @param subscriptionId - Azure subscription ID.
+ * **Security**: `subscriptionId` is validated as a UUID. `rgName` and
+ * `location` are URI-encoded. Only the `location` field is sent in the
+ * request body.
+ *
+ * @param subscriptionId - Azure subscription ID (must be a valid UUID).
  * @param rgName - Name for the resource group.
  * @param location - Azure region (e.g. "eastus").
  * @param token - Bearer token with ARM scope.
@@ -174,6 +224,7 @@ export async function createResourceGroup(
     location: string,
     token: string
 ): Promise<ArmResourceGroup> {
+    validateSubscriptionId(subscriptionId);
     const url =
         `${ARM_BASE}/subscriptions/${encodeURIComponent(subscriptionId)}` +
         `/resourcegroups/${encodeURIComponent(rgName)}` +
@@ -195,11 +246,16 @@ export async function createResourceGroup(
 /**
  * Create a Batch account via ARM PUT.
  *
- * This is a long-running operation — the response may return 202 Accepted
+ * This is a long-running operation -- the response may return 202 Accepted
  * with a Location header for polling. The returned object reflects the
  * initial response body, which may have `provisioningState: "Creating"`.
  *
- * @param subscriptionId - Azure subscription ID.
+ * **Security**: `subscriptionId` is validated as a UUID, `accountName` is
+ * validated as 3-24 lowercase alphanumeric characters. All path segments
+ * are URI-encoded. The request body contains only `location` and
+ * `properties.autoStorage: null`.
+ *
+ * @param subscriptionId - Azure subscription ID (must be a valid UUID).
  * @param resourceGroup - Resource group for the account.
  * @param accountName - Batch account name (3-24 chars, lowercase alphanumeric).
  * @param location - Azure region.
@@ -213,6 +269,8 @@ export async function createBatchAccount(
     location: string,
     token: string
 ): Promise<ArmBatchAccount> {
+    validateSubscriptionId(subscriptionId);
+    validateAccountName(accountName);
     const url =
         `${ARM_BASE}/subscriptions/${encodeURIComponent(subscriptionId)}` +
         `/resourceGroups/${encodeURIComponent(resourceGroup)}` +

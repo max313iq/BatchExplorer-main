@@ -26,6 +26,56 @@ import {
 } from "../../auth/msal-auth";
 
 /* ------------------------------------------------------------------ */
+/*  Skeleton pulse animation (inline keyframes via style tag)          */
+/* ------------------------------------------------------------------ */
+
+const SKELETON_KEYFRAMES = `
+@keyframes skeletonPulse {
+  0% { opacity: 0.6; }
+  50% { opacity: 1; }
+  100% { opacity: 0.6; }
+}`;
+
+const SkeletonBar: React.FC<{
+    width: number | string;
+    height: number;
+    style?: React.CSSProperties;
+}> = ({ width, height, style }) => (
+    <div
+        style={{
+            width,
+            height,
+            background: "#333",
+            borderRadius: 4,
+            animation: "skeletonPulse 1.5s ease-in-out infinite",
+            ...style,
+        }}
+    />
+);
+
+const AccountCardSkeleton: React.FC = () => (
+    <div
+        style={{
+            background: "#1e1e1e",
+            borderRadius: 6,
+            marginBottom: 8,
+            padding: "12px 16px",
+        }}
+        aria-hidden="true"
+    >
+        <Stack horizontal verticalAlign="center" tokens={{ childrenGap: 12 }}>
+            <SkeletonBar width={20} height={20} />
+            <div style={{ flex: 1 }}>
+                <SkeletonBar width={160} height={14} />
+                <SkeletonBar width={200} height={10} style={{ marginTop: 6 }} />
+                <SkeletonBar width={120} height={10} style={{ marginTop: 4 }} />
+            </div>
+            <SkeletonBar width={60} height={20} />
+        </Stack>
+    </div>
+);
+
+/* ------------------------------------------------------------------ */
 /*  Summary stat item (reused from account-info-page style)           */
 /* ------------------------------------------------------------------ */
 
@@ -68,16 +118,17 @@ const EmptyState: React.FC = () => (
                 borderRadius: 6,
             },
         }}
+        role="status"
     >
         <Icon
             iconName="Contact"
-            styles={{ root: { fontSize: 40, color: "#444" } }}
+            styles={{ root: { fontSize: 40, color: "#555" } }}
         />
         <Text
             variant="large"
             styles={{ root: { color: "#888", fontWeight: 600 } }}
         >
-            No Azure accounts
+            No Azure accounts found
         </Text>
         <Text styles={{ root: { color: "#666", fontSize: 13 } }}>
             Click &quot;Add Account&quot; to sign in with an Azure AD account.
@@ -120,6 +171,8 @@ const AccountCard: React.FC<AccountCardProps> = ({ account, onRemove }) => {
             {/* Card header row */}
             <button
                 onClick={() => setExpanded((prev) => !prev)}
+                aria-expanded={expanded}
+                aria-label={`${account.name || account.username} - ${account.subscriptionCount} subscriptions. Click to ${expanded ? "collapse" : "expand"}.`}
                 style={{
                     width: "100%",
                     background: "transparent",
@@ -167,6 +220,7 @@ const AccountCard: React.FC<AccountCardProps> = ({ account, onRemove }) => {
                                     display: "block",
                                 },
                             }}
+                            title={account.tenantId}
                         >
                             Tenant: {account.tenantId}
                         </Text>
@@ -174,12 +228,16 @@ const AccountCard: React.FC<AccountCardProps> = ({ account, onRemove }) => {
 
                     {/* Status indicator */}
                     {account.status === "loading" && (
-                        <Spinner size={SpinnerSize.small} />
+                        <Spinner
+                            size={SpinnerSize.small}
+                            aria-label="Loading account"
+                        />
                     )}
                     {account.status === "error" && (
                         <Icon
                             iconName="Error"
                             styles={{ root: { color: "#d13438" } }}
+                            aria-label="Account error"
                         />
                     )}
 
@@ -193,6 +251,8 @@ const AccountCard: React.FC<AccountCardProps> = ({ account, onRemove }) => {
                             fontSize: 12,
                             fontWeight: 700,
                         }}
+                        role="status"
+                        aria-live="polite"
                     >
                         {account.subscriptionCount} subs
                     </span>
@@ -200,6 +260,8 @@ const AccountCard: React.FC<AccountCardProps> = ({ account, onRemove }) => {
                     {/* Remove button */}
                     <IconButton
                         iconProps={{ iconName: "Delete" }}
+                        aria-label={`Remove account ${account.name || account.username}`}
+                        title={`Remove account ${account.name || account.username}`}
                         onClick={(e) => {
                             e.stopPropagation();
                             onRemove(account.homeAccountId);
@@ -241,6 +303,7 @@ const AccountCard: React.FC<AccountCardProps> = ({ account, onRemove }) => {
                             <SearchBox
                                 placeholder="Filter subscriptions..."
                                 value={subSearch}
+                                aria-label="Filter subscriptions"
                                 onChange={(
                                     _:
                                         | React.ChangeEvent<HTMLInputElement>
@@ -290,6 +353,7 @@ const AccountCard: React.FC<AccountCardProps> = ({ account, onRemove }) => {
                                                     display: "block",
                                                 },
                                             }}
+                                            title={sub.subscriptionId}
                                         >
                                             {sub.subscriptionId}
                                         </Text>
@@ -329,6 +393,8 @@ export const AzureAccountsPage: React.FC = () => {
     const state = useMultiRegionState();
     const store = useMultiRegionStore();
     const [adding, setAdding] = React.useState(false);
+    const [initialLoading, setInitialLoading] = React.useState(true);
+    const [error, setError] = React.useState<string | null>(null);
 
     const accounts: AzureLoginAccount[] = React.useMemo(
         () => state.azureAccounts ?? [],
@@ -342,6 +408,7 @@ export const AzureAccountsPage: React.FC = () => {
 
     /* ---- Load accounts on mount ---- */
     const loadAllAccounts = React.useCallback(async () => {
+        setError(null);
         try {
             const msalAccounts = await getAllLoggedInAccounts();
             if (!msalAccounts || msalAccounts.length === 0) {
@@ -386,9 +453,12 @@ export const AzureAccountsPage: React.FC = () => {
                     }
                 })
             );
-        } catch {
-            // If getAllLoggedInAccounts itself fails, set empty
+        } catch (e: unknown) {
+            const msg = e instanceof Error ? e.message : String(e);
+            setError(msg);
             store.setAzureAccounts([]);
+        } finally {
+            setInitialLoading(false);
         }
     }, [store]);
 
@@ -399,6 +469,7 @@ export const AzureAccountsPage: React.FC = () => {
     /* ---- Add account ---- */
     const handleAddAccount = React.useCallback(async () => {
         setAdding(true);
+        setError(null);
         try {
             const result = await loginAccount();
             if (!result) {
@@ -438,8 +509,9 @@ export const AzureAccountsPage: React.FC = () => {
                     error: msg,
                 });
             }
-        } catch {
-            // Login failed or was cancelled — nothing to do
+        } catch (e: unknown) {
+            const msg = e instanceof Error ? e.message : String(e);
+            setError(`Failed to add account: ${msg}`);
         } finally {
             setAdding(false);
         }
@@ -465,6 +537,8 @@ export const AzureAccountsPage: React.FC = () => {
 
     return (
         <div style={{ padding: "16px 0" }}>
+            <style>{SKELETON_KEYFRAMES}</style>
+
             {/* Header bar */}
             <Stack
                 horizontal
@@ -485,14 +559,39 @@ export const AzureAccountsPage: React.FC = () => {
                     iconProps={{ iconName: "AddFriend" }}
                     onClick={handleAddAccount}
                     disabled={adding}
+                    aria-label="Add Azure account"
                 />
-                {adding && <Spinner size={SpinnerSize.small} />}
+                {adding && (
+                    <Spinner
+                        size={SpinnerSize.small}
+                        aria-label="Adding account"
+                    />
+                )}
                 <DefaultButton
                     text="Refresh All"
                     iconProps={{ iconName: "Refresh" }}
                     onClick={handleRefreshAll}
+                    aria-label="Refresh all accounts"
                 />
             </Stack>
+
+            {/* Error state */}
+            {error && (
+                <MessageBar
+                    messageBarType={MessageBarType.error}
+                    onDismiss={() => setError(null)}
+                    styles={{ root: { marginBottom: 12 } }}
+                    actions={
+                        <DefaultButton
+                            text="Retry"
+                            onClick={handleRefreshAll}
+                            aria-label="Retry loading accounts"
+                        />
+                    }
+                >
+                    {error}
+                </MessageBar>
+            )}
 
             {/* Summary stats */}
             <Stack
@@ -506,6 +605,8 @@ export const AzureAccountsPage: React.FC = () => {
                         marginBottom: 16,
                     },
                 }}
+                role="status"
+                aria-live="polite"
             >
                 <SummaryStatItem
                     icon="Contact"
@@ -521,8 +622,14 @@ export const AzureAccountsPage: React.FC = () => {
                 />
             </Stack>
 
-            {/* Account cards */}
-            {accounts.length === 0 ? (
+            {/* Account cards / skeleton / empty */}
+            {initialLoading && accounts.length === 0 ? (
+                <div aria-label="Loading accounts" role="status">
+                    <AccountCardSkeleton />
+                    <AccountCardSkeleton />
+                    <AccountCardSkeleton />
+                </div>
+            ) : accounts.length === 0 ? (
                 <EmptyState />
             ) : (
                 accounts.map((account) => (

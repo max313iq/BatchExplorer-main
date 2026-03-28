@@ -290,6 +290,19 @@ export interface AzureLoginSubscription {
     tenantId: string;
 }
 
+// --- Audit Log ---
+
+export interface AuditEntry {
+    id: string;
+    timestamp: string;
+    actor: string;
+    action: string;
+    target: string;
+    details?: Record<string, unknown>;
+    status: "success" | "failure";
+    error?: string;
+}
+
 // --- Main State ---
 
 export interface MultiRegionState {
@@ -308,6 +321,7 @@ export interface MultiRegionState {
     workflow: WorkflowState;
     activities: Activity[];
     azureAccounts: AzureLoginAccount[]; // all logged-in AAD accounts
+    auditEntries: AuditEntry[];
 }
 
 export const DEFAULT_GLOBAL_FILTER: GlobalFilter = {
@@ -352,5 +366,6 @@ export function createInitialState(): MultiRegionState {
         workflow: { ...DEFAULT_WORKFLOW_STATE },
         activities: [],
         azureAccounts: [],
+        auditEntries: [],
     };
 }

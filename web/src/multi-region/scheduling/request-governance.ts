@@ -50,6 +50,14 @@ export interface GovernanceStats {
     retryCount: number;
     throttleCount: number;
     lastThrottleAt: number | null;
+    /** Total requests that completed successfully. */
+    successCount: number;
+    /** Total requests that failed (after exhausting retries). */
+    failureCount: number;
+    /** Cumulative latency in ms for completed requests (success + failure). */
+    totalLatencyMs: number;
+    /** Number of requests used to compute totalLatencyMs. */
+    latencySampleCount: number;
 }
 
 // ---------------------------------------------------------------------------
@@ -183,13 +191,20 @@ export class RequestGovernance {
     async read<T>(key: string, fn: () => Promise<T>): Promise<T> {
         this._stats.totalReads++;
         const alreadyInflight = this._deduplicator.isInflight(key);
-        const result = await this._deduplicator.deduplicate(key, () =>
-            this._readScheduler.run(key, () => this.withRetry(fn))
-        );
-        if (alreadyInflight) {
-            this._stats.deduplicatedReads++;
+        const start = Date.now();
+        try {
+            const result = await this._deduplicator.deduplicate(key, () =>
+                this._readScheduler.run(key, () => this.withRetry(fn))
+            );
+            if (alreadyInflight) {
+                this._stats.deduplicatedReads++;
+            }
+            this._recordLatency(start, true);
+            return result;
+        } catch (error) {
+            this._recordLatency(start, false);
+            throw error;
         }
-        return result;
     }
 
     /**
@@ -198,7 +213,17 @@ export class RequestGovernance {
      */
     async write<T>(fn: () => Promise<T>): Promise<T> {
         this._stats.totalWrites++;
-        return this._writeScheduler.run("__write__", () => this.withRetry(fn));
+        const start = Date.now();
+        try {
+            const result = await this._writeScheduler.run("__write__", () =>
+                this.withRetry(fn)
+            );
+            this._recordLatency(start, true);
+            return result;
+        } catch (error) {
+            this._recordLatency(start, false);
+            throw error;
+        }
     }
 
     /**
@@ -268,9 +293,27 @@ export class RequestGovernance {
         this._stats = this._emptyStats();
     }
 
+    /** Average latency in ms across all completed requests, or 0 if none. */
+    get averageLatencyMs(): number {
+        return this._stats.latencySampleCount > 0
+            ? this._stats.totalLatencyMs / this._stats.latencySampleCount
+            : 0;
+    }
+
     // -----------------------------------------------------------------------
     // Internals
     // -----------------------------------------------------------------------
+
+    private _recordLatency(startMs: number, success: boolean): void {
+        const elapsed = Date.now() - startMs;
+        this._stats.totalLatencyMs += elapsed;
+        this._stats.latencySampleCount++;
+        if (success) {
+            this._stats.successCount++;
+        } else {
+            this._stats.failureCount++;
+        }
+    }
 
     private _emptyStats(): GovernanceStats {
         return {
@@ -280,6 +323,10 @@ export class RequestGovernance {
             retryCount: 0,
             throttleCount: 0,
             lastThrottleAt: null,
+            successCount: 0,
+            failureCount: 0,
+            totalLatencyMs: 0,
+            latencySampleCount: 0,
         };
     }
 }

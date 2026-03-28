@@ -12,6 +12,8 @@ export interface BatchApiError {
 
 export type ErrorClassification =
     | "AuthenticationFailed"
+    | "AuthorizationFailed"
+    | "RateLimited"
     | "QuotaExceeded"
     | "InsufficientCapacity"
     | "PoolExists"
@@ -31,6 +33,23 @@ export function classifyError(
         statusCode === 401
     ) {
         return "AuthenticationFailed";
+    }
+
+    if (
+        lower.includes("forbidden") ||
+        lower.includes("accessdenied") ||
+        lower.includes("access denied") ||
+        statusCode === 403
+    ) {
+        return "AuthorizationFailed";
+    }
+
+    if (
+        statusCode === 429 ||
+        lower.includes("too many requests") ||
+        lower.includes("rate limit")
+    ) {
+        return "RateLimited";
     }
 
     if (
@@ -88,6 +107,18 @@ export function getActionableErrorMessage(
                 message: "Authentication failed",
                 suggestion:
                     "Re-run `az login` to refresh your credentials and retry.",
+            };
+        case "AuthorizationFailed":
+            return {
+                message: "Access denied",
+                suggestion:
+                    "You may not have permissions on this subscription. Check your Azure RBAC role.",
+            };
+        case "RateLimited":
+            return {
+                message: "Rate limited by Azure",
+                suggestion:
+                    "The scheduler will automatically retry with backoff. No action needed.",
             };
         case "QuotaExceeded":
             return {
@@ -203,4 +234,61 @@ export function getActionableErrorMessage(
         message: error.length > 120 ? error.substring(0, 120) + "..." : error,
         suggestion: "Check the agent logs for more details.",
     };
+}
+
+// ---------------------------------------------------------------------------
+// Patterns that should never appear in user-facing error messages.
+// ---------------------------------------------------------------------------
+
+const SENSITIVE_PATTERNS = [
+    // Bearer tokens / auth headers
+    /Bearer\s+[A-Za-z0-9\-._~+/]+=*/gi,
+    // Azure SAS tokens
+    /[?&]sig=[A-Za-z0-9%+/=]+/gi,
+    // Shared keys
+    /SharedKey\s+\S+/gi,
+    // Full URLs with tokens or keys in query params
+    /https?:\/\/[^\s]*[?&](token|key|sig|sas|password|secret)=[^\s&]*/gi,
+    // Stack traces (multi-line "at ..." blocks)
+    /\s+at\s+\S+\s+\([^)]+\)/g,
+    // Connection strings
+    /AccountKey=[A-Za-z0-9+/=]+/gi,
+    // Subscription IDs embedded in long ARM resource IDs (keep the error but redact the path)
+    /\/subscriptions\/[0-9a-f-]{36}/gi,
+];
+
+/**
+ * Strip sensitive information from an error before displaying it in the UI.
+ *
+ * Removes Bearer tokens, SAS tokens, shared keys, connection strings,
+ * stack traces, and internal ARM resource paths. The result is safe to
+ * show to end-users without leaking credentials or internal URLs.
+ *
+ * @param error - Any thrown value (Error, string, or unknown).
+ * @returns A sanitized, user-safe error string (max 200 chars).
+ */
+export function sanitizeErrorMessage(error: unknown): string {
+    let raw: string;
+    if (error instanceof Error) {
+        raw = error.message;
+    } else if (typeof error === "string") {
+        raw = error;
+    } else {
+        raw = "An unexpected error occurred.";
+    }
+
+    let sanitized = raw;
+    for (const pattern of SENSITIVE_PATTERNS) {
+        sanitized = sanitized.replace(pattern, "[REDACTED]");
+    }
+
+    // Collapse multiple [REDACTED] in a row
+    sanitized = sanitized.replace(/(\[REDACTED\]\s*){2,}/g, "[REDACTED] ");
+
+    // Trim to reasonable length
+    if (sanitized.length > 200) {
+        sanitized = sanitized.substring(0, 197) + "...";
+    }
+
+    return sanitized.trim() || "An unexpected error occurred.";
 }
