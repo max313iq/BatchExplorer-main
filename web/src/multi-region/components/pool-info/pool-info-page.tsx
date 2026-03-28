@@ -346,18 +346,23 @@ export const PoolInfoPage: React.FC<PoolInfoPageProps> = ({ orchestrator }) => {
     };
 
     const submitResize = async () => {
-        if (!selectedPool) return;
+        if (selectedPools.length === 0) return;
         setResizeSubmitting(true);
         try {
-            await orchestrator.execute({
-                action: "resize_pool",
-                payload: {
-                    accountId: selectedPool.accountId,
-                    poolId: selectedPool.poolId,
-                    targetDedicatedNodes: resizeDedicated,
-                    targetLowPriorityNodes: resizeLowPriority,
-                },
-            });
+            // Apply resize to ALL selected pools, not just the first one
+            await Promise.allSettled(
+                selectedPools.map((pool) =>
+                    orchestrator.execute({
+                        action: "resize_pool",
+                        payload: {
+                            accountId: pool.accountId,
+                            poolId: pool.poolId,
+                            targetDedicatedNodes: resizeDedicated,
+                            targetLowPriorityNodes: resizeLowPriority,
+                        },
+                    })
+                )
+            );
             setShowResizeDialog(false);
         } catch {
             /* handled by orchestrator */
@@ -430,14 +435,19 @@ export const PoolInfoPage: React.FC<PoolInfoPageProps> = ({ orchestrator }) => {
         setStartTaskError(null);
         setStartTaskSubmitting(true);
         try {
-            await orchestrator.execute({
-                action: "update_start_task",
-                payload: {
-                    accountId: selectedPool.accountId,
-                    poolId: selectedPool.poolId,
-                    startTask: startTaskPayload,
-                },
-            });
+            // Apply start task update to ALL selected pools
+            await Promise.allSettled(
+                selectedPools.map((pool) =>
+                    orchestrator.execute({
+                        action: "update_start_task",
+                        payload: {
+                            accountId: pool.accountId,
+                            poolId: pool.poolId,
+                            startTask: startTaskPayload,
+                        },
+                    })
+                )
+            );
             setShowStartTaskDialog(false);
         } catch {
             /* handled by orchestrator */
@@ -954,8 +964,14 @@ export const PoolInfoPage: React.FC<PoolInfoPageProps> = ({ orchestrator }) => {
                 onDismiss={() => setShowResizeDialog(false)}
                 dialogContentProps={{
                     type: DialogType.normal,
-                    title: "Resize Pool",
-                    subText: "Adjust the target node counts for this pool.",
+                    title:
+                        selectedPools.length > 1
+                            ? `Resize ${selectedPools.length} Pools`
+                            : "Resize Pool",
+                    subText:
+                        selectedPools.length > 1
+                            ? `Apply the same resize to all ${selectedPools.length} selected pools.`
+                            : "Adjust the target node counts for this pool.",
                 }}
                 modalProps={{
                     isBlocking: true,
@@ -1098,10 +1114,16 @@ export const PoolInfoPage: React.FC<PoolInfoPageProps> = ({ orchestrator }) => {
                 onDismiss={() => setShowStartTaskDialog(false)}
                 dialogContentProps={{
                     type: DialogType.normal,
-                    title: "Update Start Task",
-                    subText: selectedPool
-                        ? `Pool: ${selectedPool.poolId} (${selectedPool.accountName})`
-                        : "",
+                    title:
+                        selectedPools.length > 1
+                            ? `Update Start Task (${selectedPools.length} Pools)`
+                            : "Update Start Task",
+                    subText:
+                        selectedPools.length > 1
+                            ? `Apply the same start task to all ${selectedPools.length} selected pools.`
+                            : selectedPool
+                              ? `Pool: ${selectedPool.poolId} (${selectedPool.accountName})`
+                              : "",
                 }}
                 modalProps={{
                     isBlocking: true,
