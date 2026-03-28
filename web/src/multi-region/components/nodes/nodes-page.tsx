@@ -357,22 +357,13 @@ export const NodesPage: React.FC<NodesPageProps> = ({ orchestrator }) => {
         return () => clearInterval(interval);
     }, [autoRecovery, orchestrator, state.nodes]);
 
-    // --- Helper to get selected IDs, honoring selectAllResults ---
+    // --- Helper to get selected IDs — selectAll = ALL sorted nodes (all pages) ---
     const getSelectedIds = React.useCallback((): string[] => {
-        if (selectAllResults) {
+        if (selectAll || selectAllResults) {
             return sortedNodes.map((n) => n.id);
         }
-        if (selectAll) {
-            return displayNodes.map((n) => n.id);
-        }
         return Array.from(selectedNodeIds);
-    }, [
-        selectAll,
-        selectAllResults,
-        displayNodes,
-        sortedNodes,
-        selectedNodeIds,
-    ]);
+    }, [selectAll, selectAllResults, sortedNodes, selectedNodeIds]);
 
     // --- Show confirmation dialog ---
     const showConfirmation = React.useCallback(
@@ -758,27 +749,24 @@ export const NodesPage: React.FC<NodesPageProps> = ({ orchestrator }) => {
         });
     }, [sortConfig, handleColumnClick]);
 
-    const actionCount = selectAllResults
-        ? sortedNodes.length
-        : selectAll
-          ? displayNodes.length
-          : selectedNodeIds.size;
+    const actionCount = selectAll ? sortedNodes.length : selectedNodeIds.size;
 
-    // --- Handle select-all checkbox ---
+    // --- Handle select-all checkbox — selects ALL sorted nodes across ALL pages ---
     const handleSelectAllChange = React.useCallback(
         (
             _ev?: React.FormEvent<HTMLElement | HTMLInputElement>,
             checked?: boolean
         ) => {
             setSelectAll(!!checked);
-            setSelectAllResults(false);
+            setSelectAllResults(!!checked);
             if (checked) {
-                setSelectedNodeIds(new Set(displayNodes.map((n) => n.id)));
+                // Select ALL filtered/sorted nodes across ALL pages
+                setSelectedNodeIds(new Set(sortedNodes.map((n) => n.id)));
             } else {
                 setSelectedNodeIds(new Set());
             }
         },
-        [displayNodes]
+        [sortedNodes]
     );
 
     // --- Handle page size change ---
