@@ -38,24 +38,44 @@ declare const ENV: {
 };
 
 /**
- * Detect if this page is running inside an MSAL popup/redirect.
- * The auth response may arrive in the hash (#code=) or query string (?code=).
- * We also check for error responses and the MSAL client.info parameter.
+ * Detect if this page load is an MSAL popup callback.
+ *
+ * We do NOT rely on window.opener — browsers null it out after cross-origin
+ * navigation through login.microsoftonline.com for security reasons.
+ *
+ * Instead we parse the MSAL `state` parameter (always present in popup
+ * callbacks) which contains base64url-encoded JSON with:
+ *   { meta: { interactionType: "popup" | "redirect" | "silent" }, ... }
+ *
+ * This is the same detection logic MSAL itself uses internally.
  */
-function isMsalPopup(): boolean {
-    if (!window.opener) return false;
-    const hash = window.location.hash;
-    const search = window.location.search;
-    return (
-        hash.includes("code=") ||
-        hash.includes("error=") ||
-        hash.includes("client_info=") ||
-        search.includes("code=") ||
-        search.includes("error=")
-    );
+function isMsalPopupCallback(): boolean {
+    const urlParams = new URLSearchParams(window.location.search);
+    const hashParams = new URLSearchParams(window.location.hash.substring(1));
+    const stateParam = urlParams.get("state") || hashParams.get("state");
+    const hasCode =
+        urlParams.has("code") ||
+        urlParams.has("error") ||
+        hashParams.has("code") ||
+        hashParams.has("error");
+
+    if (!stateParam || !hasCode) return false;
+
+    try {
+        // MSAL state format: base64url(JSON) | optional-user-state
+        const [libraryStateEncoded] = stateParam.split("|");
+        const padding = "=".repeat((4 - (libraryStateEncoded.length % 4)) % 4);
+        const base64 = (libraryStateEncoded + padding)
+            .replace(/-/g, "+")
+            .replace(/_/g, "/");
+        const libraryState = JSON.parse(atob(base64));
+        return libraryState?.meta?.interactionType === "popup";
+    } catch {
+        return false;
+    }
 }
 
-if (isMsalPopup()) {
+if (isMsalPopupCallback()) {
     // We are inside the MSAL login popup callback. Do NOT render the app.
     //
     // WHY broadcastResponseToMainFrame instead of handleRedirectPromise:
