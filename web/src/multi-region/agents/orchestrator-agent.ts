@@ -16,6 +16,7 @@ import {
     createPool,
     patchPool,
     removeNodes,
+    deletePool,
 } from "../services";
 import type { BatchPool as SdkBatchPool } from "../services";
 
@@ -96,7 +97,8 @@ export type OrchestratorAction =
     | "auto_create_pools_from_quota"
     | "resize_pool"
     | "update_start_task"
-    | "create_pools_smart";
+    | "create_pools_smart"
+    | "delete_pool";
 
 export class OrchestratorAgent implements Agent {
     readonly name = "orchestrator" as const;
@@ -496,6 +498,12 @@ export class OrchestratorAgent implements Agent {
                     );
                     break;
 
+                case "delete_pool":
+                    result = await this._deletePool(
+                        params.payload as Record<string, unknown>
+                    );
+                    break;
+
                 default:
                     throw new Error(`Unknown action: ${action}`);
             }
@@ -590,6 +598,8 @@ export class OrchestratorAgent implements Agent {
             case "resize_pool":
                 return `pool ${(payload.poolId as string) ?? ""}`;
             case "update_start_task":
+                return `pool ${(payload.poolId as string) ?? ""}`;
+            case "delete_pool":
                 return `pool ${(payload.poolId as string) ?? ""}`;
             default:
                 return action;
@@ -1642,6 +1652,54 @@ export class OrchestratorAgent implements Agent {
             summary: {
                 poolId: payload.poolId,
                 accountId: payload.accountId,
+            },
+        };
+    }
+
+    /**
+     * Delete a pool by account ID and pool ID.
+     * Used by the "Remove Empty Pools" feature.
+     */
+    private async _deletePool(
+        payload: Record<string, unknown>
+    ): Promise<AgentResult> {
+        const { store } = this._ctx;
+        const account = store
+            .getState()
+            .accounts.find((a) => a.id === payload.accountId);
+        if (!account) {
+            throw new Error(`Account not found: ${payload.accountId}`);
+        }
+
+        const token = await this._getBatchAccessToken();
+        const endpoint = accountEndpoint(account.accountName, account.region);
+
+        await deletePool(endpoint, payload.poolId as string, token);
+
+        store.addNotification({
+            type: "success",
+            message: `Pool ${payload.poolId} deleted from ${account.accountName}`,
+        });
+
+        // Remove from poolInfos in store
+        const currentInfos = store.getState().poolInfos;
+        const filtered = currentInfos.filter(
+            (p) =>
+                !(
+                    p.poolId === payload.poolId &&
+                    p.accountId === payload.accountId
+                )
+        );
+        if (filtered.length !== currentInfos.length) {
+            store.setPoolInfos(filtered);
+        }
+
+        return {
+            status: "completed",
+            summary: {
+                poolId: payload.poolId,
+                accountId: payload.accountId,
+                deleted: true,
             },
         };
     }
