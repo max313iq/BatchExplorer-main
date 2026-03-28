@@ -454,6 +454,54 @@ const DashboardContent: React.FC<{ tokenProvider?: TokenProvider }> = ({
         return result;
     }, [store, tokenProvider]);
 
+    // After login: sync all MSAL accounts + their subscriptions into store.azureAccounts
+    // so the Azure Accounts page reflects the new account without needing a manual refresh.
+    const syncAccountsToStore = React.useCallback(async () => {
+        try {
+            const msalAccounts = await msalAuth.getAllLoggedInAccounts();
+            if (msalAccounts.length === 0) return;
+            // Create loading-state entries first so the UI shows immediately
+            store.setAzureAccounts(
+                msalAccounts.map((acct) => ({
+                    homeAccountId: acct.homeAccountId,
+                    username: acct.username ?? "",
+                    name: acct.name ?? acct.username ?? "",
+                    tenantId: acct.tenantId ?? "",
+                    environment: acct.environment ?? "",
+                    subscriptions: [],
+                    subscriptionCount: 0,
+                    status: "loading" as const,
+                    error: null,
+                    addedAt: new Date().toISOString(),
+                }))
+            );
+            // Load subscriptions per account (parallel, best-effort)
+            await Promise.allSettled(
+                msalAccounts.map(async (acct) => {
+                    try {
+                        const subs = await msalAuth.listSubscriptionsForAccount(
+                            acct.homeAccountId
+                        );
+                        store.updateAzureAccount(acct.homeAccountId, {
+                            subscriptions: subs as any,
+                            subscriptionCount: subs.length,
+                            status: "active",
+                            error: null,
+                        });
+                    } catch (err: any) {
+                        store.updateAzureAccount(acct.homeAccountId, {
+                            status: "error",
+                            error:
+                                err?.message ?? "Failed to load subscriptions",
+                        });
+                    }
+                })
+            );
+        } catch {
+            // Best-effort — Azure Accounts page has its own Refresh button
+        }
+    }, [store]);
+
     // Azure login via MSAL popup
     const handleLogin = React.useCallback(async () => {
         try {
@@ -466,31 +514,27 @@ const DashboardContent: React.FC<{ tokenProvider?: TokenProvider }> = ({
                 );
             }
         } catch (e: any) {
-            // Popup might have closed or timed out, but the auth code
-            // may still have been processed and stored in localStorage.
-            // Don't show error yet — try health check first.
+            // Popup might have closed/timed out — don't show error yet
             console.warn(
                 "[MSAL] Popup closed/error, checking if auth succeeded anyway:",
                 e?.message
             );
         }
-        // ALWAYS re-check auth after popup attempt — even if popup threw.
-        // The account may have been stored in localStorage by handlePopupIfNeeded
-        // or by the popup's MSAL instance before the popup closed.
-        await new Promise((r) => setTimeout(r, 1000)); // wait for localStorage sync
+        // Re-check auth after popup attempt (even if it threw)
+        await new Promise((r) => setTimeout(r, 500));
         const result = await checkLogin();
         if (!result?.healthy) {
-            // Only show error if auth truly failed
             const user = await msalAuth.getCurrentUser();
             if (user) {
-                // User IS in cache but health check failed for another reason
                 _authMode = "msal";
                 setCurrentAuthMode("msal");
                 setMsalUserName(user.username ?? user.name ?? "Azure User");
-                await checkLogin(); // retry
+                await checkLogin();
             }
         }
-    }, [checkLogin]);
+        // Sync logged-in accounts into store so Azure Accounts page updates
+        await syncAccountsToStore();
+    }, [checkLogin, syncAccountsToStore]);
 
     // Logout
     const handleLogout = React.useCallback(async () => {
