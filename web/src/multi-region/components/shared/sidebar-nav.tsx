@@ -16,6 +16,7 @@ export type PageKey =
     | "unused-quota"
     | "monitoring"
     | "nodes"
+    | "gpu-calculator"
     | "audit-log";
 
 interface NavItem {
@@ -128,6 +129,11 @@ export const SidebarNav: React.FC<SidebarNavProps> = ({
                 label: "Nodes",
                 icon: "Server",
                 badge: state.nodes.length,
+            },
+            {
+                key: "gpu-calculator" as PageKey,
+                label: "GPU Calculator",
+                icon: "Calculator",
             },
             {
                 key: "audit-log",

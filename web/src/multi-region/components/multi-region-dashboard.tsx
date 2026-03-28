@@ -31,6 +31,7 @@ import { AzureAccountsPage } from "./azure-accounts/azure-accounts-page";
 import { MonitoringPage } from "./monitoring/monitoring-page";
 import { PoolDefaultsPage } from "./pool-defaults/pool-defaults-page";
 import { SupportTicketPage } from "./support-ticket/support-ticket-page";
+import { GpuCalculatorPage } from "./gpu-calculator/gpu-calculator-page";
 import { AgentLogPanel } from "./shared/agent-log-panel";
 import { ActivityPanel } from "./shared/activity-panel";
 import * as msalAuth from "../auth/msal-auth";
@@ -414,6 +415,8 @@ const PageContent: React.FC<{
             return <SupportTicketPage orchestrator={orchestrator} />;
         case "nodes":
             return <NodesPage orchestrator={orchestrator} />;
+        case "gpu-calculator":
+            return <GpuCalculatorPage />;
         case "audit-log":
             return <AuditLogPage />;
         default:
