@@ -68,6 +68,55 @@ let _activeAccount: AccountInfo | null = null;
 const _accounts = new Map<string, AccountInfo>();
 
 // ---------------------------------------------------------------------------
+// Cache management — localStorage quota guard
+// ---------------------------------------------------------------------------
+
+/**
+ * Clear all MSAL-related entries from localStorage to free quota.
+ * Called automatically on cache_quota_exceeded errors.
+ * Resets all in-memory state so getMsalInstance() reinitialises cleanly.
+ */
+function _clearMsalCache(): void {
+    const keysToRemove = Object.keys(localStorage).filter(
+        (k) =>
+            k.startsWith(AZURE_CLI_CLIENT_ID) ||
+            k.startsWith("msal.") ||
+            k.includes("login.microsoftonline.com") ||
+            k.includes("msal")
+    );
+    for (const key of keysToRemove) {
+        try {
+            localStorage.removeItem(key);
+        } catch {
+            /* ignore */
+        }
+    }
+    _accounts.clear();
+    _activeAccount = null;
+    _initComplete = null;
+    console.warn(
+        "[MSAL] localStorage quota exceeded — cache cleared. Sign in again."
+    );
+}
+
+function _isQuotaError(error: unknown): boolean {
+    const code = (error as any)?.errorCode ?? "";
+    const msg = (error as any)?.message ?? "";
+    return (
+        code === "cache_quota_exceeded" ||
+        msg.includes("cache_quota_exceeded") ||
+        msg.includes("QuotaExceededError")
+    );
+}
+
+/**
+ * Exported utility — call from UI if the user wants to manually clear auth cache.
+ */
+export function purgeMsalCache(): void {
+    _clearMsalCache();
+}
+
+// ---------------------------------------------------------------------------
 // Popup detection — if we are inside an MSAL popup, handle the redirect
 // promise and close immediately so the full app never renders in the popup.
 // ---------------------------------------------------------------------------
@@ -147,8 +196,23 @@ async function getMsalInstance(): Promise<PublicClientApplication> {
     if (_initComplete) return _initComplete;
 
     _initComplete = (async () => {
-        const msalApp = new PublicClientApplication(msalConfig);
-        await msalApp.initialize();
+        const initMsal = async (): Promise<PublicClientApplication> => {
+            const msalApp = new PublicClientApplication(msalConfig);
+            await msalApp.initialize();
+            return msalApp;
+        };
+
+        let msalApp: PublicClientApplication;
+        try {
+            msalApp = await initMsal();
+        } catch (initErr) {
+            if (_isQuotaError(initErr)) {
+                _clearMsalCache();
+                msalApp = await initMsal(); // one retry after clearing
+            } else {
+                throw initErr;
+            }
+        }
 
         // Check for any pending redirect (in case redirect was used previously)
         try {
@@ -326,6 +390,14 @@ async function acquireTokenForAccount(
     try {
         return await msalApp.acquireTokenSilent(silentRequest);
     } catch (error) {
+        // Cache quota exceeded — clear and surface a clear message
+        if (_isQuotaError(error)) {
+            _clearMsalCache();
+            throw new Error(
+                "Browser storage quota exceeded and MSAL cache was cleared. " +
+                    "Please sign in again."
+            );
+        }
         if (error instanceof InteractionRequiredAuthError) {
             if (_loginInProgress) {
                 await _loginInProgress;
