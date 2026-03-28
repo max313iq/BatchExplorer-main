@@ -104,6 +104,17 @@ export const PoolInfoPage: React.FC<PoolInfoPageProps> = ({ orchestrator }) => {
         React.useState(3);
     const [startTaskWaitForSuccess, setStartTaskWaitForSuccess] =
         React.useState(true);
+    const [startTaskUserScope, setStartTaskUserScope] = React.useState<
+        "pool" | "task"
+    >("pool");
+    const [startTaskElevation, setStartTaskElevation] = React.useState<
+        "admin" | "nonadmin"
+    >("admin");
+    const [startTaskResourceFiles, setStartTaskResourceFiles] = React.useState<
+        Array<{ httpUrl: string; filePath: string }>
+    >([]);
+    const [startTaskRebootAfter, setStartTaskRebootAfter] =
+        React.useState(false);
     const [startTaskError, setStartTaskError] = React.useState<string | null>(
         null
     );
@@ -459,6 +470,32 @@ export const PoolInfoPage: React.FC<PoolInfoPageProps> = ({ orchestrator }) => {
         setStartTaskWaitForSuccess(
             (existing.waitForSuccess as boolean) ?? true
         );
+        // Load user identity
+        const userIdentity = existing.userIdentity as
+            | { autoUser?: { scope?: string; elevationLevel?: string } }
+            | undefined;
+        setStartTaskUserScope(
+            (userIdentity?.autoUser?.scope as "pool" | "task") ?? "pool"
+        );
+        setStartTaskElevation(
+            (userIdentity?.autoUser?.elevationLevel as "admin" | "nonadmin") ??
+                "admin"
+        );
+        // Load resource files
+        const resFiles =
+            (existing.resourceFiles as Array<{
+                httpUrl?: string;
+                filePath?: string;
+            }>) ?? [];
+        setStartTaskResourceFiles(
+            resFiles.length > 0
+                ? resFiles.map((rf) => ({
+                      httpUrl: rf.httpUrl ?? "",
+                      filePath: rf.filePath ?? "",
+                  }))
+                : []
+        );
+        setStartTaskRebootAfter(false);
         setStartTaskError(null);
         setShowStartTaskDialog(true);
     };
@@ -481,8 +518,29 @@ export const PoolInfoPage: React.FC<PoolInfoPageProps> = ({ orchestrator }) => {
         );
     };
 
+    const addResourceFile = () => {
+        setStartTaskResourceFiles((prev) => [
+            ...prev,
+            { httpUrl: "", filePath: "" },
+        ]);
+    };
+
+    const removeResourceFile = (index: number) => {
+        setStartTaskResourceFiles((prev) => prev.filter((_, i) => i !== index));
+    };
+
+    const updateResourceFile = (
+        index: number,
+        field: "httpUrl" | "filePath",
+        val: string
+    ) => {
+        setStartTaskResourceFiles((prev) =>
+            prev.map((rf, i) => (i === index ? { ...rf, [field]: val } : rf))
+        );
+    };
+
     const submitStartTask = async () => {
-        if (!selectedPool) return;
+        if (selectedPools.length === 0) return;
         if (!startTaskCommandLine.trim()) {
             setStartTaskError("Command line is required");
             return;
@@ -492,13 +550,29 @@ export const PoolInfoPage: React.FC<PoolInfoPageProps> = ({ orchestrator }) => {
             .filter((ev) => ev.name.trim() !== "")
             .map((ev) => ({ name: ev.name, value: ev.value }));
 
+        const resFiles = startTaskResourceFiles
+            .filter((rf) => rf.httpUrl.trim() !== "")
+            .map((rf) => ({
+                httpUrl: rf.httpUrl,
+                filePath: rf.filePath || undefined,
+            }));
+
         const startTaskPayload: Record<string, unknown> = {
             commandLine: startTaskCommandLine,
             maxTaskRetryCount: startTaskMaxRetryCount,
             waitForSuccess: startTaskWaitForSuccess,
+            userIdentity: {
+                autoUser: {
+                    scope: startTaskUserScope,
+                    elevationLevel: startTaskElevation,
+                },
+            },
         };
         if (envSettings.length > 0) {
             startTaskPayload.environmentSettings = envSettings;
+        }
+        if (resFiles.length > 0) {
+            startTaskPayload.resourceFiles = resFiles;
         }
 
         setStartTaskError(null);
@@ -517,6 +591,24 @@ export const PoolInfoPage: React.FC<PoolInfoPageProps> = ({ orchestrator }) => {
                     })
                 )
             );
+
+            // Reboot all nodes in selected pools if requested
+            if (startTaskRebootAfter) {
+                await Promise.allSettled(
+                    selectedPools.map((pool) =>
+                        orchestrator.execute({
+                            action: "node_action",
+                            payload: {
+                                accountId: pool.accountId,
+                                poolId: pool.poolId,
+                                action: "reboot",
+                                nodeIds: "all",
+                            },
+                        })
+                    )
+                );
+            }
+
             setShowStartTaskDialog(false);
         } catch {
             /* handled by orchestrator */
@@ -1513,6 +1605,7 @@ export const PoolInfoPage: React.FC<PoolInfoPageProps> = ({ orchestrator }) => {
                             setStartTaskError(null);
                         }}
                         placeholder="/bin/bash -c 'echo hello'"
+                        aria-label="Start task command line"
                         styles={{
                             field: {
                                 fontFamily:
@@ -1521,6 +1614,100 @@ export const PoolInfoPage: React.FC<PoolInfoPageProps> = ({ orchestrator }) => {
                             },
                         }}
                     />
+
+                    {/* User Identity */}
+                    <Stack horizontal tokens={{ childrenGap: 16 }}>
+                        <Dropdown
+                            label="User Identity Scope"
+                            selectedKey={startTaskUserScope}
+                            onChange={(_e, opt) =>
+                                setStartTaskUserScope(
+                                    (opt?.key as "pool" | "task") ?? "pool"
+                                )
+                            }
+                            options={[
+                                { key: "pool", text: "Pool user" },
+                                { key: "task", text: "Task user" },
+                            ]}
+                            styles={{ root: { width: 180 } }}
+                            aria-label="User identity scope"
+                        />
+                        <Dropdown
+                            label="Elevation Level"
+                            selectedKey={startTaskElevation}
+                            onChange={(_e, opt) =>
+                                setStartTaskElevation(
+                                    (opt?.key as "admin" | "nonadmin") ??
+                                        "admin"
+                                )
+                            }
+                            options={[
+                                { key: "admin", text: "Admin" },
+                                { key: "nonadmin", text: "Non-admin" },
+                            ]}
+                            styles={{ root: { width: 180 } }}
+                            aria-label="Elevation level"
+                        />
+                    </Stack>
+
+                    {/* Resource Files */}
+                    <Label>Resource Files</Label>
+                    <Stack tokens={{ childrenGap: 6 }}>
+                        {startTaskResourceFiles.map((rf, idx) => (
+                            <Stack
+                                key={idx}
+                                horizontal
+                                verticalAlign="end"
+                                tokens={{ childrenGap: 8 }}
+                            >
+                                <TextField
+                                    placeholder="HTTP URL"
+                                    value={rf.httpUrl}
+                                    onChange={(_e, val) =>
+                                        updateResourceFile(
+                                            idx,
+                                            "httpUrl",
+                                            val ?? ""
+                                        )
+                                    }
+                                    styles={{ root: { flex: 2 } }}
+                                    aria-label={`Resource file ${idx + 1} URL`}
+                                />
+                                <TextField
+                                    placeholder="File path (optional)"
+                                    value={rf.filePath}
+                                    onChange={(_e, val) =>
+                                        updateResourceFile(
+                                            idx,
+                                            "filePath",
+                                            val ?? ""
+                                        )
+                                    }
+                                    styles={{ root: { flex: 1 } }}
+                                    aria-label={`Resource file ${idx + 1} path`}
+                                />
+                                <IconButton
+                                    iconProps={{ iconName: "Delete" }}
+                                    title="Remove resource file"
+                                    onClick={() => removeResourceFile(idx)}
+                                    styles={{
+                                        root: { height: 32, width: 32 },
+                                    }}
+                                />
+                            </Stack>
+                        ))}
+                        <DefaultButton
+                            text="Add Resource File"
+                            iconProps={{ iconName: "Add" }}
+                            onClick={addResourceFile}
+                            styles={{
+                                root: {
+                                    alignSelf: "flex-start",
+                                    fontSize: 12,
+                                },
+                            }}
+                        />
+                    </Stack>
 
                     {/* Environment Variables */}
                     <Label>Environment Variables</Label>
@@ -1539,6 +1726,7 @@ export const PoolInfoPage: React.FC<PoolInfoPageProps> = ({ orchestrator }) => {
                                         updateEnvVar(idx, "name", val ?? "")
                                     }
                                     styles={{ root: { width: 180 } }}
+                                    aria-label={`Env var ${idx + 1} name`}
                                 />
                                 <TextField
                                     placeholder="Value"
@@ -1547,10 +1735,11 @@ export const PoolInfoPage: React.FC<PoolInfoPageProps> = ({ orchestrator }) => {
                                         updateEnvVar(idx, "value", val ?? "")
                                     }
                                     styles={{ root: { flex: 1 } }}
+                                    aria-label={`Env var ${idx + 1} value`}
                                 />
                                 <IconButton
                                     iconProps={{ iconName: "Delete" }}
-                                    title="Remove"
+                                    title="Remove variable"
                                     onClick={() => removeEnvVar(idx)}
                                     styles={{
                                         root: { height: 32, width: 32 },
@@ -1563,7 +1752,10 @@ export const PoolInfoPage: React.FC<PoolInfoPageProps> = ({ orchestrator }) => {
                             iconProps={{ iconName: "Add" }}
                             onClick={addEnvVar}
                             styles={{
-                                root: { alignSelf: "flex-start", fontSize: 12 },
+                                root: {
+                                    alignSelf: "flex-start",
+                                    fontSize: 12,
+                                },
                             }}
                         />
                     </Stack>
@@ -1605,6 +1797,40 @@ export const PoolInfoPage: React.FC<PoolInfoPageProps> = ({ orchestrator }) => {
                         }
                     />
 
+                    {/* Reboot nodes after update */}
+                    <div
+                        style={{
+                            borderTop: "1px solid #333",
+                            paddingTop: 12,
+                            marginTop: 4,
+                        }}
+                    >
+                        <Toggle
+                            label="Reboot all nodes after update"
+                            inlineLabel
+                            checked={startTaskRebootAfter}
+                            onChange={(_e, checked) =>
+                                setStartTaskRebootAfter(checked ?? false)
+                            }
+                            styles={{
+                                label: {
+                                    color: startTaskRebootAfter
+                                        ? "#e3a400"
+                                        : undefined,
+                                },
+                            }}
+                        />
+                        {startTaskRebootAfter && (
+                            <MessageBar
+                                messageBarType={MessageBarType.warning}
+                                styles={{ root: { marginTop: 4 } }}
+                            >
+                                All nodes in the selected pool(s) will be
+                                rebooted after the start task is updated.
+                            </MessageBar>
+                        )}
+                    </div>
+
                     {startTaskError && (
                         <MessageBar messageBarType={MessageBarType.error}>
                             {startTaskError}
@@ -1613,9 +1839,20 @@ export const PoolInfoPage: React.FC<PoolInfoPageProps> = ({ orchestrator }) => {
                 </Stack>
                 <DialogFooter>
                     <PrimaryButton
-                        text={startTaskSubmitting ? "Submitting..." : "Update"}
+                        text={
+                            startTaskSubmitting
+                                ? "Submitting..."
+                                : startTaskRebootAfter
+                                  ? "Update & Reboot Nodes"
+                                  : "Update Start Task"
+                        }
                         onClick={submitStartTask}
                         disabled={startTaskSubmitting}
+                        aria-label={
+                            startTaskRebootAfter
+                                ? "Update start task and reboot all nodes"
+                                : "Update start task"
+                        }
                     />
                     <DefaultButton
                         text="Cancel"
