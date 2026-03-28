@@ -578,38 +578,115 @@ export const PoolInfoPage: React.FC<PoolInfoPageProps> = ({ orchestrator }) => {
         setStartTaskError(null);
         setStartTaskSubmitting(true);
         try {
-            // Apply start task update to ALL selected pools
-            await Promise.allSettled(
+            // Update start task on ALL selected pools — track results
+            const updateResults = await Promise.allSettled(
                 selectedPools.map((pool) =>
-                    orchestrator.execute({
-                        action: "update_start_task",
-                        payload: {
-                            accountId: pool.accountId,
-                            poolId: pool.poolId,
-                            startTask: startTaskPayload,
-                        },
-                    })
-                )
-            );
-
-            // Reboot all nodes in selected pools if requested
-            if (startTaskRebootAfter) {
-                await Promise.allSettled(
-                    selectedPools.map((pool) =>
-                        orchestrator.execute({
-                            action: "reboot_pool_nodes",
+                    orchestrator
+                        .execute({
+                            action: "update_start_task",
                             payload: {
                                 accountId: pool.accountId,
                                 poolId: pool.poolId,
+                                startTask: startTaskPayload,
                             },
                         })
+                        .then(() => ({
+                            poolId: pool.poolId,
+                            ok: true as const,
+                        }))
+                        .catch((err) => ({
+                            poolId: pool.poolId,
+                            ok: false as const,
+                            error:
+                                err instanceof Error
+                                    ? err.message
+                                    : String(err),
+                        }))
+                )
+            );
+
+            const updated = updateResults.filter(
+                (r) => r.status === "fulfilled" && r.value.ok
+            );
+            const failedUpdates = updateResults
+                .filter(
+                    (
+                        r
+                    ): r is PromiseFulfilledResult<{
+                        poolId: string;
+                        ok: false;
+                        error: string;
+                    }> => r.status === "fulfilled" && !r.value.ok
+                )
+                .map((r) => r.value);
+
+            // Reboot nodes in successfully updated pools
+            let rebootSummary = "";
+            if (startTaskRebootAfter && updated.length > 0) {
+                const poolsToReboot = updated
+                    .filter(
+                        (
+                            r
+                        ): r is PromiseFulfilledResult<{
+                            poolId: string;
+                            ok: true;
+                        }> => r.status === "fulfilled" && r.value.ok
                     )
+                    .map((r) => r.value.poolId);
+                const rebootResults = await Promise.allSettled(
+                    selectedPools
+                        .filter((p) => poolsToReboot.includes(p.poolId))
+                        .map((pool) =>
+                            orchestrator
+                                .execute({
+                                    action: "reboot_pool_nodes",
+                                    payload: {
+                                        accountId: pool.accountId,
+                                        poolId: pool.poolId,
+                                    },
+                                })
+                                .then(() => ({
+                                    poolId: pool.poolId,
+                                    ok: true as const,
+                                }))
+                                .catch((err) => ({
+                                    poolId: pool.poolId,
+                                    ok: false as const,
+                                    error:
+                                        err instanceof Error
+                                            ? err.message
+                                            : String(err),
+                                }))
+                        )
                 );
+                const rebooted = rebootResults.filter(
+                    (r) => r.status === "fulfilled" && r.value.ok
+                ).length;
+                const rebootFailed = rebootResults.length - rebooted;
+                rebootSummary = ` | Rebooted: ${rebooted}/${rebootResults.length}`;
+                if (rebootFailed > 0) {
+                    rebootSummary += ` (${rebootFailed} failed)`;
+                }
             }
 
-            setShowStartTaskDialog(false);
-        } catch {
-            /* handled by orchestrator */
+            // Show results
+            if (failedUpdates.length === 0) {
+                setShowStartTaskDialog(false);
+            } else {
+                const failedList = failedUpdates
+                    .slice(0, 5)
+                    .map((f) => `${f.poolId}: ${f.error}`)
+                    .join("\n");
+                const extra =
+                    failedUpdates.length > 5
+                        ? `\n...and ${failedUpdates.length - 5} more`
+                        : "";
+                setStartTaskError(
+                    `Updated ${updated.length}/${selectedPools.length} pools${rebootSummary}.\n\nFailed:\n${failedList}${extra}`
+                );
+            }
+        } catch (err) {
+            setStartTaskError(err instanceof Error ? err.message : String(err));
         } finally {
             setStartTaskSubmitting(false);
         }
