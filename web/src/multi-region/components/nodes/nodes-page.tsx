@@ -1120,56 +1120,25 @@ export const NodesPage: React.FC<NodesPageProps> = ({ orchestrator }) => {
                         styles={{ root: { marginTop: 24 } }}
                     />
                     <Checkbox
-                        label={`Select all (${displayNodes.length})`}
+                        label={`Select all (${sortedNodes.length})`}
                         checked={selectAll}
                         onChange={handleSelectAllChange}
                         styles={{ root: { marginTop: 24 } }}
                     />
                 </Stack>
 
-                {/* "Select All N Results" link */}
-                {selectAll &&
-                    !selectAllResults &&
-                    sortedNodes.length > displayNodes.length && (
-                        <div
-                            style={{ fontSize: 13, color: "#0078d4" }}
-                            aria-live="polite"
-                        >
-                            All {displayNodes.length} nodes on this page are
-                            selected.{" "}
-                            <button
-                                onClick={() => {
-                                    setSelectAllResults(true);
-                                    setSelectedNodeIds(
-                                        new Set(sortedNodes.map((n) => n.id))
-                                    );
-                                }}
-                                style={{
-                                    background: "none",
-                                    border: "none",
-                                    color: "#0078d4",
-                                    cursor: "pointer",
-                                    textDecoration: "underline",
-                                    padding: 0,
-                                    fontSize: 13,
-                                }}
-                                aria-label={`Select all ${sortedNodes.length} results`}
-                            >
-                                Select All {sortedNodes.length} Results
-                            </button>
-                        </div>
-                    )}
-
-                {selectAllResults && (
+                {/* Show selection count across all pages */}
+                {selectAll && (
                     <div
                         style={{ fontSize: 13, color: "#0078d4" }}
                         aria-live="polite"
                     >
-                        All {sortedNodes.length} nodes are selected.{" "}
+                        All {sortedNodes.length} nodes across all pages
+                        selected.{" "}
                         <button
                             onClick={() => {
-                                setSelectAllResults(false);
                                 setSelectAll(false);
+                                setSelectAllResults(false);
                                 setSelectedNodeIds(new Set());
                             }}
                             style={{
