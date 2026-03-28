@@ -30,20 +30,66 @@ import * as ReactDOM from "react-dom";
 import { Application } from "./components";
 import { MemoryCacheManager } from "@azure/bonito-core/lib/cache";
 import { FakeAccountService } from "@batch/ui-service/lib/account";
+import { broadcastResponseToMainFrame } from "@azure/msal-browser/redirect-bridge";
 
 // Defined by webpack
 declare const ENV: {
     MODE: EnvironmentMode;
 };
 
-// Bootstrap the app
-const rootEl = document.getElementById("batch-explorer-root");
-if (!rootEl) {
-    throw new Error(
-        "Failed to initialize: No element with an ID of 'batch-explorer-root' found."
+/**
+ * Detect if this page is running inside an MSAL popup/redirect.
+ * The auth response may arrive in the hash (#code=) or query string (?code=).
+ * We also check for error responses and the MSAL client.info parameter.
+ */
+function isMsalPopup(): boolean {
+    if (!window.opener) return false;
+    const hash = window.location.hash;
+    const search = window.location.search;
+    return (
+        hash.includes("code=") ||
+        hash.includes("error=") ||
+        hash.includes("client_info=") ||
+        search.includes("code=") ||
+        search.includes("error=")
     );
 }
-init(rootEl);
+
+if (isMsalPopup()) {
+    // We are inside the MSAL login popup callback. Do NOT render the app.
+    //
+    // WHY broadcastResponseToMainFrame instead of handleRedirectPromise:
+    //   The parent's loginPopup() stores the PKCE code verifier in its own
+    //   sessionStorage. A fresh MSAL instance here cannot do the token exchange
+    //   without it, and direct token POSTs would hit CORS anyway.
+    //   broadcastResponseToMainFrame() reads the raw auth code from the URL
+    //   and sends it to the parent via BroadcastChannel. The parent completes
+    //   the exchange using its own verifier + proxy network client, then the
+    //   popup is closed automatically.
+    document.title = "Signing in...";
+    document.body.innerText = "";
+
+    broadcastResponseToMainFrame().catch((err) => {
+        console.error("[MSAL Popup] broadcastResponseToMainFrame error:", err);
+        // Safety-net: close the popup so the user isn't left stranded
+        setTimeout(() => {
+            try {
+                window.close();
+            } catch {
+                /**/
+            }
+        }, 500);
+    });
+} else {
+    // Bootstrap the app
+    const rootEl = document.getElementById("batch-explorer-root");
+    if (!rootEl) {
+        throw new Error(
+            "Failed to initialize: No element with an ID of 'batch-explorer-root' found."
+        );
+    }
+    init(rootEl);
+}
 
 export async function init(rootEl: HTMLElement): Promise<void> {
     const localizer = new HttpLocalizer();
