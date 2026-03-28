@@ -22,6 +22,12 @@ import {
     UserPreferences,
     WorkflowState,
 } from "./store-types";
+import {
+    PoolDefaults,
+    loadPoolDefaults,
+    savePoolDefaults,
+    resetPoolDefaults as resetPoolDefaultsStorage,
+} from "./pool-defaults";
 
 const STORAGE_KEY = "multi-region-sessions";
 const SESSION_INDEX_KEY = "multi-region-session-index";
@@ -34,6 +40,8 @@ export class MultiRegionStore {
 
     constructor(initialState?: Partial<MultiRegionState>) {
         this._state = { ...createInitialState(), ...initialState };
+        // Hydrate pool defaults from localStorage on startup
+        this._state.poolDefaults = loadPoolDefaults();
     }
 
     getState(): Readonly<MultiRegionState> {
@@ -398,6 +406,34 @@ export class MultiRegionStore {
                 a.homeAccountId === homeAccountId ? { ...a, ...patch } : a
             ),
         };
+        this._notify();
+    }
+
+    // --- Pool Defaults ---
+
+    setPoolDefaults(defaults: PoolDefaults): void {
+        this._state = { ...this._state, poolDefaults: defaults };
+        savePoolDefaults(defaults);
+        this._notify();
+    }
+
+    updatePoolDefaults(patch: Partial<PoolDefaults>): void {
+        const updated = { ...this._state.poolDefaults, ...patch };
+        this._state = { ...this._state, poolDefaults: updated };
+        savePoolDefaults(updated);
+        this._notify();
+    }
+
+    resetPoolDefaults(): PoolDefaults {
+        const fresh = resetPoolDefaultsStorage();
+        this._state = { ...this._state, poolDefaults: fresh };
+        this._notify();
+        return fresh;
+    }
+
+    loadPoolDefaultsFromStorage(): void {
+        const loaded = loadPoolDefaults();
+        this._state = { ...this._state, poolDefaults: loaded };
         this._notify();
     }
 

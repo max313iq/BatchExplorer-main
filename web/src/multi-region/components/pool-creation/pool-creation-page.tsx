@@ -22,6 +22,7 @@ import {
 import { StatusBadge } from "../shared/status-badge";
 import { OrchestratorAgent } from "../../agents/orchestrator-agent";
 import { IconButton } from "@fluentui/react/lib/Button";
+import { buildPoolConfigFromDefaults } from "../../store/pool-defaults";
 
 const stackTokens: IStackTokens = { childrenGap: 12 };
 
@@ -134,6 +135,10 @@ export const PoolCreationPage: React.FC<PoolCreationPageProps> = ({
 }) => {
     const state = useMultiRegionState();
     const store = useMultiRegionStore();
+    const poolDefaults = (state as unknown as Record<string, unknown>)
+        .poolDefaults as
+        | import("../../store/pool-defaults").PoolDefaults
+        | undefined;
     const [poolConfigJson, setPoolConfigJson] = React.useState(
         JSON.stringify(DEFAULT_POOL_CONFIG, null, 2)
     );
@@ -146,7 +151,8 @@ export const PoolCreationPage: React.FC<PoolCreationPageProps> = ({
     const [smartMode, setSmartMode] = React.useState(true);
     const [selectedVmSizes, setSelectedVmSizes] = React.useState<string[]>([]);
     const [startTaskCmd, setStartTaskCmd] = React.useState(
-        '/bin/bash -c "echo Hello"'
+        poolDefaults?.startTask?.commandLine ??
+            DEFAULT_POOL_CONFIG.startTask.commandLine
     );
     const [envVars, setEnvVars] = React.useState<EnvVar[]>([]);
     const [maxRetryCount, setMaxRetryCount] = React.useState(3);
@@ -262,42 +268,56 @@ export const PoolCreationPage: React.FC<PoolCreationPageProps> = ({
                     .filter((ev) => ev.name.trim() !== "")
                     .map((ev) => ({ name: ev.name, value: ev.value }));
 
-                // Build pool config from simple fields -- no JSON editing needed
-                const poolConfig = {
-                    id: "pool",
-                    vmSize: selectedVmSizes[0].toLowerCase(),
-                    virtualMachineConfiguration: {
-                        nodeAgentSKUId: "batch.node.ubuntu 22.04",
-                        imageReference: {
-                            publisher: "canonical",
-                            offer: "0001-com-ubuntu-server-jammy",
-                            sku: "22_04-lts-gen2",
-                            version: "latest",
-                        },
-                    },
-                    resizeTimeout: "PT15M",
-                    targetDedicatedNodes: 0,
-                    targetLowPriorityNodes: 0,
-                    taskSlotsPerNode: 1,
-                    taskSchedulingPolicy: { nodeFillType: "Pack" },
-                    enableAutoScale: false,
-                    enableInterNodeCommunication: false,
-                    startTask: {
-                        commandLine: startTaskCmd,
-                        environmentSettings,
-                        maxTaskRetryCount: maxRetryCount,
-                        resourceFiles: [],
-                        userIdentity: {
-                            autoUser: {
-                                scope: "pool",
-                                elevationLevel: "admin",
+                // Build pool config: start from pool defaults if available, else use hardcoded values
+                let poolConfig: Record<string, unknown>;
+                if (poolDefaults) {
+                    poolConfig = buildPoolConfigFromDefaults(poolDefaults, {
+                        id: "pool",
+                        targetLowPriorityNodes: 0,
+                        vmSize: selectedVmSizes[0].toLowerCase(),
+                    });
+                    // Force dedicated=0 for LP-only mode
+                    poolConfig.targetDedicatedNodes = 0;
+                    // Always disable autoscale in smart mode
+                    poolConfig.enableAutoScale = false;
+                } else {
+                    poolConfig = {
+                        id: "pool",
+                        vmSize: selectedVmSizes[0].toLowerCase(),
+                        virtualMachineConfiguration: {
+                            nodeAgentSKUId: "batch.node.ubuntu 22.04",
+                            imageReference: {
+                                publisher: "canonical",
+                                offer: "0001-com-ubuntu-server-jammy",
+                                sku: "22_04-lts-gen2",
+                                version: "latest",
                             },
                         },
-                        waitForSuccess,
+                        resizeTimeout: "PT15M",
+                        targetDedicatedNodes: 0,
+                        targetLowPriorityNodes: 0,
+                        taskSlotsPerNode: 1,
+                        taskSchedulingPolicy: { nodeFillType: "Pack" },
+                        enableAutoScale: false,
+                        enableInterNodeCommunication: false,
+                        certificateReferences: [],
+                        metadata: [],
+                        userAccounts: [],
+                    };
+                }
+                // Overlay user customizations from the UI
+                poolConfig.startTask = {
+                    commandLine: startTaskCmd,
+                    environmentSettings,
+                    maxTaskRetryCount: maxRetryCount,
+                    resourceFiles: [],
+                    userIdentity: {
+                        autoUser: {
+                            scope: "pool",
+                            elevationLevel: "admin",
+                        },
                     },
-                    certificateReferences: [],
-                    metadata: [],
-                    userAccounts: [],
+                    waitForSuccess,
                 };
                 await orchestrator.execute({
                     action: "create_pools_smart",

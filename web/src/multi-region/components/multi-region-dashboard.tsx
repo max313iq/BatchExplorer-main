@@ -29,6 +29,7 @@ import { AccountInfoPage } from "./account-info/account-info-page";
 import { UnusedQuotaPage } from "./unused-quota/unused-quota-page";
 import { AzureAccountsPage } from "./azure-accounts/azure-accounts-page";
 import { MonitoringPage } from "./monitoring/monitoring-page";
+import { PoolDefaultsPage } from "./pool-defaults/pool-defaults-page";
 import { SupportTicketPage } from "./support-ticket/support-ticket-page";
 import { AgentLogPanel } from "./shared/agent-log-panel";
 import { ActivityPanel } from "./shared/activity-panel";
@@ -394,6 +395,8 @@ const PageContent: React.FC<{
             return <QuotaStatusPage orchestrator={orchestrator} />;
         case "pools":
             return <PoolCreationPage orchestrator={orchestrator} />;
+        case "pool-defaults":
+            return <PoolDefaultsPage />;
         case "pool-info":
             return <PoolInfoPage orchestrator={orchestrator} />;
         case "account-info":

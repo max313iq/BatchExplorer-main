@@ -303,6 +303,11 @@ export interface AuditEntry {
     error?: string;
 }
 
+// --- Pool Defaults (re-export type for state) ---
+
+import { PoolDefaults, INITIAL_POOL_DEFAULTS } from "./pool-defaults";
+export { PoolDefaults, INITIAL_POOL_DEFAULTS };
+
 // --- Main State ---
 
 export interface MultiRegionState {
@@ -322,6 +327,7 @@ export interface MultiRegionState {
     activities: Activity[];
     azureAccounts: AzureLoginAccount[]; // all logged-in AAD accounts
     auditEntries: AuditEntry[];
+    poolDefaults: PoolDefaults;
 }
 
 export const DEFAULT_GLOBAL_FILTER: GlobalFilter = {
@@ -367,5 +373,6 @@ export function createInitialState(): MultiRegionState {
         activities: [],
         azureAccounts: [],
         auditEntries: [],
+        poolDefaults: { ...INITIAL_POOL_DEFAULTS },
     };
 }

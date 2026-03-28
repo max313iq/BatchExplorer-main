@@ -15,6 +15,28 @@ export type {
     WorkflowStep,
 } from "./store/store-types";
 
+// Pool defaults
+export {
+    loadPoolDefaults,
+    savePoolDefaults,
+    resetPoolDefaults,
+    buildPoolConfigFromDefaults,
+    INITIAL_POOL_DEFAULTS,
+} from "./store/pool-defaults";
+export type {
+    PoolDefaults,
+    StartTaskConfig,
+    VmConfig,
+    ImageReference,
+    EnvSetting,
+    ResourceFile,
+    UserAccount,
+    MetadataItem,
+    ScaleType,
+    TaskSchedulingPolicy,
+    OsCategory,
+} from "./store/pool-defaults";
+
 // Scheduling
 export { RequestScheduler } from "./scheduling/request-scheduler";
 export type { RequestSchedulerOptions } from "./scheduling/request-scheduler";

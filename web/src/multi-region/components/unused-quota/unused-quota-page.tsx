@@ -28,6 +28,8 @@ import { useMultiRegionState } from "../../store/store-context";
 import { OrchestratorAgent } from "../../agents/orchestrator-agent";
 import { AccountInfo } from "../../store/store-types";
 import { getVCpus, getAllVmSizes, VmSizeInfo } from "../shared/vm-sizes";
+import { buildPoolConfigFromDefaults } from "../../store/pool-defaults";
+import type { PoolDefaults } from "../../store/pool-defaults";
 
 /* ---- Skeleton ---- */
 const SKELETON_KEYFRAMES = `
@@ -224,6 +226,8 @@ export const UnusedQuotaPage: React.FC<UnusedQuotaPageProps> = ({
     onNavigate,
 }) => {
     const state = useMultiRegionState();
+    const poolDefaults = (state as unknown as Record<string, unknown>)
+        .poolDefaults as PoolDefaults | undefined;
     const [loading, setLoading] = React.useState(false);
     const [error, setError] = React.useState<string | null>(null);
     const [uqPage, setUqPage] = React.useState(1);
@@ -505,12 +509,25 @@ export const UnusedQuotaPage: React.FC<UnusedQuotaPageProps> = ({
             for (const row of selectedRows) {
                 if (row.maxNodes <= 0 || row.suggestedVm === "N/A") continue;
 
-                const poolConfig: Record<string, unknown> = {
-                    vmSize: row.suggestedVm,
-                    targetDedicatedNodes: 0,
-                    targetLowPriorityNodes: row.maxNodes,
-                    taskSlotsPerNode: 1,
-                };
+                // Use pool defaults from store if available, otherwise fall back to hardcoded config
+                let poolConfig: Record<string, unknown>;
+                if (poolDefaults) {
+                    poolConfig = buildPoolConfigFromDefaults(poolDefaults, {
+                        id: `pool-${row.accountName}-${Date.now()}`,
+                        targetLowPriorityNodes: row.maxNodes,
+                        vmSize: row.suggestedVm,
+                    });
+                    // Force dedicated=0 for LP-only mode
+                    poolConfig.targetDedicatedNodes = 0;
+                } else {
+                    poolConfig = {
+                        vmSize: row.suggestedVm,
+                        targetDedicatedNodes: 0,
+                        targetLowPriorityNodes: row.maxNodes,
+                        taskSlotsPerNode: 1,
+                    };
+                }
+                // Overlay any start task customization from the dialog UI
                 if (startTask) {
                     poolConfig.startTask = startTask;
                 }

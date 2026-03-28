@@ -10,6 +10,7 @@ export type PageKey =
     | "quota-status"
     | "support-tickets"
     | "pools"
+    | "pool-defaults"
     | "pool-info"
     | "account-info"
     | "unused-quota"
@@ -87,6 +88,12 @@ export const SidebarNav: React.FC<SidebarNavProps> = ({
                 label: "Pools",
                 icon: "BuildQueue",
                 badge: state.pools.length,
+            },
+            {
+                key: "pool-defaults" as PageKey,
+                label: "Pool Settings",
+                icon: "Settings",
+                badge: undefined,
             },
             {
                 key: "pool-info",
