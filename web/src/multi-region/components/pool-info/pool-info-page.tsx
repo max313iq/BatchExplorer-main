@@ -710,8 +710,11 @@ export const PoolInfoPage: React.FC<PoolInfoPageProps> = ({ orchestrator }) => {
     // Select All handler
     const handleSelectAll = (_ev?: React.FormEvent, checked?: boolean) => {
         if (checked) {
+            // Select ALL filtered pools across ALL pages, not just current page
+            setSelectedPools([...filteredPools]);
             selection.setAllSelected(true);
         } else {
+            setSelectedPools([]);
             selection.setAllSelected(false);
         }
     };

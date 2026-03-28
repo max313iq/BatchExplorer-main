@@ -1634,35 +1634,80 @@ export class OrchestratorAgent implements Agent {
         payload: Record<string, unknown>
     ): Promise<AgentResult> {
         const { store } = this._ctx;
+        const poolId = payload.poolId as string;
+        const accountId = payload.accountId as string;
+
         const account = store
             .getState()
-            .accounts.find((a) => a.id === payload.accountId);
+            .accounts.find((a) => a.id === accountId);
         if (!account) {
-            throw new Error(`Account not found: ${payload.accountId}`);
+            // Fallback: try matching by poolInfos accountId
+            const poolInfo = store
+                .getState()
+                .poolInfos.find((p) => p.poolId === poolId);
+            if (poolInfo) {
+                const fallbackAccount = store
+                    .getState()
+                    .accounts.find((a) => a.id === poolInfo.accountId);
+                if (fallbackAccount) {
+                    return this._updateStartTaskForAccount(
+                        fallbackAccount,
+                        poolId,
+                        payload.startTask
+                    );
+                }
+            }
+            throw new Error(
+                `Account not found: ${accountId} (pool: ${poolId})`
+            );
         }
 
+        return this._updateStartTaskForAccount(
+            account,
+            poolId,
+            payload.startTask
+        );
+    }
+
+    private async _updateStartTaskForAccount(
+        account: { accountName: string; region: string },
+        poolId: string,
+        startTask: unknown
+    ): Promise<AgentResult> {
+        const { store } = this._ctx;
         const token = await this._getBatchAccessToken();
         const endpoint = accountEndpoint(account.accountName, account.region);
 
-        await patchPool(
-            endpoint,
-            payload.poolId as string,
-            {
-                startTask: payload.startTask,
-            },
-            token
-        );
+        store.addLog({
+            agent: "orchestrator",
+            level: "info",
+            message: `Updating start task on ${account.accountName}/${poolId}`,
+        });
+
+        await patchPool(endpoint, poolId, { startTask }, token);
+
+        // Also update the pool info in the store so UI reflects change immediately
+        const poolInfos = store.getState().poolInfos;
+        const poolInfoIdx = poolInfos.findIndex((p) => p.poolId === poolId);
+        if (poolInfoIdx >= 0) {
+            const updated = [...poolInfos];
+            updated[poolInfoIdx] = {
+                ...updated[poolInfoIdx],
+                startTask: startTask as Record<string, unknown>,
+            };
+            store.setPoolInfos(updated);
+        }
 
         store.addNotification({
             type: "success",
-            message: `Pool ${payload.poolId} start task updated successfully`,
+            message: `Pool ${poolId} start task updated on ${account.accountName}`,
         });
 
         return {
             status: "completed",
             summary: {
-                poolId: payload.poolId,
-                accountId: payload.accountId,
+                poolId,
+                accountName: account.accountName,
             },
         };
     }
