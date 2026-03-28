@@ -17,6 +17,8 @@ import {
     patchPool,
     removeNodes,
     deletePool,
+    listNodes,
+    performNodeAction,
 } from "../services";
 import type { BatchPool as SdkBatchPool } from "../services";
 
@@ -98,7 +100,8 @@ export type OrchestratorAction =
     | "resize_pool"
     | "update_start_task"
     | "create_pools_smart"
-    | "delete_pool";
+    | "delete_pool"
+    | "reboot_pool_nodes";
 
 export class OrchestratorAgent implements Agent {
     readonly name = "orchestrator" as const;
@@ -504,6 +507,12 @@ export class OrchestratorAgent implements Agent {
                     );
                     break;
 
+                case "reboot_pool_nodes":
+                    result = await this._rebootPoolNodes(
+                        params.payload as Record<string, unknown>
+                    );
+                    break;
+
                 default:
                     throw new Error(`Unknown action: ${action}`);
             }
@@ -601,6 +610,8 @@ export class OrchestratorAgent implements Agent {
                 return `pool ${(payload.poolId as string) ?? ""}`;
             case "delete_pool":
                 return `pool ${(payload.poolId as string) ?? ""}`;
+            case "reboot_pool_nodes":
+                return `pool ${(payload.poolId as string) ?? ""} nodes`;
             default:
                 return action;
         }
@@ -1700,6 +1711,99 @@ export class OrchestratorAgent implements Agent {
                 poolId: payload.poolId,
                 accountId: payload.accountId,
                 deleted: true,
+            },
+        };
+    }
+
+    /**
+     * Reboot ALL nodes in a pool. Called after updating the start task
+     * so nodes pick up the new configuration.
+     *
+     * Lists nodes via the Batch API (not from store — store may be stale),
+     * then reboots each one. Nodes in non-rebootable states are skipped.
+     */
+    private async _rebootPoolNodes(
+        payload: Record<string, unknown>
+    ): Promise<AgentResult> {
+        const { store } = this._ctx;
+        const account = store
+            .getState()
+            .accounts.find((a) => a.id === payload.accountId);
+        if (!account) {
+            throw new Error(`Account not found: ${payload.accountId}`);
+        }
+
+        const token = await this._getBatchAccessToken();
+        const endpoint = accountEndpoint(account.accountName, account.region);
+        const poolId = payload.poolId as string;
+
+        // List actual nodes from the Batch API (not store)
+        const nodes = await listNodes(endpoint, poolId, token);
+
+        if (!nodes || nodes.length === 0) {
+            store.addNotification({
+                type: "warning",
+                message: `Pool ${poolId}: no nodes to reboot`,
+            });
+            return {
+                status: "completed",
+                summary: { poolId, rebooted: 0, total: 0 },
+            };
+        }
+
+        let rebooted = 0;
+        let skipped = 0;
+        let failed = 0;
+
+        for (const node of nodes) {
+            const nodeId = node.id;
+            if (!nodeId) continue;
+
+            // Skip nodes in states that can't be rebooted
+            const nodeState = node.state?.toLowerCase();
+            if (
+                nodeState === "creating" ||
+                nodeState === "starting" ||
+                nodeState === "leavingpool" ||
+                nodeState === "offline" ||
+                nodeState === "unusable"
+            ) {
+                skipped++;
+                continue;
+            }
+
+            try {
+                await performNodeAction(
+                    endpoint,
+                    poolId,
+                    nodeId,
+                    "reboot",
+                    token
+                );
+                rebooted++;
+            } catch (err) {
+                failed++;
+                store.addLog({
+                    agent: "orchestrator",
+                    level: "warn",
+                    message: `Failed to reboot node ${nodeId}: ${err instanceof Error ? err.message : String(err)}`,
+                });
+            }
+        }
+
+        store.addNotification({
+            type: "success",
+            message: `Pool ${poolId}: rebooted ${rebooted}/${nodes.length} nodes${skipped > 0 ? ` (${skipped} skipped)` : ""}${failed > 0 ? ` (${failed} failed)` : ""}`,
+        });
+
+        return {
+            status: "completed",
+            summary: {
+                poolId,
+                rebooted,
+                skipped,
+                failed,
+                total: nodes.length,
             },
         };
     }

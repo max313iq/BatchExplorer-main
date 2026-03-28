@@ -597,12 +597,10 @@ export const PoolInfoPage: React.FC<PoolInfoPageProps> = ({ orchestrator }) => {
                 await Promise.allSettled(
                     selectedPools.map((pool) =>
                         orchestrator.execute({
-                            action: "node_action",
+                            action: "reboot_pool_nodes",
                             payload: {
                                 accountId: pool.accountId,
                                 poolId: pool.poolId,
-                                action: "reboot",
-                                nodeIds: "all",
                             },
                         })
                     )
