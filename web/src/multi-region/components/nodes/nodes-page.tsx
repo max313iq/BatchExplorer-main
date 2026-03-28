@@ -398,8 +398,9 @@ export const NodesPage: React.FC<NodesPageProps> = ({ orchestrator }) => {
                 setIsActing(true);
                 setError(null);
                 try {
-                    // Use bulk_node_action for large selections (calls Batch API
-                    // directly per pool instead of one-by-one through the scheduler)
+                    console.log(
+                        `[Nodes] Dispatching bulk_node_action: actionType=${action}, nodeCount=${ids.length}`
+                    );
                     await orchestrator.execute({
                         action: "bulk_node_action",
                         payload: {
