@@ -271,7 +271,8 @@ function EnhancedTableInner<T>(
 
     // ----- column click (sort) ---------------------------------------------
     const handleColumnClick = React.useCallback(
-        (_ev: React.MouseEvent<HTMLElement>, column: IColumn) => {
+        (_ev?: React.MouseEvent<HTMLElement>, column?: IColumn) => {
+            if (!column) return;
             const col = columns.find((c) => c.key === column.key);
             if (!col || col.sortable === false) return;
             setSort((prev) => {

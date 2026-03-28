@@ -267,6 +267,29 @@ export interface QuotaSuggestion {
     maxDedicatedNodes: number;
 }
 
+// --- Azure Login Accounts (multi-account auth) ---
+
+/** Represents a logged-in Azure AD account with its discovered subscriptions */
+export interface AzureLoginAccount {
+    homeAccountId: string; // MSAL account ID (unique key)
+    username: string; // e.g. "user@contoso.com"
+    name: string; // display name
+    tenantId: string; // home tenant ID
+    environment: string; // e.g. "login.microsoftonline.com"
+    subscriptions: AzureLoginSubscription[];
+    subscriptionCount: number; // convenience
+    status: "active" | "loading" | "error";
+    error?: string | null;
+    addedAt: string; // ISO timestamp
+}
+
+export interface AzureLoginSubscription {
+    subscriptionId: string;
+    displayName: string;
+    state: string; // "Enabled", "Disabled", "Warned", etc.
+    tenantId: string;
+}
+
 // --- Main State ---
 
 export interface MultiRegionState {
@@ -284,6 +307,7 @@ export interface MultiRegionState {
     notifications: ToastNotification[];
     workflow: WorkflowState;
     activities: Activity[];
+    azureAccounts: AzureLoginAccount[]; // all logged-in AAD accounts
 }
 
 export const DEFAULT_GLOBAL_FILTER: GlobalFilter = {
@@ -327,5 +351,6 @@ export function createInitialState(): MultiRegionState {
         notifications: [],
         workflow: { ...DEFAULT_WORKFLOW_STATE },
         activities: [],
+        azureAccounts: [],
     };
 }

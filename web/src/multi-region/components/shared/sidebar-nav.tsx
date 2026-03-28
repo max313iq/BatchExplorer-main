@@ -3,14 +3,17 @@ import { Icon } from "@fluentui/react/lib/Icon";
 import { useMultiRegionState } from "../../store/store-context";
 
 export type PageKey =
+    | "azure-accounts"
     | "overview"
     | "accounts"
     | "quotas"
     | "quota-status"
+    | "support-tickets"
     | "pools"
     | "pool-info"
     | "account-info"
     | "unused-quota"
+    | "monitoring"
     | "nodes";
 
 interface NavItem {
@@ -37,6 +40,18 @@ export const SidebarNav: React.FC<SidebarNavProps> = ({
 
     const items: NavItem[] = React.useMemo(
         () => [
+            {
+                key: "azure-accounts" as PageKey,
+                label: "Azure Accounts",
+                icon: "Contact",
+                badge: (state as unknown as Record<string, unknown>)
+                    .azureAccounts
+                    ? (
+                          (state as unknown as Record<string, unknown>)
+                              .azureAccounts as unknown[]
+                      ).length
+                    : 0,
+            },
             { key: "overview", label: "Overview", icon: "ViewDashboard" },
             {
                 key: "accounts",
@@ -59,6 +74,12 @@ export const SidebarNav: React.FC<SidebarNavProps> = ({
                 badge: state.quotaRequests.filter(
                     (q) => q.status === "approved"
                 ).length,
+            },
+            {
+                key: "support-tickets" as PageKey,
+                label: "Support Tickets",
+                icon: "Ticket",
+                badge: state.quotaRequests?.length ?? 0,
             },
             {
                 key: "pools",
@@ -85,6 +106,14 @@ export const SidebarNav: React.FC<SidebarNavProps> = ({
                 badge: state.accountInfos.filter(
                     (a) => a.lowPriorityCoresFree > 0
                 ).length,
+            },
+            {
+                key: "monitoring" as PageKey,
+                label: "Monitoring",
+                icon: "Health",
+                badge:
+                    state.agentLogs?.filter((l) => l.level === "error")
+                        .length ?? 0,
             },
             {
                 key: "nodes",

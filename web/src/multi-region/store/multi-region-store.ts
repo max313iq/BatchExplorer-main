@@ -4,6 +4,7 @@ import {
     AgentLogEntry,
     AgentName,
     AgentStatus,
+    AzureLoginAccount,
     createInitialState,
     DEFAULT_AGENT_STATUSES,
     DEFAULT_USER_PREFERENCES,
@@ -329,6 +330,59 @@ export class MultiRegionStore {
             "multi-region-prefs",
             JSON.stringify({ ...current, ...prefs })
         );
+    }
+
+    // --- Azure Accounts (multi-account auth) ---
+
+    /** Set / replace all AzureLoginAccounts */
+    setAzureAccounts(accounts: AzureLoginAccount[]): void {
+        this._state = {
+            ...this._state,
+            azureAccounts: [...accounts],
+        };
+        this._notify();
+    }
+
+    /** Upsert a single AzureLoginAccount (by homeAccountId) */
+    upsertAzureAccount(account: AzureLoginAccount): void {
+        const existing = this._state.azureAccounts.findIndex(
+            (a) => a.homeAccountId === account.homeAccountId
+        );
+        let azureAccounts: AzureLoginAccount[];
+        if (existing >= 0) {
+            azureAccounts = this._state.azureAccounts.map((a) =>
+                a.homeAccountId === account.homeAccountId ? account : a
+            );
+        } else {
+            azureAccounts = [...this._state.azureAccounts, account];
+        }
+        this._state = { ...this._state, azureAccounts };
+        this._notify();
+    }
+
+    /** Remove an AzureLoginAccount by homeAccountId */
+    removeAzureAccount(homeAccountId: string): void {
+        this._state = {
+            ...this._state,
+            azureAccounts: this._state.azureAccounts.filter(
+                (a) => a.homeAccountId !== homeAccountId
+            ),
+        };
+        this._notify();
+    }
+
+    /** Patch a single AzureLoginAccount */
+    updateAzureAccount(
+        homeAccountId: string,
+        patch: Partial<AzureLoginAccount>
+    ): void {
+        this._state = {
+            ...this._state,
+            azureAccounts: this._state.azureAccounts.map((a) =>
+                a.homeAccountId === homeAccountId ? { ...a, ...patch } : a
+            ),
+        };
+        this._notify();
     }
 
     // --- Export ---

@@ -27,6 +27,9 @@ import { NodesPage } from "./nodes/nodes-page";
 import { PoolInfoPage } from "./pool-info/pool-info-page";
 import { AccountInfoPage } from "./account-info/account-info-page";
 import { UnusedQuotaPage } from "./unused-quota/unused-quota-page";
+import { AzureAccountsPage } from "./azure-accounts/azure-accounts-page";
+import { MonitoringPage } from "./monitoring/monitoring-page";
+import { SupportTicketPage } from "./support-ticket/support-ticket-page";
 import { AgentLogPanel } from "./shared/agent-log-panel";
 import { ActivityPanel } from "./shared/activity-panel";
 import * as msalAuth from "../auth/msal-auth";
@@ -42,35 +45,6 @@ const DEFAULT_SCHEDULER_OPTIONS = {
     jitterPct: 0.2,
     maxQueueSize: 100,
 };
-
-interface CachedToken {
-    accessToken: string;
-    expiresOn: string;
-}
-
-let _cachedArmToken: CachedToken | null = null;
-let _cachedBatchToken: CachedToken | null = null;
-
-function isTokenValid(cached: CachedToken | null): boolean {
-    if (!cached) return false;
-    return Date.now() < new Date(cached.expiresOn).getTime() - 2 * 60 * 1000;
-}
-
-async function fetchTokenFromProxy(endpoint: string): Promise<CachedToken> {
-    const response = await fetch(endpoint);
-    if (!response.ok) {
-        let errorMsg = `Token request failed (${response.status})`;
-        try {
-            const err = await response.json();
-            errorMsg = err?.error ?? err?.details ?? errorMsg;
-        } catch {
-            /* use default */
-        }
-        throw new Error(errorMsg);
-    }
-    const data = await response.json();
-    return { accessToken: data.accessToken, expiresOn: data.expiresOn };
-}
 
 async function getAccessTokenFromCli(tenantId?: string): Promise<string> {
     return msalAuth.getArmToken(tenantId);
@@ -401,6 +375,8 @@ const PageContent: React.FC<{
     onNavigate: (key: PageKey) => void;
 }> = ({ page, orchestrator, store, onNavigate }) => {
     switch (page) {
+        case "azure-accounts":
+            return <AzureAccountsPage />;
         case "overview":
             return (
                 <OverviewPage
@@ -425,9 +401,13 @@ const PageContent: React.FC<{
             return (
                 <UnusedQuotaPage
                     orchestrator={orchestrator}
-                    onNavigate={onNavigate}
+                    onNavigate={onNavigate as (key: string) => void}
                 />
             );
+        case "monitoring":
+            return <MonitoringPage orchestrator={orchestrator} />;
+        case "support-tickets":
+            return <SupportTicketPage orchestrator={orchestrator} />;
         case "nodes":
             return <NodesPage orchestrator={orchestrator} />;
         default:
@@ -443,7 +423,8 @@ const DashboardContent: React.FC<{ tokenProvider?: TokenProvider }> = ({
     const store = useMultiRegionStore();
     const [healthCheck, setHealthCheck] =
         React.useState<HealthCheckResult | null>(null);
-    const [activePage, setActivePage] = React.useState<PageKey>("overview");
+    const [activePage, setActivePage] =
+        React.useState<PageKey>("azure-accounts");
     const [sidebarCollapsed, setSidebarCollapsed] = React.useState(
         () => store.getUserPreferences().sidebarCollapsed
     );
