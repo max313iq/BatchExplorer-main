@@ -398,8 +398,10 @@ export const NodesPage: React.FC<NodesPageProps> = ({ orchestrator }) => {
                 setIsActing(true);
                 setError(null);
                 try {
+                    // Use bulk_node_action for large selections (calls Batch API
+                    // directly per pool instead of one-by-one through the scheduler)
                     await orchestrator.execute({
-                        action: "node_action",
+                        action: "bulk_node_action",
                         payload: {
                             actionType: action,
                             nodeIds: ids,
@@ -859,9 +861,8 @@ export const NodesPage: React.FC<NodesPageProps> = ({ orchestrator }) => {
                     <DetailsList
                         items={displayNodes}
                         columns={columns}
-                        selectionMode={SelectionMode.multiple}
-                        selection={selection}
-                        checkboxVisibility={CheckboxVisibility.always}
+                        selectionMode={SelectionMode.none}
+                        checkboxVisibility={CheckboxVisibility.hidden}
                         layoutMode={DetailsListLayoutMode.fixedColumns}
                         getKey={(item: ManagedNode) => item.id}
                         onRenderRow={(props, defaultRender) => {

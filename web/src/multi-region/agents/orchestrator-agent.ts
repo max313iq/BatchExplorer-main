@@ -101,7 +101,8 @@ export type OrchestratorAction =
     | "update_start_task"
     | "create_pools_smart"
     | "delete_pool"
-    | "reboot_pool_nodes";
+    | "reboot_pool_nodes"
+    | "bulk_node_action";
 
 export class OrchestratorAgent implements Agent {
     readonly name = "orchestrator" as const;
@@ -513,6 +514,12 @@ export class OrchestratorAgent implements Agent {
                     );
                     break;
 
+                case "bulk_node_action":
+                    result = await this._bulkNodeAction(
+                        params.payload as Record<string, unknown>
+                    );
+                    break;
+
                 default:
                     throw new Error(`Unknown action: ${action}`);
             }
@@ -612,6 +619,8 @@ export class OrchestratorAgent implements Agent {
                 return `pool ${(payload.poolId as string) ?? ""}`;
             case "reboot_pool_nodes":
                 return `pool ${(payload.poolId as string) ?? ""} nodes`;
+            case "bulk_node_action":
+                return `${(payload.actionType as string) ?? "action"} all nodes`;
             default:
                 return action;
         }
@@ -1849,6 +1858,172 @@ export class OrchestratorAgent implements Agent {
                 skipped,
                 failed,
                 total: nodes.length,
+            },
+        };
+    }
+
+    /**
+     * Bulk node action — applies reboot/reimage/disableScheduling/enableScheduling
+     * to ALL nodes across ALL pools, grouped by account+pool.
+     *
+     * Unlike the per-node node_action (which processes store ManagedNode IDs
+     * one by one through the scheduler), this calls the Batch API directly
+     * per pool using listNodes + performNodeAction. Much faster for hundreds
+     * of nodes.
+     */
+    private async _bulkNodeAction(
+        payload: Record<string, unknown>
+    ): Promise<AgentResult> {
+        const { store } = this._ctx;
+        const actionType = payload.actionType as string;
+
+        if (
+            actionType !== "reboot" &&
+            actionType !== "reimage" &&
+            actionType !== "disableScheduling" &&
+            actionType !== "enableScheduling"
+        ) {
+            throw new Error(`Invalid bulk action type: ${actionType}`);
+        }
+
+        // Group nodes from store by accountId + poolId
+        const nodeIds = payload.nodeIds as string[] | undefined;
+        const storeNodes = store.getState().nodes;
+        const targetNodes = nodeIds
+            ? storeNodes.filter((n) => nodeIds.includes(n.id))
+            : storeNodes;
+
+        // Group by account → pool → nodeIds (Batch API node IDs, not store IDs)
+        const groups = new Map<
+            string,
+            {
+                account: { accountName: string; region: string };
+                pools: Map<string, string[]>;
+            }
+        >();
+
+        for (const node of targetNodes) {
+            const account = store
+                .getState()
+                .accounts.find((a) => a.id === node.accountId);
+            if (!account) continue;
+
+            if (!groups.has(node.accountId)) {
+                groups.set(node.accountId, {
+                    account: {
+                        accountName: account.accountName,
+                        region: account.region,
+                    },
+                    pools: new Map(),
+                });
+            }
+            const group = groups.get(node.accountId)!;
+            if (!group.pools.has(node.poolId)) {
+                group.pools.set(node.poolId, []);
+            }
+            group.pools.get(node.poolId)!.push(node.nodeId);
+        }
+
+        let totalActioned = 0;
+        let totalSkipped = 0;
+        let totalFailed = 0;
+        let totalNodes = 0;
+
+        const token = await this._getBatchAccessToken();
+
+        for (const [, group] of groups) {
+            const endpoint = accountEndpoint(
+                group.account.accountName,
+                group.account.region
+            );
+
+            for (const [poolId, batchNodeIds] of group.pools) {
+                store.addLog({
+                    agent: "orchestrator",
+                    level: "info",
+                    message: `${actionType} ${batchNodeIds.length} nodes in ${group.account.accountName}/${poolId}`,
+                });
+
+                // Use Batch API listNodes to get current state (store may be stale)
+                let liveNodes: Array<{ id: string; state?: string }>;
+                try {
+                    liveNodes = await listNodes(endpoint, poolId, token);
+                } catch {
+                    // Fallback: use the store node IDs
+                    liveNodes = batchNodeIds.map((id) => ({
+                        id,
+                        state: "idle",
+                    }));
+                }
+
+                // Filter to only nodes in our selection
+                const batchNodeIdSet = new Set(batchNodeIds);
+                const targetLiveNodes = liveNodes.filter((n) =>
+                    batchNodeIdSet.has(n.id)
+                );
+
+                for (const node of targetLiveNodes) {
+                    totalNodes++;
+                    const nodeState = node.state?.toLowerCase() ?? "";
+
+                    // Skip non-actionable states
+                    if (
+                        nodeState === "creating" ||
+                        nodeState === "starting" ||
+                        nodeState === "leavingpool" ||
+                        nodeState === "unusable"
+                    ) {
+                        totalSkipped++;
+                        continue;
+                    }
+
+                    try {
+                        await performNodeAction(
+                            endpoint,
+                            poolId,
+                            node.id,
+                            actionType as
+                                | "reboot"
+                                | "reimage"
+                                | "disableScheduling"
+                                | "enableScheduling",
+                            token
+                        );
+                        totalActioned++;
+                    } catch (err) {
+                        totalFailed++;
+                        store.addLog({
+                            agent: "orchestrator",
+                            level: "warn",
+                            message: `Failed ${actionType} on ${node.id}: ${err instanceof Error ? err.message : String(err)}`,
+                        });
+                    }
+                }
+            }
+        }
+
+        const label =
+            actionType === "reboot"
+                ? "Rebooted"
+                : actionType === "reimage"
+                  ? "Reimaged"
+                  : actionType === "disableScheduling"
+                    ? "Disabled scheduling on"
+                    : "Enabled scheduling on";
+
+        store.addNotification({
+            type: totalFailed === 0 ? "success" : "warning",
+            message: `${label} ${totalActioned}/${totalNodes} nodes${totalSkipped > 0 ? ` (${totalSkipped} skipped)` : ""}${totalFailed > 0 ? ` (${totalFailed} failed)` : ""}`,
+        });
+
+        return {
+            status: "completed",
+            summary: {
+                actionType,
+                actioned: totalActioned,
+                skipped: totalSkipped,
+                failed: totalFailed,
+                total: totalNodes,
             },
         };
     }
