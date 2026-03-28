@@ -442,11 +442,13 @@ export const UnusedQuotaPage: React.FC<UnusedQuotaPageProps> = ({
         }
     };
 
-    // Select All handler
+    // Select All handler — selects ALL filtered rows across ALL pages
     const handleSelectAll = (_ev?: React.FormEvent, checked?: boolean) => {
         if (checked) {
+            setSelectedRows([...filteredRows]);
             selection.setAllSelected(true);
         } else {
+            setSelectedRows([]);
             selection.setAllSelected(false);
         }
     };

@@ -422,18 +422,17 @@ export const AccountInfoPage: React.FC<AccountInfoPageProps> = ({
     }, [sortedAccounts, page, pageSize]);
 
     const allSelected =
-        paginatedAccounts.length > 0 &&
-        paginatedAccounts.every((a) => selectedIds.has(a.id));
-    const someSelected =
-        paginatedAccounts.some((a) => selectedIds.has(a.id)) && !allSelected;
+        sortedAccounts.length > 0 && selectedIds.size === sortedAccounts.length;
+    const someSelected = selectedIds.size > 0 && !allSelected;
 
     const toggleSelectAll = React.useCallback(() => {
         if (allSelected) {
             setSelectedIds(new Set());
         } else {
-            setSelectedIds(new Set(paginatedAccounts.map((a) => a.id)));
+            // Select ALL filtered/sorted accounts across ALL pages
+            setSelectedIds(new Set(sortedAccounts.map((a) => a.id)));
         }
-    }, [allSelected, paginatedAccounts]);
+    }, [allSelected, sortedAccounts]);
 
     const toggleSelect = React.useCallback((id: string) => {
         setSelectedIds((prev) => {
