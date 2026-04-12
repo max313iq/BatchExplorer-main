@@ -88,6 +88,101 @@ async function toAzureError(response: Response): Promise<AzureRequestError> {
 }
 
 /**
+ * Poll an Azure async operation until it completes or times out.
+ * Azure long-running operations return 202 with a Location or Azure-AsyncOperation header.
+ * We poll that URL until the operation reaches a terminal state.
+ */
+async function pollAsyncOperation(
+    pollUrl: string,
+    token: string,
+    timeoutMs: number = 300000, // 5 minutes
+    intervalMs: number = 5000 // 5 seconds
+): Promise<{ status: string; body: Record<string, unknown> }> {
+    const startTime = Date.now();
+
+    while (Date.now() - startTime < timeoutMs) {
+        await new Promise((resolve) => setTimeout(resolve, intervalMs));
+
+        const response = await fetch(pollUrl, {
+            headers: armHeaders(token),
+        });
+
+        if (response.status === 200 || response.status === 201) {
+            // Operation complete — return the final resource
+            const body = (await response.json()) as Record<string, unknown>;
+            return { status: "Succeeded", body };
+        }
+
+        if (response.status === 202) {
+            // Still in progress — check for updated Location header
+            const newUrl =
+                response.headers.get("Location") ??
+                response.headers.get("Azure-AsyncOperation");
+            if (newUrl) {
+                pollUrl = newUrl;
+            }
+            // Continue polling
+            continue;
+        }
+
+        if (!response.ok) {
+            // Operation failed
+            const errorBody = (await response
+                .json()
+                .catch(() => ({}))) as Record<string, unknown>;
+            const innerErr = errorBody?.error as
+                | Record<string, unknown>
+                | undefined;
+            throw new AzureRequestError(
+                (innerErr?.message as string) ??
+                    `Async operation failed: ${response.status}`,
+                response.status,
+                (innerErr?.code as string) ?? "AsyncOperationFailed",
+                errorBody
+            );
+        }
+
+        // Check if response body has a terminal status
+        const body = (await response.json().catch(() => ({}))) as Record<
+            string,
+            unknown
+        >;
+        const props = body?.properties as Record<string, unknown> | undefined;
+        const opStatus = (
+            (body?.status as string) ??
+            (props?.provisioningState as string) ??
+            ""
+        ).toLowerCase();
+
+        if (opStatus === "succeeded" || opStatus === "completed") {
+            return { status: "Succeeded", body };
+        }
+        if (
+            opStatus === "failed" ||
+            opStatus === "canceled" ||
+            opStatus === "cancelled"
+        ) {
+            const errInner = body?.error as Record<string, unknown> | undefined;
+            throw new AzureRequestError(
+                (errInner?.message as string) ?? `Operation ${opStatus}`,
+                response.status,
+                (errInner?.code as string) ?? "OperationFailed",
+                body
+            );
+        }
+        // Still in progress (InProgress, Creating, etc.) — continue polling
+    }
+
+    // Timeout
+    throw new AzureRequestError(
+        `Async operation timed out after ${timeoutMs / 1000}s`,
+        408,
+        "OperationTimeout",
+        {}
+    );
+}
+
+/**
  * Generic paginated fetch that follows ARM `nextLink` values.
  */
 async function fetchAllPages<T>(
@@ -236,6 +331,17 @@ export async function createResourceGroup(
         body: JSON.stringify({ location }),
     });
 
+    // Handle async creation (unlikely for RGs but be safe)
+    if (response.status === 202) {
+        const pollUrl =
+            response.headers.get("Location") ??
+            response.headers.get("Azure-AsyncOperation");
+        if (pollUrl) {
+            const result = await pollAsyncOperation(pollUrl, token);
+            return result.body as unknown as ArmResourceGroup;
+        }
+    }
+
     if (!response.ok) {
         throw await toAzureError(response);
     }
@@ -288,9 +394,68 @@ export async function createBatchAccount(
         }),
     });
 
+    // Handle async creation (202 Accepted)
+    if (response.status === 202) {
+        const pollUrl =
+            response.headers.get("Location") ??
+            response.headers.get("Azure-AsyncOperation");
+        if (pollUrl) {
+            const result = await pollAsyncOperation(pollUrl, token);
+            return result.body as unknown as ArmBatchAccount;
+        }
+        // No poll URL — fall through to return what we have
+    }
+
     if (!response.ok) {
         throw await toAzureError(response);
     }
 
-    return response.json();
+    // 200 or 201 — synchronous success
+    const account = (await response.json()) as ArmBatchAccount;
+
+    // Verify provisioningState if present
+    const provState = (
+        account as unknown as Record<string, Record<string, unknown>>
+    )?.properties?.provisioningState as string | undefined;
+    if (provState && provState !== "Succeeded" && provState !== "succeeded") {
+        // Account is still provisioning — poll the resource URL directly
+        const resourceUrl =
+            `${ARM_BASE}/subscriptions/${encodeURIComponent(subscriptionId)}` +
+            `/resourceGroups/${encodeURIComponent(resourceGroup)}` +
+            `/providers/Microsoft.Batch/batchAccounts/${encodeURIComponent(accountName)}` +
+            `?api-version=${ARM_BATCH_API}`;
+
+        const maxWaitMs = 120000; // 2 minutes
+        const pollMs = 5000;
+        const start = Date.now();
+
+        while (Date.now() - start < maxWaitMs) {
+            await new Promise((r) => setTimeout(r, pollMs));
+            const pollResp = await fetch(resourceUrl, {
+                headers: armHeaders(token),
+            });
+            if (pollResp.ok) {
+                const polled = (await pollResp.json()) as Record<
+                    string,
+                    Record<string, unknown>
+                >;
+                const state = polled?.properties?.provisioningState as
+                    | string
+                    | undefined;
+                if (state === "Succeeded" || state === "succeeded") {
+                    return polled as unknown as ArmBatchAccount;
+                }
+                if (state === "Failed" || state === "Canceled") {
+                    throw new AzureRequestError(
+                        `Batch account creation ${state}: ${(polled?.properties?.statusText as string) ?? ""}`,
+                        400,
+                        `ProvisioningState${state}`,
+                        polled as unknown as Record<string, unknown>
+                    );
+                }
+            }
+        }
+    }
+
+    return account;
 }

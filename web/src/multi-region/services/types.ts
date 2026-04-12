@@ -19,15 +19,53 @@ export interface AzureError {
 
 /** Thrown when an Azure REST call returns a non-2xx status. */
 export class AzureRequestError extends Error {
+    public readonly isRetryable: boolean;
+    public readonly isAsync: boolean;
+
     constructor(
         message: string,
         public readonly status: number,
         public readonly code: string,
-        public readonly body: Record<string, unknown>
+        public readonly body: unknown,
+        isRetryable = false,
+        isAsync = false,
+        public readonly locationHeader?: string
     ) {
         super(message);
         this.name = "AzureRequestError";
+
+        // Auto-detect retryable if not explicitly set
+        this.isRetryable = isRetryable || isRetryableStatus(status);
+        // Auto-detect async if not explicitly set
+        this.isAsync = isAsync || isAsyncAccepted(status);
     }
+}
+
+/** Check if an HTTP status indicates an async accepted operation */
+export function isAsyncAccepted(status: number): boolean {
+    return status === 202;
+}
+
+/** Check if an HTTP status is retryable (transient failure) */
+export function isRetryableStatus(status: number): boolean {
+    return status === 429 || status === 500 || status === 502 || status === 503;
+}
+
+/** Check if a provisioningState indicates completion */
+export function isTerminalProvisioningState(state: string): boolean {
+    const lower = state.toLowerCase();
+    return (
+        lower === "succeeded" ||
+        lower === "failed" ||
+        lower === "canceled" ||
+        lower === "cancelled" ||
+        lower === "deleted"
+    );
+}
+
+/** Check if a provisioningState indicates success */
+export function isSuccessProvisioningState(state: string): boolean {
+    return state.toLowerCase() === "succeeded";
 }
 
 // ---------------------------------------------------------------------------

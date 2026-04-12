@@ -164,11 +164,17 @@ export class ProvisionerAgent implements Agent {
                         token
                     );
                 });
+                store.addLog({
+                    agent: "provisioner",
+                    level: "info",
+                    message: `Resource group ${resourceGroup} created in ${region}`,
+                });
 
                 // Step 2: Create Batch account
+                let result: unknown;
                 await scheduler.run(input.subscriptionId, async () => {
                     const token = await getAccessToken();
-                    await createBatchAccount(
+                    result = await createBatchAccount(
                         input.subscriptionId,
                         resourceGroup,
                         accountName,
@@ -178,6 +184,34 @@ export class ProvisionerAgent implements Agent {
                 });
 
                 lastWriteTime = Date.now();
+
+                // Safety net: verify provisioning state from the returned resource
+                const provisioningState = (
+                    result as {
+                        properties?: {
+                            provisioningState?: string;
+                            statusText?: string;
+                        };
+                    }
+                )?.properties?.provisioningState;
+
+                if (
+                    provisioningState === "Failed" ||
+                    provisioningState === "Canceled"
+                ) {
+                    const statusText =
+                        (result as { properties?: { statusText?: string } })
+                            ?.properties?.statusText ?? "Unknown error";
+                    throw new Error(
+                        `Batch account provisioning ${provisioningState}: ${statusText}`
+                    );
+                }
+
+                store.addLog({
+                    agent: "provisioner",
+                    level: "info",
+                    message: `Account ${accountName} provisioning state: ${provisioningState ?? "Succeeded"}`,
+                });
 
                 store.updateAccount(accountId, {
                     provisioningState: "created",
