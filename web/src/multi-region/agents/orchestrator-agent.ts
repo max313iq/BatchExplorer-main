@@ -709,16 +709,42 @@ export class OrchestratorAgent implements Agent {
                 READ_CONCURRENCY
             );
 
+            const disabledSubs: string[] = [];
+
             for (let i = 0; i < subResults.length; i++) {
                 const settled = subResults[i];
                 if (settled.status === "rejected") {
                     const errMsg =
                         settled.reason?.message ?? String(settled.reason);
-                    store.addLog({
-                        agent: "provisioner",
-                        level: "error",
-                        message: `Discovery failed for subscription ${subscriptions[i].subscriptionId.substring(0, 8)}: ${errMsg}`,
-                    });
+                    const subShort = subscriptions[i].subscriptionId.substring(
+                        0,
+                        8
+                    );
+
+                    // Detect disabled/suspended subscriptions
+                    const isDisabled =
+                        errMsg.includes("SubscriptionNotFound") ||
+                        errMsg.includes("subscription is disabled") ||
+                        errMsg.includes("suspended") ||
+                        errMsg.includes("suspicious activity") ||
+                        errMsg.includes("Acceptable Use Policy") ||
+                        (settled.reason?.status === 403 &&
+                            errMsg.includes("does not have authorization"));
+
+                    if (isDisabled) {
+                        disabledSubs.push(subscriptions[i].subscriptionId);
+                        store.addLog({
+                            agent: "provisioner",
+                            level: "warn",
+                            message: `⚠ Subscription ${subShort}... is DISABLED or SUSPENDED — skipping. To reactivate: Azure Portal → Help + Support → New Support Request → Billing → Reactivate Subscription`,
+                        });
+                    } else {
+                        store.addLog({
+                            agent: "provisioner",
+                            level: "error",
+                            message: `Discovery failed for subscription ${subShort}...: ${errMsg}`,
+                        });
+                    }
                     failedSubs++;
                 } else {
                     for (const acct of settled.value.accounts) {
