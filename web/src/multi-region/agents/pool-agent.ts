@@ -139,6 +139,9 @@ export class PoolAgent implements Agent {
                     await createPool(accountEndpoint, poolConfig, token);
                 });
 
+                // Throttle between pool creations
+                await new Promise((r) => setTimeout(r, 500));
+
                 store.updatePool(internalId, {
                     provisioningState: "created",
                 });
@@ -349,6 +352,9 @@ export class PoolAgent implements Agent {
                     totalCreated++;
                     accountCreated = true;
 
+                    // Throttle between pool creations to avoid Azure fraud detection
+                    await new Promise((r) => setTimeout(r, 1000));
+
                     // Wait for pool to finish resizing to get ACTUAL node count
                     store.addLog({
                         agent: "pool",
@@ -434,6 +440,8 @@ export class PoolAgent implements Agent {
                             level: "warn",
                             message: `${account.accountName}: ${vmSize} failed (${errorMsg}), trying next VM size`,
                         });
+                        // Brief pause before trying next VM size
+                        await new Promise((r) => setTimeout(r, 500));
                         // Continue to next VM size
                         continue;
                     }
@@ -468,6 +476,9 @@ export class PoolAgent implements Agent {
                 });
                 totalFailed++;
             }
+
+            // Throttle between accounts
+            await new Promise((r) => setTimeout(r, 500));
         }
 
         const status =

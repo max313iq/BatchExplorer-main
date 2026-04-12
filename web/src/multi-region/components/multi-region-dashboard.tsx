@@ -485,28 +485,26 @@ const DashboardContent: React.FC<{ tokenProvider?: TokenProvider }> = ({
                     addedAt: new Date().toISOString(),
                 }))
             );
-            // Load subscriptions per account (parallel, best-effort)
-            await Promise.allSettled(
-                msalAccounts.map(async (acct) => {
-                    try {
-                        const subs = await msalAuth.listSubscriptionsForAccount(
-                            acct.homeAccountId
-                        );
-                        store.updateAzureAccount(acct.homeAccountId, {
-                            subscriptions: subs as any,
-                            subscriptionCount: subs.length,
-                            status: "active",
-                            error: null,
-                        });
-                    } catch (err: any) {
-                        store.updateAzureAccount(acct.homeAccountId, {
-                            status: "error",
-                            error:
-                                err?.message ?? "Failed to load subscriptions",
-                        });
-                    }
-                })
-            );
+            // Load subscriptions sequentially to avoid burst
+            for (const acct of msalAccounts) {
+                try {
+                    const subs = await msalAuth.listSubscriptionsForAccount(
+                        acct.homeAccountId
+                    );
+                    store.updateAzureAccount(acct.homeAccountId, {
+                        subscriptions: subs as any,
+                        subscriptionCount: subs.length,
+                        status: "active",
+                        error: null,
+                    });
+                } catch (err: any) {
+                    store.updateAzureAccount(acct.homeAccountId, {
+                        status: "error",
+                        error: err?.message ?? "Failed to load subscriptions",
+                    });
+                }
+                await new Promise((r) => setTimeout(r, 300));
+            }
         } catch {
             // Best-effort — Azure Accounts page has its own Refresh button
         }
@@ -594,16 +592,14 @@ const DashboardContent: React.FC<{ tokenProvider?: TokenProvider }> = ({
                     payload: {},
                 });
                 if (cancelled) return;
-                await Promise.all([
-                    orchestrator.execute({
-                        action: "refresh_pool_info",
-                        payload: {},
-                    }),
-                    orchestrator.execute({
-                        action: "refresh_account_info",
-                        payload: {},
-                    }),
-                ]);
+                await orchestrator.execute({
+                    action: "refresh_pool_info",
+                    payload: {},
+                });
+                await orchestrator.execute({
+                    action: "refresh_account_info",
+                    payload: {},
+                });
                 if (cancelled) return;
                 if (store.getState().poolInfos.length > 0) {
                     await orchestrator.execute({
@@ -630,17 +626,15 @@ const DashboardContent: React.FC<{ tokenProvider?: TokenProvider }> = ({
 
             autoRefreshRunningRef.current = true;
             try {
-                // Parallel: pools + accounts
-                await Promise.all([
-                    orchestrator.execute({
-                        action: "refresh_pool_info",
-                        payload: {},
-                    }),
-                    orchestrator.execute({
-                        action: "refresh_account_info",
-                        payload: {},
-                    }),
-                ]);
+                // Sequential: pools then accounts to avoid burst
+                await orchestrator.execute({
+                    action: "refresh_pool_info",
+                    payload: {},
+                });
+                await orchestrator.execute({
+                    action: "refresh_account_info",
+                    payload: {},
+                });
                 // Then nodes
                 if (store.getState().poolInfos.length > 0) {
                     await orchestrator.execute({

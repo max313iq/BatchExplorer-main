@@ -27,7 +27,7 @@ export interface RetryDecision {
 
 const DEFAULT_RETRY_BACKOFF_SECONDS = [2, 4, 8, 16, 32];
 const DEFAULT_MAX_QUEUE_SIZE = 1000;
-const DEFAULT_DELAY_MS = 250;
+const DEFAULT_DELAY_MS = 500;
 const DEFAULT_JITTER_PCT = 0.2;
 
 export class RequestSchedulerQueueOverflowError extends Error {

@@ -105,7 +105,7 @@ export class NodeAgent implements Agent {
 
         const token = await this._resolveToken(input.tokenProvider);
 
-        const MAX_CONCURRENT = 20;
+        const MAX_CONCURRENT = 2;
         const accountResults = await this._parallelMap(
             accountIds,
             async (accountId) => {
@@ -146,6 +146,8 @@ export class NodeAgent implements Agent {
                                     pool.id,
                                     token
                                 );
+                                // Throttle after each listNodes call
+                                await new Promise((r) => setTimeout(r, 200));
 
                                 let preemptedCount = 0;
                                 const mapped = rawNodes.map((n, idx) => {
@@ -161,6 +163,10 @@ export class NodeAgent implements Agent {
                                         idx
                                     );
                                 });
+
+                                // Throttle between pool iterations
+                                await new Promise((r) => setTimeout(r, 100));
+
                                 return {
                                     nodes: mapped,
                                     preempted: preemptedCount,
@@ -172,7 +178,7 @@ export class NodeAgent implements Agent {
                                 };
                             }
                         },
-                        MAX_CONCURRENT
+                        5
                     );
 
                     const nodes: ManagedNode[] = [];

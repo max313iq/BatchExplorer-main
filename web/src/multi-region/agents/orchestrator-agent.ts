@@ -24,7 +24,7 @@ import type { BatchPool as SdkBatchPool } from "../services";
 
 /** Bounded-concurrency Promise.allSettled — runs `fn` on each item with at most `concurrency` in flight */
 // Concurrency limit of 10 for read-only GET operations
-const READ_CONCURRENCY = 10;
+const READ_CONCURRENCY = 3;
 async function pMap<T, R>(
     items: T[],
     fn: (item: T) => Promise<R>,
@@ -701,6 +701,7 @@ export class OrchestratorAgent implements Agent {
                             sub.subscriptionId,
                             token
                         );
+                    await new Promise((r) => setTimeout(r, 300)); // throttle between subscriptions
                     return {
                         subId: sub.subscriptionId,
                         accounts,
@@ -873,6 +874,7 @@ export class OrchestratorAgent implements Agent {
                     };
                 });
 
+                await new Promise((r) => setTimeout(r, 100)); // throttle between accounts
                 return { account, pools };
             },
             READ_CONCURRENCY
@@ -936,7 +938,7 @@ export class OrchestratorAgent implements Agent {
             this._getBatchAccessToken(),
         ]);
 
-        // Parallel account info refresh with Promise.allSettled via pMap (concurrency=10)
+        // Sequential account info refresh with low concurrency to avoid 429s
         const acctResults = await pMap(
             accounts,
             async (account) => {
@@ -950,16 +952,14 @@ export class OrchestratorAgent implements Agent {
                     account.region
                 );
 
-                // Fetch pools (Batch SDK) and quota (ARM SDK) in parallel for this account
-                const [sdkPools, armData] = await Promise.all([
-                    listPools(endpoint, batchToken),
-                    getBatchAccount(
-                        account.subscriptionId,
-                        resourceGroup,
-                        account.accountName,
-                        armToken
-                    ),
-                ]);
+                // Fetch pools then quota sequentially to avoid burst
+                const sdkPools = await listPools(endpoint, batchToken);
+                const armData = await getBatchAccount(
+                    account.subscriptionId,
+                    resourceGroup,
+                    account.accountName,
+                    armToken
+                );
 
                 const poolsData = sdkPools.map((p: SdkBatchPool) => ({
                     vmSize: p.vmSize ?? "",
@@ -1044,7 +1044,7 @@ export class OrchestratorAgent implements Agent {
                 };
                 return info;
             },
-            READ_CONCURRENCY
+            2
         );
 
         const allAccountInfos: AccountInfo[] = [];
@@ -1224,6 +1224,7 @@ export class OrchestratorAgent implements Agent {
                     account.region
                 );
                 await createPool(endpoint, poolBody, token);
+                await new Promise((r) => setTimeout(r, 1000)); // throttle between pool creates
 
                 store.addLog({
                     agent: "orchestrator",
@@ -2015,6 +2016,7 @@ export class OrchestratorAgent implements Agent {
                                 | "enableScheduling",
                             token
                         );
+                        await new Promise((r) => setTimeout(r, 50)); // throttle between nodes
                         totalActioned++;
                     } catch (err) {
                         totalFailed++;
