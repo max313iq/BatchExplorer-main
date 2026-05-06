@@ -1045,7 +1045,7 @@ const OverviewPageInner: React.FC<OverviewPageProps> = ({
                         icon="AllCurrency"
                         title="Quotas"
                         color="#8764b8"
-                        onClick={() => onNavigate("quotas")}
+                        onClick={() => onNavigate("quota-status")}
                         error={cardErrors.quotas ?? null}
                         items={[
                             {

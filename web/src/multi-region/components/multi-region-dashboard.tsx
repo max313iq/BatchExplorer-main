@@ -21,7 +21,6 @@ import { ErrorBoundary } from "./shared/error-boundary";
 import { GlobalFilterBar } from "./global-filter-bar";
 import { OverviewPage } from "./overview/overview-page";
 import { AccountProvisioningPage } from "./account-provisioning/account-provisioning-page";
-import { QuotaRequestsPage } from "./quota-requests/quota-requests-page";
 import { QuotaStatusPage } from "./quota-status/quota-status-page";
 import { PoolCreationPage } from "./pool-creation/pool-creation-page";
 import { NodesPage } from "./nodes/nodes-page";
@@ -380,7 +379,6 @@ const PAGE_ORDER: PageKey[] = [
     "azure-accounts",
     "overview",
     "accounts",
-    "quotas",
     "quota-status",
     "support-tickets",
     "pools",
@@ -428,8 +426,6 @@ const renderPageBody = (
             );
         case "accounts":
             return <AccountProvisioningPage orchestrator={orchestrator} />;
-        case "quotas":
-            return <QuotaRequestsPage orchestrator={orchestrator} />;
         case "quota-status":
             return <QuotaStatusPage orchestrator={orchestrator} />;
         case "pools":

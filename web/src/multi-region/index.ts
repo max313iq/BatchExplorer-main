@@ -67,7 +67,6 @@ export { LoadingSkeleton } from "./components/shared/loading-skeleton";
 // Page components
 export { OverviewPage } from "./components/overview/overview-page";
 export { AccountProvisioningPage } from "./components/account-provisioning/account-provisioning-page";
-export { QuotaRequestsPage } from "./components/quota-requests/quota-requests-page";
 export { QuotaStatusPage } from "./components/quota-status/quota-status-page";
 export { PoolCreationPage } from "./components/pool-creation/pool-creation-page";
 export { PoolInfoPage } from "./components/pool-info/pool-info-page";
