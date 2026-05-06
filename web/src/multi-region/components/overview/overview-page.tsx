@@ -395,13 +395,10 @@ const QuickActions: React.FC<{
     const failedAccounts = state.accounts.filter(
         (a) => a.provisioningState === "failed"
     ).length;
-    const failedQuotas = state.quotaRequests.filter(
-        (q) => q.status === "failed"
-    ).length;
     const failedPools = state.pools.filter(
         (p) => p.provisioningState === "failed"
     ).length;
-    const totalFailed = failedAccounts + failedQuotas + failedPools;
+    const totalFailed = failedAccounts + failedPools;
 
     return (
         <Stack horizontal tokens={{ childrenGap: 8 }} wrap>
@@ -411,7 +408,6 @@ const QuickActions: React.FC<{
                     iconProps={{ iconName: "Refresh" }}
                     onClick={() => {
                         if (failedAccounts > 0) store.retryFailedAccounts();
-                        if (failedQuotas > 0) store.retryFailedQuotas();
                         if (failedPools > 0) store.retryFailedPools();
                         store.addNotification({
                             type: "info",
@@ -823,7 +819,6 @@ export interface OverviewPageProps {
 
 type CardErrorMap = {
     accounts?: string | null;
-    quotas?: string | null;
     pools?: string | null;
     nodes?: string | null;
     accountInfo?: string | null;
@@ -1036,31 +1031,6 @@ const OverviewPageInner: React.FC<OverviewPageProps> = ({
                             {
                                 label: "Failed",
                                 value: stats.failedAccounts,
-                                color: "#d13438",
-                            },
-                        ]}
-                    />
-                    <StatCard
-                        id="kpi-quotas"
-                        icon="AllCurrency"
-                        title="Quotas"
-                        color="#8764b8"
-                        onClick={() => onNavigate("quota-status")}
-                        error={cardErrors.quotas ?? null}
-                        items={[
-                            {
-                                label: "Pending",
-                                value: stats.pendingQuotas,
-                                color: "#c8a000",
-                            },
-                            {
-                                label: "Approved",
-                                value: stats.approvedQuotas,
-                                color: "#107c10",
-                            },
-                            {
-                                label: "Denied",
-                                value: stats.deniedQuotas,
                                 color: "#d13438",
                             },
                         ]}

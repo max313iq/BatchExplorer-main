@@ -6,8 +6,6 @@ export type PageKey =
     | "azure-accounts"
     | "overview"
     | "accounts"
-    | "quota-status"
-    | "support-tickets"
     | "pools"
     | "pool-defaults"
     | "pool-info"
@@ -60,20 +58,6 @@ export const SidebarNav: React.FC<SidebarNavProps> = ({
                 label: "Accounts",
                 icon: "ServerProcesses",
                 badge: state.accounts.length,
-            },
-            {
-                key: "quota-status",
-                label: "Quota Status",
-                icon: "Diagnostic",
-                badge: state.quotaRequests.filter(
-                    (q) => q.status === "approved"
-                ).length,
-            },
-            {
-                key: "support-tickets" as PageKey,
-                label: "Support Tickets",
-                icon: "Ticket",
-                badge: state.quotaRequests?.length ?? 0,
             },
             {
                 key: "pools",

@@ -28,8 +28,8 @@ export class WorkflowAgent {
     }
 
     /**
-     * Full provisioning workflow:
-     *   discover -> quota -> monitor -> pool
+     * Provisioning workflow (quota gating removed):
+     *   discover -> pool
      */
     async execute(config: WorkflowConfig): Promise<AgentResult> {
         const { store } = this._ctx;
@@ -73,121 +73,30 @@ export class WorkflowAgent {
 
             completedSteps.push("discover");
             store.setWorkflowState({
-                currentStep: "quota",
+                currentStep: "pool",
                 completedSteps: [...completedSteps],
             });
 
-            // Step 2: Submit quota requests
+            // Step 2: Create pools across all created accounts (no quota gating)
             if (this._cancelled) {
                 return this._cancelledResult(store, completedSteps);
             }
 
-            const state = store.getState();
-            const createdAccountIds = state.accounts
+            const updatedState = store.getState();
+            const poolAccountIds = updatedState.accounts
                 .filter((a) => a.provisioningState === "created")
                 .map((a) => a.id);
 
             store.addLog({
                 agent: "orchestrator",
                 level: "info",
-                message: `Workflow: submitting quota requests for ${createdAccountIds.length} accounts`,
-            });
-
-            const quotaResult = await this._orchestrator.execute({
-                action: "submit_quota_requests",
-                payload: {
-                    accountIds: createdAccountIds,
-                    quotaType: config.quotaType,
-                    newLimit: config.quotaLimit,
-                    contactConfig: {
-                        email: config.contactEmail,
-                        timezone: "Russian Standard Time",
-                        country: "MEX",
-                    },
-                },
-            });
-
-            if (this._cancelled) {
-                return this._cancelledResult(store, completedSteps);
-            }
-
-            if (quotaResult.status === "failed") {
-                return this._failStep(
-                    "quota",
-                    quotaResult,
-                    store,
-                    completedSteps
-                );
-            }
-
-            completedSteps.push("quota");
-            store.setWorkflowState({
-                currentStep: "monitor",
-                completedSteps: [...completedSteps],
-            });
-
-            // Step 3: Monitor quota status
-            if (this._cancelled) {
-                return this._cancelledResult(store, completedSteps);
-            }
-
-            store.addLog({
-                agent: "orchestrator",
-                level: "info",
-                message: "Workflow: starting continuous quota monitoring",
-            });
-
-            const monitorResult = await this._orchestrator.execute({
-                action: "check_quota_status",
-                payload: {
-                    mode: "continuous",
-                    intervalSeconds: config.monitorIntervalSeconds ?? 60,
-                    maxPollingMinutes: config.monitorMaxMinutes ?? 30,
-                },
-            });
-
-            if (this._cancelled) {
-                return this._cancelledResult(store, completedSteps);
-            }
-
-            if (monitorResult.status === "failed") {
-                return this._failStep(
-                    "monitor",
-                    monitorResult,
-                    store,
-                    completedSteps
-                );
-            }
-
-            completedSteps.push("monitor");
-            store.setWorkflowState({
-                currentStep: "pool",
-                completedSteps: [...completedSteps],
-            });
-
-            // Step 4: Create pools for approved accounts
-            if (this._cancelled) {
-                return this._cancelledResult(store, completedSteps);
-            }
-
-            const updatedState = store.getState();
-            const approvedAccountIds = updatedState.quotaRequests
-                .filter((r) => r.status === "approved")
-                .map((r) => r.accountId);
-
-            // Deduplicate account IDs
-            const uniqueApprovedIds = [...new Set(approvedAccountIds)];
-
-            store.addLog({
-                agent: "orchestrator",
-                level: "info",
-                message: `Workflow: creating pools for ${uniqueApprovedIds.length} approved accounts`,
+                message: `Workflow: creating pools for ${poolAccountIds.length} accounts`,
             });
 
             const poolResult = await this._orchestrator.execute({
                 action: "create_pools",
                 payload: {
-                    accountIds: uniqueApprovedIds,
+                    accountIds: poolAccountIds,
                     poolConfig: config.poolConfig,
                 },
             });
@@ -223,8 +132,6 @@ export class WorkflowAgent {
                 summary: {
                     completedSteps: [...completedSteps],
                     discover: discoverResult.summary,
-                    quota: quotaResult.summary,
-                    monitor: monitorResult.summary,
                     pool: poolResult.summary,
                 },
             };
@@ -390,16 +297,10 @@ export class WorkflowAgent {
     }
 
     /**
-     * Detect accounts that have approved quota but no pools using that quota.
+     * Detect accounts with free LP/dedicated cores but no pools using that capacity.
      */
     private _detectUnusedQuota(): Record<string, unknown> {
         const state = this._ctx.store.getState();
-
-        const approvedAccounts = new Set(
-            state.quotaRequests
-                .filter((r) => r.status === "approved")
-                .map((r) => r.accountId)
-        );
 
         const accountsWithPools = new Set(
             state.pools
@@ -407,7 +308,6 @@ export class WorkflowAgent {
                 .map((p) => p.accountId)
         );
 
-        // Also check accountInfos for actual usage data
         const accountsWithUsage = new Set(
             state.accountInfos
                 .filter(
@@ -421,28 +321,32 @@ export class WorkflowAgent {
             accountId: string;
             accountName: string;
             region: string;
-            approvedLimit: number;
+            freeLpCores: number;
+            freeDedicatedCores: number;
         }> = [];
 
-        for (const accountId of approvedAccounts) {
+        for (const info of state.accountInfos) {
             if (
-                accountsWithPools.has(accountId) ||
-                accountsWithUsage.has(accountId)
+                accountsWithPools.has(info.id) ||
+                accountsWithUsage.has(info.id)
             ) {
                 continue;
             }
-            const account = state.accounts.find((a) => a.id === accountId);
-            const quota = state.quotaRequests.find(
-                (r) => r.accountId === accountId && r.status === "approved"
-            );
-            if (account && quota) {
-                unused.push({
-                    accountId,
-                    accountName: account.accountName,
-                    region: account.region,
-                    approvedLimit: quota.requestedLimit,
-                });
+            if (
+                info.lowPriorityCoresFree <= 0 &&
+                info.dedicatedCoresFree <= 0
+            ) {
+                continue;
             }
+            const account = state.accounts.find((a) => a.id === info.id);
+            if (!account) continue;
+            unused.push({
+                accountId: info.id,
+                accountName: account.accountName,
+                region: account.region,
+                freeLpCores: info.lowPriorityCoresFree,
+                freeDedicatedCores: info.dedicatedCoresFree,
+            });
         }
 
         return {

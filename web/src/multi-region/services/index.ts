@@ -39,11 +39,3 @@ export {
     performNodeAction,
     removeNodes,
 } from "./batch-service";
-
-// Support ticket adapter (pre-existing)
-export { SupportTicketAdapter } from "./support-ticket-adapter";
-export type {
-    SubmitQuotaTicketParams,
-    SupportTicketResponse,
-    SupportPlan,
-} from "./support-ticket-adapter";

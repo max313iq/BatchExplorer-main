@@ -69,7 +69,6 @@ export function useDashboardStats() {
     const state = useMultiRegionState();
     return React.useMemo(() => {
         const accounts = state.accounts;
-        const quotas = state.quotaRequests;
         const pools = state.pools;
         const nodes = state.nodes;
         return {
@@ -80,13 +79,6 @@ export function useDashboardStats() {
             failedAccounts: accounts.filter(
                 (a) => a.provisioningState === "failed"
             ).length,
-            pendingQuotas: quotas.filter(
-                (q) => q.status === "pending" || q.status === "submitted"
-            ).length,
-            approvedQuotas: quotas.filter((q) => q.status === "approved")
-                .length,
-            deniedQuotas: quotas.filter((q) => q.status === "denied").length,
-            failedQuotas: quotas.filter((q) => q.status === "failed").length,
             totalPools: pools.length,
             createdPools: pools.filter((p) => p.provisioningState === "created")
                 .length,
@@ -105,5 +97,5 @@ export function useDashboardStats() {
                     n.state === "preempted"
             ).length,
         };
-    }, [state.accounts, state.quotaRequests, state.pools, state.nodes]);
+    }, [state.accounts, state.pools, state.nodes]);
 }

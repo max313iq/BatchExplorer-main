@@ -52,41 +52,11 @@ export class FilterAgent implements Agent {
             accounts = accounts.filter((a) => idSet.has(a.id));
         }
 
-        // Enrich with quota and pool status
-        const quotaByAccount = new Map<
-            string,
-            { status: string; limit?: number }
-        >();
-        for (const qr of state.quotaRequests) {
-            const existing = quotaByAccount.get(qr.accountId);
-            if (
-                !existing ||
-                qr.status === "approved" ||
-                (qr.status === "submitted" && existing.status === "pending")
-            ) {
-                quotaByAccount.set(qr.accountId, {
-                    status: qr.status,
-                    limit: qr.requestedLimit,
-                });
-            }
-        }
-
         const poolsByAccount = new Set<string>();
         for (const pool of state.pools) {
             if (pool.provisioningState === "created") {
                 poolsByAccount.add(pool.accountId);
             }
-        }
-
-        // Filter by quota status
-        if (f.quotaStatus && f.quotaStatus !== "all") {
-            accounts = accounts.filter((a) => {
-                const quota = quotaByAccount.get(a.id);
-                if (f.quotaStatus === "none") {
-                    return !quota;
-                }
-                return quota?.status === f.quotaStatus;
-            });
         }
 
         // Filter by hasPool
@@ -99,18 +69,13 @@ export class FilterAgent implements Agent {
 
         return {
             matchCount: accounts.length,
-            accounts: accounts.map((a) => {
-                const quota = quotaByAccount.get(a.id);
-                return {
-                    accountId: a.id,
-                    accountName: a.accountName,
-                    region: a.region,
-                    subscriptionId: a.subscriptionId,
-                    quotaStatus: quota?.status ?? "none",
-                    quotaLimit: quota?.limit,
-                    hasPool: poolsByAccount.has(a.id),
-                };
-            }),
+            accounts: accounts.map((a) => ({
+                accountId: a.id,
+                accountName: a.accountName,
+                region: a.region,
+                subscriptionId: a.subscriptionId,
+                hasPool: poolsByAccount.has(a.id),
+            })),
         };
     }
 }

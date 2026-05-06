@@ -11,16 +11,6 @@ import { AZURE_REGIONS } from "./shared/constants";
 
 const stackTokens: IStackTokens = { childrenGap: 12 };
 
-// Status options now include "failed" (was missing per brief enterprise_gaps).
-const STATUS_OPTIONS: IDropdownOption[] = [
-    { key: "all", text: "All Statuses" },
-    { key: "pending", text: "Pending" },
-    { key: "submitted", text: "Submitted" },
-    { key: "approved", text: "Approved" },
-    { key: "denied", text: "Denied" },
-    { key: "failed", text: "Failed" },
-];
-
 const PROVISIONING_OPTIONS: IDropdownOption[] = [
     { key: "all", text: "All States" },
     { key: "pending", text: "Pending" },
@@ -104,17 +94,6 @@ export const GlobalFilterBar: React.FC = () => {
         [store, state.globalFilter.subscriptionIds]
     );
 
-    const handleQuotaStatusChange = React.useCallback(
-        (_e: any, option?: IDropdownOption) => {
-            if (option) {
-                store.setGlobalFilter({
-                    quotaStatus: option.key as any,
-                });
-            }
-        },
-        [store]
-    );
-
     const handleProvisioningStateChange = React.useCallback(
         (_e: any, option?: IDropdownOption) => {
             if (option) {
@@ -131,7 +110,6 @@ export const GlobalFilterBar: React.FC = () => {
         store.setGlobalFilter({
             regions: [],
             subscriptionIds: [],
-            quotaStatus: "all",
             provisioningState: "all",
             searchText: "",
         });
@@ -143,7 +121,6 @@ export const GlobalFilterBar: React.FC = () => {
         return (
             (f.regions && f.regions.length > 0) ||
             (f.subscriptionIds && f.subscriptionIds.length > 0) ||
-            (f.quotaStatus && f.quotaStatus !== "all") ||
             (f.provisioningState && f.provisioningState !== "all") ||
             (f.searchText && f.searchText.length > 0)
         );
@@ -184,15 +161,6 @@ export const GlobalFilterBar: React.FC = () => {
                     selectedKeys={state.globalFilter.subscriptionIds}
                     onChange={handleSubscriptionChange}
                     styles={{ dropdown: { width: 220 } }}
-                />
-                <Dropdown
-                    placeholder="Quota status"
-                    label="Quota Status"
-                    ariaLabel="Filter by quota status"
-                    options={STATUS_OPTIONS}
-                    selectedKey={state.globalFilter.quotaStatus}
-                    onChange={handleQuotaStatusChange}
-                    styles={{ dropdown: { width: 150 } }}
                 />
                 <Dropdown
                     placeholder="Account state"

@@ -78,7 +78,6 @@ export interface FilterInput {
     filters: {
         regions?: string[];
         subscriptionIds?: string[];
-        quotaStatus?: string;
         provisioningState?: string;
         accountIds?: string[];
         hasPool?: boolean;
@@ -93,8 +92,6 @@ export interface FilterOutput {
         accountName: string;
         region: string;
         subscriptionId: string;
-        quotaStatus: string;
-        quotaLimit?: number;
         hasPool: boolean;
     }>;
 }

@@ -124,7 +124,7 @@ export function getActionableErrorMessage(
             return {
                 message: "Quota exceeded",
                 suggestion:
-                    "Request a quota increase in the Azure portal or via the Quota Requests page.",
+                    "Request a quota increase in the Azure portal.",
             };
         case "InsufficientCapacity":
             return {

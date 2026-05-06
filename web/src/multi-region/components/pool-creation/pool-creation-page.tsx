@@ -154,14 +154,10 @@ const PoolCreationPageInner: React.FC<PoolCreationPageProps> = ({
         };
     }, []);
 
-    // Only show accounts with approved quota or created status
-    const eligibleAccounts = state.accounts.filter((a) => {
-        if (a.provisioningState !== "created") return false;
-        const quota = state.quotaRequests.find(
-            (q) => q.accountId === a.id && q.status === "approved"
-        );
-        return quota !== undefined || state.quotaRequests.length === 0;
-    });
+    // Show all created accounts
+    const eligibleAccounts = state.accounts.filter(
+        (a) => a.provisioningState === "created"
+    );
 
     React.useEffect(() => {
         if (selectAll) {
@@ -398,21 +394,6 @@ const PoolCreationPageInner: React.FC<PoolCreationPageProps> = ({
             minWidth: 160,
         },
         { key: "region", name: "Region", fieldName: "region", minWidth: 120 },
-        {
-            key: "quotaStatus",
-            name: "Quota",
-            minWidth: 100,
-            onRender: (item) => {
-                const quota = state.quotaRequests.find(
-                    (q) => q.accountId === item.id
-                );
-                return quota ? (
-                    <StatusBadge status={quota.status} />
-                ) : (
-                    <span style={{ color: "#605e5c" }}>-</span>
-                );
-            },
-        },
     ];
 
     const poolColumns: IColumn[] = [
@@ -465,8 +446,7 @@ const PoolCreationPageInner: React.FC<PoolCreationPageProps> = ({
     ];
 
     // Loading state: store hasn't been hydrated with any accounts yet.
-    const accountsLoading =
-        state.accounts.length === 0 && state.quotaRequests.length === 0;
+    const accountsLoading = state.accounts.length === 0;
 
     // Pre-submit summary numbers for confirmation dialog.
     const targetVmCount = smartMode ? getAllVmSizes().length : 1;
@@ -547,8 +527,8 @@ const PoolCreationPageInner: React.FC<PoolCreationPageProps> = ({
 
                 {eligibleAccounts.length === 0 && !isRunning && (
                     <MessageBar messageBarType={MessageBarType.info}>
-                        No eligible accounts available. Provision accounts and
-                        get quota approved before creating pools.
+                        No eligible accounts available. Provision accounts
+                        before creating pools.
                     </MessageBar>
                 )}
 

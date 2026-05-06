@@ -1,6 +1,5 @@
 import { Agent, AgentContext, AgentResult } from "./agent-types";
 import { ProvisionerAgent } from "./provisioner-agent";
-import { QuotaAgent } from "./quota-agent";
 import { MonitorAgent } from "./monitor-agent";
 import { FilterAgent } from "./filter-agent";
 import { PoolAgent } from "./pool-agent";
@@ -82,8 +81,6 @@ export interface TokenProvider {
 export type OrchestratorAction =
     | "create_accounts"
     | "discover_accounts"
-    | "submit_quota_requests"
-    | "check_quota_status"
     | "filter_accounts"
     | "create_pools"
     | "list_nodes"
@@ -108,7 +105,6 @@ export class OrchestratorAgent implements Agent {
     readonly name = "orchestrator" as const;
 
     private readonly _provisioner: ProvisionerAgent;
-    private readonly _quota: QuotaAgent;
     private readonly _monitor: MonitorAgent;
     private readonly _filter: FilterAgent;
     private readonly _pool: PoolAgent;
@@ -124,7 +120,6 @@ export class OrchestratorAgent implements Agent {
         this._tokenProvider = tokenProvider;
         this._deduplicator = new RequestDeduplicator();
         this._provisioner = new ProvisionerAgent(_ctx);
-        this._quota = new QuotaAgent(_ctx);
         this._monitor = new MonitorAgent(_ctx);
         this._filter = new FilterAgent(_ctx.store);
         this._pool = new PoolAgent(_ctx);
@@ -167,7 +162,6 @@ export class OrchestratorAgent implements Agent {
 
     cancel(): void {
         this._provisioner.cancel();
-        this._quota.cancel();
         this._monitor.cancel();
         this._pool.cancel();
         this._node.cancel();
@@ -229,39 +223,6 @@ export class OrchestratorAgent implements Agent {
                             this._discoverAccounts(
                                 params.payload as Record<string, unknown>
                             )
-                    );
-                    break;
-
-                case "submit_quota_requests":
-                    this._validatePrecondition("submit_quota_requests", () => {
-                        const state = store.getState();
-                        const createdAccounts = state.accounts.filter(
-                            (a) => a.provisioningState === "created"
-                        );
-                        if (createdAccounts.length === 0) {
-                            throw new Error(
-                                "No created accounts found. Create accounts first."
-                            );
-                        }
-                    });
-                    result = await this._quota.execute(
-                        params.payload as Record<string, unknown>
-                    );
-                    store.addNotification({
-                        type:
-                            result.status === "completed"
-                                ? "success"
-                                : "warning",
-                        message:
-                            result.status === "completed"
-                                ? "Quota requests submitted successfully"
-                                : `Quota submission finished with status: ${result.status}`,
-                    });
-                    break;
-
-                case "check_quota_status":
-                    result = await this._monitor.execute(
-                        params.payload as Record<string, unknown>
                     );
                     break;
 
@@ -458,24 +419,21 @@ export class OrchestratorAgent implements Agent {
 
                 case "retry_failed": {
                     const retryAccountIds = store.retryFailedAccounts();
-                    const retryQuotaIds = store.retryFailedQuotas();
                     const retryPoolIds = store.retryFailedPools();
 
                     result = {
                         status: "completed",
                         summary: {
                             retriedAccounts: retryAccountIds.length,
-                            retriedQuotas: retryQuotaIds.length,
                             retriedPools: retryPoolIds.length,
                             accountIds: retryAccountIds,
-                            quotaIds: retryQuotaIds,
                             poolIds: retryPoolIds,
                         },
                     };
 
                     store.addNotification({
                         type: "info",
-                        message: `Retry queued: ${retryAccountIds.length} accounts, ${retryQuotaIds.length} quotas, ${retryPoolIds.length} pools`,
+                        message: `Retry queued: ${retryAccountIds.length} accounts, ${retryPoolIds.length} pools`,
                     });
                     break;
                 }
@@ -581,10 +539,6 @@ export class OrchestratorAgent implements Agent {
                     : "all subscriptions";
             case "create_accounts":
                 return `${(payload.regions as string[])?.length ?? 0} regions`;
-            case "submit_quota_requests":
-                return `${(payload.quotaType as string) ?? "quota"} requests`;
-            case "check_quota_status":
-                return "quota status check";
             case "filter_accounts":
                 return "account filter";
             case "create_pools":
@@ -1609,9 +1563,6 @@ export class OrchestratorAgent implements Agent {
     // Expose child agents for direct access from UI
     get provisioner(): ProvisionerAgent {
         return this._provisioner;
-    }
-    get quota(): QuotaAgent {
-        return this._quota;
     }
     get monitor(): MonitorAgent {
         return this._monitor;

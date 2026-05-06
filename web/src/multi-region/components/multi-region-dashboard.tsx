@@ -21,7 +21,6 @@ import { ErrorBoundary } from "./shared/error-boundary";
 import { GlobalFilterBar } from "./global-filter-bar";
 import { OverviewPage } from "./overview/overview-page";
 import { AccountProvisioningPage } from "./account-provisioning/account-provisioning-page";
-import { QuotaStatusPage } from "./quota-status/quota-status-page";
 import { PoolCreationPage } from "./pool-creation/pool-creation-page";
 import { NodesPage } from "./nodes/nodes-page";
 import { PoolInfoPage } from "./pool-info/pool-info-page";
@@ -30,7 +29,6 @@ import { UnusedQuotaPage } from "./unused-quota/unused-quota-page";
 import { AzureAccountsPage } from "./azure-accounts/azure-accounts-page";
 import { MonitoringPage } from "./monitoring/monitoring-page";
 import { PoolDefaultsPage } from "./pool-defaults/pool-defaults-page";
-import { SupportTicketPage } from "./support-ticket/support-ticket-page";
 import { GpuCalculatorPage } from "./gpu-calculator/gpu-calculator-page";
 import { AgentLogPanel } from "./shared/agent-log-panel";
 import { ActivityPanel } from "./shared/activity-panel";
@@ -256,7 +254,7 @@ const SessionBar: React.FC<{ store: MultiRegionStore }> = ({ store }) => {
         () =>
             sessions.map((s) => ({
                 key: s.id,
-                text: `${s.id.substring(0, 22)}... (${s.accountCount}A/${s.quotaCount}Q/${s.poolCount}P)`,
+                text: `${s.id.substring(0, 22)}... (${s.accountCount}A/${s.poolCount}P)`,
             })),
         [sessions]
     );
@@ -289,8 +287,7 @@ const SessionBar: React.FC<{ store: MultiRegionStore }> = ({ store }) => {
                 {state.sessionId}
             </Text>
             <Text variant="tiny" styles={{ root: { color: "#555" } }}>
-                {state.accounts.length}A / {state.quotaRequests.length}Q /{" "}
-                {state.pools.length}P
+                {state.accounts.length}A / {state.pools.length}P
             </Text>
 
             <Stack
@@ -379,8 +376,6 @@ const PAGE_ORDER: PageKey[] = [
     "azure-accounts",
     "overview",
     "accounts",
-    "quota-status",
-    "support-tickets",
     "pools",
     "pool-defaults",
     "pool-info",
@@ -426,8 +421,6 @@ const renderPageBody = (
             );
         case "accounts":
             return <AccountProvisioningPage orchestrator={orchestrator} />;
-        case "quota-status":
-            return <QuotaStatusPage orchestrator={orchestrator} />;
         case "pools":
             return <PoolCreationPage orchestrator={orchestrator} />;
         case "pool-defaults":
@@ -445,8 +438,6 @@ const renderPageBody = (
             );
         case "monitoring":
             return <MonitoringPage orchestrator={orchestrator} />;
-        case "support-tickets":
-            return <SupportTicketPage orchestrator={orchestrator} />;
         case "nodes":
             return <NodesPage orchestrator={orchestrator} />;
         case "gpu-calculator":

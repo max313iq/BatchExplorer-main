@@ -45,7 +45,6 @@ export type { RequestSchedulerOptions } from "./scheduling/request-scheduler";
 export * from "./agents/agent-types";
 export { OrchestratorAgent } from "./agents/orchestrator-agent";
 export { ProvisionerAgent } from "./agents/provisioner-agent";
-export { QuotaAgent } from "./agents/quota-agent";
 export { MonitorAgent } from "./agents/monitor-agent";
 export { FilterAgent } from "./agents/filter-agent";
 export { PoolAgent } from "./agents/pool-agent";
@@ -67,7 +66,6 @@ export { LoadingSkeleton } from "./components/shared/loading-skeleton";
 // Page components
 export { OverviewPage } from "./components/overview/overview-page";
 export { AccountProvisioningPage } from "./components/account-provisioning/account-provisioning-page";
-export { QuotaStatusPage } from "./components/quota-status/quota-status-page";
 export { PoolCreationPage } from "./components/pool-creation/pool-creation-page";
 export { PoolInfoPage } from "./components/pool-info/pool-info-page";
 export { AccountInfoPage } from "./components/account-info/account-info-page";

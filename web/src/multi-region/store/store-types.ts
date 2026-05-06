@@ -15,13 +15,6 @@ export type AccountProvisioningState =
     | "created"
     | "failed";
 
-export type QuotaRequestStatus =
-    | "pending"
-    | "submitted"
-    | "approved"
-    | "denied"
-    | "failed";
-
 export type PoolCreationState = "pending" | "creating" | "created" | "failed";
 
 export type NodeState =
@@ -55,21 +48,6 @@ export interface ManagedAccount {
     region: string;
     provisioningState: AccountProvisioningState;
     createdAt?: string;
-    error?: string | null;
-}
-
-export interface QuotaRequest {
-    id: string;
-    accountId: string;
-    ticketId: string;
-    subscriptionId: string;
-    region: string;
-    quotaType: QuotaType;
-    requestedLimit: number;
-    status: QuotaRequestStatus;
-    submittedAt?: string;
-    lastCheckedAt?: string;
-    resolvedAt?: string | null;
     error?: string | null;
 }
 
@@ -115,7 +93,6 @@ export interface AgentLogEntry {
 export interface GlobalFilter {
     regions: string[];
     subscriptionIds: string[];
-    quotaStatus: QuotaRequestStatus | "all";
     provisioningState: AccountProvisioningState | "all";
     accountIds: string[];
     hasPool?: boolean;
@@ -314,7 +291,6 @@ export interface MultiRegionState {
     sessionId: string;
     subscriptions: Subscription[];
     accounts: ManagedAccount[];
-    quotaRequests: QuotaRequest[];
     pools: ManagedPool[];
     nodes: ManagedNode[];
     poolInfos: PoolInfo[];
@@ -333,7 +309,6 @@ export interface MultiRegionState {
 export const DEFAULT_GLOBAL_FILTER: GlobalFilter = {
     regions: [],
     subscriptionIds: [],
-    quotaStatus: "all",
     provisioningState: "all",
     accountIds: [],
     searchText: "",
@@ -360,7 +335,6 @@ export function createInitialState(): MultiRegionState {
         sessionId: generateSessionId(),
         subscriptions: [],
         accounts: [],
-        quotaRequests: [],
         pools: [],
         nodes: [],
         poolInfos: [],

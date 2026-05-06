@@ -16,7 +16,6 @@ import {
     ManagedPool,
     MultiRegionState,
     PoolInfo,
-    QuotaRequest,
     Subscription,
     ToastNotification,
     UserPreferences,
@@ -96,26 +95,6 @@ export class MultiRegionStore {
         this._state = {
             ...this._state,
             accounts: this._state.accounts.filter((a) => a.id !== id),
-        };
-        this._notify();
-    }
-
-    // --- Quota Requests ---
-
-    addQuotaRequest(request: QuotaRequest): void {
-        this._state = {
-            ...this._state,
-            quotaRequests: [...this._state.quotaRequests, request],
-        };
-        this._notify();
-    }
-
-    updateQuotaRequest(id: string, patch: Partial<QuotaRequest>): void {
-        this._state = {
-            ...this._state,
-            quotaRequests: this._state.quotaRequests.map((r) =>
-                r.id === id ? { ...r, ...patch } : r
-            ),
         };
         this._notify();
     }
@@ -466,22 +445,6 @@ export class MultiRegionStore {
         return ids;
     }
 
-    retryFailedQuotas(): string[] {
-        const ids = this._state.quotaRequests
-            .filter((r) => r.status === "failed")
-            .map((r) => r.id);
-        this._state = {
-            ...this._state,
-            quotaRequests: this._state.quotaRequests.map((r) =>
-                r.status === "failed"
-                    ? { ...r, status: "pending" as const, error: null }
-                    : r
-            ),
-        };
-        this._notify();
-        return ids;
-    }
-
     retryFailedPools(): string[] {
         const ids = this._state.pools
             .filter((p) => p.provisioningState === "failed")
@@ -534,7 +497,6 @@ export class MultiRegionStore {
                 id: this._state.sessionId,
                 savedAt: new Date().toISOString(),
                 accountCount: this._state.accounts.length,
-                quotaCount: this._state.quotaRequests.length,
                 poolCount: this._state.pools.length,
             };
             if (existing >= 0) {
@@ -567,7 +529,7 @@ export class MultiRegionStore {
             this.addLog({
                 agent: "orchestrator",
                 level: "info",
-                message: `Session loaded: ${sessionId} (${saved.accounts.length} accounts, ${saved.quotaRequests.length} quotas, ${saved.pools.length} pools)`,
+                message: `Session loaded: ${sessionId} (${saved.accounts.length} accounts, ${saved.pools.length} pools)`,
             });
             return true;
         } catch {
@@ -580,7 +542,6 @@ export class MultiRegionStore {
         id: string;
         savedAt: string;
         accountCount: number;
-        quotaCount: number;
         poolCount: number;
     }> {
         return this._getSessionIndex();
@@ -608,7 +569,7 @@ export class MultiRegionStore {
         let lastFingerprint = "";
         return this.onChange(() => {
             const s = this._state;
-            const fp = `${s.accounts.length}:${s.quotaRequests.length}:${s.pools.length}:${s.nodes.length}:${s.subscriptions.length}`;
+            const fp = `${s.accounts.length}:${s.pools.length}:${s.nodes.length}:${s.subscriptions.length}`;
             if (fp === lastFingerprint) return;
             lastFingerprint = fp;
             if (timer) clearTimeout(timer);
@@ -620,7 +581,6 @@ export class MultiRegionStore {
         id: string;
         savedAt: string;
         accountCount: number;
-        quotaCount: number;
         poolCount: number;
     }> {
         try {
