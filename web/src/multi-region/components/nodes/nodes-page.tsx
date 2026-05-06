@@ -15,11 +15,13 @@ import { Checkbox } from "@fluentui/react/lib/Checkbox";
 import { Toggle } from "@fluentui/react/lib/Toggle";
 import { Text } from "@fluentui/react/lib/Text";
 import { Dropdown, IDropdownOption } from "@fluentui/react/lib/Dropdown";
-import { Dialog, DialogType, DialogFooter } from "@fluentui/react/lib/Dialog";
 import { Icon } from "@fluentui/react/lib/Icon";
 import { useMultiRegionState } from "../../store/store-context";
 import { OrchestratorAgent } from "../../agents/orchestrator-agent";
 import { StatusBadge } from "../shared/status-badge";
+import { ErrorBoundary } from "../shared/error-boundary";
+import { SkeletonLoader as SharedSkeletonLoader } from "../shared/skeleton-loader";
+import { ConfirmationDialog } from "../shared/confirmation-dialog";
 import { ManagedNode, NodeState } from "../../store/store-types";
 
 interface NodesPageProps {
@@ -81,16 +83,16 @@ interface ConfirmDialogState {
     hidden: boolean;
     title: string;
     message: string;
+    danger: boolean;
     onConfirm: () => void;
 }
 
-const SKELETON_PULSE_KEYFRAMES = `
-@keyframes skeleton-pulse {
-    0% { opacity: 0.6; }
-    50% { opacity: 1; }
-    100% { opacity: 0.6; }
+interface BulkActionResult {
+    label: string;
+    succeeded: number;
+    failed: number;
+    failedIds: string[];
 }
-`;
 
 function compareValues(a: unknown, b: unknown, desc: boolean): number {
     const aVal = a ?? "";
@@ -106,43 +108,6 @@ function compareValues(a: unknown, b: unknown, desc: boolean): number {
         });
     }
     return desc ? -result : result;
-}
-
-function SkeletonLoader(): React.ReactElement {
-    const colWidths = [180, 100, 160, 110, 120, 100];
-    return (
-        <>
-            <style>{SKELETON_PULSE_KEYFRAMES}</style>
-            <div role="status" aria-label="Loading nodes">
-                {Array.from({ length: 8 }).map((_, rowIdx) => (
-                    <div
-                        key={rowIdx}
-                        style={{
-                            display: "flex",
-                            gap: 16,
-                            padding: "10px 0",
-                            borderBottom: "1px solid #292929",
-                        }}
-                    >
-                        {colWidths.map((w, colIdx) => (
-                            <div
-                                key={colIdx}
-                                style={{
-                                    width: w,
-                                    height: 16,
-                                    background: "#333",
-                                    borderRadius: 4,
-                                    animation:
-                                        "skeleton-pulse 1.5s ease-in-out infinite",
-                                    animationDelay: `${rowIdx * 0.05 + colIdx * 0.03}s`,
-                                }}
-                            />
-                        ))}
-                    </div>
-                ))}
-            </div>
-        </>
-    );
 }
 
 const DESTRUCTIVE_ACTIONS: Set<NodeActionType | "deleteNodes" | "recreate"> =
@@ -165,11 +130,15 @@ const ACTION_LABELS: Record<string, string> = {
     recreate: "recreate",
 };
 
-export const NodesPage: React.FC<NodesPageProps> = ({ orchestrator }) => {
+const NodesPageInner: React.FC<NodesPageProps> = ({ orchestrator }) => {
     const state = useMultiRegionState();
     const [isLoading, setIsLoading] = React.useState(false);
     const [isActing, setIsActing] = React.useState(false);
     const [error, setError] = React.useState<string | null>(null);
+    const [bulkResult, setBulkResult] =
+        React.useState<BulkActionResult | null>(null);
+    const [bulkProgressMessage, setBulkProgressMessage] =
+        React.useState<string | null>(null);
     const [selectedNodeIds, setSelectedNodeIds] = React.useState<Set<string>>(
         new Set()
     );
@@ -193,6 +162,7 @@ export const NodesPage: React.FC<NodesPageProps> = ({ orchestrator }) => {
             hidden: true,
             title: "",
             message: "",
+            danger: false,
             onConfirm: () => {},
         });
 
@@ -371,12 +341,14 @@ export const NodesPage: React.FC<NodesPageProps> = ({ orchestrator }) => {
             actionLabel: string,
             count: number,
             onConfirm: () => void,
-            extraMessage?: string
+            extraMessage?: string,
+            danger = false
         ) => {
             setConfirmDialog({
                 hidden: false,
                 title: `Confirm ${actionLabel}`,
                 message: `Are you sure you want to ${actionLabel} ${count} node${count === 1 ? "" : "s"}?${extraMessage ? " " + extraMessage : ""}`,
+                danger,
                 onConfirm,
             });
         },
@@ -386,6 +358,27 @@ export const NodesPage: React.FC<NodesPageProps> = ({ orchestrator }) => {
     const dismissConfirmDialog = React.useCallback(() => {
         setConfirmDialog((prev) => ({ ...prev, hidden: true }));
     }, []);
+
+    // --- Compute bulk-action outcome from the store after dispatch ---
+    const computeBulkResult = React.useCallback(
+        (label: string, attemptedIds: string[]): BulkActionResult => {
+            const failedIds: string[] = [];
+            for (const id of attemptedIds) {
+                const node = state.nodes.find((n) => n.id === id);
+                // Treat nodes whose state is unknown/unusable post-action as failed
+                if (node && ERROR_STATES.has(node.state)) {
+                    failedIds.push(id);
+                }
+            }
+            return {
+                label,
+                succeeded: attemptedIds.length - failedIds.length,
+                failed: failedIds.length,
+                failedIds,
+            };
+        },
+        [state.nodes]
+    );
 
     const handleNodeAction = React.useCallback(
         async (action: NodeActionType) => {
@@ -397,10 +390,11 @@ export const NodesPage: React.FC<NodesPageProps> = ({ orchestrator }) => {
             const executeAction = async () => {
                 setIsActing(true);
                 setError(null);
+                setBulkResult(null);
+                setBulkProgressMessage(
+                    `${label} starting on ${ids.length} node${ids.length === 1 ? "" : "s"}...`
+                );
                 try {
-                    console.log(
-                        `[Nodes] Dispatching bulk_node_action: actionType=${action}, nodeCount=${ids.length}`
-                    );
                     await orchestrator.execute({
                         action: "bulk_node_action",
                         payload: {
@@ -408,12 +402,20 @@ export const NodesPage: React.FC<NodesPageProps> = ({ orchestrator }) => {
                             nodeIds: ids,
                         },
                     });
+                    setBulkResult(computeBulkResult(label, ids));
                 } catch (err: unknown) {
                     const message =
                         err instanceof Error ? err.message : String(err);
                     setError(message);
+                    setBulkResult({
+                        label,
+                        succeeded: 0,
+                        failed: ids.length,
+                        failedIds: ids.slice(0, 10),
+                    });
                 } finally {
                     setIsActing(false);
+                    setBulkProgressMessage(null);
                 }
             };
 
@@ -424,12 +426,20 @@ export const NodesPage: React.FC<NodesPageProps> = ({ orchestrator }) => {
                         : action === "reimage"
                           ? "Running tasks will be requeued."
                           : undefined;
-                showConfirmation(label, ids.length, executeAction, extra);
+                showConfirmation(
+                    label,
+                    ids.length,
+                    executeAction,
+                    extra,
+                    action === "delete" ||
+                        action === "reimage" ||
+                        action === "reboot"
+                );
             } else {
                 await executeAction();
             }
         },
-        [orchestrator, getSelectedIds, showConfirmation]
+        [orchestrator, getSelectedIds, showConfirmation, computeBulkResult]
     );
 
     // --- Bulk delete (grouped by pool) ---
@@ -447,17 +457,34 @@ export const NodesPage: React.FC<NodesPageProps> = ({ orchestrator }) => {
         const executeDelete = async () => {
             setIsActing(true);
             setError(null);
+            setBulkResult(null);
+            setBulkProgressMessage(
+                `Deleting ${ids.length} node${ids.length === 1 ? "" : "s"} across ${poolSet.size} pool(s)...`
+            );
             try {
                 await orchestrator.execute({
                     action: "delete_nodes",
                     payload: { nodeIds: ids },
                 });
+                setBulkResult({
+                    label: "delete",
+                    succeeded: ids.length,
+                    failed: 0,
+                    failedIds: [],
+                });
             } catch (err: unknown) {
                 const message =
                     err instanceof Error ? err.message : String(err);
                 setError(message);
+                setBulkResult({
+                    label: "delete",
+                    succeeded: 0,
+                    failed: ids.length,
+                    failedIds: ids.slice(0, 10),
+                });
             } finally {
                 setIsActing(false);
+                setBulkProgressMessage(null);
             }
         };
 
@@ -465,7 +492,8 @@ export const NodesPage: React.FC<NodesPageProps> = ({ orchestrator }) => {
             "delete",
             ids.length,
             executeDelete,
-            `This will affect ${poolSet.size} pool(s). This action cannot be undone.`
+            `This will affect ${poolSet.size} pool(s). This action cannot be undone.`,
+            true
         );
     }, [orchestrator, getSelectedIds, state.nodes, showConfirmation]);
 
@@ -819,7 +847,13 @@ export const NodesPage: React.FC<NodesPageProps> = ({ orchestrator }) => {
     const renderContent = () => {
         // Skeleton loader: loading and no nodes at all yet
         if (isLoading && state.nodes.length === 0) {
-            return <SkeletonLoader />;
+            return (
+                <SharedSkeletonLoader
+                    variant="table"
+                    rows={8}
+                    columns={6}
+                />
+            );
         }
 
         // Empty state: not loading and no nodes exist
@@ -858,7 +892,12 @@ export const NodesPage: React.FC<NodesPageProps> = ({ orchestrator }) => {
         // Node list with pagination
         return (
             <>
-                <div onKeyDown={handleRowKeyDown} role="presentation">
+                <div
+                    onKeyDown={handleRowKeyDown}
+                    role="grid"
+                    aria-rowcount={sortedNodes.length}
+                    aria-label={`Nodes table, ${sortedNodes.length} total rows`}
+                >
                     <DetailsList
                         items={displayNodes}
                         columns={columns}
@@ -870,8 +909,18 @@ export const NodesPage: React.FC<NodesPageProps> = ({ orchestrator }) => {
                             if (!props || !defaultRender) return null;
                             const item = props.item as ManagedNode;
                             const isSelected = selectedNodeIds.has(item.id);
+                            // 1-based aria-rowindex spanning all pages
+                            const rowIndex =
+                                clampedPage * pageSize +
+                                (props.itemIndex ?? 0) +
+                                1;
                             return (
-                                <div aria-selected={isSelected} role="row">
+                                <div
+                                    aria-selected={isSelected}
+                                    role="row"
+                                    aria-rowindex={rowIndex}
+                                    aria-label={`Node ${item.id}, pool ${item.poolId}, account ${item.accountName}, state ${item.state}`}
+                                >
                                     {defaultRender(props)}
                                 </div>
                             );
@@ -955,6 +1004,49 @@ export const NodesPage: React.FC<NodesPageProps> = ({ orchestrator }) => {
                         aria-live="polite"
                     >
                         {error}
+                    </MessageBar>
+                )}
+
+                {/* Bulk-action progress: aria-live polite for screen readers */}
+                {bulkProgressMessage && (
+                    <MessageBar
+                        messageBarType={MessageBarType.info}
+                        aria-live="polite"
+                        role="status"
+                    >
+                        {bulkProgressMessage}
+                    </MessageBar>
+                )}
+
+                {/* Bulk-action result summary */}
+                {bulkResult && !bulkProgressMessage && (
+                    <MessageBar
+                        messageBarType={
+                            bulkResult.failed === 0
+                                ? MessageBarType.success
+                                : bulkResult.succeeded === 0
+                                  ? MessageBarType.error
+                                  : MessageBarType.warning
+                        }
+                        onDismiss={() => setBulkResult(null)}
+                        aria-live="polite"
+                        isMultiline
+                    >
+                        Bulk {bulkResult.label}:{" "}
+                        <b>{bulkResult.succeeded}</b> succeeded,{" "}
+                        <b>{bulkResult.failed}</b> failed.
+                        {bulkResult.failedIds.length > 0 && (
+                            <>
+                                {" "}
+                                Failed node IDs:{" "}
+                                <code style={{ fontSize: 11 }}>
+                                    {bulkResult.failedIds.slice(0, 8).join(", ")}
+                                    {bulkResult.failedIds.length > 8
+                                        ? `, +${bulkResult.failedIds.length - 8} more`
+                                        : ""}
+                                </code>
+                            </>
+                        )}
                     </MessageBar>
                 )}
 
@@ -1126,6 +1218,7 @@ export const NodesPage: React.FC<NodesPageProps> = ({ orchestrator }) => {
                         checked={selectAll}
                         onChange={handleSelectAllChange}
                         styles={{ root: { marginTop: 24 } }}
+                        ariaLabel={`Select all ${sortedNodes.length} filtered nodes across all pages`}
                     />
                 </Stack>
 
@@ -1259,31 +1352,26 @@ export const NodesPage: React.FC<NodesPageProps> = ({ orchestrator }) => {
                 {renderContent()}
             </Stack>
 
-            {/* Confirmation Dialog */}
-            <Dialog
+            {/* Confirmation Dialog (shared) */}
+            <ConfirmationDialog
                 hidden={confirmDialog.hidden}
-                onDismiss={dismissConfirmDialog}
-                dialogContentProps={{
-                    type: DialogType.normal,
-                    title: confirmDialog.title,
-                    subText: confirmDialog.message,
+                title={confirmDialog.title}
+                message={confirmDialog.message}
+                danger={confirmDialog.danger}
+                confirmText="Confirm"
+                cancelText="Cancel"
+                onConfirm={() => {
+                    dismissConfirmDialog();
+                    confirmDialog.onConfirm();
                 }}
-                modalProps={{ isBlocking: true }}
-            >
-                <DialogFooter>
-                    <PrimaryButton
-                        text="Confirm"
-                        onClick={() => {
-                            dismissConfirmDialog();
-                            confirmDialog.onConfirm();
-                        }}
-                    />
-                    <DefaultButton
-                        text="Cancel"
-                        onClick={dismissConfirmDialog}
-                    />
-                </DialogFooter>
-            </Dialog>
+                onCancel={dismissConfirmDialog}
+            />
         </div>
     );
 };
+
+export const NodesPage: React.FC<NodesPageProps> = (props) => (
+    <ErrorBoundary>
+        <NodesPageInner {...props} />
+    </ErrorBoundary>
+);

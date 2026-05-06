@@ -24,56 +24,9 @@ import {
     listSubscriptionsForAccount,
     getAllLoggedInAccounts,
 } from "../../auth/msal-auth";
-
-/* ------------------------------------------------------------------ */
-/*  Skeleton pulse animation (inline keyframes via style tag)          */
-/* ------------------------------------------------------------------ */
-
-const SKELETON_KEYFRAMES = `
-@keyframes skeletonPulse {
-  0% { opacity: 0.6; }
-  50% { opacity: 1; }
-  100% { opacity: 0.6; }
-}`;
-
-const SkeletonBar: React.FC<{
-    width: number | string;
-    height: number;
-    style?: React.CSSProperties;
-}> = ({ width, height, style }) => (
-    <div
-        style={{
-            width,
-            height,
-            background: "#333",
-            borderRadius: 4,
-            animation: "skeletonPulse 1.5s ease-in-out infinite",
-            ...style,
-        }}
-    />
-);
-
-const AccountCardSkeleton: React.FC = () => (
-    <div
-        style={{
-            background: "#1e1e1e",
-            borderRadius: 6,
-            marginBottom: 8,
-            padding: "12px 16px",
-        }}
-        aria-hidden="true"
-    >
-        <Stack horizontal verticalAlign="center" tokens={{ childrenGap: 12 }}>
-            <SkeletonBar width={20} height={20} />
-            <div style={{ flex: 1 }}>
-                <SkeletonBar width={160} height={14} />
-                <SkeletonBar width={200} height={10} style={{ marginTop: 6 }} />
-                <SkeletonBar width={120} height={10} style={{ marginTop: 4 }} />
-            </div>
-            <SkeletonBar width={60} height={20} />
-        </Stack>
-    </div>
-);
+import { ErrorBoundary } from "../shared/error-boundary";
+import { SkeletonLoader } from "../shared/skeleton-loader";
+import { ConfirmationDialog } from "../shared/confirmation-dialog";
 
 /* ------------------------------------------------------------------ */
 /*  Summary stat item (reused from account-info-page style)           */
@@ -173,6 +126,7 @@ const AccountCard: React.FC<AccountCardProps> = ({ account, onRemove }) => {
                 onClick={() => setExpanded((prev) => !prev)}
                 aria-expanded={expanded}
                 aria-label={`${account.name || account.username} - ${account.subscriptionCount} subscriptions. Click to ${expanded ? "collapse" : "expand"}.`}
+                data-account-card-header="true"
                 style={{
                     width: "100%",
                     background: "transparent",
@@ -372,6 +326,13 @@ const AccountCard: React.FC<AccountCardProps> = ({ account, onRemove }) => {
                                             padding: "2px 8px",
                                             fontSize: 11,
                                         }}
+                                        role="status"
+                                        aria-label={`Subscription state: ${sub.state}`}
+                                        title={
+                                            sub.state === "Enabled"
+                                                ? "Subscription is active"
+                                                : `Subscription is ${sub.state}. Re-login may be required.`
+                                        }
                                     >
                                         {sub.state}
                                     </span>
@@ -389,12 +350,17 @@ const AccountCard: React.FC<AccountCardProps> = ({ account, onRemove }) => {
 /*  Main page component                                               */
 /* ------------------------------------------------------------------ */
 
-export const AzureAccountsPage: React.FC = () => {
+const AzureAccountsPageInner: React.FC = () => {
     const state = useMultiRegionState();
     const store = useMultiRegionStore();
     const [adding, setAdding] = React.useState(false);
     const [initialLoading, setInitialLoading] = React.useState(true);
     const [error, setError] = React.useState<string | null>(null);
+    const [pendingRemoveId, setPendingRemoveId] = React.useState<string | null>(
+        null
+    );
+    const [removing, setRemoving] = React.useState(false);
+    const gridRef = React.useRef<HTMLDivElement>(null);
 
     const accounts: AzureLoginAccount[] = React.useMemo(
         () => state.azureAccounts ?? [],
@@ -404,6 +370,33 @@ export const AzureAccountsPage: React.FC = () => {
     const totalSubCount = React.useMemo(
         () => accounts.reduce((sum, a) => sum + a.subscriptionCount, 0),
         [accounts]
+    );
+
+    // Detect disabled subscriptions and accounts in error state
+    const disabledSubInfo = React.useMemo(() => {
+        let disabledCount = 0;
+        const accountsWithDisabled: string[] = [];
+        for (const a of accounts) {
+            const dis = a.subscriptions.filter((s) => s.state !== "Enabled");
+            if (dis.length > 0) {
+                disabledCount += dis.length;
+                accountsWithDisabled.push(a.name || a.username);
+            }
+        }
+        const errorAccounts = accounts.filter((a) => a.status === "error");
+        return {
+            disabledCount,
+            accountsWithDisabled,
+            errorAccounts,
+        };
+    }, [accounts]);
+
+    const pendingRemoveAccount = React.useMemo(
+        () =>
+            pendingRemoveId
+                ? accounts.find((a) => a.homeAccountId === pendingRemoveId)
+                : undefined,
+        [pendingRemoveId, accounts]
     );
 
     /* ---- Load accounts on mount ---- */
@@ -517,28 +510,76 @@ export const AzureAccountsPage: React.FC = () => {
         }
     }, [store]);
 
-    /* ---- Remove account ---- */
-    const handleRemove = React.useCallback(
-        async (homeAccountId: string) => {
+    /* ---- Request remove (opens confirmation) ---- */
+    const handleRequestRemove = React.useCallback(
+        (homeAccountId: string) => setPendingRemoveId(homeAccountId),
+        []
+    );
+
+    /* ---- Confirmed remove ---- */
+    const handleConfirmRemove = React.useCallback(async () => {
+        if (!pendingRemoveId) return;
+        setRemoving(true);
+        try {
             try {
-                await logoutAccount(homeAccountId);
+                await logoutAccount(pendingRemoveId);
             } catch {
                 // Best-effort logout
             }
-            store.removeAzureAccount(homeAccountId);
-        },
-        [store]
-    );
+            store.removeAzureAccount(pendingRemoveId);
+        } finally {
+            setRemoving(false);
+            setPendingRemoveId(null);
+        }
+    }, [pendingRemoveId, store]);
+
+    const handleCancelRemove = React.useCallback(() => {
+        if (removing) return;
+        setPendingRemoveId(null);
+    }, [removing]);
 
     /* ---- Refresh all ---- */
     const handleRefreshAll = React.useCallback(() => {
         loadAllAccounts();
     }, [loadAllAccounts]);
 
+    /* ---- Re-login for disabled subscription resolution ---- */
+    const handleReLogin = React.useCallback(async () => {
+        try {
+            await loginAccount();
+        } catch {
+            // ignore; loginAccount surfaces its own errors
+        }
+        loadAllAccounts();
+    }, [loadAllAccounts]);
+
+    /* ---- Keyboard navigation between account cards ---- */
+    const handleGridKeyDown = React.useCallback(
+        (e: React.KeyboardEvent<HTMLDivElement>) => {
+            if (e.key !== "ArrowDown" && e.key !== "ArrowUp") return;
+            const root = gridRef.current;
+            if (!root) return;
+            const cards = Array.from(
+                root.querySelectorAll<HTMLButtonElement>(
+                    "button[data-account-card-header='true']"
+                )
+            );
+            if (cards.length === 0) return;
+            const active = document.activeElement as HTMLElement | null;
+            const idx = cards.findIndex((c) => c === active);
+            if (idx === -1) return;
+            e.preventDefault();
+            const next =
+                e.key === "ArrowDown"
+                    ? Math.min(cards.length - 1, idx + 1)
+                    : Math.max(0, idx - 1);
+            cards[next]?.focus();
+        },
+        []
+    );
+
     return (
         <div style={{ padding: "16px 0" }}>
-            <style>{SKELETON_KEYFRAMES}</style>
-
             {/* Header bar */}
             <Stack
                 horizontal
@@ -593,6 +634,56 @@ export const AzureAccountsPage: React.FC = () => {
                 </MessageBar>
             )}
 
+            {/* Disabled subscription / account-error inline notice */}
+            {(disabledSubInfo.disabledCount > 0 ||
+                disabledSubInfo.errorAccounts.length > 0) && (
+                <MessageBar
+                    messageBarType={MessageBarType.warning}
+                    styles={{ root: { marginBottom: 12 } }}
+                    role="status"
+                    aria-live="polite"
+                    actions={
+                        <Stack horizontal tokens={{ childrenGap: 8 }}>
+                            <DefaultButton
+                                text="Re-login"
+                                iconProps={{ iconName: "Signin" }}
+                                onClick={handleReLogin}
+                                aria-label="Re-login to resolve disabled subscriptions"
+                            />
+                            <DefaultButton
+                                text="Refresh subscriptions"
+                                iconProps={{ iconName: "Refresh" }}
+                                onClick={handleRefreshAll}
+                                aria-label="Refresh subscriptions"
+                            />
+                        </Stack>
+                    }
+                >
+                    {disabledSubInfo.disabledCount > 0 && (
+                        <span>
+                            {disabledSubInfo.disabledCount} subscription
+                            {disabledSubInfo.disabledCount === 1
+                                ? ""
+                                : "s"} not enabled
+                            {disabledSubInfo.accountsWithDisabled.length > 0
+                                ? ` (${disabledSubInfo.accountsWithDisabled.join(", ")})`
+                                : ""}
+                            .{" "}
+                        </span>
+                    )}
+                    {disabledSubInfo.errorAccounts.length > 0 && (
+                        <span>
+                            {disabledSubInfo.errorAccounts.length} account
+                            {disabledSubInfo.errorAccounts.length === 1
+                                ? ""
+                                : "s"}{" "}
+                            failed to load subscriptions.{" "}
+                        </span>
+                    )}
+                    Re-login or refresh to recover.
+                </MessageBar>
+            )}
+
             {/* Summary stats */}
             <Stack
                 horizontal
@@ -624,22 +715,58 @@ export const AzureAccountsPage: React.FC = () => {
 
             {/* Account cards / skeleton / empty */}
             {initialLoading && accounts.length === 0 ? (
-                <div aria-label="Loading accounts" role="status">
-                    <AccountCardSkeleton />
-                    <AccountCardSkeleton />
-                    <AccountCardSkeleton />
-                </div>
+                <SkeletonLoader variant="list" rows={3} />
             ) : accounts.length === 0 ? (
                 <EmptyState />
             ) : (
-                accounts.map((account) => (
-                    <AccountCard
-                        key={account.homeAccountId}
-                        account={account}
-                        onRemove={handleRemove}
-                    />
-                ))
+                <div
+                    ref={gridRef}
+                    role="list"
+                    aria-label="Azure accounts"
+                    onKeyDown={handleGridKeyDown}
+                >
+                    {accounts.map((account) => (
+                        <div role="listitem" key={account.homeAccountId}>
+                            <AccountCard
+                                account={account}
+                                onRemove={handleRequestRemove}
+                            />
+                        </div>
+                    ))}
+                </div>
             )}
+
+            {/* Confirmation dialog for destructive remove */}
+            <ConfirmationDialog
+                hidden={pendingRemoveId === null}
+                title="Remove Azure account?"
+                message={
+                    pendingRemoveAccount
+                        ? `Sign out and remove "${
+                              pendingRemoveAccount.name ||
+                              pendingRemoveAccount.username
+                          }"? You'll need to sign in again to access its ${
+                              pendingRemoveAccount.subscriptionCount
+                          } subscription${
+                              pendingRemoveAccount.subscriptionCount === 1
+                                  ? ""
+                                  : "s"
+                          }.`
+                        : "Sign out and remove this account?"
+                }
+                confirmText="Remove"
+                cancelText="Cancel"
+                danger
+                loading={removing}
+                onConfirm={handleConfirmRemove}
+                onCancel={handleCancelRemove}
+            />
         </div>
     );
 };
+
+export const AzureAccountsPage: React.FC = () => (
+    <ErrorBoundary>
+        <AzureAccountsPageInner />
+    </ErrorBoundary>
+);

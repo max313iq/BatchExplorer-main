@@ -29,6 +29,35 @@ import {
     INITIAL_POOL_DEFAULTS,
     buildPoolConfigFromDefaults,
 } from "../../store/pool-defaults";
+import { ErrorBoundary } from "../shared/error-boundary";
+import { SkeletonLoader } from "../shared/skeleton-loader";
+import { ConfirmationDialog } from "../shared/confirmation-dialog";
+
+/* ------------------------------------------------------------------ */
+/*  Dirty-state helper                                                 */
+/* ------------------------------------------------------------------ */
+
+function deepEqual(a: unknown, b: unknown): boolean {
+    if (a === b) return true;
+    if (typeof a !== typeof b) return false;
+    if (a && b && typeof a === "object") {
+        const ka = Object.keys(a as object);
+        const kb = Object.keys(b as object);
+        if (ka.length !== kb.length) return false;
+        for (const k of ka) {
+            if (
+                !deepEqual(
+                    (a as Record<string, unknown>)[k],
+                    (b as Record<string, unknown>)[k]
+                )
+            ) {
+                return false;
+            }
+        }
+        return true;
+    }
+    return false;
+}
 
 /* ------------------------------------------------------------------ */
 /*  Constants                                                          */
@@ -253,11 +282,43 @@ function makeSpinHandlers(
 /*  Main component                                                     */
 /* ------------------------------------------------------------------ */
 
-export const PoolDefaultsPage: React.FC = () => {
+const PoolDefaultsPageInner: React.FC = () => {
     const state = useMultiRegionState();
     const store = useMultiRegionStore();
-    const defaults: PoolDefaults = state.poolDefaults ?? INITIAL_POOL_DEFAULTS;
+    const defaults: PoolDefaults | undefined = state.poolDefaults;
 
+    // Initial-load skeleton: poolDefaults is hydrated synchronously on store
+    // construction, but defend against the brief gap before that runs.
+    if (!defaults) {
+        return (
+            <div style={{ padding: "16px 0" }}>
+                <h1
+                    style={{
+                        color: "#eee",
+                        fontSize: 20,
+                        fontWeight: 600,
+                        margin: "0 0 16px 0",
+                    }}
+                >
+                    Pool Default Settings
+                </h1>
+                <SkeletonLoader variant="form" rows={8} />
+            </div>
+        );
+    }
+
+    return <PoolDefaultsForm defaults={defaults} store={store} />;
+};
+
+interface PoolDefaultsFormProps {
+    defaults: PoolDefaults;
+    store: ReturnType<typeof useMultiRegionStore>;
+}
+
+const PoolDefaultsForm: React.FC<PoolDefaultsFormProps> = ({
+    defaults,
+    store,
+}) => {
     // Track which sections are expanded
     const [expandedSections, setExpandedSections] = React.useState<Set<number>>(
         new Set([1, 2, 3, 4, 5])
@@ -265,6 +326,21 @@ export const PoolDefaultsPage: React.FC = () => {
 
     // "Saved!" toast
     const [savedMsg, setSavedMsg] = React.useState(false);
+
+    // Snapshot of the defaults at the moment the user last saved (or page-mount
+    // load). Used to render an "unsaved changes" banner.
+    const [savedSnapshot, setSavedSnapshot] =
+        React.useState<PoolDefaults>(defaults);
+    const isDirty = React.useMemo(
+        () => !deepEqual(defaults, savedSnapshot),
+        [defaults, savedSnapshot]
+    );
+
+    // Save-confirmation dialog
+    const [confirmSaveOpen, setConfirmSaveOpen] = React.useState(false);
+
+    // Save banner ref — focus moved here on save success/fail for a11y
+    const saveBannerRef = React.useRef<HTMLDivElement | null>(null);
 
     const toggleSection = (n: number) => {
         setExpandedSections((prev) => {
@@ -297,22 +373,39 @@ export const PoolDefaultsPage: React.FC = () => {
         [update, defaults.startTask]
     );
 
-    // Save handler
+    // Save handler — opens confirmation; the actual save runs after confirm.
     const handleSave = React.useCallback(() => {
+        setConfirmSaveOpen(true);
+    }, []);
+
+    const handleConfirmSave = React.useCallback(() => {
         (
             store as unknown as { setPoolDefaults: (d: PoolDefaults) => void }
         ).setPoolDefaults(defaults);
+        setSavedSnapshot(defaults);
         setSavedMsg(true);
-        setTimeout(() => setSavedMsg(false), 3000);
+        setConfirmSaveOpen(false);
+        // Move focus to the success banner for screen-reader users.
+        window.setTimeout(() => {
+            saveBannerRef.current?.focus();
+        }, 0);
+        window.setTimeout(() => setSavedMsg(false), 3000);
     }, [store, defaults]);
 
-    // Reset handler
+    // Reset confirmation dialog
+    const [confirmResetOpen, setConfirmResetOpen] = React.useState(false);
+
+    // Reset handler — wraps in shared ConfirmationDialog (no native window.confirm).
     const handleReset = React.useCallback(() => {
-        if (window.confirm("Reset all pool defaults to factory values?")) {
-            (
-                store as unknown as { resetPoolDefaults: () => void }
-            ).resetPoolDefaults();
-        }
+        setConfirmResetOpen(true);
+    }, []);
+
+    const handleConfirmReset = React.useCallback(() => {
+        (
+            store as unknown as { resetPoolDefaults: () => void }
+        ).resetPoolDefaults();
+        setSavedSnapshot(INITIAL_POOL_DEFAULTS);
+        setConfirmResetOpen(false);
     }, [store]);
 
     // OS category change handler
@@ -458,25 +551,41 @@ export const PoolDefaultsPage: React.FC = () => {
 
     return (
         <div style={{ padding: "16px 0" }}>
-            {/* Header */}
+            {/* Header — proper heading element for a11y */}
             <Stack
                 horizontal
                 verticalAlign="center"
                 tokens={{ childrenGap: 12 }}
                 styles={{ root: { marginBottom: 16 } }}
             >
-                <Text
-                    variant="xLarge"
-                    styles={{ root: { fontWeight: 600, color: "#eee" } }}
+                <h1
+                    style={{
+                        fontSize: 20,
+                        fontWeight: 600,
+                        color: "#eee",
+                        margin: 0,
+                    }}
                 >
                     Pool Default Settings
-                </Text>
+                </h1>
                 <Text variant="small" styles={{ root: { color: "#888" } }}>
                     OS, start task, and network defaults used by all pool
                     creation modes. Pool names, VM sizes, and node counts are
                     calculated automatically.
                 </Text>
             </Stack>
+
+            {/* Unsaved-changes banner */}
+            {isDirty && (
+                <MessageBar
+                    messageBarType={MessageBarType.warning}
+                    aria-live="polite"
+                    styles={{ root: { marginBottom: 12 } }}
+                >
+                    You have unsaved changes. Click <b>Save Defaults</b> to
+                    apply them.
+                </MessageBar>
+            )}
 
             {/* ============ SECTION 1: OS Configuration ============ */}
             <SectionCard
@@ -1208,15 +1317,69 @@ export const PoolDefaultsPage: React.FC = () => {
                     </Stack>
 
                     {savedMsg && (
-                        <MessageBar
-                            messageBarType={MessageBarType.success}
-                            aria-label="Defaults saved successfully"
+                        <div
+                            ref={saveBannerRef}
+                            tabIndex={-1}
+                            aria-live="assertive"
                         >
-                            Saved to localStorage
-                        </MessageBar>
+                            <MessageBar
+                                messageBarType={MessageBarType.success}
+                                aria-label="Defaults saved successfully"
+                            >
+                                Saved to localStorage
+                            </MessageBar>
+                        </div>
                     )}
                 </Stack>
             </SectionCard>
+
+            {/* Save confirmation — warns user that changes affect future
+                pool creations across pool-creation, unused-quota, and
+                orchestrator's auto-pool-create flows. */}
+            <ConfirmationDialog
+                hidden={!confirmSaveOpen}
+                title="Save pool defaults?"
+                message={
+                    <div>
+                        <p style={{ margin: "0 0 8px 0" }}>
+                            These defaults will be applied to{" "}
+                            <b>all future pool creations</b> made through this
+                            tool — including pool-creation, unused-quota
+                            recovery, and the orchestrator&apos;s auto-pool
+                            workflow.
+                        </p>
+                        <p style={{ margin: 0, color: "#bbb" }}>
+                            Existing pools are not affected.
+                        </p>
+                    </div>
+                }
+                confirmText="Save Defaults"
+                cancelText="Cancel"
+                onConfirm={handleConfirmSave}
+                onCancel={() => setConfirmSaveOpen(false)}
+            />
+
+            {/* Reset confirmation — replaces native window.confirm */}
+            <ConfirmationDialog
+                hidden={!confirmResetOpen}
+                title="Reset pool defaults?"
+                message="All pool defaults will be reverted to factory values. This cannot be undone."
+                confirmText="Reset to Factory"
+                cancelText="Cancel"
+                danger
+                onConfirm={handleConfirmReset}
+                onCancel={() => setConfirmResetOpen(false)}
+            />
         </div>
     );
 };
+
+/**
+ * Public page entry — wraps the inner form in an ErrorBoundary so a render
+ * failure in any of the 7 sections does not blank the whole dashboard pane.
+ */
+export const PoolDefaultsPage: React.FC = () => (
+    <ErrorBoundary>
+        <PoolDefaultsPageInner />
+    </ErrorBoundary>
+);

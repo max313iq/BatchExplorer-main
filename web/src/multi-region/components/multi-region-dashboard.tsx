@@ -5,6 +5,7 @@ import { Dropdown, IDropdownOption } from "@fluentui/react/lib/Dropdown";
 import { Stack } from "@fluentui/react/lib/Stack";
 import { Text } from "@fluentui/react/lib/Text";
 import { Toggle } from "@fluentui/react/lib/Toggle";
+import { ProgressIndicator } from "@fluentui/react/lib/ProgressIndicator";
 import {
     MultiRegionStoreProvider,
     useMultiRegionState,
@@ -371,12 +372,49 @@ const SessionBar: React.FC<{ store: MultiRegionStore }> = ({ store }) => {
 
 // --- Page Router ---
 
+const ACTIVE_PAGE_STORAGE_KEY = "multi-region:activePage";
+
+// Sidebar order — must match SidebarNav items array order for Alt+1..9 hotkeys.
+// Only the first 9 are reachable via Alt+1..Alt+9; remainder are sidebar-click only.
+const PAGE_ORDER: PageKey[] = [
+    "azure-accounts",
+    "overview",
+    "accounts",
+    "quotas",
+    "quota-status",
+    "support-tickets",
+    "pools",
+    "pool-defaults",
+    "pool-info",
+    "account-info",
+    "unused-quota",
+    "monitoring",
+    "nodes",
+    "gpu-calculator",
+    "audit-log",
+];
+
 const PageContent: React.FC<{
     page: PageKey;
     orchestrator: OrchestratorAgent;
     store: MultiRegionStore;
     onNavigate: (key: PageKey) => void;
 }> = ({ page, orchestrator, store, onNavigate }) => {
+    // Each page gets its own boundary keyed by page so a crash in one page
+    // doesn't blank the whole shell, and the boundary auto-resets on navigation.
+    return (
+        <ErrorBoundary key={`page-${page}`}>
+            {renderPageBody(page, orchestrator, store, onNavigate)}
+        </ErrorBoundary>
+    );
+};
+
+const renderPageBody = (
+    page: PageKey,
+    orchestrator: OrchestratorAgent,
+    store: MultiRegionStore,
+    onNavigate: (key: PageKey) => void
+): React.ReactNode => {
     switch (page) {
         case "azure-accounts":
             return <AzureAccountsPage />;
@@ -432,13 +470,49 @@ const DashboardContent: React.FC<{ tokenProvider?: TokenProvider }> = ({
     const store = useMultiRegionStore();
     const [healthCheck, setHealthCheck] =
         React.useState<HealthCheckResult | null>(null);
-    const [activePage, setActivePage] =
-        React.useState<PageKey>("azure-accounts");
+    const [activePage, setActivePage] = React.useState<PageKey>(() => {
+        // Restore last-viewed page from sessionStorage so a refresh preserves nav.
+        try {
+            const saved = sessionStorage.getItem(ACTIVE_PAGE_STORAGE_KEY);
+            if (saved && PAGE_ORDER.includes(saved as PageKey)) {
+                return saved as PageKey;
+            }
+        } catch {
+            /* sessionStorage may be disabled */
+        }
+        return "azure-accounts";
+    });
     const [sidebarCollapsed, setSidebarCollapsed] = React.useState(
         () => store.getUserPreferences().sidebarCollapsed
     );
     const [autoRefreshEnabled, setAutoRefreshEnabled] = React.useState(true);
+    const [refreshInFlight, setRefreshInFlight] = React.useState(false);
     const autoRefreshRunningRef = React.useRef(false);
+
+    // Persist activePage on change so refresh keeps the user on the same page.
+    React.useEffect(() => {
+        try {
+            sessionStorage.setItem(ACTIVE_PAGE_STORAGE_KEY, activePage);
+        } catch {
+            /* sessionStorage may be disabled */
+        }
+    }, [activePage]);
+
+    // Alt+1..9 → switch sidebar pages (matches PAGE_ORDER).
+    React.useEffect(() => {
+        const onKeyDown = (e: KeyboardEvent): void => {
+            if (!e.altKey || e.ctrlKey || e.metaKey || e.shiftKey) return;
+            const idx = parseInt(e.key, 10);
+            if (Number.isNaN(idx) || idx < 1 || idx > 9) return;
+            const target = PAGE_ORDER[idx - 1];
+            if (target) {
+                e.preventDefault();
+                setActivePage(target);
+            }
+        };
+        window.addEventListener("keydown", onKeyDown);
+        return () => window.removeEventListener("keydown", onKeyDown);
+    }, []);
     const [darkMode, setDarkMode] = React.useState(true);
     const [currentAuthMode, setCurrentAuthMode] = React.useState<
         "msal" | "cli"
@@ -586,6 +660,7 @@ const DashboardContent: React.FC<{ tokenProvider?: TokenProvider }> = ({
         if (!healthCheck?.healthy) return;
         let cancelled = false;
         (async () => {
+            setRefreshInFlight(true);
             try {
                 await orchestrator.execute({
                     action: "discover_accounts",
@@ -609,6 +684,8 @@ const DashboardContent: React.FC<{ tokenProvider?: TokenProvider }> = ({
                 }
             } catch {
                 /* logged by agents */
+            } finally {
+                if (!cancelled) setRefreshInFlight(false);
             }
         })();
         return () => {
@@ -625,6 +702,7 @@ const DashboardContent: React.FC<{ tokenProvider?: TokenProvider }> = ({
             if (store.getState().accounts.length === 0) return;
 
             autoRefreshRunningRef.current = true;
+            setRefreshInFlight(true);
             try {
                 // Sequential: pools then accounts to avoid burst
                 await orchestrator.execute({
@@ -646,6 +724,7 @@ const DashboardContent: React.FC<{ tokenProvider?: TokenProvider }> = ({
                 /* silent */
             } finally {
                 autoRefreshRunningRef.current = false;
+                setRefreshInFlight(false);
             }
         }, 60000);
 
@@ -663,6 +742,48 @@ const DashboardContent: React.FC<{ tokenProvider?: TokenProvider }> = ({
         <div
             style={{ display: "flex", flexDirection: "column", height: "100%" }}
         >
+            {/* Skip-to-content link for screen-reader/keyboard users — visible on focus */}
+            <a
+                href="#page-content"
+                style={{
+                    position: "absolute",
+                    left: -9999,
+                    top: 0,
+                    background: "#0078d4",
+                    color: "#fff",
+                    padding: "8px 16px",
+                    zIndex: 10000,
+                    textDecoration: "none",
+                    fontSize: 13,
+                }}
+                onFocus={(e) => {
+                    e.currentTarget.style.left = "8px";
+                    e.currentTarget.style.top = "8px";
+                }}
+                onBlur={(e) => {
+                    e.currentTarget.style.left = "-9999px";
+                }}
+            >
+                Skip to content
+            </a>
+            {/* Top loading bar — visible whenever an async refresh is in flight */}
+            <div
+                style={{ height: 2 }}
+                role="status"
+                aria-live="polite"
+                aria-label={
+                    refreshInFlight ? "Loading data" : "Idle"
+                }
+            >
+                {refreshInFlight && (
+                    <ProgressIndicator
+                        styles={{
+                            root: { margin: 0 },
+                            itemProgress: { padding: 0 },
+                        }}
+                    />
+                )}
+            </div>
             <SessionBar store={store} />
             <Stack
                 horizontal
@@ -730,7 +851,9 @@ const DashboardContent: React.FC<{ tokenProvider?: TokenProvider }> = ({
                     }}
                 >
                     {activePage !== "overview" && <GlobalFilterBar />}
-                    <div
+                    <main
+                        id="page-content"
+                        tabIndex={-1}
                         style={{
                             flex: 1,
                             overflow: "auto",
@@ -743,7 +866,7 @@ const DashboardContent: React.FC<{ tokenProvider?: TokenProvider }> = ({
                             store={store}
                             onNavigate={setActivePage}
                         />
-                    </div>
+                    </main>
                 </div>
             </div>
             <ActivityPanel />

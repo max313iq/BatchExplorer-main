@@ -16,55 +16,8 @@ import {
 import { useMultiRegionState } from "../../store/store-context";
 import { OrchestratorAgent } from "../../agents/orchestrator-agent";
 import { QuotaRequest, QuotaRequestStatus } from "../../store/store-types";
-
-/* ------------------------------------------------------------------ */
-/*  Skeleton                                                           */
-/* ------------------------------------------------------------------ */
-
-const SKELETON_KEYFRAMES = `
-@keyframes skeletonPulse {
-  0% { opacity: 0.6; }
-  50% { opacity: 1; }
-  100% { opacity: 0.6; }
-}`;
-
-const TableSkeleton: React.FC = () => (
-    <div
-        style={{
-            background: "#252525",
-            borderRadius: 8,
-            padding: 16,
-        }}
-        aria-hidden="true"
-    >
-        {Array.from({ length: 5 }).map((_, row) => (
-            <div
-                key={row}
-                style={{
-                    display: "flex",
-                    gap: 12,
-                    padding: "8px 0",
-                    borderBottom: "1px solid #2a2a2a",
-                }}
-            >
-                {[100, 100, 90, 80, 70, 90, 130, 130].map((w, i) => (
-                    <div
-                        key={i}
-                        style={{
-                            width: w,
-                            height: 10,
-                            background: "#333",
-                            borderRadius: 4,
-                            animation:
-                                "skeletonPulse 1.5s ease-in-out infinite",
-                            animationDelay: `${row * 0.1}s`,
-                        }}
-                    />
-                ))}
-            </div>
-        ))}
-    </div>
-);
+import { ErrorBoundary } from "../shared/error-boundary";
+import { SkeletonLoader } from "../shared/skeleton-loader";
 
 /* ------------------------------------------------------------------ */
 /*  Pagination                                                         */
@@ -295,7 +248,7 @@ const columns: IColumn[] = [
 /*  Main component                                                     */
 /* ------------------------------------------------------------------ */
 
-export const SupportTicketPage: React.FC<{
+const SupportTicketPageInner: React.FC<{
     orchestrator: OrchestratorAgent;
 }> = ({ orchestrator }) => {
     const state = useMultiRegionState();
@@ -351,9 +304,11 @@ export const SupportTicketPage: React.FC<{
     }, [orchestrator]);
 
     return (
-        <div style={{ padding: "16px 0" }}>
-            <style>{SKELETON_KEYFRAMES}</style>
-
+        <div
+            style={{ padding: "16px 0" }}
+            role="region"
+            aria-labelledby="support-ticket-heading"
+        >
             <Stack
                 horizontal
                 verticalAlign="center"
@@ -363,8 +318,11 @@ export const SupportTicketPage: React.FC<{
                 <Icon
                     iconName="Ticket"
                     styles={{ root: { fontSize: 20, color: "#0078d4" } }}
+                    aria-hidden="true"
                 />
                 <Text
+                    id="support-ticket-heading"
+                    as="h1"
                     variant="xLarge"
                     styles={{ root: { fontWeight: 600, color: "#eee" } }}
                 >
@@ -436,7 +394,19 @@ export const SupportTicketPage: React.FC<{
 
             {/* Skeleton when checking with empty data */}
             {checking && quotaRequests.length === 0 ? (
-                <TableSkeleton />
+                <div
+                    style={{
+                        background: "#252525",
+                        borderRadius: 8,
+                        padding: 16,
+                    }}
+                >
+                    <SkeletonLoader
+                        variant="table"
+                        rows={5}
+                        columns={8}
+                    />
+                </div>
             ) : quotaRequests.length === 0 ? (
                 <Stack
                     horizontalAlign="center"
@@ -449,6 +419,7 @@ export const SupportTicketPage: React.FC<{
                         },
                     }}
                     role="status"
+                    aria-labelledby="support-ticket-empty-heading"
                 >
                     <Icon
                         iconName="Ticket"
@@ -459,16 +430,27 @@ export const SupportTicketPage: React.FC<{
                                 display: "block",
                             },
                         }}
+                        aria-hidden="true"
                     />
                     <Text
+                        id="support-ticket-empty-heading"
+                        as="h2"
                         variant="large"
                         styles={{ root: { color: "#888", fontWeight: 600 } }}
                     >
                         No quota requests found
                     </Text>
                     <Text variant="medium" styles={{ root: { color: "#666" } }}>
-                        Submit quota increase requests from the Quotas page.
+                        Submit quota increase requests from the Quotas page to
+                        track them here.
                     </Text>
+                    <PrimaryButton
+                        text="Check for new tickets"
+                        iconProps={{ iconName: "Refresh" }}
+                        onClick={handleCheckStatus}
+                        disabled={checking}
+                        aria-label="Check for new support tickets"
+                    />
                 </Stack>
             ) : (
                 <>
@@ -523,3 +505,11 @@ export const SupportTicketPage: React.FC<{
         </div>
     );
 };
+
+export const SupportTicketPage: React.FC<{
+    orchestrator: OrchestratorAgent;
+}> = (props) => (
+    <ErrorBoundary>
+        <SupportTicketPageInner {...props} />
+    </ErrorBoundary>
+);

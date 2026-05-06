@@ -30,52 +30,9 @@ import { AccountInfo } from "../../store/store-types";
 import { getVCpus, getAllVmSizes, VmSizeInfo } from "../shared/vm-sizes";
 import { buildPoolConfigFromDefaults } from "../../store/pool-defaults";
 import type { PoolDefaults } from "../../store/pool-defaults";
-
-/* ---- Skeleton ---- */
-const SKELETON_KEYFRAMES = `
-@keyframes skeletonPulse {
-  0% { opacity: 0.6; }
-  50% { opacity: 1; }
-  100% { opacity: 0.6; }
-}`;
-
-const TableSkeletonUQ: React.FC = () => (
-    <div
-        style={{
-            background: "#1e1e1e",
-            borderRadius: 6,
-            padding: 16,
-        }}
-        aria-hidden="true"
-    >
-        {Array.from({ length: 5 }).map((_, row) => (
-            <div
-                key={row}
-                style={{
-                    display: "flex",
-                    gap: 12,
-                    padding: "8px 0",
-                    borderBottom: "1px solid #2a2a2a",
-                }}
-            >
-                {[120, 80, 80, 70, 70, 70, 60, 140, 70].map((w, i) => (
-                    <div
-                        key={i}
-                        style={{
-                            width: w,
-                            height: 10,
-                            background: "#333",
-                            borderRadius: 4,
-                            animation:
-                                "skeletonPulse 1.5s ease-in-out infinite",
-                            animationDelay: `${row * 0.1}s`,
-                        }}
-                    />
-                ))}
-            </div>
-        ))}
-    </div>
-);
+import { ErrorBoundary } from "../shared/error-boundary";
+import { SkeletonLoader } from "../shared/skeleton-loader";
+import { ConfirmationDialog } from "../shared/confirmation-dialog";
 
 /* ---- Pagination ---- */
 const PAGE_SIZE_OPTIONS_UQ: IDropdownOption[] = [
@@ -221,7 +178,7 @@ function getSuggestedVm(freeLpCores: number): VmSizeInfo | null {
     return gpuVms.length > 0 ? gpuVms[0] : null;
 }
 
-export const UnusedQuotaPage: React.FC<UnusedQuotaPageProps> = ({
+const UnusedQuotaPageInner: React.FC<UnusedQuotaPageProps> = ({
     orchestrator,
     onNavigate,
 }) => {
@@ -504,7 +461,12 @@ export const UnusedQuotaPage: React.FC<UnusedQuotaPageProps> = ({
         setShowAutoCreateDialog(true);
     };
 
+    const requestAutoCreateConfirm = () => {
+        setShowAutoCreateConfirm(true);
+    };
+
     const submitAutoCreate = async () => {
+        setShowAutoCreateConfirm(false);
         setAutoCreateSubmitting(true);
         try {
             const startTask = buildStartTaskConfig();
@@ -700,10 +662,11 @@ export const UnusedQuotaPage: React.FC<UnusedQuotaPageProps> = ({
         [sortKey, sortDescending]
     );
 
-    return (
-        <div style={{ padding: "16px 0" }}>
-            <style>{SKELETON_KEYFRAMES}</style>
+    const [showAutoCreateConfirm, setShowAutoCreateConfirm] =
+        React.useState(false);
 
+    return (
+        <div style={{ padding: "16px 0" }} role="region" aria-label="Unused Quota page">
             {/* Error state */}
             {error && (
                 <MessageBar
@@ -876,6 +839,9 @@ export const UnusedQuotaPage: React.FC<UnusedQuotaPageProps> = ({
                             <IconButton
                                 iconProps={{ iconName: "Delete" }}
                                 title="Remove"
+                                ariaLabel={`Remove environment variable ${
+                                    ev.name || idx + 1
+                                }`}
                                 onClick={() => removeEnvVar(idx)}
                                 styles={{
                                     root: { height: 32, width: 32 },
@@ -887,6 +853,7 @@ export const UnusedQuotaPage: React.FC<UnusedQuotaPageProps> = ({
                         text="Add Variable"
                         iconProps={{ iconName: "Add" }}
                         onClick={addEnvVar}
+                        aria-label="Add environment variable"
                         styles={{
                             root: {
                                 alignSelf: "flex-start",
@@ -934,7 +901,18 @@ export const UnusedQuotaPage: React.FC<UnusedQuotaPageProps> = ({
 
             {/* Table */}
             {loading && allRows.length === 0 ? (
-                <TableSkeletonUQ />
+                <div
+                    role="status"
+                    aria-live="polite"
+                    aria-label="Loading unused quota data"
+                    style={{
+                        background: "#1e1e1e",
+                        borderRadius: 6,
+                        padding: 16,
+                    }}
+                >
+                    <SkeletonLoader variant="table" rows={5} columns={9} />
+                </div>
             ) : allRows.length === 0 ? (
                 <Stack
                     horizontalAlign="center"
@@ -947,21 +925,31 @@ export const UnusedQuotaPage: React.FC<UnusedQuotaPageProps> = ({
                         },
                     }}
                     role="status"
+                    aria-label="No unused quota data available"
                 >
                     <Icon
                         iconName="Savings"
                         styles={{ root: { fontSize: 40, color: "#555" } }}
+                        aria-hidden="true"
                     />
                     <Text
                         variant="large"
+                        as="h2"
                         styles={{ root: { color: "#888", fontWeight: 600 } }}
                     >
                         No account info found
                     </Text>
                     <Text styles={{ root: { color: "#666", fontSize: 13 } }}>
-                        Click &quot;Refresh&quot; to load account data and see
-                        unused quota.
+                        Refresh to load account data and surface unused quota
+                        across your regions.
                     </Text>
+                    <PrimaryButton
+                        text="Refresh"
+                        iconProps={{ iconName: "Refresh" }}
+                        onClick={handleRefresh}
+                        disabled={loading}
+                        aria-label="Refresh unused quota data"
+                    />
                 </Stack>
             ) : (
                 <div
@@ -1205,18 +1193,40 @@ export const UnusedQuotaPage: React.FC<UnusedQuotaPageProps> = ({
                                 ? "Creating..."
                                 : "Create Pools"
                         }
-                        onClick={submitAutoCreate}
+                        onClick={requestAutoCreateConfirm}
                         disabled={autoCreateSubmitting}
+                        aria-label="Confirm and create pools"
                     />
                     <DefaultButton
                         text="Cancel"
                         onClick={() => setShowAutoCreateDialog(false)}
+                        aria-label="Cancel auto-create pools"
                     />
                 </DialogFooter>
             </Dialog>
+
+            <ConfirmationDialog
+                hidden={!showAutoCreateConfirm}
+                title="Create pools across selected accounts?"
+                message={`This will spawn ${
+                    selectedRows.filter((r) => r.maxNodes > 0).length
+                } pool creation request(s) and consume capacity. This action cannot be undone automatically.`}
+                confirmText="Create pools"
+                cancelText="Cancel"
+                danger
+                loading={autoCreateSubmitting}
+                onConfirm={submitAutoCreate}
+                onCancel={() => setShowAutoCreateConfirm(false)}
+            />
         </div>
     );
 };
+
+export const UnusedQuotaPage: React.FC<UnusedQuotaPageProps> = (props) => (
+    <ErrorBoundary>
+        <UnusedQuotaPageInner {...props} />
+    </ErrorBoundary>
+);
 
 const SummaryStatItem: React.FC<{
     icon: string;

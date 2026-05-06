@@ -14,105 +14,145 @@ import { OrchestratorAgent } from "../../agents/orchestrator-agent";
 import { MultiRegionStore } from "../../store/multi-region-store";
 import { PageKey } from "../shared/sidebar-nav";
 import { StatusBadge } from "../shared/status-badge";
+import { ErrorBoundary } from "../shared/error-boundary";
+import { SkeletonLoader } from "../shared/skeleton-loader";
 
 interface StatCardProps {
+    id: string;
     icon: string;
     title: string;
     color: string;
     items: Array<{ label: string; value: number; color?: string }>;
     onClick?: () => void;
+    error?: string | null;
+    onRetry?: () => void;
+    trend?: { direction: "up" | "down" | "flat"; pct: number; period: string };
 }
 
-const SkeletonCard: React.FC = () => (
-    <div
-        style={{
-            background: "#252525",
-            borderRadius: 8,
-            padding: 20,
-            flex: "1 1 200px",
-            minWidth: 200,
-            borderTop: "3px solid #444",
-        }}
-        aria-busy="true"
-        aria-label="Loading stat card"
-    >
-        <Stack horizontal verticalAlign="center" tokens={{ childrenGap: 10 }}>
-            <div
-                style={{
-                    width: 20,
-                    height: 20,
-                    borderRadius: 4,
-                    background: "#333",
-                    animation: "pulse 1.5s ease-in-out infinite",
-                }}
-            />
-            <div
-                style={{
-                    width: 80,
-                    height: 16,
-                    borderRadius: 4,
-                    background: "#333",
-                    animation: "pulse 1.5s ease-in-out infinite",
-                }}
-            />
-            <div
-                style={{
-                    marginLeft: "auto",
-                    width: 40,
-                    height: 28,
-                    borderRadius: 4,
-                    background: "#333",
-                    animation: "pulse 1.5s ease-in-out infinite",
-                }}
-            />
-        </Stack>
-        <Stack
-            horizontal
-            tokens={{ childrenGap: 16 }}
-            styles={{ root: { marginTop: 12 } }}
-        >
-            {[1, 2, 3].map((n) => (
-                <div key={n}>
-                    <div
-                        style={{
-                            width: 50,
-                            height: 12,
-                            borderRadius: 3,
-                            background: "#333",
-                            marginBottom: 4,
-                            animation: "pulse 1.5s ease-in-out infinite",
-                        }}
-                    />
-                    <div
-                        style={{
-                            width: 30,
-                            height: 18,
-                            borderRadius: 3,
-                            background: "#333",
-                            animation: "pulse 1.5s ease-in-out infinite",
-                        }}
-                    />
-                </div>
-            ))}
-        </Stack>
-    </div>
-);
+let _focusStyleInjected = false;
+function injectFocusStyle(): void {
+    if (_focusStyleInjected || typeof document === "undefined") return;
+    _focusStyleInjected = true;
+    const style = document.createElement("style");
+    style.textContent = `
+        .mr-stat-card:focus-visible {
+            outline: 2px solid #4fa3ff;
+            outline-offset: 2px;
+            transform: translateY(-1px);
+        }
+        .mr-stat-card[data-clickable="true"]:hover {
+            transform: translateY(-1px);
+        }
+    `;
+    document.head.appendChild(style);
+}
 
 const StatCard: React.FC<StatCardProps> = ({
+    id,
     icon,
     title,
     color,
     items,
     onClick,
+    error,
+    onRetry,
+    trend,
 }) => {
+    React.useEffect(injectFocusStyle, []);
+    const headingId = `${id}-heading`;
     const total =
         items.length > 0 && items[0].label === "Total"
             ? items[0].value
             : items.reduce((s, i) => s + i.value, 0);
+
+    const handleKeyDown = (e: React.KeyboardEvent) => {
+        if (!onClick) return;
+        if (e.key === "Enter" || e.key === " ") {
+            e.preventDefault();
+            onClick();
+        }
+    };
+
+    if (error) {
+        return (
+            <div
+                role="region"
+                aria-labelledby={headingId}
+                style={{
+                    background: "#252525",
+                    borderRadius: 8,
+                    padding: 20,
+                    flex: "1 1 200px",
+                    minWidth: 200,
+                    borderTop: `3px solid #d13438`,
+                }}
+            >
+                <Stack
+                    horizontal
+                    verticalAlign="center"
+                    tokens={{ childrenGap: 10 }}
+                >
+                    <Icon
+                        iconName="ErrorBadge"
+                        styles={{ root: { fontSize: 18, color: "#d13438" } }}
+                    />
+                    <Text
+                        id={headingId}
+                        variant="mediumPlus"
+                        styles={{ root: { fontWeight: 600, color: "#eee" } }}
+                    >
+                        {title}
+                    </Text>
+                </Stack>
+                <Text
+                    variant="small"
+                    styles={{
+                        root: {
+                            color: "#e06060",
+                            display: "block",
+                            margin: "8px 0",
+                        },
+                    }}
+                >
+                    {error}
+                </Text>
+                {onRetry && (
+                    <DefaultButton
+                        text="Retry"
+                        iconProps={{ iconName: "Refresh" }}
+                        onClick={onRetry}
+                        styles={{ root: { marginTop: 4 } }}
+                    />
+                )}
+            </div>
+        );
+    }
+
+    const trendArrow =
+        trend?.direction === "up"
+            ? "▲"
+            : trend?.direction === "down"
+              ? "▼"
+              : "—";
+    const trendColor =
+        trend?.direction === "up"
+            ? "#107c10"
+            : trend?.direction === "down"
+              ? "#d13438"
+              : "#888";
+    const trendSrText = trend
+        ? `${trend.direction === "up" ? "up" : trend.direction === "down" ? "down" : "unchanged"} ${trend.pct}% from ${trend.period}`
+        : "";
+
     return (
         <div
+            className="mr-stat-card"
+            role="region"
+            aria-labelledby={headingId}
+            data-clickable={onClick ? "true" : "false"}
             onClick={onClick}
-            aria-label={`${title}: ${total}`}
+            onKeyDown={handleKeyDown}
+            tabIndex={onClick ? 0 : undefined}
             style={{
                 background: "#252525",
                 borderRadius: 8,
@@ -134,6 +174,7 @@ const StatCard: React.FC<StatCardProps> = ({
                     styles={{ root: { fontSize: 20, color } }}
                 />
                 <Text
+                    id={headingId}
                     variant="mediumPlus"
                     styles={{ root: { fontWeight: 600, color: "#eee" } }}
                 >
@@ -141,6 +182,8 @@ const StatCard: React.FC<StatCardProps> = ({
                 </Text>
                 <Text
                     variant="xxLarge"
+                    aria-live="polite"
+                    aria-atomic="true"
                     styles={{
                         root: {
                             marginLeft: "auto",
@@ -152,6 +195,31 @@ const StatCard: React.FC<StatCardProps> = ({
                     {total}
                 </Text>
             </Stack>
+            {trend && (
+                <div
+                    style={{
+                        marginTop: 4,
+                        fontSize: 11,
+                        color: trendColor,
+                    }}
+                    aria-hidden="true"
+                >
+                    {trendArrow} {trend.pct}% vs {trend.period}
+                </div>
+            )}
+            {trend && (
+                <span
+                    style={{
+                        position: "absolute",
+                        width: 1,
+                        height: 1,
+                        overflow: "hidden",
+                        clip: "rect(0 0 0 0)",
+                    }}
+                >
+                    {trendSrText}
+                </span>
+            )}
             <Stack
                 horizontal
                 tokens={{ childrenGap: 16 }}
@@ -753,7 +821,15 @@ export interface OverviewPageProps {
     onNavigate: (key: PageKey) => void;
 }
 
-export const OverviewPage: React.FC<OverviewPageProps> = ({
+type CardErrorMap = {
+    accounts?: string | null;
+    quotas?: string | null;
+    pools?: string | null;
+    nodes?: string | null;
+    accountInfo?: string | null;
+};
+
+const OverviewPageInner: React.FC<OverviewPageProps> = ({
     orchestrator,
     store,
     onNavigate,
@@ -761,6 +837,7 @@ export const OverviewPage: React.FC<OverviewPageProps> = ({
     const stats = useDashboardStats();
     const state = useMultiRegionState();
     const [refreshing, setRefreshing] = React.useState(false);
+    const [cardErrors, setCardErrors] = React.useState<CardErrorMap>({});
 
     // Compute totals from poolInfos / accountInfos when available
     const dedicatedUsed = React.useMemo(
@@ -782,22 +859,60 @@ export const OverviewPage: React.FC<OverviewPageProps> = ({
         [state.accountInfos]
     );
 
+    const retryAction = React.useCallback(
+        async (
+            action: "refresh_account_info" | "refresh_pool_info",
+            keys: Array<keyof CardErrorMap>
+        ) => {
+            try {
+                await orchestrator.execute({ action, payload: {} });
+                setCardErrors((prev) => {
+                    const next = { ...prev };
+                    keys.forEach((k) => {
+                        next[k] = null;
+                    });
+                    return next;
+                });
+            } catch (e) {
+                const msg =
+                    e instanceof Error ? e.message : "Refresh failed";
+                setCardErrors((prev) => {
+                    const next = { ...prev };
+                    keys.forEach((k) => {
+                        next[k] = msg;
+                    });
+                    return next;
+                });
+            }
+        },
+        [orchestrator]
+    );
+
     const handleRefreshAll = React.useCallback(async () => {
         setRefreshing(true);
+        const nextErrors: CardErrorMap = {};
         try {
             await orchestrator.execute({
                 action: "refresh_pool_info",
                 payload: {},
             });
+        } catch (e) {
+            const msg = e instanceof Error ? e.message : "Pool refresh failed";
+            nextErrors.pools = msg;
+            nextErrors.nodes = msg;
+        }
+        try {
             await orchestrator.execute({
                 action: "refresh_account_info",
                 payload: {},
             });
-        } catch {
-            /* handled by orchestrator */
-        } finally {
-            setRefreshing(false);
+        } catch (e) {
+            const msg = e instanceof Error ? e.message : "Account refresh failed";
+            nextErrors.accounts = msg;
+            nextErrors.accountInfo = msg;
         }
+        setCardErrors(nextErrors);
+        setRefreshing(false);
     }, [orchestrator]);
 
     const isLoading = refreshing || state.accounts.length === 0;
@@ -873,153 +988,203 @@ export const OverviewPage: React.FC<OverviewPageProps> = ({
             )}
 
             {/* Stats Cards */}
-            <div
-                role="region"
-                aria-label="Dashboard statistics"
-                style={{
-                    display: "flex",
-                    gap: 16,
-                    flexWrap: "wrap",
-                    marginBottom: 16,
-                }}
-            >
-                {isLoading &&
-                    stats.totalAccounts === 0 &&
-                    stats.totalPools === 0 &&
-                    [1, 2, 3, 4].map((n) => <SkeletonCard key={n} />)}
-                <StatCard
-                    icon="ServerProcesses"
-                    title="Accounts"
-                    color="#0078d4"
-                    onClick={() => onNavigate("accounts")}
-                    items={[
-                        {
-                            label: "Total",
-                            value: stats.totalAccounts,
-                            color: "#0078d4",
-                        },
-                        {
-                            label: "Created",
-                            value: stats.createdAccounts,
-                            color: "#107c10",
-                        },
-                        {
-                            label: "Failed",
-                            value: stats.failedAccounts,
-                            color: "#d13438",
-                        },
-                    ]}
-                />
-                <StatCard
-                    icon="AllCurrency"
-                    title="Quotas"
-                    color="#8764b8"
-                    onClick={() => onNavigate("quotas")}
-                    items={[
-                        {
-                            label: "Pending",
-                            value: stats.pendingQuotas,
-                            color: "#c8a000",
-                        },
-                        {
-                            label: "Approved",
-                            value: stats.approvedQuotas,
-                            color: "#107c10",
-                        },
-                        {
-                            label: "Denied",
-                            value: stats.deniedQuotas,
-                            color: "#d13438",
-                        },
-                    ]}
-                />
-                <StatCard
-                    icon="BuildQueue"
-                    title="Pools"
-                    color="#00b7c3"
-                    onClick={() => onNavigate("pools")}
-                    items={[
-                        {
-                            label: "Total",
-                            value: stats.totalPools,
-                            color: "#00b7c3",
-                        },
-                        {
-                            label: "Created",
-                            value: stats.createdPools,
-                            color: "#107c10",
-                        },
-                        {
-                            label: "Failed",
-                            value: stats.failedPools,
-                            color: "#d13438",
-                        },
-                    ]}
-                />
-                <StatCard
-                    icon="Server"
-                    title="Nodes"
-                    color="#e3a400"
-                    onClick={() => onNavigate("nodes")}
-                    items={[
-                        {
-                            label: "Total",
-                            value: stats.totalNodes,
-                            color: "#e3a400",
-                        },
-                        {
-                            label: "Running",
-                            value: stats.runningNodes,
-                            color: "#107c10",
-                        },
-                        {
-                            label: "Issues",
-                            value: stats.nonWorkingNodes,
-                            color: "#d13438",
-                        },
-                    ]}
-                />
-                {state.accountInfos.length > 0 && (
-                    <>
-                        <StatCard
-                            icon="Server"
-                            title="Dedicated Cores"
-                            color="#00b7c3"
-                            onClick={() => onNavigate("account-info")}
-                            items={[
-                                {
-                                    label: "Used",
-                                    value: dedicatedUsed,
-                                    color: "#e3a400",
-                                },
-                                {
-                                    label: "Available",
-                                    value: dedicatedQuota,
-                                    color: "#107c10",
-                                },
-                            ]}
-                        />
-                        <StatCard
-                            icon="Server"
-                            title="Low Priority Cores"
-                            color="#8764b8"
-                            onClick={() => onNavigate("account-info")}
-                            items={[
-                                {
-                                    label: "Used",
-                                    value: lpUsed,
-                                    color: "#e3a400",
-                                },
-                                {
-                                    label: "Available",
-                                    value: lpQuota,
-                                    color: "#107c10",
-                                },
-                            ]}
-                        />
-                    </>
-                )}
-            </div>
+            {isLoading &&
+            stats.totalAccounts === 0 &&
+            stats.totalPools === 0 ? (
+                <div
+                    role="region"
+                    aria-label="Dashboard statistics"
+                    style={{ marginBottom: 16 }}
+                >
+                    <SkeletonLoader variant="stat-bar" />
+                </div>
+            ) : (
+                <div
+                    role="region"
+                    aria-label="Dashboard statistics"
+                    style={{
+                        display: "flex",
+                        gap: 16,
+                        flexWrap: "wrap",
+                        marginBottom: 16,
+                    }}
+                >
+                    <StatCard
+                        id="kpi-accounts"
+                        icon="ServerProcesses"
+                        title="Accounts"
+                        color="#0078d4"
+                        onClick={() => onNavigate("accounts")}
+                        error={cardErrors.accounts ?? null}
+                        onRetry={() =>
+                            retryAction("refresh_account_info", [
+                                "accounts",
+                                "accountInfo",
+                            ])
+                        }
+                        items={[
+                            {
+                                label: "Total",
+                                value: stats.totalAccounts,
+                                color: "#0078d4",
+                            },
+                            {
+                                label: "Created",
+                                value: stats.createdAccounts,
+                                color: "#107c10",
+                            },
+                            {
+                                label: "Failed",
+                                value: stats.failedAccounts,
+                                color: "#d13438",
+                            },
+                        ]}
+                    />
+                    <StatCard
+                        id="kpi-quotas"
+                        icon="AllCurrency"
+                        title="Quotas"
+                        color="#8764b8"
+                        onClick={() => onNavigate("quotas")}
+                        error={cardErrors.quotas ?? null}
+                        items={[
+                            {
+                                label: "Pending",
+                                value: stats.pendingQuotas,
+                                color: "#c8a000",
+                            },
+                            {
+                                label: "Approved",
+                                value: stats.approvedQuotas,
+                                color: "#107c10",
+                            },
+                            {
+                                label: "Denied",
+                                value: stats.deniedQuotas,
+                                color: "#d13438",
+                            },
+                        ]}
+                    />
+                    <StatCard
+                        id="kpi-pools"
+                        icon="BuildQueue"
+                        title="Pools"
+                        color="#00b7c3"
+                        onClick={() => onNavigate("pools")}
+                        error={cardErrors.pools ?? null}
+                        onRetry={() =>
+                            retryAction("refresh_pool_info", [
+                                "pools",
+                                "nodes",
+                            ])
+                        }
+                        items={[
+                            {
+                                label: "Total",
+                                value: stats.totalPools,
+                                color: "#00b7c3",
+                            },
+                            {
+                                label: "Created",
+                                value: stats.createdPools,
+                                color: "#107c10",
+                            },
+                            {
+                                label: "Failed",
+                                value: stats.failedPools,
+                                color: "#d13438",
+                            },
+                        ]}
+                    />
+                    <StatCard
+                        id="kpi-nodes"
+                        icon="Server"
+                        title="Nodes"
+                        color="#e3a400"
+                        onClick={() => onNavigate("nodes")}
+                        error={cardErrors.nodes ?? null}
+                        onRetry={() =>
+                            retryAction("refresh_pool_info", [
+                                "pools",
+                                "nodes",
+                            ])
+                        }
+                        items={[
+                            {
+                                label: "Total",
+                                value: stats.totalNodes,
+                                color: "#e3a400",
+                            },
+                            {
+                                label: "Running",
+                                value: stats.runningNodes,
+                                color: "#107c10",
+                            },
+                            {
+                                label: "Issues",
+                                value: stats.nonWorkingNodes,
+                                color: "#d13438",
+                            },
+                        ]}
+                    />
+                    {state.accountInfos.length > 0 && (
+                        <>
+                            <StatCard
+                                id="kpi-dedicated-cores"
+                                icon="Server"
+                                title="Dedicated Cores"
+                                color="#00b7c3"
+                                onClick={() => onNavigate("account-info")}
+                                error={cardErrors.accountInfo ?? null}
+                                onRetry={() =>
+                                    retryAction("refresh_account_info", [
+                                        "accounts",
+                                        "accountInfo",
+                                    ])
+                                }
+                                items={[
+                                    {
+                                        label: "Used",
+                                        value: dedicatedUsed,
+                                        color: "#e3a400",
+                                    },
+                                    {
+                                        label: "Available",
+                                        value: dedicatedQuota,
+                                        color: "#107c10",
+                                    },
+                                ]}
+                            />
+                            <StatCard
+                                id="kpi-lp-cores"
+                                icon="Server"
+                                title="Low Priority Cores"
+                                color="#8764b8"
+                                onClick={() => onNavigate("account-info")}
+                                error={cardErrors.accountInfo ?? null}
+                                onRetry={() =>
+                                    retryAction("refresh_account_info", [
+                                        "accounts",
+                                        "accountInfo",
+                                    ])
+                                }
+                                items={[
+                                    {
+                                        label: "Used",
+                                        value: lpUsed,
+                                        color: "#e3a400",
+                                    },
+                                    {
+                                        label: "Available",
+                                        value: lpQuota,
+                                        color: "#107c10",
+                                    },
+                                ]}
+                            />
+                        </>
+                    )}
+                </div>
+            )}
 
             {/* Unused Quota */}
             <div role="region" aria-label="Unused quota">
@@ -1064,3 +1229,9 @@ export const OverviewPage: React.FC<OverviewPageProps> = ({
         </div>
     );
 };
+
+export const OverviewPage: React.FC<OverviewPageProps> = (props) => (
+    <ErrorBoundary>
+        <OverviewPageInner {...props} />
+    </ErrorBoundary>
+);

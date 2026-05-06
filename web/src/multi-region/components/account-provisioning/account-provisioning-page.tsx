@@ -19,61 +19,61 @@ import {
     useMultiRegionStore,
 } from "../../store/store-context";
 import { StatusBadge } from "../shared/status-badge";
+import { ErrorBoundary } from "../shared/error-boundary";
+import { SkeletonLoader } from "../shared/skeleton-loader";
+import { ConfirmationDialog } from "../shared/confirmation-dialog";
 import { OrchestratorAgent } from "../../agents/orchestrator-agent";
 import {
     AZURE_REGIONS,
     DEFAULT_CONFIG,
     isValidSubscriptionId,
 } from "../shared/constants";
+import {
+    runPreflight,
+    preflightCanSubmit,
+    PreflightLevel,
+    PreflightResult,
+} from "../../shared/account-provisioning-preflight";
 
 const stackTokens: IStackTokens = { childrenGap: 12 };
-
-/* ---- Skeleton ---- */
-const SKELETON_KEYFRAMES = `
-@keyframes skeletonPulse {
-  0% { opacity: 0.6; }
-  50% { opacity: 1; }
-  100% { opacity: 0.6; }
-}`;
-
-const AccountTableSkeleton: React.FC = () => (
-    <div aria-hidden="true" style={{ marginTop: 8 }}>
-        {Array.from({ length: 4 }).map((_, row) => (
-            <div
-                key={row}
-                style={{
-                    display: "flex",
-                    gap: 12,
-                    padding: "8px 0",
-                    borderBottom: "1px solid #2a2a2a",
-                }}
-            >
-                {[120, 160, 200, 100, 200].map((w, i) => (
-                    <div
-                        key={i}
-                        style={{
-                            width: w,
-                            height: 10,
-                            background: "#333",
-                            borderRadius: 4,
-                            animation:
-                                "skeletonPulse 1.5s ease-in-out infinite",
-                            animationDelay: `${row * 0.1}s`,
-                        }}
-                    />
-                ))}
-            </div>
-        ))}
-    </div>
-);
 
 interface AccountProvisioningPageProps {
     orchestrator: OrchestratorAgent;
 }
 
-export const AccountProvisioningPage: React.FC<
-    AccountProvisioningPageProps
-> = ({ orchestrator }) => {
+/* ---- Preflight chip → MessageBar ---- */
+const LEVEL_TO_BAR: Record<PreflightLevel, MessageBarType> = {
+    ok: MessageBarType.success,
+    warn: MessageBarType.warning,
+    error: MessageBarType.severeWarning,
+    unknown: MessageBarType.info,
+};
+
+const PreflightChips: React.FC<{ checks: PreflightResult[] }> = ({
+    checks,
+}) => (
+    <Stack
+        tokens={{ childrenGap: 6 }}
+        role="status"
+        aria-live="polite"
+        aria-label="Pre-flight checks"
+    >
+        {checks.map((c) => (
+            <MessageBar
+                key={c.id}
+                messageBarType={LEVEL_TO_BAR[c.level]}
+                styles={{ root: { fontSize: 12 } }}
+                aria-label={`${c.label}: ${c.detail}`}
+            >
+                <b>{c.label}.</b> {c.detail}
+            </MessageBar>
+        ))}
+    </Stack>
+);
+
+const AccountProvisioningPageInner: React.FC<AccountProvisioningPageProps> = ({
+    orchestrator,
+}) => {
     const state = useMultiRegionState();
     const store = useMultiRegionStore();
     const [selectedRegions, setSelectedRegions] = React.useState<string[]>([]);
@@ -86,6 +86,7 @@ export const AccountProvisioningPage: React.FC<
     const [validationError, setValidationError] = React.useState<string | null>(
         null
     );
+    const [confirmHidden, setConfirmHidden] = React.useState(true);
 
     // Pre-fill from user preferences on mount
     React.useEffect(() => {
@@ -126,6 +127,30 @@ export const AccountProvisioningPage: React.FC<
         []
     );
 
+    // Pre-flight checks (recomputed on each relevant change)
+    const preflight = React.useMemo<PreflightResult[]>(
+        () =>
+            runPreflight({
+                subscriptionId,
+                selectedRegions,
+                accounts: state.accounts,
+                subscriptions: state.subscriptions,
+                azureAccounts: state.azureAccounts ?? [],
+                maxRegions: DEFAULT_CONFIG.maxRegionsPerRequest,
+            }),
+        [
+            subscriptionId,
+            selectedRegions,
+            state.accounts,
+            state.subscriptions,
+            state.azureAccounts,
+        ]
+    );
+    const canSubmit = React.useMemo(
+        () => preflightCanSubmit(preflight),
+        [preflight]
+    );
+
     const validateInputs = React.useCallback((): boolean => {
         if (!subscriptionId.trim()) {
             setValidationError("Subscription ID is required.");
@@ -149,8 +174,13 @@ export const AccountProvisioningPage: React.FC<
         return true;
     }, [subscriptionId, selectedRegions, state.subscriptions.length]);
 
-    const handleCreate = React.useCallback(async () => {
+    const requestCreate = React.useCallback(() => {
         if (!validateInputs()) return;
+        setConfirmHidden(false);
+    }, [validateInputs]);
+
+    const handleConfirmCreate = React.useCallback(async () => {
+        setConfirmHidden(true);
         setIsRunning(true);
         try {
             await orchestrator.execute({
@@ -163,7 +193,7 @@ export const AccountProvisioningPage: React.FC<
         } finally {
             setIsRunning(false);
         }
-    }, [orchestrator, subscriptionId, selectedRegions, validateInputs]);
+    }, [orchestrator, subscriptionId, selectedRegions]);
 
     const handleDiscover = React.useCallback(async () => {
         if (!subscriptionId.trim()) {
@@ -252,6 +282,43 @@ export const AccountProvisioningPage: React.FC<
     ).length;
     const totalCount = state.accounts.length;
 
+    // Confirmation dialog message body
+    const confirmMessage = (
+        <div style={{ fontSize: 13, lineHeight: 1.5 }}>
+            <p style={{ margin: "0 0 8px" }}>
+                You are about to create{" "}
+                <b>
+                    {selectedRegions.length} Batch account
+                    {selectedRegions.length === 1 ? "" : "s"}
+                </b>{" "}
+                across <b>{selectedRegions.length} region(s)</b>:
+            </p>
+            <div
+                style={{
+                    fontSize: 12,
+                    color: "#a0a0a0",
+                    margin: "0 0 12px",
+                    maxHeight: 80,
+                    overflowY: "auto",
+                }}
+            >
+                {selectedRegions.join(", ")}
+            </div>
+            <MessageBar
+                messageBarType={MessageBarType.warning}
+                styles={{ root: { marginBottom: 8 } }}
+            >
+                Each account incurs Azure storage and management overhead. Costs
+                scale with the number of pools and nodes you later attach.
+            </MessageBar>
+            <MessageBar messageBarType={MessageBarType.severeWarning}>
+                <b>This action is irreversible from this UI.</b> Account and
+                resource group cleanup must be performed manually in the Azure
+                portal or via CLI.
+            </MessageBar>
+        </div>
+    );
+
     // Subscription selector shared between tabs
     const subscriptionSelector = (
         <>
@@ -268,6 +335,7 @@ export const AccountProvisioningPage: React.FC<
                         o && handleSubscriptionChange(o.key as string)
                     }
                     styles={{ dropdown: { maxWidth: 450 } }}
+                    aria-label="Azure subscription"
                 />
             ) : (
                 <TextField
@@ -276,23 +344,24 @@ export const AccountProvisioningPage: React.FC<
                     onChange={(_e, v) => handleSubscriptionChange(v ?? "")}
                     placeholder="Enter Azure subscription ID (run 'az login' to auto-load)"
                     styles={{ root: { maxWidth: 450 } }}
+                    aria-label="Azure subscription ID"
                 />
             )}
         </>
     );
 
     return (
-        <div style={{ padding: "16px" }}>
-            <style>{SKELETON_KEYFRAMES}</style>
-            <h2 style={{ margin: "0 0 16px", fontSize: "20px" }}>
+        <div style={{ padding: "16px" }} role="region" aria-label="Account provisioning page">
+            <h1 style={{ margin: "0 0 16px", fontSize: "20px" }}>
                 Account Provisioning
-            </h2>
+            </h1>
 
             {validationError && (
                 <MessageBar
                     messageBarType={MessageBarType.error}
                     onDismiss={() => setValidationError(null)}
                     styles={{ root: { marginBottom: 12 } }}
+                    role="alert"
                 >
                     {validationError}
                 </MessageBar>
@@ -304,6 +373,16 @@ export const AccountProvisioningPage: React.FC<
             >
                 <PivotItem headerText="Create New" itemIcon="Add">
                     <div style={{ paddingTop: 12 }}>
+                        <h2
+                            style={{
+                                margin: "0 0 8px",
+                                fontSize: 14,
+                                fontWeight: 600,
+                                color: "#a0a0a0",
+                            }}
+                        >
+                            Configuration
+                        </h2>
                         <Stack tokens={stackTokens}>
                             {subscriptionSelector}
                             <Dropdown
@@ -325,6 +404,7 @@ export const AccountProvisioningPage: React.FC<
                                     handleRegionsChange(newRegions);
                                 }}
                                 styles={{ dropdown: { maxWidth: 450 } }}
+                                aria-label="Azure regions"
                             />
 
                             {selectedRegions.length >=
@@ -338,6 +418,18 @@ export const AccountProvisioningPage: React.FC<
                                 </MessageBar>
                             )}
 
+                            <h3
+                                style={{
+                                    margin: "8px 0 4px",
+                                    fontSize: 13,
+                                    fontWeight: 600,
+                                    color: "#a0a0a0",
+                                }}
+                            >
+                                Pre-flight checks
+                            </h3>
+                            <PreflightChips checks={preflight} />
+
                             <Stack horizontal tokens={{ childrenGap: 8 }}>
                                 <PrimaryButton
                                     text={
@@ -348,9 +440,10 @@ export const AccountProvisioningPage: React.FC<
                                     disabled={
                                         isRunning ||
                                         !subscriptionId.trim() ||
-                                        selectedRegions.length === 0
+                                        selectedRegions.length === 0 ||
+                                        !canSubmit
                                     }
-                                    onClick={handleCreate}
+                                    onClick={requestCreate}
                                     styles={{ root: { maxWidth: 250 } }}
                                     aria-label={`Create ${selectedRegions.length} Batch accounts`}
                                 />
@@ -364,6 +457,7 @@ export const AccountProvisioningPage: React.FC<
                                                 color: "#d13438",
                                             },
                                         }}
+                                        aria-label="Stop account creation"
                                     />
                                 )}
                                 {failedCount > 0 && !isRunning && (
@@ -371,6 +465,7 @@ export const AccountProvisioningPage: React.FC<
                                         text={`Retry Failed (${failedCount})`}
                                         onClick={handleRetryFailed}
                                         iconProps={{ iconName: "Refresh" }}
+                                        aria-label={`Retry ${failedCount} failed accounts`}
                                     />
                                 )}
                             </Stack>
@@ -386,6 +481,7 @@ export const AccountProvisioningPage: React.FC<
                                         : undefined
                                 }
                                 styles={{ root: { marginTop: 16 } }}
+                                ariaValueText={`${createdCount + failedCount} of ${totalCount > 0 ? totalCount : selectedRegions.length} accounts processed`}
                             />
                         )}
                     </div>
@@ -417,6 +513,7 @@ export const AccountProvisioningPage: React.FC<
                                     iconProps={{
                                         iconName: "Search",
                                     }}
+                                    aria-label="Discover existing Batch accounts"
                                 />
                             </Stack>
 
@@ -424,6 +521,7 @@ export const AccountProvisioningPage: React.FC<
                                 <MessageBar
                                     messageBarType={MessageBarType.error}
                                     onDismiss={() => setDiscoverError(null)}
+                                    role="alert"
                                 >
                                     {discoverError}
                                 </MessageBar>
@@ -444,11 +542,23 @@ export const AccountProvisioningPage: React.FC<
             </Pivot>
 
             {(isRunning || isDiscovering) && state.accounts.length === 0 && (
-                <AccountTableSkeleton />
+                <div style={{ marginTop: 8 }}>
+                    <SkeletonLoader variant="table" rows={4} columns={5} />
+                </div>
             )}
 
             {state.accounts.length > 0 && (
                 <div style={{ marginTop: 8 }}>
+                    <h2
+                        style={{
+                            margin: "0 0 8px",
+                            fontSize: 14,
+                            fontWeight: 600,
+                            color: "#a0a0a0",
+                        }}
+                    >
+                        Provisioned accounts
+                    </h2>
                     <div
                         style={{
                             fontSize: "13px",
@@ -457,6 +567,7 @@ export const AccountProvisioningPage: React.FC<
                         }}
                         role="status"
                         aria-live="polite"
+                        aria-atomic="true"
                     >
                         {totalCount} accounts ({createdCount} ready,{" "}
                         {failedCount} failed)
@@ -467,6 +578,7 @@ export const AccountProvisioningPage: React.FC<
                         layoutMode={DetailsListLayoutMode.justified}
                         selectionMode={SelectionMode.none}
                         compact
+                        ariaLabelForGrid="Provisioned Batch accounts"
                     />
                 </div>
             )}
@@ -490,6 +602,7 @@ export const AccountProvisioningPage: React.FC<
                         styles={{
                             root: { fontSize: 40, color: "#555" },
                         }}
+                        aria-hidden="true"
                     />
                     <Text
                         variant="large"
@@ -509,6 +622,26 @@ export const AccountProvisioningPage: React.FC<
                     </Text>
                 </Stack>
             )}
+
+            <ConfirmationDialog
+                hidden={confirmHidden}
+                title="Create Batch accounts?"
+                message={confirmMessage}
+                confirmText={`Create ${selectedRegions.length} accounts`}
+                cancelText="Cancel"
+                danger
+                onConfirm={handleConfirmCreate}
+                onCancel={() => setConfirmHidden(true)}
+                loading={isRunning}
+            />
         </div>
     );
 };
+
+export const AccountProvisioningPage: React.FC<
+    AccountProvisioningPageProps
+> = (props) => (
+    <ErrorBoundary>
+        <AccountProvisioningPageInner {...props} />
+    </ErrorBoundary>
+);

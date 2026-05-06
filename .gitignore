@@ -20,3 +20,8 @@ Localize/out/
 /util/bux/__tests__/loc-source/generated
 /web/src/generated/*
 TempTypeSpecFiles
+
+# Local agent tooling artifacts (orchestration scratch)
+.agent-briefs/
+.agent-dossier.md
+.agent-summaries/

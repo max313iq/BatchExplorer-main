@@ -8,19 +8,49 @@ import { Dropdown, IDropdownOption } from "@fluentui/react/lib/Dropdown";
 import { useMultiRegionState } from "../../store/store-context";
 import { OrchestratorAgent } from "../../agents/orchestrator-agent";
 import { AgentName, AgentStatus } from "../../store/store-types";
+import { ErrorBoundary } from "../shared/error-boundary";
+import { SkeletonLoader } from "../shared/skeleton-loader";
 
 /* ------------------------------------------------------------------ */
-/*  Skeleton                                                           */
+/*  Stale-data badge                                                   */
 /* ------------------------------------------------------------------ */
 
-const SKELETON_KEYFRAMES = `
-@keyframes skeletonPulse {
-  0% { opacity: 0.6; }
-  50% { opacity: 1; }
-  100% { opacity: 0.6; }
-}`;
-
-/* Skeleton bars kept minimal — monitoring page data is always local/reactive */
+const StaleBadge: React.FC<{ lastRefreshedAt: number; paused: boolean }> = ({
+    lastRefreshedAt,
+    paused,
+}) => {
+    const [now, setNow] = React.useState(Date.now());
+    React.useEffect(() => {
+        const t = setInterval(() => setNow(Date.now()), 1000);
+        return () => clearInterval(t);
+    }, []);
+    const ageSec = Math.max(0, Math.floor((now - lastRefreshedAt) / 1000));
+    const color =
+        ageSec >= 300 ? "#d13438" : ageSec >= 60 ? "#e3a400" : "#107c10";
+    const bg =
+        ageSec >= 300 ? "#3a0a0a" : ageSec >= 60 ? "#3a2a0a" : "#0a3a0a";
+    const label = paused
+        ? `Paused (last refresh ${ageSec}s ago)`
+        : `Last refreshed ${ageSec}s ago`;
+    return (
+        <span
+            role="status"
+            aria-live="polite"
+            aria-label={label}
+            style={{
+                padding: "2px 10px",
+                borderRadius: 10,
+                fontSize: 11,
+                fontWeight: 600,
+                color,
+                background: bg,
+                border: `1px solid ${color}`,
+            }}
+        >
+            {label}
+        </span>
+    );
+};
 
 /* ------------------------------------------------------------------ */
 /*  Pagination                                                         */
@@ -186,11 +216,16 @@ const sectionStyle: React.CSSProperties = {
 /*  Main component                                                     */
 /* ------------------------------------------------------------------ */
 
-export const MonitoringPage: React.FC<{ orchestrator: OrchestratorAgent }> = ({
-    orchestrator,
+const MonitoringPageInner: React.FC<{ orchestrator: OrchestratorAgent }> = ({
+    orchestrator: _orchestrator,
 }) => {
     const state = useMultiRegionState();
     const [autoRefresh, setAutoRefresh] = React.useState(false);
+    const [, setTick] = React.useState(0);
+    const [paused, setPaused] = React.useState(
+        typeof document !== "undefined" && document.visibilityState === "hidden"
+    );
+    const [lastRefreshedAt, setLastRefreshedAt] = React.useState(Date.now());
 
     // Pagination state for activities
     const [actPage, setActPage] = React.useState(1);
@@ -200,14 +235,35 @@ export const MonitoringPage: React.FC<{ orchestrator: OrchestratorAgent }> = ({
     const [logPage, setLogPage] = React.useState(1);
     const [logPageSize, setLogPageSize] = React.useState(25);
 
-    // Auto-refresh every 30s
+    // Pause/resume auto-refresh on tab visibility change
     React.useEffect(() => {
-        if (!autoRefresh) return;
+        const onVis = () => {
+            const hidden = document.visibilityState === "hidden";
+            setPaused(hidden);
+            if (!hidden) {
+                // Resume: trigger an immediate refresh tick
+                setLastRefreshedAt(Date.now());
+                setTick((t) => t + 1);
+            }
+        };
+        document.addEventListener("visibilitychange", onVis);
+        return () => document.removeEventListener("visibilitychange", onVis);
+    }, []);
+
+    // Auto-refresh every 30s; skipped while tab is hidden
+    React.useEffect(() => {
+        if (!autoRefresh || paused) return;
         const interval = setInterval(() => {
-            // Force a re-render by reading state (state is reactive via context)
+            setLastRefreshedAt(Date.now());
+            setTick((t) => t + 1);
         }, 30000);
         return () => clearInterval(interval);
-    }, [autoRefresh]);
+    }, [autoRefresh, paused]);
+
+    const handleManualRefresh = React.useCallback(() => {
+        setLastRefreshedAt(Date.now());
+        setTick((t) => t + 1);
+    }, []);
 
     const allActivities = React.useMemo(
         () => (state.activities ?? []).slice().reverse(),
@@ -241,9 +297,7 @@ export const MonitoringPage: React.FC<{ orchestrator: OrchestratorAgent }> = ({
     }, [allLogs, logPage, logPageSize]);
 
     return (
-        <div style={{ padding: "16px 0" }}>
-            <style>{SKELETON_KEYFRAMES}</style>
-
+        <div style={{ padding: "16px 0" }} aria-label="Monitoring page">
             <Stack
                 horizontal
                 verticalAlign="center"
@@ -260,15 +314,43 @@ export const MonitoringPage: React.FC<{ orchestrator: OrchestratorAgent }> = ({
                 >
                     Monitoring
                 </Text>
-                <div style={{ marginLeft: "auto" }}>
+                <StaleBadge
+                    lastRefreshedAt={lastRefreshedAt}
+                    paused={autoRefresh && paused}
+                />
+                <div
+                    style={{
+                        marginLeft: "auto",
+                        display: "flex",
+                        alignItems: "center",
+                        gap: 12,
+                    }}
+                >
+                    <DefaultButton
+                        iconProps={{ iconName: "Refresh" }}
+                        text="Refresh"
+                        onClick={handleManualRefresh}
+                        aria-label="Manually refresh monitoring data"
+                        styles={{ root: { fontSize: 11 } }}
+                    />
                     <Toggle
-                        label="Auto-refresh (30s)"
+                        label={
+                            autoRefresh && paused
+                                ? "Auto-refresh (paused)"
+                                : "Auto-refresh (30s)"
+                        }
                         inlineLabel
                         checked={autoRefresh}
                         onChange={(_e, checked) =>
                             setAutoRefresh(checked ?? false)
                         }
-                        aria-label="Toggle auto-refresh every 30 seconds"
+                        aria-label={
+                            autoRefresh
+                                ? paused
+                                    ? "Auto-refresh paused while tab is hidden"
+                                    : "Disable auto-refresh"
+                                : "Enable auto-refresh every 30 seconds"
+                        }
                         styles={{
                             root: { marginBottom: 0 },
                             label: { color: "#999", fontSize: 11 },
@@ -390,11 +472,15 @@ export const MonitoringPage: React.FC<{ orchestrator: OrchestratorAgent }> = ({
                     Recent Activity
                 </Text>
                 {allActivities.length === 0 ? (
-                    <EmptySection
-                        icon="BarChart4"
-                        title="No activity recorded"
-                        subtitle="Activities will appear here as operations are performed."
-                    />
+                    autoRefresh && !paused ? (
+                        <SkeletonLoader variant="list" rows={4} />
+                    ) : (
+                        <EmptySection
+                            icon="BarChart4"
+                            title="No activity recorded"
+                            subtitle="Activities will appear here as operations are performed."
+                        />
+                    )
                 ) : (
                     <>
                         <div
@@ -403,6 +489,10 @@ export const MonitoringPage: React.FC<{ orchestrator: OrchestratorAgent }> = ({
                                 flexDirection: "column",
                                 gap: 4,
                             }}
+                            role="log"
+                            aria-live="polite"
+                            aria-relevant="additions"
+                            aria-label="Recent activity stream"
                         >
                             {paginatedActivities.map((activity) => (
                                 <div
@@ -500,11 +590,15 @@ export const MonitoringPage: React.FC<{ orchestrator: OrchestratorAgent }> = ({
                     Agent Logs
                 </Text>
                 {allLogs.length === 0 ? (
-                    <EmptySection
-                        icon="TextDocument"
-                        title="No logs yet"
-                        subtitle="Agent log entries will appear here as agents execute actions."
-                    />
+                    autoRefresh && !paused ? (
+                        <SkeletonLoader variant="list" rows={4} />
+                    ) : (
+                        <EmptySection
+                            icon="TextDocument"
+                            title="No logs yet"
+                            subtitle="Agent log entries will appear here as agents execute actions."
+                        />
+                    )
                 ) : (
                     <>
                         <div
@@ -513,6 +607,10 @@ export const MonitoringPage: React.FC<{ orchestrator: OrchestratorAgent }> = ({
                                 flexDirection: "column",
                                 gap: 2,
                             }}
+                            role="log"
+                            aria-live="polite"
+                            aria-relevant="additions"
+                            aria-label="Agent log stream"
                         >
                             {paginatedLogs.map((log, i) => {
                                 const levelColor =
@@ -604,3 +702,11 @@ export const MonitoringPage: React.FC<{ orchestrator: OrchestratorAgent }> = ({
         </div>
     );
 };
+
+export const MonitoringPage: React.FC<{ orchestrator: OrchestratorAgent }> = (
+    props
+) => (
+    <ErrorBoundary>
+        <MonitoringPageInner {...props} />
+    </ErrorBoundary>
+);

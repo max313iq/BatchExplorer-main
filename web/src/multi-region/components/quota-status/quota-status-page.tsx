@@ -13,51 +13,66 @@ import { Stack, IStackTokens } from "@fluentui/react/lib/Stack";
 import { Text } from "@fluentui/react/lib/Text";
 import { Icon } from "@fluentui/react/lib/Icon";
 import { MessageBar, MessageBarType } from "@fluentui/react/lib/MessageBar";
+import { PrimaryButton } from "@fluentui/react/lib/Button";
 import { useMultiRegionState } from "../../store/store-context";
 import { StatusBadge } from "../shared/status-badge";
 import { OrchestratorAgent } from "../../agents/orchestrator-agent";
 import { QuotaRequest } from "../../store/store-types";
 import { DEFAULT_CONFIG } from "../shared/constants";
+import { ErrorBoundary } from "../shared/error-boundary";
+import { SkeletonLoader } from "../shared/skeleton-loader";
 
 const stackTokens: IStackTokens = { childrenGap: 12 };
 
-/* ---- Skeleton ---- */
-const SKELETON_KEYFRAMES = `
-@keyframes skeletonPulse {
-  0% { opacity: 0.6; }
-  50% { opacity: 1; }
-  100% { opacity: 0.6; }
-}`;
+const EMPTY_STATE_HEADING_ID = "quota-status-empty-heading";
 
-const TableSkeleton: React.FC = () => (
-    <div aria-hidden="true" style={{ padding: 16 }}>
-        {Array.from({ length: 4 }).map((_, row) => (
-            <div
-                key={row}
-                style={{
-                    display: "flex",
-                    gap: 12,
-                    padding: "8px 0",
-                    borderBottom: "1px solid #2a2a2a",
-                }}
-            >
-                {[140, 120, 100, 110, 100, 160, 160].map((w, i) => (
-                    <div
-                        key={i}
-                        style={{
-                            width: w,
-                            height: 10,
-                            background: "#333",
-                            borderRadius: 4,
-                            animation:
-                                "skeletonPulse 1.5s ease-in-out infinite",
-                            animationDelay: `${row * 0.1}s`,
-                        }}
-                    />
-                ))}
-            </div>
-        ))}
-    </div>
+/* ---- Empty State ---- */
+const EmptyState: React.FC<{
+    icon: string;
+    heading: string;
+    guidance: string;
+    ctaText: string;
+    onCta: () => void;
+    ctaDisabled?: boolean;
+    headingId?: string;
+}> = ({ icon, heading, guidance, ctaText, onCta, ctaDisabled, headingId }) => (
+    <Stack
+        horizontalAlign="center"
+        tokens={{ childrenGap: 12 }}
+        styles={{
+            root: {
+                padding: "48px 16px",
+                background: "#1e1e1e",
+                borderRadius: 6,
+                marginTop: 16,
+            },
+        }}
+        role="region"
+        aria-labelledby={headingId}
+    >
+        <Icon
+            iconName={icon}
+            styles={{ root: { fontSize: 40, color: "#555" } }}
+            aria-hidden="true"
+        />
+        <Text
+            id={headingId}
+            variant="large"
+            styles={{ root: { color: "#888", fontWeight: 600 } }}
+        >
+            {heading}
+        </Text>
+        <Text styles={{ root: { color: "#666", fontSize: 13 } }}>
+            {guidance}
+        </Text>
+        <PrimaryButton
+            text={ctaText}
+            onClick={onCta}
+            disabled={ctaDisabled}
+            iconProps={{ iconName: "Refresh" }}
+            aria-label={ctaText}
+        />
+    </Stack>
 );
 
 /* ---- Pagination ---- */
@@ -145,7 +160,7 @@ interface QuotaStatusPageProps {
     orchestrator: OrchestratorAgent;
 }
 
-export const QuotaStatusPage: React.FC<QuotaStatusPageProps> = ({
+const QuotaStatusPageInner: React.FC<QuotaStatusPageProps> = ({
     orchestrator,
 }) => {
     const state = useMultiRegionState();
@@ -346,7 +361,6 @@ export const QuotaStatusPage: React.FC<QuotaStatusPageProps> = ({
 
     return (
         <div style={{ padding: "16px" }}>
-            <style>{SKELETON_KEYFRAMES}</style>
             <h2 style={{ margin: "0 0 16px", fontSize: "20px" }}>
                 Quota Status Dashboard
             </h2>
@@ -356,6 +370,7 @@ export const QuotaStatusPage: React.FC<QuotaStatusPageProps> = ({
                 <MessageBar
                     messageBarType={MessageBarType.error}
                     onDismiss={() => setError(null)}
+                    dismissButtonAriaLabel="Dismiss error message"
                     styles={{ root: { marginBottom: 12 } }}
                     actions={
                         <DefaultButton
@@ -369,20 +384,26 @@ export const QuotaStatusPage: React.FC<QuotaStatusPageProps> = ({
                 </MessageBar>
             )}
 
-            <Stack horizontal tokens={stackTokens} verticalAlign="end">
+            <Stack
+                horizontal
+                tokens={stackTokens}
+                verticalAlign="end"
+                role="toolbar"
+                aria-label="Quota status controls"
+            >
                 <DefaultButton
                     text={isRefreshing ? "Refreshing..." : "Refresh Now"}
                     disabled={isRefreshing}
                     onClick={handleRefresh}
                     iconProps={{ iconName: "Refresh" }}
-                    aria-label="Refresh quota status"
+                    aria-label="Refresh quota status now"
                 />
                 <Toggle
                     label="Auto-refresh"
                     checked={autoRefresh}
                     onChange={(_e, checked) => setAutoRefresh(!!checked)}
                     inlineLabel
-                    aria-label="Toggle auto-refresh"
+                    aria-label="Toggle automatic quota status refresh"
                 />
                 <Dropdown
                     label="Interval"
@@ -397,42 +418,29 @@ export const QuotaStatusPage: React.FC<QuotaStatusPageProps> = ({
                     }}
                     styles={{ dropdown: { width: 130 } }}
                     disabled={!autoRefresh}
-                    aria-label="Refresh interval"
+                    aria-label="Auto-refresh interval"
                 />
             </Stack>
 
             {/* Skeleton when loading with no data */}
             {isRefreshing && state.quotaRequests.length === 0 ? (
-                <TableSkeleton />
-            ) : state.quotaRequests.length === 0 ? (
-                <Stack
-                    horizontalAlign="center"
-                    tokens={{ childrenGap: 12 }}
-                    styles={{
-                        root: {
-                            padding: "48px 16px",
-                            background: "#1e1e1e",
-                            borderRadius: 6,
-                            marginTop: 16,
-                        },
-                    }}
-                    role="status"
+                <div
+                    style={{ marginTop: 16 }}
+                    aria-busy="true"
+                    aria-label="Loading quota requests"
                 >
-                    <Icon
-                        iconName="Clock"
-                        styles={{ root: { fontSize: 40, color: "#555" } }}
-                    />
-                    <Text
-                        variant="large"
-                        styles={{ root: { color: "#888", fontWeight: 600 } }}
-                    >
-                        No quota requests found
-                    </Text>
-                    <Text styles={{ root: { color: "#666", fontSize: 13 } }}>
-                        Submit quota increase requests first, then monitor their
-                        status here.
-                    </Text>
-                </Stack>
+                    <SkeletonLoader variant="table" rows={4} columns={7} />
+                </div>
+            ) : state.quotaRequests.length === 0 ? (
+                <EmptyState
+                    icon="Clock"
+                    heading="No quota requests found"
+                    guidance="Submit quota increase requests first, then monitor their status here."
+                    ctaText="Refresh"
+                    onCta={handleRefresh}
+                    ctaDisabled={isRefreshing}
+                    headingId={EMPTY_STATE_HEADING_ID}
+                />
             ) : (
                 <div style={{ marginTop: 16 }}>
                     <Pivot aria-label="Quota request status tabs">
@@ -463,3 +471,9 @@ export const QuotaStatusPage: React.FC<QuotaStatusPageProps> = ({
         </div>
     );
 };
+
+export const QuotaStatusPage: React.FC<QuotaStatusPageProps> = (props) => (
+    <ErrorBoundary>
+        <QuotaStatusPageInner {...props} />
+    </ErrorBoundary>
+);

@@ -21,47 +21,11 @@ import {
 import { StatusBadge } from "../shared/status-badge";
 import { OrchestratorAgent } from "../../agents/orchestrator-agent";
 import { DEFAULT_CONFIG } from "../shared/constants";
+import { ErrorBoundary } from "../shared/error-boundary";
+import { SkeletonLoader } from "../shared/skeleton-loader";
+import { ConfirmationDialog } from "../shared/confirmation-dialog";
 
 const stackTokens: IStackTokens = { childrenGap: 12 };
-
-/* ---- Skeleton ---- */
-const SKELETON_KEYFRAMES = `
-@keyframes skeletonPulse {
-  0% { opacity: 0.6; }
-  50% { opacity: 1; }
-  100% { opacity: 0.6; }
-}`;
-
-const TableSkeleton: React.FC = () => (
-    <div aria-hidden="true" style={{ marginTop: 16 }}>
-        {Array.from({ length: 4 }).map((_, row) => (
-            <div
-                key={row}
-                style={{
-                    display: "flex",
-                    gap: 12,
-                    padding: "8px 0",
-                    borderBottom: "1px solid #2a2a2a",
-                }}
-            >
-                {[140, 120, 200, 100, 160].map((w, i) => (
-                    <div
-                        key={i}
-                        style={{
-                            width: w,
-                            height: 10,
-                            background: "#333",
-                            borderRadius: 4,
-                            animation:
-                                "skeletonPulse 1.5s ease-in-out infinite",
-                            animationDelay: `${row * 0.1}s`,
-                        }}
-                    />
-                ))}
-            </div>
-        ))}
-    </div>
-);
 
 /* ---- Pagination ---- */
 const PAGE_SIZE_OPTIONS: IDropdownOption[] = [
@@ -141,7 +105,7 @@ interface QuotaRequestsPageProps {
     orchestrator: OrchestratorAgent;
 }
 
-export const QuotaRequestsPage: React.FC<QuotaRequestsPageProps> = ({
+const QuotaRequestsPageInner: React.FC<QuotaRequestsPageProps> = ({
     orchestrator,
 }) => {
     const state = useMultiRegionState();
@@ -168,6 +132,7 @@ export const QuotaRequestsPage: React.FC<QuotaRequestsPageProps> = ({
     );
     const [reqPage, setReqPage] = React.useState(1);
     const [reqPageSize, setReqPageSize] = React.useState(25);
+    const [confirmHidden, setConfirmHidden] = React.useState(true);
 
     React.useEffect(() => {
         if (prefsLoaded.current) return;
@@ -269,8 +234,13 @@ export const QuotaRequestsPage: React.FC<QuotaRequestsPageProps> = ({
         return true;
     }, [selectedAccountIds.size, email, newLimit]);
 
-    const handleSubmit = React.useCallback(async () => {
+    const handleRequestSubmit = React.useCallback(() => {
         if (!validateInputs()) return;
+        setConfirmHidden(false);
+    }, [validateInputs]);
+
+    const handleConfirmSubmit = React.useCallback(async () => {
+        setConfirmHidden(true);
         setIsRunning(true);
         try {
             await orchestrator.execute({
@@ -300,7 +270,6 @@ export const QuotaRequestsPage: React.FC<QuotaRequestsPageProps> = ({
         email,
         supportPlanId,
         customToken,
-        validateInputs,
     ]);
 
     const accountColumns: IColumn[] = [
@@ -364,7 +333,14 @@ export const QuotaRequestsPage: React.FC<QuotaRequestsPageProps> = ({
             key: "status",
             name: "Status",
             minWidth: 100,
-            onRender: (item) => <StatusBadge status={item.status} />,
+            onRender: (item) => (
+                <span
+                    role="status"
+                    aria-label={`Quota request status: ${item.status}`}
+                >
+                    <StatusBadge status={item.status} />
+                </span>
+            ),
         },
         {
             key: "submittedAt",
@@ -387,9 +363,13 @@ export const QuotaRequestsPage: React.FC<QuotaRequestsPageProps> = ({
         return state.quotaRequests.slice(start, start + reqPageSize);
     }, [state.quotaRequests, reqPage, reqPageSize]);
 
+    const emptyRequestsButHasAccounts =
+        !isRunning &&
+        state.quotaRequests.length === 0 &&
+        createdAccounts.length > 0;
+
     return (
         <div style={{ padding: "16px" }}>
-            <style>{SKELETON_KEYFRAMES}</style>
             <h2 style={{ margin: "0 0 16px", fontSize: "20px" }}>
                 Quota Requests (Low Priority vCPU)
             </h2>
@@ -494,13 +474,15 @@ export const QuotaRequestsPage: React.FC<QuotaRequestsPageProps> = ({
                             selectedAccountIds.size === 0 ||
                             !email.trim()
                         }
-                        onClick={handleSubmit}
+                        onClick={handleRequestSubmit}
+                        ariaLabel={`Submit ${selectedAccountIds.size} quota request${selectedAccountIds.size === 1 ? "" : "s"}`}
                         styles={{ root: { maxWidth: 300 } }}
                     />
                     {isRunning && (
                         <DefaultButton
                             text="Stop"
                             onClick={() => orchestrator.cancel()}
+                            ariaLabel="Stop submitting quota requests"
                             styles={{
                                 root: {
                                     borderColor: "#d13438",
@@ -512,6 +494,21 @@ export const QuotaRequestsPage: React.FC<QuotaRequestsPageProps> = ({
                 </Stack>
             </Stack>
 
+            <ConfirmationDialog
+                hidden={confirmHidden}
+                title="Submit quota requests?"
+                message={`This will file ${selectedAccountIds.size} Azure Support ticket${
+                    selectedAccountIds.size === 1 ? "" : "s"
+                } requesting a new ${quotaType} vCPU limit of ${newLimit}. Tickets cannot be recalled once submitted.`}
+                confirmText={`Submit ${selectedAccountIds.size} ticket${
+                    selectedAccountIds.size === 1 ? "" : "s"
+                }`}
+                cancelText="Cancel"
+                onConfirm={handleConfirmSubmit}
+                onCancel={() => setConfirmHidden(true)}
+                loading={isRunning}
+            />
+
             {isRunning && (
                 <ProgressIndicator
                     label="Submitting quota requests..."
@@ -519,7 +516,52 @@ export const QuotaRequestsPage: React.FC<QuotaRequestsPageProps> = ({
                 />
             )}
 
-            {isRunning && state.quotaRequests.length === 0 && <TableSkeleton />}
+            {isRunning && state.quotaRequests.length === 0 && (
+                <div style={{ marginTop: 16 }}>
+                    <SkeletonLoader variant="table" rows={4} columns={5} />
+                </div>
+            )}
+
+            {emptyRequestsButHasAccounts && (
+                <Stack
+                    horizontalAlign="center"
+                    tokens={{ childrenGap: 12 }}
+                    styles={{
+                        root: {
+                            padding: "48px 16px",
+                            background: "#1e1e1e",
+                            borderRadius: 6,
+                            marginTop: 16,
+                        },
+                    }}
+                    role="status"
+                >
+                    <Icon
+                        iconName="Ticket"
+                        styles={{ root: { fontSize: 40, color: "#555" } }}
+                        aria-hidden="true"
+                    />
+                    <Text
+                        variant="large"
+                        styles={{ root: { color: "#bbb", fontWeight: 600 } }}
+                    >
+                        No quota requests submitted yet
+                    </Text>
+                    <Text
+                        styles={{ root: { color: "#888", fontSize: 13 } }}
+                    >
+                        Pick accounts above and file a new vCPU quota request.
+                    </Text>
+                    <PrimaryButton
+                        text="New request"
+                        ariaLabel="Start a new quota request"
+                        disabled={
+                            selectedAccountIds.size === 0 || !email.trim()
+                        }
+                        onClick={handleRequestSubmit}
+                    />
+                </Stack>
+            )}
 
             {state.quotaRequests.length > 0 && (
                 <div style={{ marginTop: 16 }}>
@@ -603,3 +645,9 @@ export const QuotaRequestsPage: React.FC<QuotaRequestsPageProps> = ({
         </div>
     );
 };
+
+export const QuotaRequestsPage: React.FC<QuotaRequestsPageProps> = (props) => (
+    <ErrorBoundary>
+        <QuotaRequestsPageInner {...props} />
+    </ErrorBoundary>
+);

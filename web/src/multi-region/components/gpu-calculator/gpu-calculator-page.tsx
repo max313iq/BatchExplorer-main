@@ -3,9 +3,12 @@ import { Stack } from "@fluentui/react/lib/Stack";
 import { Text } from "@fluentui/react/lib/Text";
 import { TextField } from "@fluentui/react/lib/TextField";
 import { Icon } from "@fluentui/react/lib/Icon";
+import { MessageBar, MessageBarType } from "@fluentui/react/lib/MessageBar";
 import { useMultiRegionState } from "../../store/store-context";
 import { PoolInfo } from "../../store/store-types";
 import { getVmSizeInfo, getAllVmSizes, VmSizeInfo } from "../shared/vm-sizes";
+import { ErrorBoundary } from "../shared/error-boundary";
+import { SkeletonLoader } from "../shared/skeleton-loader";
 
 // ---------------------------------------------------------------------------
 // Default GPU speeds (Mnos/s = mega-nodes per second, user's benchmark unit)
@@ -280,7 +283,11 @@ const RegionCard: React.FC<{
                         borderCollapse: "collapse",
                         fontSize: 13,
                     }}
+                    aria-label={`VM breakdown for ${summary.region}`}
                 >
+                    <caption className="sr-only" style={srOnlyStyle}>
+                        VM size breakdown for region {summary.region}
+                    </caption>
                     <thead>
                         <tr
                             style={{
@@ -292,6 +299,7 @@ const RegionCard: React.FC<{
                             }}
                         >
                             <th
+                                scope="col"
                                 style={{
                                     textAlign: "left",
                                     padding: "6px 8px",
@@ -300,6 +308,7 @@ const RegionCard: React.FC<{
                                 VM Size
                             </th>
                             <th
+                                scope="col"
                                 style={{
                                     textAlign: "center",
                                     padding: "6px 8px",
@@ -308,6 +317,7 @@ const RegionCard: React.FC<{
                                 GPU Type
                             </th>
                             <th
+                                scope="col"
                                 style={{
                                     textAlign: "right",
                                     padding: "6px 8px",
@@ -316,6 +326,7 @@ const RegionCard: React.FC<{
                                 Nodes
                             </th>
                             <th
+                                scope="col"
                                 style={{
                                     textAlign: "right",
                                     padding: "6px 8px",
@@ -324,6 +335,7 @@ const RegionCard: React.FC<{
                                 GPUs/Node
                             </th>
                             <th
+                                scope="col"
                                 style={{
                                     textAlign: "right",
                                     padding: "6px 8px",
@@ -332,6 +344,7 @@ const RegionCard: React.FC<{
                                 Total GPUs
                             </th>
                             <th
+                                scope="col"
                                 style={{
                                     textAlign: "right",
                                     padding: "6px 8px",
@@ -340,6 +353,7 @@ const RegionCard: React.FC<{
                                 Speed/GPU
                             </th>
                             <th
+                                scope="col"
                                 style={{
                                     textAlign: "right",
                                     padding: "6px 8px",
@@ -454,14 +468,40 @@ function formatSpeed(mnos: number): string {
     return `${mnos.toLocaleString()} Mnos/s`;
 }
 
+// Visually hidden but readable by screen readers (used for <caption>).
+const srOnlyStyle: React.CSSProperties = {
+    position: "absolute",
+    width: 1,
+    height: 1,
+    padding: 0,
+    margin: -1,
+    overflow: "hidden",
+    clip: "rect(0,0,0,0)",
+    whiteSpace: "nowrap",
+    border: 0,
+};
+
 function formatNumber(n: number): string {
     return n.toLocaleString();
 }
 
 // ---------------------------------------------------------------------------
+// Validation
+// ---------------------------------------------------------------------------
+// Reasonable upper bound for a per-GPU benchmark figure. Anything beyond this
+// is almost certainly a typo (e.g. extra zero) and would distort all totals.
+const MAX_REASONABLE_SPEED = 100000;
+
+interface SpeedValidation {
+    invalid: string[]; // gpu types with invalid input (NaN/negative)
+    extreme: string[]; // gpu types with absurdly large input
+    rawInputs: Map<string, string>; // last raw text per gpu type
+}
+
+// ---------------------------------------------------------------------------
 // Main page
 // ---------------------------------------------------------------------------
-export const GpuCalculatorPage: React.FC = () => {
+const GpuCalculatorPageInner: React.FC = () => {
     const state = useMultiRegionState();
 
     // Editable GPU speeds
@@ -473,9 +513,38 @@ export const GpuCalculatorPage: React.FC = () => {
         return m;
     });
 
+    // Track raw input + validation flags so we can warn BEFORE the value is
+    // committed to the speeds map (which drives the totals).
+    const [validation, setValidation] = React.useState<SpeedValidation>({
+        invalid: [],
+        extreme: [],
+        rawInputs: new Map(),
+    });
+
     const updateSpeed = (gpuType: string, value: string) => {
-        const num = parseFloat(value);
-        if (!isNaN(num) && num >= 0) {
+        const trimmed = (value ?? "").trim();
+        const num = parseFloat(trimmed);
+        const isInvalid = trimmed === "" || isNaN(num) || num < 0;
+        const isExtreme = !isInvalid && num > MAX_REASONABLE_SPEED;
+
+        setValidation((prev) => {
+            const nextInvalid = new Set(prev.invalid);
+            const nextExtreme = new Set(prev.extreme);
+            const nextRaw = new Map(prev.rawInputs);
+            nextRaw.set(gpuType, trimmed);
+            if (isInvalid) nextInvalid.add(gpuType);
+            else nextInvalid.delete(gpuType);
+            if (isExtreme) nextExtreme.add(gpuType);
+            else nextExtreme.delete(gpuType);
+            return {
+                invalid: Array.from(nextInvalid),
+                extreme: Array.from(nextExtreme),
+                rawInputs: nextRaw,
+            };
+        });
+
+        // Only commit a clean, non-extreme number to the live speeds map.
+        if (!isInvalid && !isExtreme) {
             setSpeeds((prev) => {
                 const next = new Map(prev);
                 next.set(gpuType, num);
@@ -483,6 +552,10 @@ export const GpuCalculatorPage: React.FC = () => {
             });
         }
     };
+
+    // Detect "still loading" — state.poolInfos is undefined until the store
+    // hydrates. After hydration it's an array (possibly empty).
+    const isLoading = state.poolInfos === undefined;
 
     // Calculate from live pool data
     const poolInfos = state.poolInfos ?? [];
@@ -521,6 +594,41 @@ export const GpuCalculatorPage: React.FC = () => {
     // All VM sizes for reference
     const allVms = getAllVmSizes();
 
+    if (isLoading) {
+        return (
+            <div style={{ padding: "16px 0" }} aria-busy="true">
+                <Stack
+                    horizontal
+                    verticalAlign="center"
+                    tokens={{ childrenGap: 12 }}
+                    styles={{ root: { marginBottom: 16 } }}
+                >
+                    <Icon
+                        iconName="Calculator"
+                        styles={{
+                            root: { fontSize: 24, color: "#8764b8" },
+                        }}
+                    />
+                    <Text
+                        variant="xLarge"
+                        styles={{
+                            root: { fontWeight: 600, color: "#eee" },
+                        }}
+                    >
+                        GPU Calculator
+                    </Text>
+                </Stack>
+                <div style={{ marginBottom: 16 }}>
+                    <SkeletonLoader variant="stat-bar" />
+                </div>
+                <div style={{ marginBottom: 16 }}>
+                    <SkeletonLoader variant="card" cards={3} />
+                </div>
+                <SkeletonLoader variant="table" rows={6} columns={7} />
+            </div>
+        );
+    }
+
     return (
         <div style={{ padding: "16px 0" }}>
             {/* Header */}
@@ -539,6 +647,7 @@ export const GpuCalculatorPage: React.FC = () => {
                 <div>
                     <Text
                         variant="xLarge"
+                        as="h1"
                         styles={{
                             root: { fontWeight: 600, color: "#eee" },
                         }}
@@ -560,6 +669,36 @@ export const GpuCalculatorPage: React.FC = () => {
                     </Text>
                 </div>
             </Stack>
+
+            {/* Inline validation warning (rendered before compute output so a
+                screen-reader user hears it before the totals announce). */}
+            {(validation.invalid.length > 0 ||
+                validation.extreme.length > 0) && (
+                <div style={{ marginBottom: 12 }}>
+                    <MessageBar
+                        messageBarType={MessageBarType.warning}
+                        isMultiline
+                        role="alert"
+                    >
+                        {validation.invalid.length > 0 && (
+                            <span>
+                                Enter a non-negative number for{" "}
+                                <b>{validation.invalid.join(", ")}</b> speed.
+                                The previous value is still being used.
+                            </span>
+                        )}
+                        {validation.extreme.length > 0 && (
+                            <span>
+                                {" "}
+                                Values above{" "}
+                                {MAX_REASONABLE_SPEED.toLocaleString()} Mnos/s
+                                for <b>{validation.extreme.join(", ")}</b> look
+                                unrealistic and were not applied.
+                            </span>
+                        )}
+                    </MessageBar>
+                </div>
+            )}
 
             {/* GPU Speed Settings */}
             <div
@@ -584,89 +723,124 @@ export const GpuCalculatorPage: React.FC = () => {
                     GPU Speed Settings (Mnos/s per GPU)
                 </Text>
                 <Stack horizontal tokens={{ childrenGap: 24 }} wrap>
-                    {DEFAULT_GPU_SPEEDS.map((gs) => (
-                        <Stack
-                            key={gs.gpuType}
-                            horizontal
-                            verticalAlign="center"
-                            tokens={{ childrenGap: 8 }}
-                        >
-                            <span
-                                style={{
-                                    background:
-                                        gs.gpuType === "H100"
-                                            ? "#2a1a0a"
-                                            : "#0a2a1a",
-                                    color:
-                                        gs.gpuType === "H100"
-                                            ? "#e3a400"
-                                            : "#107c10",
-                                    borderRadius: 4,
-                                    padding: "4px 10px",
-                                    fontSize: 13,
-                                    fontWeight: 700,
-                                    minWidth: 50,
-                                    textAlign: "center",
-                                }}
+                    {DEFAULT_GPU_SPEEDS.map((gs) => {
+                        const fieldId = `gpu-speed-${gs.gpuType}`;
+                        const raw = validation.rawInputs.get(gs.gpuType);
+                        const displayValue =
+                            raw !== undefined
+                                ? raw
+                                : String(
+                                      speeds.get(gs.gpuType) ?? gs.defaultSpeed
+                                  );
+                        const isFieldInvalid = validation.invalid.includes(
+                            gs.gpuType
+                        );
+                        const isFieldExtreme = validation.extreme.includes(
+                            gs.gpuType
+                        );
+                        const errorMsg = isFieldInvalid
+                            ? "Enter a non-negative number"
+                            : isFieldExtreme
+                              ? `Max ${MAX_REASONABLE_SPEED.toLocaleString()} Mnos/s`
+                              : undefined;
+                        return (
+                            <Stack
+                                key={gs.gpuType}
+                                horizontal
+                                verticalAlign="center"
+                                tokens={{ childrenGap: 8 }}
                             >
-                                {gs.gpuType}
-                            </span>
-                            <TextField
-                                value={String(
-                                    speeds.get(gs.gpuType) ?? gs.defaultSpeed
-                                )}
-                                onChange={(_e, val) =>
-                                    updateSpeed(gs.gpuType, val ?? "0")
-                                }
-                                type="number"
-                                styles={{
-                                    root: { width: 120 },
-                                    field: {
-                                        textAlign: "right",
-                                        fontWeight: 600,
-                                    },
-                                }}
-                                suffix="Mnos/s"
-                                aria-label={`${gs.gpuType} speed in Mnos/s`}
-                            />
-                        </Stack>
-                    ))}
+                                <label
+                                    htmlFor={fieldId}
+                                    style={{
+                                        background:
+                                            gs.gpuType === "H100"
+                                                ? "#2a1a0a"
+                                                : "#0a2a1a",
+                                        color:
+                                            gs.gpuType === "H100"
+                                                ? "#e3a400"
+                                                : "#107c10",
+                                        borderRadius: 4,
+                                        padding: "4px 10px",
+                                        fontSize: 13,
+                                        fontWeight: 700,
+                                        minWidth: 50,
+                                        textAlign: "center",
+                                        cursor: "pointer",
+                                    }}
+                                >
+                                    {gs.gpuType}
+                                </label>
+                                <TextField
+                                    id={fieldId}
+                                    value={displayValue}
+                                    onChange={(_e, val) =>
+                                        updateSpeed(gs.gpuType, val ?? "")
+                                    }
+                                    type="number"
+                                    min={0}
+                                    max={MAX_REASONABLE_SPEED}
+                                    step={1}
+                                    styles={{
+                                        root: { width: 140 },
+                                        field: {
+                                            textAlign: "right",
+                                            fontWeight: 600,
+                                        },
+                                    }}
+                                    suffix="Mnos/s"
+                                    aria-label={`${gs.gpuType} benchmark speed in Mnos per second per GPU`}
+                                    aria-invalid={
+                                        isFieldInvalid || isFieldExtreme
+                                    }
+                                    errorMessage={errorMsg}
+                                />
+                            </Stack>
+                        );
+                    })}
                 </Stack>
             </div>
 
-            {/* Summary Stats */}
-            <Stack
-                horizontal
-                tokens={{ childrenGap: 12 }}
-                wrap
-                styles={{ root: { marginBottom: 16 } }}
+            {/* Summary Stats — announced when totals change */}
+            <section
+                aria-label="GPU calculator totals"
+                aria-live="polite"
+                aria-atomic="true"
             >
-                <StatCard
-                    icon="Globe"
-                    label="Regions"
-                    value={String(regionCount)}
-                    color="#0078d4"
-                />
-                <StatCard
-                    icon="Server"
-                    label="Total Nodes"
-                    value={formatNumber(grandTotalNodes)}
-                    color="#00b7c3"
-                />
-                <StatCard
-                    icon="ProcessingRun"
-                    label="Total GPUs"
-                    value={formatNumber(grandTotalGpus)}
-                    color="#e3a400"
-                />
-                <StatCard
-                    icon="SpeedHigh"
-                    label="Total Speed"
-                    value={formatSpeed(grandTotalSpeed)}
-                    color="#8764b8"
-                    sub={`${grandTotalGpus} GPUs × avg ${grandTotalGpus > 0 ? Math.round(grandTotalSpeed / grandTotalGpus) : 0} Mnos/s`}
-                />
-            </Stack>
+                <Stack
+                    horizontal
+                    tokens={{ childrenGap: 12 }}
+                    wrap
+                    styles={{ root: { marginBottom: 16 } }}
+                >
+                    <StatCard
+                        icon="Globe"
+                        label="Regions"
+                        value={String(regionCount)}
+                        color="#0078d4"
+                    />
+                    <StatCard
+                        icon="Server"
+                        label="Total Nodes"
+                        value={formatNumber(grandTotalNodes)}
+                        color="#00b7c3"
+                    />
+                    <StatCard
+                        icon="ProcessingRun"
+                        label="Total GPUs"
+                        value={formatNumber(grandTotalGpus)}
+                        color="#e3a400"
+                    />
+                    <StatCard
+                        icon="SpeedHigh"
+                        label="Total Speed"
+                        value={formatSpeed(grandTotalSpeed)}
+                        color="#8764b8"
+                        sub={`${grandTotalGpus} GPUs × avg ${grandTotalGpus > 0 ? Math.round(grandTotalSpeed / grandTotalGpus) : 0} Mnos/s`}
+                    />
+                </Stack>
+            </section>
 
             {/* GPU Type Breakdown */}
             <Stack
@@ -768,7 +942,11 @@ export const GpuCalculatorPage: React.FC = () => {
                         borderCollapse: "collapse",
                         fontSize: 13,
                     }}
+                    aria-label="GPU VM size reference"
                 >
+                    <caption style={srOnlyStyle}>
+                        Reference table of GPU VM sizes and per-node speeds
+                    </caption>
                     <thead>
                         <tr
                             style={{
@@ -779,6 +957,7 @@ export const GpuCalculatorPage: React.FC = () => {
                             }}
                         >
                             <th
+                                scope="col"
                                 style={{
                                     textAlign: "left",
                                     padding: "6px 8px",
@@ -787,6 +966,7 @@ export const GpuCalculatorPage: React.FC = () => {
                                 VM Size
                             </th>
                             <th
+                                scope="col"
                                 style={{
                                     textAlign: "center",
                                     padding: "6px 8px",
@@ -795,6 +975,7 @@ export const GpuCalculatorPage: React.FC = () => {
                                 GPU
                             </th>
                             <th
+                                scope="col"
                                 style={{
                                     textAlign: "right",
                                     padding: "6px 8px",
@@ -803,6 +984,7 @@ export const GpuCalculatorPage: React.FC = () => {
                                 GPUs/Node
                             </th>
                             <th
+                                scope="col"
                                 style={{
                                     textAlign: "right",
                                     padding: "6px 8px",
@@ -811,6 +993,7 @@ export const GpuCalculatorPage: React.FC = () => {
                                 VRAM/GPU
                             </th>
                             <th
+                                scope="col"
                                 style={{
                                     textAlign: "right",
                                     padding: "6px 8px",
@@ -819,6 +1002,7 @@ export const GpuCalculatorPage: React.FC = () => {
                                 vCPUs
                             </th>
                             <th
+                                scope="col"
                                 style={{
                                     textAlign: "right",
                                     padding: "6px 8px",
@@ -827,6 +1011,7 @@ export const GpuCalculatorPage: React.FC = () => {
                                 RAM (GB)
                             </th>
                             <th
+                                scope="col"
                                 style={{
                                     textAlign: "right",
                                     padding: "6px 8px",
@@ -934,52 +1119,72 @@ export const GpuCalculatorPage: React.FC = () => {
                 </table>
             </div>
 
-            {/* Per-Region Cards */}
-            {regionSummaries.length === 0 ? (
-                <Stack
-                    horizontalAlign="center"
-                    tokens={{ childrenGap: 12 }}
-                    styles={{ root: { padding: 40 } }}
-                >
-                    <Icon
-                        iconName="Calculator"
-                        styles={{
-                            root: { fontSize: 48, color: "#555" },
-                        }}
-                    />
-                    <Text variant="large" styles={{ root: { color: "#888" } }}>
-                        No active GPU pools
-                    </Text>
-                    <Text variant="small" styles={{ root: { color: "#666" } }}>
-                        GPU calculations will appear once pools with nodes are
-                        discovered. Go to Pool Info and click Refresh.
-                    </Text>
-                </Stack>
-            ) : (
-                <>
-                    <Text
-                        variant="medium"
-                        styles={{
-                            root: {
-                                fontWeight: 600,
-                                color: "#ccc",
-                                marginBottom: 8,
-                                display: "block",
-                            },
-                        }}
+            {/* Per-Region Cards — announced on update */}
+            <section
+                aria-label="Per-region GPU breakdown"
+                aria-live="polite"
+            >
+                {regionSummaries.length === 0 ? (
+                    <Stack
+                        horizontalAlign="center"
+                        tokens={{ childrenGap: 12 }}
+                        styles={{ root: { padding: 40 } }}
                     >
-                        Per-Region Breakdown ({regionCount} region
-                        {regionCount !== 1 ? "s" : ""})
-                    </Text>
-                    {regionSummaries.map((summary) => (
-                        <RegionCard
-                            key={summary.region}
-                            summary={summary}
-                            grandTotalSpeed={grandTotalSpeed}
+                        <Icon
+                            iconName="Calculator"
+                            styles={{
+                                root: { fontSize: 48, color: "#555" },
+                            }}
                         />
-                    ))}
-                </>
-            )}
+                        <Text
+                            variant="large"
+                            styles={{ root: { color: "#888" } }}
+                        >
+                            No active GPU pools
+                        </Text>
+                        <Text
+                            variant="small"
+                            styles={{ root: { color: "#666" } }}
+                        >
+                            GPU calculations will appear once pools with nodes
+                            are discovered. Go to Pool Info and click Refresh.
+                        </Text>
+                    </Stack>
+                ) : (
+                    <>
+                        <Text
+                            variant="medium"
+                            as="h2"
+                            styles={{
+                                root: {
+                                    fontWeight: 600,
+                                    color: "#ccc",
+                                    marginBottom: 8,
+                                    display: "block",
+                                },
+                            }}
+                        >
+                            Per-Region Breakdown ({regionCount} region
+                            {regionCount !== 1 ? "s" : ""})
+                        </Text>
+                        {regionSummaries.map((summary) => (
+                            <RegionCard
+                                key={summary.region}
+                                summary={summary}
+                                grandTotalSpeed={grandTotalSpeed}
+                            />
+                        ))}
+                    </>
+                )}
+            </section>
         </div>
     );
 };
+
+// Public export — wraps the inner page in an ErrorBoundary so a crash in any
+// region card or VM table doesn't take down the whole dashboard.
+export const GpuCalculatorPage: React.FC = () => (
+    <ErrorBoundary>
+        <GpuCalculatorPageInner />
+    </ErrorBoundary>
+);

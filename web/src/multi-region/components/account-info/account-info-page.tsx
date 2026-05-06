@@ -17,81 +17,18 @@ import { MessageBar, MessageBarType } from "@fluentui/react/lib/MessageBar";
 import { useMultiRegionState } from "../../store/store-context";
 import { OrchestratorAgent } from "../../agents/orchestrator-agent";
 import { AccountInfo } from "../../store/store-types";
-
-/* ------------------------------------------------------------------ */
-/*  Skeleton                                                           */
-/* ------------------------------------------------------------------ */
-
-const SKELETON_KEYFRAMES = `
-@keyframes skeletonPulse {
-  0% { opacity: 0.6; }
-  50% { opacity: 1; }
-  100% { opacity: 0.6; }
-}`;
-
-const TableSkeleton: React.FC = () => (
-    <div
-        style={{
-            background: "#1e1e1e",
-            borderRadius: 6,
-            padding: 16,
-        }}
-        aria-label="Loading account data"
-        role="status"
-        aria-hidden="true"
-    >
-        {/* Header row */}
-        <div
-            style={{
-                display: "flex",
-                gap: 12,
-                marginBottom: 12,
-                borderBottom: "1px solid #333",
-                paddingBottom: 8,
-            }}
-        >
-            {[80, 120, 80, 70, 70, 70, 70, 70, 70, 70].map((w, i) => (
-                <div
-                    key={i}
-                    style={{
-                        width: w,
-                        height: 12,
-                        background: "#333",
-                        borderRadius: 4,
-                        animation: "skeletonPulse 1.5s ease-in-out infinite",
-                    }}
-                />
-            ))}
-        </div>
-        {/* Data rows */}
-        {Array.from({ length: 6 }).map((_, row) => (
-            <div
-                key={row}
-                style={{
-                    display: "flex",
-                    gap: 12,
-                    padding: "8px 0",
-                    borderBottom: "1px solid #2a2a2a",
-                }}
-            >
-                {[80, 120, 80, 70, 70, 70, 70, 70, 70, 70].map((w, i) => (
-                    <div
-                        key={i}
-                        style={{
-                            width: w,
-                            height: 10,
-                            background: "#333",
-                            borderRadius: 4,
-                            animation:
-                                "skeletonPulse 1.5s ease-in-out infinite",
-                            animationDelay: `${row * 0.1}s`,
-                        }}
-                    />
-                ))}
-            </div>
-        ))}
-    </div>
-);
+import { ErrorBoundary } from "../shared/error-boundary";
+import { SkeletonLoader } from "../shared/skeleton-loader";
+import {
+    safeNum,
+    usagePct,
+    lpUsageColor,
+    sortAccounts,
+    ariaSort,
+    summarizeAccountInfos,
+    SortConfig,
+} from "./account-info-helpers";
+import { AccountInfoSummaryBar } from "./account-info-summary";
 
 /* ------------------------------------------------------------------ */
 /*  Pagination                                                         */
@@ -184,26 +121,6 @@ export interface AccountInfoPageProps {
     orchestrator: OrchestratorAgent;
 }
 
-/** Safely read a numeric value, returning 0 for null/undefined/NaN */
-function safeNum(value: number | null | undefined): number {
-    if (value == null || isNaN(value)) return 0;
-    return value;
-}
-
-/** UsageBar color: green < 50%, orange 50-80%, red > 80% */
-function lpUsageColor(used: number, quota: number): string {
-    if (quota <= 0) return "#999";
-    const pct = (used / quota) * 100;
-    if (pct > 80) return "#d13438";
-    if (pct >= 50) return "#e3a400";
-    return "#107c10";
-}
-
-function usagePct(used: number, quota: number): number {
-    if (quota <= 0) return 0;
-    return Math.min(100, Math.round((used / quota) * 100));
-}
-
 const UsageBar: React.FC<{ used: number; quota: number }> = ({
     used,
     quota,
@@ -219,14 +136,15 @@ const UsageBar: React.FC<{ used: number; quota: number }> = ({
                 style={{
                     width: 80,
                     height: 4,
-                    background: "#333",
+                    background: "var(--bg-tertiary, #333)",
                     borderRadius: 2,
                 }}
                 role="progressbar"
                 aria-valuenow={pct}
                 aria-valuemin={0}
                 aria-valuemax={100}
-                aria-label={`Usage: ${used} of ${quota}`}
+                aria-label={`Usage: ${used} of ${quota} cores (${pct}%)`}
+                aria-valuetext={`${pct}%`}
             >
                 <div
                     style={{
@@ -242,104 +160,67 @@ const UsageBar: React.FC<{ used: number; quota: number }> = ({
     );
 };
 
-type SortDirection = "asc" | "desc";
-
-interface SortConfig {
-    key: string;
-    direction: SortDirection;
-}
-
-function getSortValue(item: AccountInfo, key: string): string | number {
-    switch (key) {
-        case "accountName":
-            return item.accountName ?? "";
-        case "region":
-            return item.region ?? "";
-        case "subscription":
-            return item.subscriptionId ?? "";
-        case "lpQuota":
-            return safeNum(item.lowPriorityCoreQuota);
-        case "lpUsed":
-            return safeNum(item.lowPriorityCoresUsed);
-        case "lpFree":
-            return safeNum(item.lowPriorityCoresFree);
-        case "dedicatedQuota":
-            return safeNum(item.dedicatedCoreQuota);
-        case "poolCount":
-            return safeNum(item.poolCount);
-        case "poolQuota":
-            return safeNum(item.poolQuota);
-        case "poolsFree":
-            return safeNum(item.poolsFree);
-        default:
-            return 0;
-    }
-}
-
-function sortAccounts(
-    accounts: AccountInfo[],
-    sortConfig: SortConfig | null
-): AccountInfo[] {
-    if (!sortConfig) return accounts;
-    const sorted = [...accounts].sort((a, b) => {
-        const aVal = getSortValue(a, sortConfig.key);
-        const bVal = getSortValue(b, sortConfig.key);
-        if (typeof aVal === "string" && typeof bVal === "string") {
-            const cmp = aVal.localeCompare(bVal);
-            return sortConfig.direction === "asc" ? cmp : -cmp;
-        }
-        const cmp = (aVal as number) - (bVal as number);
-        return sortConfig.direction === "asc" ? cmp : -cmp;
-    });
-    return sorted;
-}
-
-function ariaSort(
-    sortConfig: SortConfig | null,
-    key: string
-): "ascending" | "descending" | "none" {
-    if (!sortConfig || sortConfig.key !== key) return "none";
-    return sortConfig.direction === "asc" ? "ascending" : "descending";
-}
-
 /* ------------------------------------------------------------------ */
 /*  Empty state                                                        */
 /* ------------------------------------------------------------------ */
 
-const EmptyState: React.FC = () => (
+const EmptyState: React.FC<{ onRefresh: () => void; loading: boolean }> = ({
+    onRefresh,
+    loading,
+}) => (
     <Stack
         horizontalAlign="center"
         tokens={{ childrenGap: 12 }}
         styles={{
             root: {
                 padding: "48px 16px",
-                background: "#1e1e1e",
+                background: "var(--bg-secondary, #1e1e1e)",
                 borderRadius: 6,
+                border: "1px solid var(--border-subtle, #2b2b2b)",
             },
         }}
         role="status"
     >
         <Icon
             iconName="AccountManagement"
+            aria-hidden="true"
             styles={{ root: { fontSize: 40, color: "#555" } }}
         />
         <Text
+            as="h2"
             variant="large"
-            styles={{ root: { color: "#888", fontWeight: 600 } }}
+            styles={{
+                root: {
+                    color: "var(--text-muted, #888)",
+                    fontWeight: 600,
+                    margin: 0,
+                },
+            }}
         >
             No account info found
         </Text>
-        <Text styles={{ root: { color: "#666", fontSize: 13 } }}>
+        <Text
+            styles={{
+                root: { color: "var(--text-muted, #666)", fontSize: 13 },
+            }}
+        >
             Click &quot;Refresh&quot; to load account data from Azure.
         </Text>
+        <PrimaryButton
+            text="Refresh"
+            iconProps={{ iconName: "Refresh" }}
+            onClick={onRefresh}
+            disabled={loading}
+            aria-label="Refresh account info"
+        />
     </Stack>
 );
 
 /* ------------------------------------------------------------------ */
-/*  Main component                                                     */
+/*  Inner component                                                    */
 /* ------------------------------------------------------------------ */
 
-export const AccountInfoPage: React.FC<AccountInfoPageProps> = ({
+const AccountInfoPageInner: React.FC<AccountInfoPageProps> = ({
     orchestrator,
 }) => {
     const state = useMultiRegionState();
@@ -429,7 +310,6 @@ export const AccountInfoPage: React.FC<AccountInfoPageProps> = ({
         if (allSelected) {
             setSelectedIds(new Set());
         } else {
-            // Select ALL filtered/sorted accounts across ALL pages
             setSelectedIds(new Set(sortedAccounts.map((a) => a.id)));
         }
     }, [allSelected, sortedAccounts]);
@@ -446,24 +326,10 @@ export const AccountInfoPage: React.FC<AccountInfoPageProps> = ({
         });
     }, []);
 
-    // Summary stats with null-safe access
-    const totalAccounts = sortedAccounts.length;
-    const totalDedicatedQuota = sortedAccounts.reduce(
-        (s, a) => s + safeNum(a.dedicatedCoreQuota),
-        0
-    );
-    const totalLpUsed = sortedAccounts.reduce(
-        (s, a) => s + safeNum(a.lowPriorityCoresUsed),
-        0
-    );
-    const totalLpQuota = sortedAccounts.reduce(
-        (s, a) => s + safeNum(a.lowPriorityCoreQuota),
-        0
-    );
-    const totalLpFree = totalLpQuota - totalLpUsed;
-    const totalPools = sortedAccounts.reduce(
-        (s, a) => s + safeNum(a.poolCount),
-        0
+    // Aggregated summary via shared helper
+    const summary = React.useMemo(
+        () => summarizeAccountInfos(sortedAccounts),
+        [sortedAccounts]
     );
 
     const handleColumnClick = React.useCallback(
@@ -726,8 +592,6 @@ export const AccountInfoPage: React.FC<AccountInfoPageProps> = ({
 
     return (
         <div style={{ padding: "16px 0" }}>
-            <style>{SKELETON_KEYFRAMES}</style>
-
             <Stack
                 horizontal
                 verticalAlign="center"
@@ -735,9 +599,10 @@ export const AccountInfoPage: React.FC<AccountInfoPageProps> = ({
                 styles={{ root: { marginBottom: 16 } }}
             >
                 <Text
+                    as="h1"
                     variant="xLarge"
                     styles={{
-                        root: { fontWeight: 600, color: "#eee" },
+                        root: { fontWeight: 600, color: "#eee", margin: 0 },
                     }}
                 >
                     Account Info
@@ -800,59 +665,22 @@ export const AccountInfoPage: React.FC<AccountInfoPageProps> = ({
                 </MessageBar>
             )}
 
-            {/* Summary Stats */}
-            <Stack
-                horizontal
-                tokens={{ childrenGap: 24 }}
-                styles={{
-                    root: {
-                        padding: "12px 16px",
-                        background: "#1e1e1e",
-                        borderRadius: 6,
-                        marginBottom: 16,
-                    },
-                }}
-                role="status"
-                aria-live="polite"
-            >
-                <SummaryStatItem
-                    icon="AccountManagement"
-                    label="Total Accounts"
-                    value={totalAccounts}
-                    color="#0078d4"
-                />
-                <SummaryStatItem
-                    icon="Server"
-                    label="Total Dedicated Quota"
-                    value={totalDedicatedQuota}
-                    color="#00b7c3"
-                />
-                <SummaryStatItem
-                    icon="Server"
-                    label="LP Used / Total"
-                    value={totalLpUsed}
-                    suffix={` / ${totalLpQuota}`}
-                    color="#8764b8"
-                />
-                <SummaryStatItem
-                    icon="StatusCircleCheckmark"
-                    label="LP Free"
-                    value={totalLpFree}
-                    color="#107c10"
-                />
-                <SummaryStatItem
-                    icon="BuildQueue"
-                    label="Total Pools"
-                    value={totalPools}
-                    color="#e3a400"
-                />
-            </Stack>
+            {/* Summary Stats — shared bar driven by helper */}
+            <AccountInfoSummaryBar summary={summary} />
 
             {/* DetailsList or skeleton or empty */}
             {loading && accountInfos.length === 0 ? (
-                <TableSkeleton />
+                <div
+                    style={{
+                        background: "var(--bg-secondary, #1e1e1e)",
+                        borderRadius: 6,
+                        padding: 16,
+                    }}
+                >
+                    <SkeletonLoader variant="table" rows={6} columns={10} />
+                </div>
             ) : accountInfos.length === 0 ? (
-                <EmptyState />
+                <EmptyState onRefresh={refresh} loading={loading} />
             ) : (
                 <>
                     <div
@@ -868,6 +696,7 @@ export const AccountInfoPage: React.FC<AccountInfoPageProps> = ({
                             layoutMode={DetailsListLayoutMode.fixedColumns}
                             selectionMode={SelectionMode.none}
                             compact
+                            ariaLabelForGrid="Account info table"
                             styles={{
                                 root: { color: "#ccc" },
                                 headerWrapper: {
@@ -910,28 +739,12 @@ export const AccountInfoPage: React.FC<AccountInfoPageProps> = ({
     );
 };
 
-const SummaryStatItem: React.FC<{
-    icon: string;
-    label: string;
-    value: number;
-    color: string;
-    suffix?: string;
-}> = ({ icon, label, value, color, suffix }) => (
-    <Stack horizontal verticalAlign="center" tokens={{ childrenGap: 8 }}>
-        <Icon iconName={icon} styles={{ root: { color, fontSize: 16 } }} />
-        <div>
-            <Text
-                variant="tiny"
-                styles={{
-                    root: { color: "#888", display: "block", fontSize: 11 },
-                }}
-            >
-                {label}
-            </Text>
-            <Text variant="large" styles={{ root: { fontWeight: 700, color } }}>
-                {value ?? 0}
-                {suffix ?? ""}
-            </Text>
-        </div>
-    </Stack>
+/* ------------------------------------------------------------------ */
+/*  Exported wrapper with ErrorBoundary                                */
+/* ------------------------------------------------------------------ */
+
+export const AccountInfoPage: React.FC<AccountInfoPageProps> = (props) => (
+    <ErrorBoundary>
+        <AccountInfoPageInner {...props} />
+    </ErrorBoundary>
 );

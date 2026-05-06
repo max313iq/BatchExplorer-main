@@ -24,8 +24,26 @@ import { OrchestratorAgent } from "../../agents/orchestrator-agent";
 import { IconButton } from "@fluentui/react/lib/Button";
 import { buildPoolConfigFromDefaults } from "../../store/pool-defaults";
 import { getAllVmSizes } from "../shared/vm-sizes";
+import { ErrorBoundary } from "../shared/error-boundary";
+import { SkeletonLoader } from "../shared/skeleton-loader";
+import { ConfirmationDialog } from "../shared/confirmation-dialog";
 
 const stackTokens: IStackTokens = { childrenGap: 12 };
+
+// Azure Batch pool ID: 1-64 chars, alphanumeric, hyphen, underscore.
+const POOL_ID_PATTERN = /^[A-Za-z0-9_-]{1,64}$/;
+const POOL_ID_ERROR_ID = "pool-id-error";
+const POOL_JSON_ERROR_ID = "pool-json-error";
+
+function validatePoolId(id: unknown): string | null {
+    if (typeof id !== "string" || id.length === 0) {
+        return "Pool ID is required.";
+    }
+    if (!POOL_ID_PATTERN.test(id)) {
+        return "Pool ID must be 1-64 chars, alphanumeric/underscore/hyphen only.";
+    }
+    return null;
+}
 
 const DEFAULT_POOL_CONFIG = {
     id: "pool",
@@ -70,7 +88,7 @@ interface PoolCreationPageProps {
     orchestrator: OrchestratorAgent;
 }
 
-export const PoolCreationPage: React.FC<PoolCreationPageProps> = ({
+const PoolCreationPageInner: React.FC<PoolCreationPageProps> = ({
     orchestrator,
 }) => {
     const state = useMultiRegionState();
@@ -96,6 +114,11 @@ export const PoolCreationPage: React.FC<PoolCreationPageProps> = ({
     const [envVars, setEnvVars] = React.useState<EnvVar[]>([]);
     const [maxRetryCount, setMaxRetryCount] = React.useState(3);
     const [waitForSuccess, setWaitForSuccess] = React.useState(true);
+    const [poolIdInput, setPoolIdInput] = React.useState("pool");
+    const [poolIdError, setPoolIdError] = React.useState<string | null>(null);
+    const [confirmHidden, setConfirmHidden] = React.useState(true);
+    const poolIdFieldRef = React.useRef<{ focus(): void } | null>(null);
+    const jsonEditorContainerRef = React.useRef<HTMLDivElement | null>(null);
 
     // Load last pool config from preferences on mount
     React.useEffect(() => {
@@ -172,17 +195,64 @@ export const PoolCreationPage: React.FC<PoolCreationPageProps> = ({
             p.allocationState === "resizing" || p.allocationState === "stopping"
     );
 
+    // Validate inline before submit; focus first error on failure.
+    const validateBeforeSubmit = React.useCallback((): boolean => {
+        setConfigError(null);
+        setPoolIdError(null);
+
+        if (smartMode && resizingPools.length > 0) {
+            setConfigError(
+                `Cannot create pools while ${resizingPools.length} pool(s) are still resizing. Wait for them to finish or stop them first.`
+            );
+            return false;
+        }
+
+        if (smartMode) {
+            const idErr = validatePoolId(poolIdInput);
+            if (idErr) {
+                setPoolIdError(idErr);
+                // Move focus to the offending input.
+                requestAnimationFrame(() => {
+                    poolIdFieldRef.current?.focus();
+                });
+                return false;
+            }
+        } else {
+            // JSON mode: parse + validate the embedded pool id pattern up front.
+            let parsed: unknown;
+            try {
+                parsed = JSON.parse(poolConfigJson);
+            } catch (e) {
+                setConfigError(
+                    `Invalid JSON: ${(e as Error).message ?? "parse error"}`
+                );
+                requestAnimationFrame(() => {
+                    jsonEditorContainerRef.current?.focus();
+                });
+                return false;
+            }
+            const id = (parsed as { id?: unknown })?.id;
+            const idErr = validatePoolId(id);
+            if (idErr) {
+                setConfigError(`Pool config: ${idErr}`);
+                requestAnimationFrame(() => {
+                    jsonEditorContainerRef.current?.focus();
+                });
+                return false;
+            }
+        }
+        return true;
+    }, [smartMode, resizingPools.length, poolIdInput, poolConfigJson]);
+
+    const handleSubmit = React.useCallback(() => {
+        if (!validateBeforeSubmit()) return;
+        setConfirmHidden(false);
+    }, [validateBeforeSubmit]);
+
     const handleCreate = React.useCallback(async () => {
+        setConfirmHidden(true);
         try {
             setConfigError(null);
-
-            // In smart mode, block if any pool is currently resizing
-            if (smartMode && resizingPools.length > 0) {
-                setConfigError(
-                    `Cannot create pools while ${resizingPools.length} pool(s) are still resizing. Wait for them to finish or stop them first.`
-                );
-                return;
-            }
 
             setIsRunning(true);
 
@@ -199,7 +269,7 @@ export const PoolCreationPage: React.FC<PoolCreationPageProps> = ({
                 let poolConfig: Record<string, unknown>;
                 if (poolDefaults) {
                     poolConfig = buildPoolConfigFromDefaults(poolDefaults, {
-                        id: "pool",
+                        id: poolIdInput,
                         targetLowPriorityNodes: 0,
                         vmSize: allVmNames[0].toLowerCase(),
                     });
@@ -209,7 +279,7 @@ export const PoolCreationPage: React.FC<PoolCreationPageProps> = ({
                     poolConfig.enableAutoScale = false;
                 } else {
                     poolConfig = {
-                        id: "pool",
+                        id: poolIdInput,
                         vmSize: allVmNames[0].toLowerCase(),
                         virtualMachineConfiguration: {
                             nodeAgentSKUId: "batch.node.ubuntu 22.04",
@@ -285,6 +355,7 @@ export const PoolCreationPage: React.FC<PoolCreationPageProps> = ({
         waitForSuccess,
         resizingPools.length,
         poolDefaults,
+        poolIdInput,
     ]);
 
     const handleRetryFailedPools = React.useCallback(() => {
@@ -393,13 +464,54 @@ export const PoolCreationPage: React.FC<PoolCreationPageProps> = ({
         },
     ];
 
+    // Loading state: store hasn't been hydrated with any accounts yet.
+    const accountsLoading =
+        state.accounts.length === 0 && state.quotaRequests.length === 0;
+
+    // Pre-submit summary numbers for confirmation dialog.
+    const targetVmCount = smartMode ? getAllVmSizes().length : 1;
+    const totalPoolsPlanned = selectedAccountIds.size * targetVmCount;
+    const targetNodesPerPool = smartMode
+        ? "fill remaining LP quota"
+        : (() => {
+              try {
+                  const cfg = JSON.parse(poolConfigJson);
+                  return String(cfg.targetLowPriorityNodes ?? 0);
+              } catch {
+                  return "?";
+              }
+          })();
+
+    const confirmMessage = (
+        <div>
+            <p style={{ margin: "0 0 8px" }}>
+                Create <strong>{totalPoolsPlanned}</strong> pool(s) across{" "}
+                <strong>{selectedAccountIds.size}</strong> account(s)
+                {smartMode && (
+                    <>
+                        , trying up to <strong>{targetVmCount}</strong> VM
+                        size(s) per account in priority order
+                    </>
+                )}
+                .
+            </p>
+            <p style={{ margin: "0 0 8px" }}>
+                Target nodes per pool: <strong>{targetNodesPerPool}</strong>{" "}
+                (low-priority).
+            </p>
+            <p style={{ margin: 0, color: "var(--text-secondary, #888)" }}>
+                This action will create live Azure resources. Continue?
+            </p>
+        </div>
+    );
+
     return (
         <div style={{ padding: "16px" }}>
-            <h2 style={{ margin: "0 0 16px", fontSize: "20px" }}>
+            <h2 style={{ margin: "0 0 16px", fontSize: "20px" }} id="pool-creation-heading">
                 Pool Creation
             </h2>
 
-            <Stack tokens={stackTokens}>
+            <Stack tokens={stackTokens} role="region" aria-labelledby="pool-creation-heading">
                 <Checkbox
                     label={`Select all eligible accounts (${eligibleAccounts.length})`}
                     checked={selectAll}
@@ -407,15 +519,23 @@ export const PoolCreationPage: React.FC<PoolCreationPageProps> = ({
                     aria-label={`Select all ${eligibleAccounts.length} eligible accounts`}
                 />
 
-                {!selectAll && eligibleAccounts.length > 0 && (
-                    <DetailsList
-                        items={eligibleAccounts}
-                        columns={accountColumns}
-                        layoutMode={DetailsListLayoutMode.justified}
-                        selectionMode={SelectionMode.none}
-                        compact
-                    />
+                {accountsLoading && (
+                    <div aria-busy="true">
+                        <SkeletonLoader variant="table" rows={4} columns={4} />
+                    </div>
                 )}
+
+                {!accountsLoading &&
+                    !selectAll &&
+                    eligibleAccounts.length > 0 && (
+                        <DetailsList
+                            items={eligibleAccounts}
+                            columns={accountColumns}
+                            layoutMode={DetailsListLayoutMode.justified}
+                            selectionMode={SelectionMode.none}
+                            compact
+                        />
+                    )}
 
                 {/* Summary: selected account count */}
                 {selectedAccountIds.size > 0 && (
@@ -462,6 +582,38 @@ export const PoolCreationPage: React.FC<PoolCreationPageProps> = ({
                                 resizing. Pool creation is blocked until they
                                 finish.
                             </MessageBar>
+                        )}
+
+                        <TextField
+                            label="Pool ID"
+                            value={poolIdInput}
+                            onChange={(_e, v) => {
+                                setPoolIdInput(v ?? "");
+                                if (poolIdError) {
+                                    const next = validatePoolId(v ?? "");
+                                    setPoolIdError(next);
+                                }
+                            }}
+                            componentRef={(c) => {
+                                // Fluent ITextField has .focus(); cast loosely.
+                                poolIdFieldRef.current = (c as unknown as {
+                                    focus?: () => void;
+                                } | null)?.focus
+                                    ? (c as unknown as { focus(): void })
+                                    : null;
+                            }}
+                            errorMessage={poolIdError ?? undefined}
+                            aria-describedby={
+                                poolIdError ? POOL_ID_ERROR_ID : undefined
+                            }
+                            aria-invalid={poolIdError ? true : undefined}
+                            description="1-64 chars, alphanumeric, underscore, hyphen."
+                            styles={{ root: { maxWidth: 320 } }}
+                        />
+                        {poolIdError && (
+                            <span id={POOL_ID_ERROR_ID} style={{ display: "none" }}>
+                                {poolIdError}
+                            </span>
                         )}
 
                         <TextField
@@ -615,8 +767,16 @@ export const PoolCreationPage: React.FC<PoolCreationPageProps> = ({
                             nodes are used.
                         </MessageBar>
 
-                        <div>
+                        <div
+                            ref={jsonEditorContainerRef}
+                            tabIndex={-1}
+                            aria-describedby={
+                                configError ? POOL_JSON_ERROR_ID : undefined
+                            }
+                            aria-invalid={configError ? true : undefined}
+                        >
                             <label
+                                htmlFor="pool-json-editor"
                                 style={{
                                     fontWeight: 600,
                                     fontSize: "14px",
@@ -648,7 +808,11 @@ export const PoolCreationPage: React.FC<PoolCreationPageProps> = ({
                 )}
 
                 {configError && (
-                    <MessageBar messageBarType={MessageBarType.error}>
+                    <MessageBar
+                        id={POOL_JSON_ERROR_ID}
+                        messageBarType={MessageBarType.error}
+                        role="alert"
+                    >
                         {configError}
                     </MessageBar>
                 )}
@@ -669,7 +833,7 @@ export const PoolCreationPage: React.FC<PoolCreationPageProps> = ({
                             selectedAccountIds.size === 0 ||
                             (smartMode && resizingPools.length > 0)
                         }
-                        onClick={handleCreate}
+                        onClick={handleSubmit}
                         styles={{ root: { maxWidth: 300 } }}
                     />
                     {isRunning && (
@@ -703,6 +867,10 @@ export const PoolCreationPage: React.FC<PoolCreationPageProps> = ({
 
             {isRunning && (
                 <div
+                    role="status"
+                    aria-live="polite"
+                    aria-atomic="false"
+                    aria-label="Smart pool creation progress"
                     style={{
                         background: "#1a1a1a",
                         border: "1px solid #333",
@@ -763,6 +931,23 @@ export const PoolCreationPage: React.FC<PoolCreationPageProps> = ({
                     />
                 </div>
             )}
+
+            <ConfirmationDialog
+                hidden={confirmHidden}
+                title="Confirm Pool Creation"
+                message={confirmMessage}
+                confirmText={`Create ${totalPoolsPlanned} pool(s)`}
+                cancelText="Cancel"
+                onConfirm={handleCreate}
+                onCancel={() => setConfirmHidden(true)}
+                loading={isRunning}
+            />
         </div>
     );
 };
+
+export const PoolCreationPage: React.FC<PoolCreationPageProps> = (props) => (
+    <ErrorBoundary>
+        <PoolCreationPageInner {...props} />
+    </ErrorBoundary>
+);

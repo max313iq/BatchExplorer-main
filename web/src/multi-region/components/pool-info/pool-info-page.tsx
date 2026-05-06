@@ -24,15 +24,28 @@ import { Label } from "@fluentui/react/lib/Label";
 import { MessageBar, MessageBarType } from "@fluentui/react/lib/MessageBar";
 import { Dropdown, IDropdownOption } from "@fluentui/react/lib/Dropdown";
 import { Checkbox } from "@fluentui/react/lib/Checkbox";
-import { useMultiRegionState } from "../../store/store-context";
+import {
+    useMultiRegionState,
+    useMultiRegionStore,
+} from "../../store/store-context";
 import { OrchestratorAgent } from "../../agents/orchestrator-agent";
 import { PoolInfo } from "../../store/store-types";
 import { StatusBadge } from "../shared/status-badge";
 import { getVCpus } from "../shared/vm-sizes";
+import { ErrorBoundary } from "../shared/error-boundary";
+import { SkeletonLoader } from "../shared/skeleton-loader";
+import { ConfirmationDialog } from "../shared/confirmation-dialog";
+import { showToast } from "../shared/toast-container";
 
 export interface PoolInfoPageProps {
     orchestrator: OrchestratorAgent;
 }
+
+export const PoolInfoPage: React.FC<PoolInfoPageProps> = (props) => (
+    <ErrorBoundary>
+        <PoolInfoPageInner {...props} />
+    </ErrorBoundary>
+);
 
 interface EnvVar {
     name: string;
@@ -53,8 +66,9 @@ type SortKey =
     | "resizeErrors"
     | "created";
 
-export const PoolInfoPage: React.FC<PoolInfoPageProps> = ({ orchestrator }) => {
+const PoolInfoPageInner: React.FC<PoolInfoPageProps> = ({ orchestrator }) => {
     const state = useMultiRegionState();
+    const store = useMultiRegionStore();
     const [loading, setLoading] = React.useState(false);
     const [autoRefresh, setAutoRefresh] = React.useState(false);
     const intervalRef = React.useRef<ReturnType<typeof setInterval> | null>(
@@ -90,6 +104,7 @@ export const PoolInfoPage: React.FC<PoolInfoPageProps> = ({ orchestrator }) => {
 
     // Resize dialog state
     const [showResizeDialog, setShowResizeDialog] = React.useState(false);
+    const [showResizeConfirm, setShowResizeConfirm] = React.useState(false);
     const [resizeDedicated, setResizeDedicated] = React.useState(0);
     const [resizeLowPriority, setResizeLowPriority] = React.useState(0);
     const [resizeSubmitting, setResizeSubmitting] = React.useState(false);
@@ -359,7 +374,7 @@ export const PoolInfoPage: React.FC<PoolInfoPageProps> = ({ orchestrator }) => {
     const submitDeleteEmptyPools = async () => {
         setDeleteEmptySubmitting(true);
         try {
-            await Promise.allSettled(
+            const results = await Promise.allSettled(
                 emptyPools.map((pool) =>
                     orchestrator.execute({
                         action: "delete_pool",
@@ -370,9 +385,26 @@ export const PoolInfoPage: React.FC<PoolInfoPageProps> = ({ orchestrator }) => {
                     })
                 )
             );
+            const failed = results.filter(
+                (r) => r.status === "rejected"
+            ).length;
+            const ok = results.length - failed;
+            if (failed === 0) {
+                showToast(store, `Removed ${ok} empty pools`, "success");
+            } else {
+                showToast(
+                    store,
+                    `Removed ${ok}/${results.length} empty pools (${failed} failed)`,
+                    "warning"
+                );
+            }
             setShowDeleteEmptyDialog(false);
-        } catch {
-            /* handled by orchestrator */
+        } catch (err) {
+            showToast(
+                store,
+                `Failed to remove empty pools: ${err instanceof Error ? err.message : String(err)}`,
+                "error"
+            );
         } finally {
             setDeleteEmptySubmitting(false);
         }
@@ -404,6 +436,13 @@ export const PoolInfoPage: React.FC<PoolInfoPageProps> = ({ orchestrator }) => {
 
     const selectedAccountInfo = getAccountInfoForPool(selectedPool);
 
+    // Resize is blocked unless ALL selected pools are in "steady" allocation state
+    const nonSteadySelected = React.useMemo(
+        () => selectedPools.filter((p) => p.allocationState !== "steady"),
+        [selectedPools]
+    );
+    const resizeBlocked = nonSteadySelected.length > 0;
+
     // Resize dialog handlers
     const openResizeDialog = () => {
         if (!selectedPool) return;
@@ -427,10 +466,18 @@ export const PoolInfoPage: React.FC<PoolInfoPageProps> = ({ orchestrator }) => {
 
     const submitResize = async () => {
         if (selectedPools.length === 0) return;
+        // Defensive: never resize when not steady
+        if (selectedPools.some((p) => p.allocationState !== "steady")) {
+            showToast(
+                store,
+                "Resize requires steady allocation state",
+                "warning"
+            );
+            return;
+        }
         setResizeSubmitting(true);
         try {
-            // Apply resize to ALL selected pools, not just the first one
-            await Promise.allSettled(
+            const results = await Promise.allSettled(
                 selectedPools.map((pool) =>
                     orchestrator.execute({
                         action: "resize_pool",
@@ -443,9 +490,31 @@ export const PoolInfoPage: React.FC<PoolInfoPageProps> = ({ orchestrator }) => {
                     })
                 )
             );
+            const failed = results.filter(
+                (r) => r.status === "rejected"
+            ).length;
+            const ok = results.length - failed;
+            if (failed === 0) {
+                showToast(
+                    store,
+                    `Resize submitted for ${ok} pool${ok === 1 ? "" : "s"}`,
+                    "success"
+                );
+            } else {
+                showToast(
+                    store,
+                    `Resize submitted ${ok}/${results.length} (${failed} failed)`,
+                    "warning"
+                );
+            }
+            setShowResizeConfirm(false);
             setShowResizeDialog(false);
-        } catch {
-            /* handled by orchestrator */
+        } catch (err) {
+            showToast(
+                store,
+                `Resize failed: ${err instanceof Error ? err.message : String(err)}`,
+                "error"
+            );
         } finally {
             setResizeSubmitting(false);
         }
@@ -671,6 +740,11 @@ export const PoolInfoPage: React.FC<PoolInfoPageProps> = ({ orchestrator }) => {
 
             // Show results
             if (failedUpdates.length === 0) {
+                showToast(
+                    store,
+                    `Start task updated on ${updated.length} pool${updated.length === 1 ? "" : "s"}${rebootSummary}`,
+                    "success"
+                );
                 setShowStartTaskDialog(false);
             } else {
                 const failedList = failedUpdates
@@ -996,22 +1070,48 @@ export const PoolInfoPage: React.FC<PoolInfoPageProps> = ({ orchestrator }) => {
                     text="Resize Pool"
                     iconProps={{ iconName: "ScaleVolume" }}
                     onClick={openResizeDialog}
-                    disabled={!selectedPool}
-                    aria-label="Resize selected pools"
+                    disabled={!selectedPool || resizeBlocked}
+                    title={
+                        resizeBlocked
+                            ? "Resize requires steady allocation state for all selected pools"
+                            : selectedPool
+                              ? `Resize pool ${selectedPool.poolId}`
+                              : "Select a pool to resize"
+                    }
+                    aria-label={
+                        selectedPools.length === 1 && selectedPool
+                            ? `Resize pool ${selectedPool.poolId}`
+                            : `Resize ${selectedPools.length} selected pools`
+                    }
                 />
+                {resizeBlocked && (
+                    <MessageBar
+                        messageBarType={MessageBarType.warning}
+                        styles={{ root: { maxWidth: 420 } }}
+                        aria-label="Resize blocked notice"
+                    >
+                        Resize requires steady state.{" "}
+                        {nonSteadySelected.length} selected pool
+                        {nonSteadySelected.length === 1 ? "" : "s"} not steady.
+                    </MessageBar>
+                )}
                 <DefaultButton
                     text="Update Start Task"
                     iconProps={{ iconName: "Play" }}
                     onClick={openStartTaskDialog}
                     disabled={!selectedPool}
-                    aria-label="Update start task for selected pools"
+                    aria-label={
+                        selectedPools.length === 1 && selectedPool
+                            ? `Update start task for pool ${selectedPool.poolId}`
+                            : `Update start task for ${selectedPools.length} selected pools`
+                    }
                 />
                 <DefaultButton
                     text="Remove Empty Pools"
                     iconProps={{ iconName: "Delete" }}
                     onClick={() => setShowDeleteEmptyDialog(true)}
                     disabled={emptyPools.length === 0 || loading}
-                    aria-label="Remove empty pools"
+                    aria-label={`Remove ${emptyPools.length} empty pools`}
                     styles={{
                         root: {
                             borderColor: "#d13438",
@@ -1213,44 +1313,11 @@ export const PoolInfoPage: React.FC<PoolInfoPageProps> = ({ orchestrator }) => {
                     style={{
                         background: "#1e1e1e",
                         borderRadius: 6,
-                        padding: 8,
+                        padding: 16,
                     }}
+                    aria-label="Loading pools"
                 >
-                    <style>{`
-                        @keyframes pulse {
-                            0%, 100% { opacity: 0.4; }
-                            50% { opacity: 1; }
-                        }
-                    `}</style>
-                    {[0, 1, 2, 3, 4].map((row) => (
-                        <div
-                            key={row}
-                            style={{
-                                display: "flex",
-                                gap: 12,
-                                padding: "10px 8px",
-                                borderBottom: "1px solid #2a2a2a",
-                            }}
-                        >
-                            {[
-                                120, 100, 80, 100, 70, 90, 80, 80, 60, 60, 80,
-                                120,
-                            ].map((width, col) => (
-                                <div
-                                    key={col}
-                                    style={{
-                                        width,
-                                        height: 16,
-                                        borderRadius: 4,
-                                        background: "#333",
-                                        animation:
-                                            "pulse 1.5s ease-in-out infinite",
-                                        animationDelay: `${row * 0.1 + col * 0.05}s`,
-                                    }}
-                                />
-                            ))}
-                        </div>
-                    ))}
+                    <SkeletonLoader variant="table" rows={6} columns={8} />
                 </div>
             )}
 
@@ -1436,68 +1503,56 @@ export const PoolInfoPage: React.FC<PoolInfoPageProps> = ({ orchestrator }) => {
                 </div>
             )}
 
-            {/* Remove Empty Pools Dialog */}
-            <Dialog
+            {/* Remove Empty Pools Confirmation */}
+            <ConfirmationDialog
                 hidden={!showDeleteEmptyDialog}
-                onDismiss={() => setShowDeleteEmptyDialog(false)}
-                dialogContentProps={{
-                    type: DialogType.normal,
-                    title: `Remove ${emptyPools.length} empty pools?`,
-                    subText: "This action cannot be undone.",
-                }}
-                modalProps={{
-                    isBlocking: true,
-                    styles: { main: { minWidth: 480 } },
-                }}
-            >
-                <Stack
-                    tokens={{ childrenGap: 4 }}
-                    styles={{ root: { maxHeight: 200, overflowY: "auto" } }}
-                >
-                    {emptyPools.slice(0, 10).map((pool) => (
-                        <Text
-                            key={pool.id}
-                            variant="small"
-                            styles={{ root: { color: "#ccc" } }}
-                        >
-                            {pool.poolId} ({pool.accountName} / {pool.region})
-                        </Text>
-                    ))}
-                    {emptyPools.length > 10 && (
-                        <Text
-                            variant="small"
+                title={`Remove ${emptyPools.length} empty pool${emptyPools.length === 1 ? "" : "s"}?`}
+                danger
+                loading={deleteEmptySubmitting}
+                confirmText={deleteEmptySubmitting ? "Deleting..." : "Remove"}
+                onConfirm={submitDeleteEmptyPools}
+                onCancel={() => setShowDeleteEmptyDialog(false)}
+                message={
+                    <Stack tokens={{ childrenGap: 8 }}>
+                        <MessageBar messageBarType={MessageBarType.warning}>
+                            This action cannot be undone. {emptyPools.length}{" "}
+                            empty pool
+                            {emptyPools.length === 1 ? "" : "s"} (0 nodes) will
+                            be permanently deleted.
+                        </MessageBar>
+                        <Stack
+                            tokens={{ childrenGap: 4 }}
                             styles={{
-                                root: { color: "#888", fontStyle: "italic" },
+                                root: { maxHeight: 200, overflowY: "auto" },
                             }}
                         >
-                            and {emptyPools.length - 10} more...
-                        </Text>
-                    )}
-                </Stack>
-                <DialogFooter>
-                    <PrimaryButton
-                        text={deleteEmptySubmitting ? "Deleting..." : "Remove"}
-                        onClick={submitDeleteEmptyPools}
-                        disabled={deleteEmptySubmitting}
-                        aria-label="Confirm remove empty pools"
-                        styles={{
-                            root: {
-                                backgroundColor: "#d13438",
-                                borderColor: "#d13438",
-                            },
-                            rootHovered: {
-                                backgroundColor: "#a4262c",
-                                borderColor: "#a4262c",
-                            },
-                        }}
-                    />
-                    <DefaultButton
-                        text="Cancel"
-                        onClick={() => setShowDeleteEmptyDialog(false)}
-                        disabled={deleteEmptySubmitting}
-                    />
-                </DialogFooter>
-            </Dialog>
+                            {emptyPools.slice(0, 10).map((pool) => (
+                                <Text
+                                    key={pool.id}
+                                    variant="small"
+                                    styles={{ root: { color: "#ccc" } }}
+                                >
+                                    {pool.poolId} ({pool.accountName} /{" "}
+                                    {pool.region}) — 0 nodes
+                                </Text>
+                            ))}
+                            {emptyPools.length > 10 && (
+                                <Text
+                                    variant="small"
+                                    styles={{
+                                        root: {
+                                            color: "#888",
+                                            fontStyle: "italic",
+                                        },
+                                    }}
+                                >
+                                    and {emptyPools.length - 10} more...
+                                </Text>
+                            )}
+                        </Stack>
+                    </Stack>
+                }
+            />
 
             {/* Resize Pool Dialog */}
             <Dialog
@@ -1523,6 +1578,15 @@ export const PoolInfoPage: React.FC<PoolInfoPageProps> = ({ orchestrator }) => {
             >
                 {selectedPool && (
                     <Stack tokens={{ childrenGap: 12 }}>
+                        {resizeBlocked && (
+                            <MessageBar
+                                messageBarType={MessageBarType.severeWarning}
+                                aria-label="Allocation state blocked"
+                            >
+                                Resize requires steady state. Some selected
+                                pools are currently in a transitional state.
+                            </MessageBar>
+                        )}
                         <Stack
                             tokens={{ childrenGap: 8 }}
                             styles={{
@@ -1537,6 +1601,14 @@ export const PoolInfoPage: React.FC<PoolInfoPageProps> = ({ orchestrator }) => {
                                 Pool ID:{" "}
                                 <span style={{ color: "#eee" }}>
                                     {selectedPool.poolId}
+                                </span>
+                            </Label>
+                            <Label styles={{ root: { color: "#999" } }}>
+                                Current nodes:{" "}
+                                <span style={{ color: "#eee" }}>
+                                    {selectedPool.currentDedicatedNodes}{" "}
+                                    dedicated /{" "}
+                                    {selectedPool.currentLowPriorityNodes} LP
                                 </span>
                             </Label>
                             <Label styles={{ root: { color: "#999" } }}>
@@ -1639,8 +1711,13 @@ export const PoolInfoPage: React.FC<PoolInfoPageProps> = ({ orchestrator }) => {
                 <DialogFooter>
                     <PrimaryButton
                         text={resizeSubmitting ? "Submitting..." : "Resize"}
-                        onClick={submitResize}
-                        disabled={resizeSubmitting}
+                        onClick={() => setShowResizeConfirm(true)}
+                        disabled={resizeSubmitting || resizeBlocked}
+                        aria-label={
+                            selectedPool
+                                ? `Submit resize for pool ${selectedPool.poolId}`
+                                : "Submit resize"
+                        }
                     />
                     <DefaultButton
                         text="Cancel"
@@ -1648,6 +1725,48 @@ export const PoolInfoPage: React.FC<PoolInfoPageProps> = ({ orchestrator }) => {
                     />
                 </DialogFooter>
             </Dialog>
+
+            {/* Resize Confirmation */}
+            <ConfirmationDialog
+                hidden={!showResizeConfirm}
+                title={
+                    selectedPools.length > 1
+                        ? `Resize ${selectedPools.length} pools?`
+                        : "Resize pool?"
+                }
+                danger
+                loading={resizeSubmitting}
+                confirmText={resizeSubmitting ? "Submitting..." : "Confirm Resize"}
+                onConfirm={submitResize}
+                onCancel={() => setShowResizeConfirm(false)}
+                message={
+                    <Stack tokens={{ childrenGap: 8 }}>
+                        {selectedPool && selectedPools.length === 1 && (
+                            <Text styles={{ root: { color: "#ccc" } }}>
+                                <b>Pool:</b> {selectedPool.poolId}
+                                <br />
+                                <b>Current nodes:</b>{" "}
+                                {selectedPool.currentDedicatedNodes} dedicated /{" "}
+                                {selectedPool.currentLowPriorityNodes} LP
+                                <br />
+                                <b>Target:</b> {resizeDedicated} dedicated /{" "}
+                                {resizeLowPriority} LP
+                            </Text>
+                        )}
+                        {selectedPools.length > 1 && (
+                            <Text styles={{ root: { color: "#ccc" } }}>
+                                Apply target {resizeDedicated} dedicated /{" "}
+                                {resizeLowPriority} LP to{" "}
+                                {selectedPools.length} pools.
+                            </Text>
+                        )}
+                        <MessageBar messageBarType={MessageBarType.warning}>
+                            Resize is a long-running operation. Existing tasks
+                            on removed nodes may be terminated.
+                        </MessageBar>
+                    </Stack>
+                }
+            />
 
             {/* Update Start Task Dialog */}
             <Dialog
