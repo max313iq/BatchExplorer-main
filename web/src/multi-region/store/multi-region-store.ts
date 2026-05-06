@@ -515,45 +515,6 @@ export class MultiRegionStore {
         }
     }
 
-    /** Load a session from localStorage */
-    loadSession(sessionId: string): boolean {
-        try {
-            const raw = localStorage.getItem(`${STORAGE_KEY}:${sessionId}`);
-            if (!raw) return false;
-            const saved = JSON.parse(raw) as MultiRegionState;
-            this._state = {
-                ...saved,
-                agentStatuses: { ...DEFAULT_AGENT_STATUSES },
-            };
-            this._notify();
-            this.addLog({
-                agent: "orchestrator",
-                level: "info",
-                message: `Session loaded: ${sessionId} (${saved.accounts.length} accounts, ${saved.pools.length} pools)`,
-            });
-            return true;
-        } catch {
-            return false;
-        }
-    }
-
-    /** List all saved sessions */
-    listSessions(): Array<{
-        id: string;
-        savedAt: string;
-        accountCount: number;
-        poolCount: number;
-    }> {
-        return this._getSessionIndex();
-    }
-
-    /** Delete a saved session */
-    deleteSession(sessionId: string): void {
-        localStorage.removeItem(`${STORAGE_KEY}:${sessionId}`);
-        const index = this._getSessionIndex().filter((s) => s.id !== sessionId);
-        localStorage.setItem(SESSION_INDEX_KEY, JSON.stringify(index));
-    }
-
     /** Start a fresh session */
     newSession(): void {
         this._state = {

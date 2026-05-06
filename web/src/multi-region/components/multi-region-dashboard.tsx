@@ -1,7 +1,6 @@
 import * as React from "react";
 import { MessageBar, MessageBarType } from "@fluentui/react/lib/MessageBar";
 import { DefaultButton, IconButton } from "@fluentui/react/lib/Button";
-import { Dropdown, IDropdownOption } from "@fluentui/react/lib/Dropdown";
 import { Stack } from "@fluentui/react/lib/Stack";
 import { Text } from "@fluentui/react/lib/Text";
 import { Toggle } from "@fluentui/react/lib/Toggle";
@@ -18,7 +17,6 @@ import { AgentContext } from "../agents/agent-types";
 import { SidebarNav, PageKey } from "./shared/sidebar-nav";
 import { ToastContainer } from "./shared/toast-container";
 import { ErrorBoundary } from "./shared/error-boundary";
-import { GlobalFilterBar } from "./global-filter-bar";
 import { OverviewPage } from "./overview/overview-page";
 import { AccountProvisioningPage } from "./account-provisioning/account-provisioning-page";
 import { PoolCreationPage } from "./pool-creation/pool-creation-page";
@@ -244,20 +242,6 @@ const AuthBanner: React.FC<{
 
 const SessionBar: React.FC<{ store: MultiRegionStore }> = ({ store }) => {
     const state = useMultiRegionState();
-    const [sessions, setSessions] = React.useState(store.listSessions());
-    const refreshSessions = React.useCallback(
-        () => setSessions(store.listSessions()),
-        [store]
-    );
-
-    const sessionOptions: IDropdownOption[] = React.useMemo(
-        () =>
-            sessions.map((s) => ({
-                key: s.id,
-                text: `${s.id.substring(0, 22)}... (${s.accountCount}A/${s.poolCount}P)`,
-            })),
-        [sessions]
-    );
 
     return (
         <Stack
@@ -300,7 +284,6 @@ const SessionBar: React.FC<{ store: MultiRegionStore }> = ({ store }) => {
                     title="Save session"
                     onClick={() => {
                         store.saveSession();
-                        refreshSessions();
                         store.addNotification({
                             type: "success",
                             message: "Session saved",
@@ -308,42 +291,11 @@ const SessionBar: React.FC<{ store: MultiRegionStore }> = ({ store }) => {
                     }}
                     styles={{ root: { height: 24, width: 24 } }}
                 />
-                {sessions.length > 0 && (
-                    <Dropdown
-                        placeholder="Load..."
-                        options={sessionOptions}
-                        onChange={(_e, opt) => {
-                            if (opt) {
-                                store.loadSession(opt.key as string);
-                                refreshSessions();
-                            }
-                        }}
-                        styles={{
-                            root: { width: 200 },
-                            dropdown: { height: 24 },
-                            title: {
-                                height: 24,
-                                lineHeight: "22px",
-                                fontSize: 11,
-                            },
-                            caretDownWrapper: {
-                                height: 24,
-                                lineHeight: "24px",
-                            },
-                        }}
-                        onRenderTitle={() => (
-                            <span style={{ fontSize: 11 }}>
-                                Load ({sessions.length})
-                            </span>
-                        )}
-                    />
-                )}
                 <IconButton
                     iconProps={{ iconName: "Add" }}
                     title="New session"
                     onClick={() => {
                         store.newSession();
-                        refreshSessions();
                     }}
                     styles={{ root: { height: 24, width: 24 } }}
                 />
@@ -837,7 +789,6 @@ const DashboardContent: React.FC<{ tokenProvider?: TokenProvider }> = ({
                         overflow: "hidden",
                     }}
                 >
-                    {activePage !== "overview" && <GlobalFilterBar />}
                     <main
                         id="page-content"
                         tabIndex={-1}
