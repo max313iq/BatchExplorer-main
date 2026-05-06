@@ -10,15 +10,18 @@ const fs = require("fs");
 const path = require("path");
 const cp = require("child_process");
 
-const targets = [
-    "packages/bonito-core",
-    "packages/bonito-ui",
-    "packages/react",
-    "packages/service",
-    "packages/playground",
-    "util/bux",
-    "util/common-config",
-];
+// CLI: pass directories as args, OR rely on the default list below.
+const targets = process.argv.slice(2).length
+    ? process.argv.slice(2)
+    : [
+          "packages/bonito-core",
+          "packages/bonito-ui",
+          "packages/react",
+          "packages/service",
+          "packages/playground",
+          "util/bux",
+          "util/common-config",
+      ];
 
 for (const t of targets) {
     const pjPath = path.join(t, "package.json");
