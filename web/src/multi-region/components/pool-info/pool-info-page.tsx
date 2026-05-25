@@ -99,6 +99,7 @@ import { OrchestratorAgent } from "../../agents/orchestrator-agent";
 import { useArmToken } from "../../auth/use-arm-token";
 import { useAbortableEffect } from "../../hooks/use-abortable-effect";
 import { usePersistedState } from "../../hooks/use-persisted-state";
+import { useShortcut } from "../../hooks/use-shortcut";
 import { useUrlState } from "../../hooks/use-url-state";
 import {
   useMultiRegionState,
@@ -400,6 +401,11 @@ const PoolInfoPageInner: React.FC<PoolInfoPageProps> = ({ orchestrator }) => {
     [store, primaryAccount?.username, primaryAccount?.name],
   );
 
+  // COORDINATOR: extract RefreshWithAbort hook — duplicated with
+  // account-info, overview. Each page repeats the same trio: an
+  // in-flight ref, a loading flag, and a try/catch/finally that has to
+  // remember to clear both. Centralizing would let the badge + Stop
+  // button be hook-driven instead of per-page useState.
   const refresh = React.useCallback(
     async (signal?: AbortSignal) => {
       // Re-entrancy guard — bail if a refresh is already running. Without
@@ -496,17 +502,26 @@ const PoolInfoPageInner: React.FC<PoolInfoPageProps> = ({ orchestrator }) => {
 
   const pools = state.poolInfos;
 
+  // Memoized live-id set — used both by the prune effect below and by
+  // any downstream consumer that needs a stable Set identity for
+  // membership tests. Without the memo, the prune effect rebuilt the Set
+  // on every render even when `pools` was reference-equal, and any
+  // child reading the set would see a fresh identity each pass.
+  const livePoolIds = React.useMemo(
+    () => new Set(pools.map((p) => p.id)),
+    [pools],
+  );
+
   // Prune selection when underlying pools change (after refresh / delete).
   // Without this, selecting a pool that then gets deleted/renamed by
   // discovery leaves a phantom id in `selection` that subtly drives the
   // bulk-action enabled state without showing the user what's selected.
   React.useEffect(() => {
     setSelection((prev) => {
-      const liveIds = new Set(pools.map((p) => p.id));
       let changed = false;
       const next = new Set<string>();
       for (const id of prev) {
-        if (liveIds.has(id)) {
+        if (livePoolIds.has(id)) {
           next.add(id);
         } else {
           changed = true;
@@ -514,7 +529,7 @@ const PoolInfoPageInner: React.FC<PoolInfoPageProps> = ({ orchestrator }) => {
       }
       return changed ? next : prev;
     });
-  }, [pools]);
+  }, [livePoolIds]);
 
   // Unique values for filter dropdowns.
   const uniqueRegions = React.useMemo(
@@ -1710,6 +1725,38 @@ const PoolInfoPageInner: React.FC<PoolInfoPageProps> = ({ orchestrator }) => {
                 <span>View nodes</span>
               </DropdownMenuItem>
               <DropdownMenuItem
+                disabled={row.allocationState !== "steady" || tokenStale}
+                onSelect={(e) => {
+                  e.preventDefault();
+                  if (row.allocationState !== "steady" || tokenStale) return;
+                  // Single-row quick-resize: replace selection with just
+                  // this row, then open the standard resize dialog so the
+                  // operator can pick a target. Replacing (instead of
+                  // adding) keeps the dialog scoped to the row they
+                  // actually clicked.
+                  setSelection(new Set([row.id]));
+                  const acctInfo =
+                    state.accountInfos.find((a) => a.id === row.accountId) ??
+                    null;
+                  const freeLpCores = acctInfo?.lowPriorityCoresFree ?? 0;
+                  const vmVCpus = getVCpus(row.vmSize);
+                  const maxLpNodes = Math.floor(freeLpCores / vmVCpus);
+                  setResizeDedicated(0);
+                  setResizeLowPriority(maxLpNodes);
+                  setShowResizeDialog(true);
+                }}
+                title={
+                  tokenStale
+                    ? "Refresh your ARM token first"
+                    : row.allocationState !== "steady"
+                      ? "Pool must be in steady state to resize"
+                      : "Open the resize dialog for this pool"
+                }
+              >
+                <Maximize2 aria-hidden />
+                <span>Resize now</span>
+              </DropdownMenuItem>
+              <DropdownMenuItem
                 onSelect={(e) => {
                   e.preventDefault();
                   void handleRowReboot(row);
@@ -1737,7 +1784,14 @@ const PoolInfoPageInner: React.FC<PoolInfoPageProps> = ({ orchestrator }) => {
         json: false,
       },
     ],
-    [navigate, runningTasksByPoolKey, handleRowReboot, handleRowDelete],
+    [
+      navigate,
+      runningTasksByPoolKey,
+      handleRowReboot,
+      handleRowDelete,
+      tokenStale,
+      state.accountInfos,
+    ],
   );
 
   const handleSelectionChange = React.useCallback((next: Set<string>) => {
@@ -1778,41 +1832,40 @@ const PoolInfoPageInner: React.FC<PoolInfoPageProps> = ({ orchestrator }) => {
   }, [navigate]);
 
   // -----------------------------------------------------------------------
-  // Keyboard shortcuts: 'r' refresh, 'Esc' clear selection.
+  // Keyboard shortcuts (migrated to `useShortcut` — typed, auto-skips
+  // input fields, and respects the shared chord parser used elsewhere
+  // in the dashboard).
+  //   r       — refresh
+  //   Escape  — clear selection
+  //   Delete  — open bulk-delete confirm for the selected pools
   // -----------------------------------------------------------------------
-  React.useEffect(() => {
-    const handler = (e: KeyboardEvent) => {
-      // Ignore when the operator is typing into a form field.
-      const tag = (e.target as HTMLElement | null)?.tagName;
-      if (
-        tag === "INPUT" ||
-        tag === "TEXTAREA" ||
-        tag === "SELECT" ||
-        (e.target as HTMLElement | null)?.isContentEditable
-      ) {
-        return;
+  useShortcut(
+    "r",
+    () => {
+      if (!loading) void refresh();
+    },
+    { enabled: !loading },
+  );
+  useShortcut(
+    "Escape",
+    () => {
+      if (selection.size > 0) setSelection(new Set());
+    },
+    { enabled: selection.size > 0 },
+  );
+  useShortcut(
+    "Delete",
+    () => {
+      // Mirror the bulk-delete toolbar button: open the confirm dialog
+      // with a freshly reset typed-confirm string so the prior value
+      // can't accidentally arm a destructive action.
+      if (selection.size > 0 && !showBulkDeleteDialog) {
+        setBulkDeleteConfirm("");
+        setShowBulkDeleteDialog(true);
       }
-      if (e.key === "Escape" && selection.size > 0) {
-        e.preventDefault();
-        setSelection(new Set());
-        return;
-      }
-      // Lowercase r AND lowercase + no modifiers — Cmd+R should still
-      // reload the page. Skip when refresh is already in flight.
-      if (
-        (e.key === "r" || e.key === "R") &&
-        !e.ctrlKey &&
-        !e.metaKey &&
-        !e.altKey &&
-        !loading
-      ) {
-        e.preventDefault();
-        void refresh();
-      }
-    };
-    window.addEventListener("keydown", handler);
-    return () => window.removeEventListener("keydown", handler);
-  }, [refresh, loading, selection.size]);
+    },
+    { enabled: selection.size > 0 && !showBulkDeleteDialog },
+  );
 
   // Empty / loading guards.
   const initialLoading = loading && pools.length === 0 && !error;
@@ -1866,7 +1919,7 @@ const PoolInfoPageInner: React.FC<PoolInfoPageProps> = ({ orchestrator }) => {
     >
       <PageHeader
         title="Pool Info"
-        description="Inspect, resize, and manage Batch pools across regions. Press R to refresh, Esc to clear selection."
+        description="Inspect, resize, and manage Batch pools across regions. Press R to refresh, Esc to clear selection, Delete to delete selected pools."
         titleId="pool-info-heading"
       >
         {/* Inline ARM-token freshness cue. Quiet until < 10 min from

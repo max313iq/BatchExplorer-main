@@ -157,10 +157,14 @@ function formatClaimValue(name: string, value: unknown): string {
  *
  * Returns the parsed JSON body, or throws an Error whose message starts
  * with `AADSTS…` when AAD rejected.
+ *
+ * The optional `signal` lets callers cancel the in-flight POST (e.g.
+ * on unmount). Aborting trips the standard `AbortError` path.
  */
 async function postTokenRequest(
   tenantId: string,
   body: URLSearchParams,
+  signal?: AbortSignal,
 ): Promise<Record<string, unknown>> {
   const target = `https://login.microsoftonline.com/${encodeURIComponent(
     tenantId,
@@ -172,6 +176,7 @@ async function postTokenRequest(
       "x-proxy-target": target,
     },
     body: body.toString(),
+    signal,
   });
   let parsed: unknown;
   try {
@@ -205,10 +210,17 @@ export const SpLoginTab: React.FC = () => {
 
   /* --- Mount lifecycle (same pattern as the parent page). */
   const mountedRef = React.useRef(true);
+  // AbortController for in-flight token POSTs. Aborted on unmount so
+  // the SP-mint fetch doesn't outlive the tab. A fresh controller is
+  // created per submit; the ref always points at the most-recent one
+  // so unmount can call .abort() exactly once.
+  const submitAbortRef = React.useRef<AbortController | null>(null);
   React.useEffect(() => {
     mountedRef.current = true;
     return () => {
       mountedRef.current = false;
+      submitAbortRef.current?.abort();
+      submitAbortRef.current = null;
     };
   }, []);
 
@@ -243,6 +255,11 @@ export const SpLoginTab: React.FC = () => {
   /* --- Submit handler. */
   const handleSubmit = React.useCallback(async () => {
     if (!canSubmit) return;
+    // Cancel any in-flight previous submit (operators clicking twice
+    // shouldn't get races). Then mount a fresh controller for this one.
+    submitAbortRef.current?.abort();
+    const controller = new AbortController();
+    submitAbortRef.current = controller;
     const startedAt = performance.now();
     setMinting(true);
     setResult(null);
@@ -264,7 +281,7 @@ export const SpLoginTab: React.FC = () => {
       } else {
         throw new Error("Certificate mode is not supported in the browser.");
       }
-      const data = await postTokenRequest(tid, body);
+      const data = await postTokenRequest(tid, body, controller.signal);
       const accessToken = data.access_token as string;
       const claims = decodeJwtClaimsUnsafe(accessToken) ?? {};
       const expiresAt =
@@ -302,6 +319,13 @@ export const SpLoginTab: React.FC = () => {
         },
       });
     } catch (err) {
+      // AbortError = operator unmounted / re-submitted. Not a real
+      // failure; bail without audit-logging a spurious failed-mint.
+      const errName = (err as { name?: string } | null)?.name;
+      if (errName === "AbortError" || controller.signal.aborted) {
+        if (mountedRef.current) setMinting(false);
+        return;
+      }
       const msg = err instanceof Error ? err.message : String(err);
       const code = extractAadErrorCode(msg);
       const durationMs = Math.round(performance.now() - startedAt);
@@ -336,6 +360,11 @@ export const SpLoginTab: React.FC = () => {
       });
     } finally {
       if (mountedRef.current) setMinting(false);
+      // Clear the ref only if it still points at this controller —
+      // an in-flight resubmit might have already swapped it.
+      if (submitAbortRef.current === controller) {
+        submitAbortRef.current = null;
+      }
     }
   }, [
     canSubmit,
@@ -417,6 +446,43 @@ export const SpLoginTab: React.FC = () => {
         </CardDescription>
       </CardHeader>
       <CardContent className="flex flex-col gap-4">
+        {/*
+          Risk warning near the SP-login surface. SP credentials are
+          high-stakes:
+            - A client_secret in browser memory is one paste-into-Slack
+              away from disclosure.
+            - The OBO assertion is a USER access token — if shared, it
+              becomes a session-take primitive.
+            - Successful mints land an app-only / OBO token in the
+              vault, which short-circuits silent acquires for the rest
+              of the app under a NON-user identity.
+          The audit log records every mint (action: tricky_login_sp_mint)
+          — but per the page's hard constraint, NEVER the secret or the
+          returned token. The banner exists so the operator sees this
+          BEFORE the first paste, not after the audit log fills.
+        */}
+        <Alert variant="warning" role="alert">
+          <ShieldAlert className="h-4 w-4" aria-hidden />
+          <AlertTitle className="text-sm">
+            Service-Principal credentials are high-stakes
+          </AlertTitle>
+          <AlertDescription className="text-xs">
+            <p className="m-0">
+              Client secrets and user assertions are pasted in plain text
+              and held only in component state for this tab&apos;s lifetime.
+              They are never logged, never persisted, and never sent
+              outside the dev-server token proxy. The resulting access
+              token is auditable (
+              <code className="font-mono">tricky_login_sp_mint</code>) but
+              the secret itself is not. Treat this surface like a
+              keyvault unlock: only paste credentials you intend to use
+              for this specific mint, on a screen you control. Prefer
+              certificate-based SPs outside the browser whenever the
+              workflow allows.
+            </p>
+          </AlertDescription>
+        </Alert>
+
         <Tabs
           value={mode}
           onValueChange={(v) => setMode(v as SpMintMode)}

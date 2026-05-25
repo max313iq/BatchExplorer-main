@@ -41,10 +41,8 @@ import {
   Check,
   ChevronsUpDown,
   Clock,
-  Database,
   Filter,
   KeyRound,
-  Layers,
   Loader2,
   LogIn,
   RefreshCw,
@@ -52,6 +50,7 @@ import {
   Search,
   ShieldAlert,
   ShieldCheck,
+  Timer,
   Trash2,
   User,
 } from "lucide-react";
@@ -100,17 +99,23 @@ import {
 import { cn, compareNumbers, compareStrings } from "@/lib/utils";
 
 import {
-  getActiveTenant,
   getAllLoggedInAccounts,
-  getArmTokenForAccount,
   getGraphTokenForAccount,
   listAccessibleTenants,
   listSubscriptionsForAccount,
   login,
   loginAccount,
   logoutAccount,
-  setActiveTenant as msalSetActiveTenant,
 } from "../../auth/msal-auth";
+// Canonical tenant-switch util — the page used to re-implement this
+// inline (~165 LOC) which drifted from the header switcher's copy.
+// Now everyone calls the SAME implementation.
+import {
+  findTenantLabel,
+  performTenantSwitch,
+  resolveActiveTenantId as resolveActiveTenantIdRaw,
+} from "../../auth/perform-tenant-switch";
+import { useAbortableEffect } from "../../hooks/use-abortable-effect";
 import { useUrlState } from "../../hooks/use-url-state";
 import { useShortcut } from "../../hooks/use-shortcut";
 import { auditLog } from "../../services/audit-log";
@@ -120,11 +125,10 @@ import {
   useMultiRegionState,
   useMultiRegionStore,
 } from "../../store/store-context";
-import {
-  AzureLoginAccount,
-  AzureLoginSubscription,
-} from "../../store/store-types";
+import { AzureLoginAccount } from "../../store/store-types";
 import { AccountIntelligencePanel } from "./account-intelligence-panel";
+import { PreLoginTenantSelector } from "./pre-login-tenant-selector";
+import { SubscriptionList } from "./subscription-list";
 import { ConfirmationDialog } from "../shared/confirmation-dialog";
 import { CopyButton, CopyableText } from "../shared/copy-button";
 import {
@@ -169,7 +173,25 @@ const STATUS_LABELS: Record<AccountStatus, string> = {
   error: "Error",
 };
 
-const SUB_SEARCH_DEBOUNCE_MS = 150;
+/**
+ * Threshold for the "stuck account" detector — an account whose
+ * `addedAt` is older than this and that is still `status === "active"`
+ * is flagged with a "Refresh due" badge to nudge the operator to
+ * re-fetch its subscriptions. 24h is conservative enough to avoid
+ * flagging recently-loaded accounts while still catching stale state
+ * after an overnight session.
+ */
+const STUCK_ACCOUNT_THRESHOLD_MS = 24 * 60 * 60 * 1000;
+
+/**
+ * Total-string-returning wrapper around the canonical
+ * `resolveActiveTenantId` (which returns `string | undefined`). The
+ * page treats the home tenant as the always-safe fallback so callers
+ * (search, columns, dropdowns) get a stable string.
+ */
+function resolveActiveTenantId(acct: AzureLoginAccount): string {
+  return resolveActiveTenantIdRaw(acct) ?? acct.tenantId;
+}
 
 function truncateMiddle(value: string, head = 8, tail = 4): string {
   if (!value || value.length <= head + tail + 1) return value;
@@ -251,76 +273,6 @@ export function purgeAccountsCache(): void {
   }
 }
 
-interface TenantChangedDetail {
-  homeAccountId: string;
-  tenantId: string;
-  fromTenantId: string | null;
-}
-
-function emitTenantChanged(detail: TenantChangedDetail): void {
-  try {
-    window.dispatchEvent(
-      new CustomEvent<TenantChangedDetail>(TENANT_CHANGED_EVENT, { detail }),
-    );
-  } catch {
-    /* SSR / non-DOM env — ignore */
-  }
-}
-
-/**
- * Run a function with one automatic retry on transient ARM failures
- * (429 + 5xx). Honors `Retry-After` when the error carries it; falls
- * back to 1.5s. Re-throws once the retry also fails.
- *
- * Bails out early if the supplied `signal` aborts between attempts so
- * we don't keep the operator waiting on a retry whose result will be
- * discarded.
- */
-async function withTransientRetry<T>(
-  fn: () => Promise<T>,
-  label: string,
-  signal?: AbortSignal,
-): Promise<T> {
-  try {
-    return await fn();
-  } catch (err) {
-    if (signal?.aborted) throw err;
-    const msg = err instanceof Error ? err.message : String(err);
-    const status = (err as { status?: number } | null)?.status;
-    const isTransient =
-      status === 429 ||
-      (typeof status === "number" && status >= 500 && status < 600) ||
-      /\b(429|5\d\d)\b/.test(msg) ||
-      /timeout|temporarily unavailable|service unavailable|network error/i.test(
-        msg,
-      );
-    if (!isTransient) throw err;
-    const retryAfter = (err as { retryAfterSeconds?: number } | null)
-      ?.retryAfterSeconds;
-    const delayMs = retryAfter
-      ? Math.min(retryAfter, 10) * 1000
-      : 1500;
-    // eslint-disable-next-line no-console
-    console.warn(
-      `[tenant-switch] transient failure on ${label}; retrying in ${delayMs}ms:`,
-      msg,
-    );
-    await new Promise<void>((resolve) => {
-      const t = setTimeout(resolve, delayMs);
-      if (signal) {
-        const onAbort = () => {
-          clearTimeout(t);
-          resolve();
-        };
-        if (signal.aborted) onAbort();
-        else signal.addEventListener("abort", onAbort, { once: true });
-      }
-    });
-    if (signal?.aborted) throw err;
-    return fn();
-  }
-}
-
 /**
  * Sort tenants so the picker is predictable across renders:
  * 1. Home tenant first.
@@ -351,560 +303,37 @@ function sortTenantsForPicker(
 }
 
 /**
- * Resolve the canonical "active tenant id" for an account across the
- * three sources of truth (per-account override, msal-cached, home).
+ * Whether an account's last-known data is considered "stale" — the
+ * `addedAt` timestamp (which is updated whenever the account is
+ * re-loaded by `loadAllAccounts` / `refreshSingleAccount`) is older
+ * than {@link STUCK_ACCOUNT_THRESHOLD_MS}. Returns false when the
+ * timestamp is missing or unparseable so a corrupted persisted blob
+ * doesn't paint a "stuck" flag indiscriminately.
  */
-function resolveActiveTenantId(acct: AzureLoginAccount): string {
-  return (
-    acct.activeTenantId ??
-    getActiveTenant(acct.homeAccountId) ??
-    acct.tenantId
-  );
+function isAccountStuck(account: AzureLoginAccount, now: number): boolean {
+  if (account.status !== "active") return false;
+  const ts = account.addedAt ? Date.parse(account.addedAt) : NaN;
+  if (!Number.isFinite(ts)) return false;
+  return now - ts > STUCK_ACCOUNT_THRESHOLD_MS;
 }
 
-function findTenantLabel(
-  tenants: TenantInfo[] | undefined,
-  tenantId: string,
-  fallback: string,
-): string {
-  const t = tenants?.find((x) => x.tenantId === tenantId);
-  return t?.displayName ?? t?.defaultDomain ?? fallback;
-}
-
-/* ------------------------------------------------------------------ */
-/*  Pre-login tenant selector                                          */
-/* ------------------------------------------------------------------ */
-
-interface PreLoginTenantSelectorProps {
-  tenantInput: string;
-  onTenantInputChange: (value: string) => void;
-  onSignIn: () => void;
-  signingIn: boolean;
-  layout: "compact" | "stacked";
-  signInLabel?: string;
-}
-
-const PreLoginTenantSelector: React.FC<PreLoginTenantSelectorProps> = ({
-  tenantInput,
-  onTenantInputChange,
-  onSignIn,
-  signingIn,
-  layout,
-  signInLabel,
-}) => {
-  const inputId = React.useId();
-  return (
-    <div
-      className={cn(
-        "flex flex-col gap-2",
-        layout === "compact" && "min-w-[260px]",
-      )}
-    >
-      <div className="flex flex-col gap-1.5">
-        <div className="flex items-center gap-1.5">
-          <Label
-            htmlFor={inputId}
-            className="text-2xs uppercase tracking-wider"
-          >
-            Tenant ID or domain (optional)
-          </Label>
-          <InfoTooltip
-            content="Set this to sign in directly against a specific tenant. Leave blank to sign into your home tenant and discover others later via the per-account tenant switcher."
-            ariaLabel="Tenant input help"
-            size={12}
-          />
-        </div>
-        <div
-          className={cn(
-            "flex gap-2",
-            layout === "stacked" ? "flex-col sm:flex-row" : "flex-row",
-          )}
-        >
-          <Input
-            id={inputId}
-            type="text"
-            placeholder="contoso.onmicrosoft.com or GUID"
-            value={tenantInput}
-            onChange={(e: React.ChangeEvent<HTMLInputElement>) =>
-              onTenantInputChange(e.target.value)
-            }
-            onKeyDown={(e: React.KeyboardEvent<HTMLInputElement>) => {
-              if (e.key === "Enter" && !signingIn) {
-                e.preventDefault();
-                onSignIn();
-              }
-            }}
-            disabled={signingIn}
-            aria-label="Tenant ID or domain"
-            className="h-8 text-xs transition-colors duration-150"
-            autoComplete="off"
-            spellCheck={false}
-          />
-          {signingIn ? (
-            <Tooltip>
-              <TooltipTrigger asChild>
-                <span>
-                  <Button
-                    variant="default"
-                    onClick={onSignIn}
-                    loading={signingIn}
-                    aria-label={signInLabel ?? "Sign in with Azure"}
-                  >
-                    {signInLabel ?? "Sign in with Azure"}
-                  </Button>
-                </span>
-              </TooltipTrigger>
-              <TooltipContent side="top">
-                Sign-in already in progress.
-              </TooltipContent>
-            </Tooltip>
-          ) : (
-            <Button
-              variant="default"
-              onClick={onSignIn}
-              loading={signingIn}
-              aria-label={signInLabel ?? "Sign in with Azure"}
-            >
-              <LogIn className="h-3.5 w-3.5" />
-              {signInLabel ?? "Sign in with Azure"}
-            </Button>
-          )}
-        </div>
-      </div>
-      <p className="flex flex-wrap items-center gap-1.5 text-2xs text-muted-foreground">
-        <span>Leave empty to use your home tenant.</span>
-        <span className="text-muted-foreground/70">
-          Press <Kbd>Enter</Kbd> in the field to sign in.
-        </span>
-      </p>
-    </div>
-  );
-};
-
-/* ------------------------------------------------------------------ */
-/*  Subscription list (used inside drawer)                             */
-/* ------------------------------------------------------------------ */
-
-interface SubscriptionListProps {
-  account: AzureLoginAccount;
-}
-
-const SubscriptionList: React.FC<SubscriptionListProps> = ({ account }) => {
-  const [subSearch, setSubSearch] = React.useState("");
-  const [debouncedSearch, setDebouncedSearch] = React.useState("");
-  const [showDisabledSubs, setShowDisabledSubs] = React.useState(false);
-
-  // Debounce the search input so each keystroke doesn't re-filter the
-  // entire list while the operator is typing. 150ms feels instant.
-  React.useEffect(() => {
-    const t = setTimeout(
-      () => setDebouncedSearch(subSearch),
-      SUB_SEARCH_DEBOUNCE_MS,
-    );
-    return () => clearTimeout(t);
-  }, [subSearch]);
-
-  const enabledSubs = React.useMemo(
-    () =>
-      account.subscriptions.filter((s) => (s.state ?? "Enabled") === "Enabled"),
-    [account.subscriptions],
-  );
-  const disabledSubs = React.useMemo(
-    () =>
-      account.subscriptions.filter((s) => (s.state ?? "Enabled") !== "Enabled"),
-    [account.subscriptions],
-  );
-
-  const filteredEnabledSubs = React.useMemo(() => {
-    if (!debouncedSearch) return enabledSubs;
-    const term = debouncedSearch.toLowerCase();
-    return enabledSubs.filter(
-      (sub) =>
-        (sub.displayName ?? "").toLowerCase().includes(term) ||
-        (sub.subscriptionId ?? "").toLowerCase().includes(term),
-    );
-  }, [enabledSubs, debouncedSearch]);
-
-  const filteredDisabledSubs = React.useMemo(() => {
-    if (!debouncedSearch) return disabledSubs;
-    const term = debouncedSearch.toLowerCase();
-    return disabledSubs.filter(
-      (sub) =>
-        (sub.displayName ?? "").toLowerCase().includes(term) ||
-        (sub.subscriptionId ?? "").toLowerCase().includes(term),
-    );
-  }, [disabledSubs, debouncedSearch]);
-
-  if (account.status === "loading") {
-    return (
-      <div
-        className="flex flex-col gap-2 py-1"
-        role="progressbar"
-        aria-label="Loading subscriptions"
-      >
-        {[0, 1, 2].map((i) => (
-          <div
-            key={i}
-            className="flex items-center gap-3 border-b border-border/40 py-1.5 last:border-b-0"
-          >
-            <Skeleton className="h-3.5 w-3.5 shrink-0 rounded-sm" />
-            <div className="flex min-w-0 flex-1 flex-col gap-1">
-              <Skeleton className="h-3 w-1/2" />
-              <Skeleton className="h-2.5 w-2/3" />
-            </div>
-            <Skeleton className="h-4 w-12" />
-          </div>
-        ))}
-      </div>
-    );
-  }
-
-  if (account.status === "error") {
-    return (
-      <ErrorState
-        message="Failed to load subscriptions."
-        detail={account.error ?? undefined}
-        size="compact"
-      />
-    );
-  }
-
-  if (account.subscriptions.length === 0) {
-    return (
-      <EmptyState
-        icon={Database}
-        title="No subscriptions"
-        description="This tenant has no subscriptions visible to this account."
-      />
-    );
-  }
-
-  return (
-    <div>
-      <div className="relative mb-2 max-w-xs">
-        <Search className="pointer-events-none absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
-        <Input
-          type="search"
-          placeholder="Filter subscriptions..."
-          value={subSearch}
-          aria-label="Filter subscriptions"
-          onChange={(e: React.ChangeEvent<HTMLInputElement>) =>
-            setSubSearch(e.target.value)
-          }
-          className="h-8 pl-8 text-xs"
-        />
-      </div>
-      <p className="mb-1 text-2xs text-muted-foreground">
-        {debouncedSearch ? (
-          <>
-            {filteredEnabledSubs.length} of {enabledSubs.length} active matches
-          </>
-        ) : (
-          <>
-            {enabledSubs.length} active
-            {disabledSubs.length > 0 && ` · ${disabledSubs.length} disabled`}
-          </>
-        )}
-      </p>
-      {filteredEnabledSubs.length === 0 ? (
-        <p className="py-2 text-xs text-muted-foreground">
-          {debouncedSearch
-            ? "No matching active subscriptions"
-            : "No active subscriptions in this tenant"}
-        </p>
-      ) : (
-        <ul role="list" className="flex flex-col">
-          {filteredEnabledSubs.map((sub: AzureLoginSubscription) => (
-            <li
-              key={sub.subscriptionId}
-              role="listitem"
-              className="group/copy flex items-center gap-3 border-b border-border/60 py-1.5 last:border-b-0"
-            >
-              <Layers className="h-3.5 w-3.5 shrink-0 text-primary" />
-              <div className="min-w-0 flex-1">
-                <p className="truncate text-xs text-foreground">
-                  {sub.displayName}
-                </p>
-                <div
-                  className="flex items-center gap-1.5"
-                  title={sub.subscriptionId}
-                >
-                  <p className="truncate font-mono text-2xs text-muted-foreground">
-                    {truncateMiddle(sub.subscriptionId, 12, 6)}
-                  </p>
-                  <CopyButton
-                    value={sub.subscriptionId}
-                    ariaLabel={`Copy subscription id ${sub.displayName}`}
-                  />
-                </div>
-              </div>
-              <Badge
-                variant="success"
-                role="status"
-                aria-label={`Subscription state: ${sub.state}`}
-                title="Subscription is active"
-              >
-                {sub.state}
-              </Badge>
-            </li>
-          ))}
-        </ul>
-      )}
-      {disabledSubs.length > 0 && (
-        <div className="mt-2 border-t border-border/60 pt-2">
-          <button
-            type="button"
-            onClick={() => setShowDisabledSubs((v) => !v)}
-            aria-expanded={showDisabledSubs}
-            aria-controls={`disabled-subs-${account.homeAccountId}`}
-            className="flex items-center gap-1.5 text-2xs text-muted-foreground transition-colors duration-150 hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-1 focus-visible:ring-offset-background motion-reduce:transition-none"
-          >
-            <span>
-              {showDisabledSubs ? "Hide" : "Show"} {disabledSubs.length} disabled
-              subscription
-              {disabledSubs.length === 1 ? "" : "s"}
-            </span>
-          </button>
-          {showDisabledSubs && (
-            <ul
-              role="list"
-              id={`disabled-subs-${account.homeAccountId}`}
-              className="mt-1.5 flex flex-col"
-            >
-              {filteredDisabledSubs.map((sub: AzureLoginSubscription) => (
-                <li
-                  key={sub.subscriptionId}
-                  role="listitem"
-                  className="group/copy flex items-center gap-3 border-b border-border/40 py-1.5 opacity-60 last:border-b-0"
-                >
-                  <Layers className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
-                  <div className="min-w-0 flex-1">
-                    <p className="truncate text-xs text-muted-foreground">
-                      {sub.displayName}
-                    </p>
-                    <div
-                      className="flex items-center gap-1.5"
-                      title={sub.subscriptionId}
-                    >
-                      <p className="truncate font-mono text-2xs text-muted-foreground/70">
-                        {truncateMiddle(sub.subscriptionId, 12, 6)}
-                      </p>
-                      <CopyButton
-                        value={sub.subscriptionId}
-                        ariaLabel={`Copy disabled subscription id ${sub.displayName}`}
-                      />
-                    </div>
-                  </div>
-                  <Badge
-                    variant="secondary"
-                    role="status"
-                    aria-label={`Subscription state: ${sub.state}`}
-                    title={`Subscription is ${sub.state}. Skipped — only Enabled subscriptions are used.`}
-                  >
-                    {sub.state}
-                  </Badge>
-                </li>
-              ))}
-            </ul>
-          )}
-        </div>
-      )}
-    </div>
-  );
-};
-
-/* ------------------------------------------------------------------ */
-/*  Centralized tenant-switch helper                                   */
-/* ------------------------------------------------------------------ */
-
-interface TenantSwitchOptions {
-  /** Where the switch was initiated from — drives the audit "from" field. */
-  source: "drawer" | "row";
-  /**
-   * Optional callback fired AFTER the switch succeeds and the new
-   * subs land in the store. The drawer uses this to re-trigger its
-   * directory-role probe.
-   */
-  onSuccess?: () => void;
-  /**
-   * Optional AbortSignal — primary purpose is the per-component
-   * unmount cleanup. The retry sleep honours this too.
-   */
-  signal?: AbortSignal;
-}
-
-/**
- * Run a tenant switch end-to-end: writes MSAL + store, pre-warms an
- * ARM token, fetches subs with one transient-retry, fires the global
- * tenant-changed event, and records the outcome to the audit log.
- *
- * Returns `{ stale }` so the caller can decide whether to clear its
- * UI spinner — when `stale: true`, a newer concurrent switch has won
- * and the caller should leave its busy state alone (the newer call
- * will clear it).
+/* PreLoginTenantSelector + SubscriptionList moved to their own files
+ * (pre-login-tenant-selector.tsx, subscription-list.tsx) — see those
+ * modules. Inline duplicates were ~340 LOC and obscured the page-level
+ * orchestration logic that lives below.
  */
-async function performTenantSwitch(
-  acct: AzureLoginAccount,
-  tenantId: string,
-  store: ReturnType<typeof useMultiRegionStore>,
-  isStale: () => boolean,
-  options: TenantSwitchOptions,
-): Promise<{ stale: boolean }> {
-  const homeAccountId = acct.homeAccountId;
-  const tenants = acct.tenants ?? [];
-  const tenantLabel = findTenantLabel(tenants, tenantId, tenantId);
-  const currentActive = resolveActiveTenantId(acct);
-  const fromLabel = findTenantLabel(
-    tenants,
-    currentActive,
-    currentActive ?? "(unknown)",
-  );
 
-  try {
-    msalSetActiveTenant(homeAccountId, tenantId);
-    store.setActiveTenant(homeAccountId, tenantId);
-    store.updateAzureAccount(homeAccountId, { status: "loading" });
-
-    // ATOMIC TOKEN ACQUISITION — see perform-tenant-switch.ts for the
-    // full rationale. Short version: pre-warm has to be SYNCHRONOUS
-    // and must escalate to interactive popup on interaction_required,
-    // otherwise every page hits the same stale-RT error simultaneously
-    // and paints "Cached session is no longer valid" everywhere.
-    try {
-      await getArmTokenForAccount(homeAccountId, tenantId);
-    } catch (acquireErr) {
-      if (isStale() || options.signal?.aborted) {
-        return { stale: true };
-      }
-      const acquireMsg =
-        acquireErr instanceof Error ? acquireErr.message : String(acquireErr);
-      const reauthPattern =
-        /interaction_required|invalid_grant|Cached session is no longer valid|AADSTS50173|AADSTS50058|AADSTS50076|AADSTS50079|AADSTS65001/i;
-      if (reauthPattern.test(acquireMsg)) {
-        try {
-          await loginAccount({
-            tenantId,
-            loginHint: acct.username || undefined,
-          });
-        } catch (popupErr) {
-          // Roll back so the picker doesn't sit on a tenant we have
-          // no token for.
-          if (currentActive && currentActive !== tenantId) {
-            msalSetActiveTenant(homeAccountId, currentActive);
-            store.setActiveTenant(homeAccountId, currentActive);
-          }
-          store.updateAzureAccount(homeAccountId, {
-            status: "active",
-            error: null,
-          });
-          const popupMsg =
-            popupErr instanceof Error ? popupErr.message : String(popupErr);
-          store.addNotification({
-            type: "error",
-            message:
-              `Tenant switch to ${tenantLabel} aborted — interactive ` +
-              `re-authentication did not complete. ${popupMsg}`,
-          });
-          auditLog.record({
-            actor: acct.username || homeAccountId,
-            action: "switch_active_tenant",
-            target: tenantLabel,
-            status: "failure",
-            error: `Re-auth popup cancelled or failed: ${popupMsg}`,
-            details: {
-              homeAccountId,
-              tenantId,
-              fromTenantId: currentActive,
-              from: options.source,
-              reason: "interactive_reauth_cancelled",
-            },
-          });
-          return { stale: false };
-        }
-        // Retry silent — must succeed now that interactive minted a
-        // fresh authority-scoped RT.
-        await getArmTokenForAccount(homeAccountId, tenantId);
-      } else {
-        throw acquireErr;
-      }
-    }
-
-    // Token is valid for the new tenant. Emit the event so every page
-    // re-fetches with a guaranteed-good token. No more "everywhere"
-    // interaction_required errors — pages' silent acquires hit MSAL's
-    // cache and return the freshly-minted token.
-    emitTenantChanged({
-      homeAccountId,
-      tenantId,
-      fromTenantId: currentActive ?? null,
-    });
-
-    const subs = await withTransientRetry(
-      () => listSubscriptionsForAccount(homeAccountId),
-      "listSubscriptionsForAccount",
-      options.signal,
-    );
-
-    if (isStale()) return { stale: true };
-
-    const enabledCount = subs.filter(
-      (s) => (s.state ?? "Enabled") === "Enabled",
-    ).length;
-    store.updateAzureAccount(homeAccountId, {
-      subscriptions: subs,
-      subscriptionCount: enabledCount,
-      status: "active",
-      error: null,
-    });
-
-    options.onSuccess?.();
-
-    store.addNotification({
-      type: "success",
-      message: `Switched ${fromLabel} → ${tenantLabel} (${subs.length} sub${subs.length === 1 ? "" : "s"})`,
-    });
-    auditLog.record({
-      actor: acct.username || homeAccountId,
-      action: "switch_active_tenant",
-      target: tenantLabel,
-      status: "success",
-      details: {
-        homeAccountId,
-        tenantId,
-        fromTenantId: currentActive,
-        subscriptionsLoaded: subs.length,
-        from: options.source,
-      },
-    });
-    return { stale: false };
-  } catch (e: unknown) {
-    if (isStale()) return { stale: true };
-    if (options.signal?.aborted) return { stale: true };
-    const msg = e instanceof Error ? e.message : String(e);
-    store.updateAzureAccount(homeAccountId, {
-      status: "error",
-      error: msg,
-    });
-    store.addNotification({
-      type: "error",
-      message: `Failed to switch to ${tenantLabel}: ${msg}`,
-    });
-    auditLog.record({
-      actor: acct.username || homeAccountId,
-      action: "switch_active_tenant",
-      target: tenantLabel,
-      status: "failure",
-      error: msg,
-      details: {
-        homeAccountId,
-        tenantId,
-        fromTenantId: currentActive,
-        from: options.source,
-      },
-    });
-    return { stale: false };
-  }
-}
+/* ------------------------------------------------------------------ */
+/*  Tenant-switch — canonical, lives in auth/perform-tenant-switch.ts  */
+/* ------------------------------------------------------------------ */
+/*
+ * The page used to own a ~165 LOC reimplementation of `performTenantSwitch`
+ * here. It drifted from the header switcher's copy (different audit
+ * shape, slightly different snapshot semantics, no rollback of the
+ * subs array on popup-cancel). It now delegates entirely to
+ * `auth/perform-tenant-switch` so every entry point — header pill, row
+ * dropdown, drawer picker, command palette — runs the SAME flow.
+ */
 
 /* ------------------------------------------------------------------ */
 /*  Account drawer (Sheet)                                             */
@@ -1035,34 +464,47 @@ const AccountDrawer: React.FC<AccountDrawerProps> = ({
 
   // Probe directory roles for the active tenant. Re-runs when
   // `roleProbeNonce` bumps (initial open, after tenant switch).
-  React.useEffect(() => {
-    if (!open || !account) return;
-    if (account.status !== "active") return;
-    const tenantId = resolveActiveTenantId(account);
-    if (!tenantId) return;
-    let cancelled = false;
-    (async () => {
+  // Uses `useAbortableEffect` so the per-effect AbortSignal is
+  // available to future fetch upgrades and so the cleanup story is
+  // a single source of truth (vs. the old `let cancelled = false`
+  // pattern). The Graph SDK calls don't currently accept a signal,
+  // but the `signal.aborted` guard still short-circuits the
+  // state-write race when the drawer closes mid-probe.
+  const activeTenantForProbe = account
+    ? resolveActiveTenantId(account)
+    : undefined;
+  const accountHomeIdForProbe = account?.homeAccountId;
+  const accountStatusForProbe = account?.status;
+  useAbortableEffect(
+    async (signal) => {
+      if (!open || !accountHomeIdForProbe) return;
+      if (accountStatusForProbe !== "active") return;
+      if (!activeTenantForProbe) return;
       try {
         const token = await getGraphTokenForAccount(
-          account.homeAccountId,
-          tenantId,
+          accountHomeIdForProbe,
+          activeTenantForProbe,
         );
+        if (signal.aborted) return;
         const roles: DirectoryRole[] = await getMyDirectoryRoles(
-          tenantId,
+          activeTenantForProbe,
           token,
         );
-        if (!cancelled) {
-          setIsPasswordAdmin(canResetPasswords(roles));
-        }
+        if (signal.aborted) return;
+        setIsPasswordAdmin(canResetPasswords(roles));
       } catch {
-        if (!cancelled) setIsPasswordAdmin(false);
+        if (signal.aborted) return;
+        setIsPasswordAdmin(false);
       }
-    })();
-    return () => {
-      cancelled = true;
-    };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [open, account, roleProbeNonce]);
+    },
+    [
+      open,
+      accountHomeIdForProbe,
+      accountStatusForProbe,
+      activeTenantForProbe,
+      roleProbeNonce,
+    ],
+  );
 
   const handleRefreshTenants = React.useCallback(() => {
     if (!account) return;
@@ -1092,10 +534,10 @@ const AccountDrawer: React.FC<AccountDrawerProps> = ({
           account,
           tenantId,
           store,
-          () => mySeq !== switchSeqRef.current,
           {
             source: "drawer",
             signal: controller.signal,
+            isStale: () => mySeq !== switchSeqRef.current,
             onSuccess: () => setRoleProbeNonce((n) => n + 1),
           },
         );
@@ -1700,9 +1142,10 @@ const AzureAccountsPageInner: React.FC = () => {
 
       registerRowSwitch(homeAccountId, tenantId);
       try {
-        await performTenantSwitch(acct, tenantId, store, isStale, {
+        await performTenantSwitch(acct, tenantId, store, {
           source: "row",
           signal: controller.signal,
+          isStale,
         });
       } finally {
         if (!isStale()) {
@@ -1754,12 +1197,15 @@ const AzureAccountsPageInner: React.FC = () => {
     let active = 0;
     let loading = 0;
     let errored = 0;
+    let stuck = 0;
+    const now = Date.now();
     for (const a of accounts) {
       if (a.status === "active") active += 1;
       else if (a.status === "loading") loading += 1;
       else if (a.status === "error") errored += 1;
+      if (isAccountStuck(a, now)) stuck += 1;
     }
-    return { active, loading, error: errored };
+    return { active, loading, error: errored, stuck };
   }, [accounts]);
 
   const totalSubCount = React.useMemo(
@@ -2196,13 +1642,35 @@ const AzureAccountsPageInner: React.FC = () => {
     setPendingBulkRemove(null);
   }, [removing]);
 
+  // COORDINATOR: extract bulk-subs-refresh — duplicated with regions /
+  // subscriptions pages (they each iterate per-account `Promise.allSettled`
+  // around `listSubscriptionsForAccount`). Worth a shared util in
+  // `services/` once at least three pages need it.
   const handleBulkRefresh = React.useCallback(async () => {
     if (selection.size === 0) return;
     const ids = Array.from(selection);
-    await Promise.allSettled(ids.map((id) => refreshSingleAccount(id)));
-    store.addNotification({
-      type: "success",
-      message: `Refreshed ${ids.length} account${ids.length === 1 ? "" : "s"}.`,
+    const results = await Promise.allSettled(
+      ids.map((id) => refreshSingleAccount(id)),
+    );
+    const failed = results.filter((r) => r.status === "rejected").length;
+    if (failed === 0) {
+      store.addNotification({
+        type: "success",
+        message: `Refreshed ${ids.length} account${ids.length === 1 ? "" : "s"}.`,
+      });
+    } else {
+      store.addNotification({
+        type: "warning",
+        message: `Refreshed ${ids.length - failed} of ${ids.length} accounts — ${failed} failed.`,
+      });
+    }
+    auditLog.record({
+      actor: "operator",
+      action: "bulk_refresh_azure_accounts",
+      target: `${ids.length} account${ids.length === 1 ? "" : "s"}`,
+      status: failed === 0 ? "success" : "failure",
+      error: failed > 0 ? `${failed} account refresh(es) failed` : undefined,
+      details: { count: ids.length, failed, ids },
     });
   }, [selection, refreshSingleAccount, store]);
 
@@ -2241,12 +1709,27 @@ const AzureAccountsPageInner: React.FC = () => {
   }, [loadAllAccounts, accounts.length]);
 
   const handleReLogin = React.useCallback(async () => {
+    const trimmed = tenantInput.trim();
     try {
-      const trimmed = tenantInput.trim();
       if (trimmed) await login(trimmed);
       else await loginAccount();
-    } catch {
-      // ignore; loginAccount surfaces its own errors via setError
+      auditLog.record({
+        actor: "operator",
+        action: "relogin_azure_account",
+        target: trimmed || "(home tenant)",
+        status: "success",
+      });
+    } catch (e: unknown) {
+      const msg = e instanceof Error ? e.message : String(e);
+      auditLog.record({
+        actor: "operator",
+        action: "relogin_azure_account",
+        target: trimmed || "(home tenant)",
+        status: "failure",
+        error: msg,
+      });
+      // Don't surface here — the subsequent refreshAll attempt will
+      // either succeed (transient popup-close) or set its own error.
     }
     void handleRefreshAll();
   }, [handleRefreshAll, tenantInput]);
@@ -2297,6 +1780,19 @@ const AzureAccountsPageInner: React.FC = () => {
   });
   useShortcut("/", () => {
     searchInputRef.current?.focus();
+  });
+  // `t` — re-trigger tenant switch. If a drawer is open, jump to its
+  // Tenants tab so the picker is visible; otherwise open the first
+  // filtered account's drawer on the Tenants tab. Operators learn this
+  // chord faster than the multi-step "click row → click tab" path,
+  // and it composes with `/` (focus search → narrow → `t`).
+  useShortcut("t", () => {
+    const targetId =
+      drawerAccountId ||
+      filteredAccounts[0]?.homeAccountId ||
+      null;
+    if (!targetId) return;
+    setFilters({ account: targetId, tab: "tenants" });
   });
 
   /* ---- Export columns ---- */
@@ -2516,7 +2012,7 @@ const AzureAccountsPageInner: React.FC = () => {
       {
         id: "status",
         header: "Status",
-        width: "w-28",
+        width: "w-36",
         sort: (a, b) => compareStrings(a.status, b.status),
         csv: (a) => STATUS_LABELS[a.status],
         cell: (a) => {
@@ -2527,21 +2023,48 @@ const AzureAccountsPageInner: React.FC = () => {
                 ? Loader2
                 : AlertCircle;
           const animate = a.status === "loading";
+          // Stuck-account detector: status is active but the last
+          // successful load is >24h old. Reads `Date.now()` on each
+          // cell render — cheap and avoids a separate ticker effect.
+          // The same age threshold drives the filter chip and the
+          // drawer header badge for visual consistency.
+          const stuck = isAccountStuck(a, Date.now());
           return (
-            <span
-              className={cn(
-                "inline-flex items-center gap-1.5 text-xs font-medium",
-                statusToneClass(a.status),
-              )}
-            >
-              <Icon
+            <span className="inline-flex flex-wrap items-center gap-1.5">
+              <span
                 className={cn(
-                  "h-3.5 w-3.5",
-                  animate && "animate-spin motion-reduce:animate-none",
+                  "inline-flex items-center gap-1.5 text-xs font-medium",
+                  statusToneClass(a.status),
                 )}
-                aria-hidden
-              />
-              {STATUS_LABELS[a.status]}
+              >
+                <Icon
+                  className={cn(
+                    "h-3.5 w-3.5",
+                    animate && "animate-spin motion-reduce:animate-none",
+                  )}
+                  aria-hidden
+                />
+                {STATUS_LABELS[a.status]}
+              </span>
+              {stuck && (
+                <Tooltip>
+                  <TooltipTrigger asChild>
+                    <span aria-label="Refresh due — last load >24h ago">
+                      <Badge
+                        variant="warning"
+                        className="gap-1 px-1 py-0 text-[9px]"
+                      >
+                        <Timer className="h-2.5 w-2.5" aria-hidden />
+                        Stale
+                      </Badge>
+                    </span>
+                  </TooltipTrigger>
+                  <TooltipContent side="top">
+                    Last refreshed more than 24h ago. Click the refresh
+                    icon to re-fetch this account.
+                  </TooltipContent>
+                </Tooltip>
+              )}
             </span>
           );
         },
@@ -2783,6 +2306,14 @@ const AzureAccountsPageInner: React.FC = () => {
           tone="destructive"
           compact
         />
+        {statusCounts.stuck > 0 && (
+          <SummaryStatItem
+            label="Stale (>24h)"
+            value={statusCounts.stuck}
+            tone="warning"
+            compact
+          />
+        )}
         <SummaryStatItem
           label="Subscriptions"
           value={totalSubCount}
@@ -3060,8 +2591,8 @@ const AzureAccountsPageInner: React.FC = () => {
       {accounts.length > 0 && (
         <p className="self-center text-2xs text-muted-foreground">
           <Clock className="mr-1 inline h-3 w-3" aria-hidden /> Tip: press{" "}
-          <Kbd>/</Kbd> to focus search, <Kbd>Enter</Kbd> on a row to open its
-          detail drawer.
+          <Kbd>/</Kbd> to focus search, <Kbd>t</Kbd> to open the tenant
+          picker, <Kbd>Enter</Kbd> on a row to open its detail drawer.
         </p>
       )}
 

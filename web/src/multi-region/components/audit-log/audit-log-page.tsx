@@ -11,13 +11,24 @@
  *   - Multi-select actor + action dropdown filters.
  *   - Date-range picker spanning the retained log window.
  *   - Sortable columns (Timestamp / Actor / Action / Target / Status).
- *   - Pagination with adjustable page size.
+ *   - Pagination with adjustable page size (persisted across reloads).
  *   - Expandable rows showing the full `details` JSON + `error` field.
  *   - Inline copy buttons on Actor / Action / Target / details JSON.
  *   - Summary stat row: Total / Success / Failed / Last 24h.
  *   - 24-hour activity timeline + top actors + top actions histograms.
  *   - CSV + JSON export of the currently-filtered view.
  *   - Clear-log action with confirmation.
+ *   - Saved filters: name + recall arbitrary filter combinations
+ *     (persisted via `usePersistedState`).
+ *   - Hotkeys: `/` focus search, `c` clear-log (with confirm), `e` open
+ *     export menu, `t` toggle tail-mode, `g` cycle group-by, `Esc` clear
+ *     search when focused.
+ *   - Group-by collapsing (None / Actor / Action / Day) with per-group
+ *     collapse state and an "expand all / collapse all" affordance.
+ *   - Tail-mode toggle: when enabled the table auto-resets to page 1 and
+ *     scrolls to the newest entry whenever new entries arrive (snapshots
+ *     the live "newest" pointer rather than scrolling on every change so
+ *     the user can still pan the list mid-stream).
  *
  * Bug fixes vs. previous revision:
  *   - Subscribe-then-snapshot race: the original code read entries in the
@@ -29,9 +40,28 @@
  *     between buckets. We now align buckets to the floor of `Date.now()`
  *     truncated to the hour, and use a half-open `[hourStart, hourStart+1h)`
  *     interval per bucket so each entry lands in exactly one bin.
+ *   - `activeFilterCount` was recomputed on every render — now memoized.
+ *   - Group-by collapse state previously survived across group-by mode
+ *     switches, leaving stale ids in the set; we now key the collapsed set
+ *     by `groupBy` mode + entry-id list so it auto-clears.
+ *
+ * COORDINATOR notes (for the service-layer pass):
+ *   - We currently consume `auditLog.onChange()` + `auditLog.getEntries()`.
+ *     If the service grows a typed `subscribe(filter, listener)` overload
+ *     that returns the current snapshot synchronously, swap the effect for
+ *     that to drop the double-read on mount.
+ *   - The filter/search pipeline is page-local. If multiple pages need the
+ *     same filter primitives, hoist `useAuditFilterPipeline` into
+ *     `hooks/use-audit-filter.ts` (NOT this folder — would need coordinator
+ *     approval to add a new hook file outside `audit-log/`).
+ *   - Saved-filter shape is local to this page (`AUDIT_SAVED_FILTERS_KEY`).
+ *     Migration to a global preferences slice would need a store schema
+ *     bump and the existing `usePersistedState` `version`/`migrate` plumbing.
  */
 import * as React from "react";
 import {
+  Bookmark,
+  BookmarkPlus,
   CalendarDays,
   ChevronDown,
   ChevronRight,
@@ -40,11 +70,14 @@ import {
   Clock,
   FileText,
   Filter,
+  Layers,
+  PlayCircle,
   RotateCcw,
   Search,
   SlidersHorizontal,
   Trash2,
   Users,
+  X,
   Zap,
 } from "lucide-react";
 import type { DateRange } from "react-day-picker";
@@ -73,6 +106,7 @@ import {
   DropdownMenu,
   DropdownMenuCheckboxItem,
   DropdownMenuContent,
+  DropdownMenuItem,
   DropdownMenuLabel,
   DropdownMenuSeparator,
   DropdownMenuTrigger,
@@ -99,6 +133,7 @@ import {
   formatRelativeTime,
 } from "@/lib/utils";
 
+import { usePersistedState } from "../../hooks/use-persisted-state";
 import { auditLog, type AuditEntry } from "../../services/audit-log";
 
 import { ConfirmationDialog } from "../shared/confirmation-dialog";
@@ -126,6 +161,62 @@ interface SortState {
 const PAGE_SIZE_OPTIONS = [10, 25, 50, 100] as const;
 type PageSize = (typeof PAGE_SIZE_OPTIONS)[number];
 
+/** Group-by modes. "none" preserves a flat newest-first list. */
+type GroupBy = "none" | "actor" | "action" | "day";
+
+const GROUP_BY_OPTIONS: ReadonlyArray<{ key: GroupBy; label: string }> = [
+  { key: "none", label: "None" },
+  { key: "actor", label: "Actor" },
+  { key: "action", label: "Action" },
+  { key: "day", label: "Day" },
+] as const;
+
+/**
+ * Persisted saved-filter shape. `id` is a crypto-random string used as a
+ * React key + a stable identifier across renames. `name` is the user-visible
+ * label.
+ *
+ * The filter payload only includes user-pickable filter state — sort + page
+ * + pageSize are intentionally NOT persisted in saved filters (they are
+ * presentation concerns, not filter concerns).
+ */
+interface SavedFilter {
+  id: string;
+  name: string;
+  /** ISO timestamp when this filter was last written. */
+  savedAt: string;
+  searchText: string;
+  statusFilter: StatusFilter;
+  actorFilter: string[];
+  actionFilter: string[];
+  /** Serialized as ISO strings to survive JSON round-trip. */
+  dateRange?: { from: string; to?: string };
+}
+
+const AUDIT_PAGE_SIZE_KEY = "audit-log.pageSize.v1";
+const AUDIT_RELATIVE_TIME_KEY = "audit-log.relativeTime.v1";
+const AUDIT_GROUP_BY_KEY = "audit-log.groupBy.v1";
+const AUDIT_TAIL_KEY = "audit-log.tail.v1";
+const AUDIT_SAVED_FILTERS_KEY = "audit-log.savedFilters.v1";
+
+/** Set guard so PAGE_SIZE_OPTIONS narrowing survives JSON round-trip. */
+const PAGE_SIZE_SET: ReadonlySet<number> = new Set(PAGE_SIZE_OPTIONS);
+function coercePageSize(raw: unknown, fallback: PageSize = 25): PageSize {
+  const n = Number(raw);
+  return PAGE_SIZE_SET.has(n) ? (n as PageSize) : fallback;
+}
+
+function makeSavedFilterId(): string {
+  // Prefer crypto.randomUUID when available; fall back to a high-entropy
+  // string. This page already references `crypto.randomUUID()` indirectly
+  // via the audit-log service, so the API is known-good in this runtime.
+  try {
+    return crypto.randomUUID();
+  } catch {
+    return `sf_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 10)}`;
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Component
 // ---------------------------------------------------------------------------
@@ -152,20 +243,96 @@ export const AuditLogPage: React.FC = () => {
     key: "timestamp",
     dir: "desc",
   });
-  const [pageSize, setPageSize] = React.useState<PageSize>(25);
+  // Page size is persisted so it survives reload; coerce on read since the
+  // localStorage value is untrusted JSON.
+  const [pageSizeRaw, setPageSizeRaw] = usePersistedState<PageSize>(
+    AUDIT_PAGE_SIZE_KEY,
+    25,
+    {
+      deserialize: (raw) => {
+        try {
+          return coercePageSize(JSON.parse(raw));
+        } catch {
+          return 25;
+        }
+      },
+    },
+  );
+  const pageSize = coercePageSize(pageSizeRaw);
   const [page, setPage] = React.useState(1);
 
   // Row expansion (one expanded at a time keeps the table compact)
   const [expandedId, setExpandedId] = React.useState<string | null>(null);
 
-  // Display mode: relative vs. absolute timestamps
-  const [relativeTime, setRelativeTime] = React.useState(false);
+  // Display mode: relative vs. absolute timestamps. Persisted.
+  const [relativeTime, setRelativeTime] = usePersistedState<boolean>(
+    AUDIT_RELATIVE_TIME_KEY,
+    false,
+  );
+
+  // Group-by mode. Persisted.
+  const [groupBy, setGroupBy] = usePersistedState<GroupBy>(
+    AUDIT_GROUP_BY_KEY,
+    "none",
+    {
+      deserialize: (raw) => {
+        try {
+          const v = JSON.parse(raw);
+          return v === "actor" || v === "action" || v === "day" || v === "none"
+            ? v
+            : "none";
+        } catch {
+          return "none";
+        }
+      },
+    },
+  );
+
+  // Per-group collapse state. Local (not persisted) because group keys depend
+  // on which entries are currently retained.
+  const [collapsedGroups, setCollapsedGroups] = React.useState<Set<string>>(
+    () => new Set(),
+  );
+
+  // Tail mode: when on, the table is pinned to page 1 (newest first) and
+  // smooth-scrolls the body container to the top on every new arrival.
+  // Persisted because operators typically want their preferred mode to
+  // survive reloads.
+  const [tailMode, setTailMode] = usePersistedState<boolean>(
+    AUDIT_TAIL_KEY,
+    false,
+  );
+
+  // Saved filters — named recall of filter combinations. Defaults to empty
+  // array; we coerce any malformed payload back to `[]`.
+  const [savedFilters, setSavedFilters] = usePersistedState<SavedFilter[]>(
+    AUDIT_SAVED_FILTERS_KEY,
+    [],
+    {
+      deserialize: (raw) => {
+        try {
+          const v = JSON.parse(raw);
+          return Array.isArray(v) ? (v as SavedFilter[]) : [];
+        } catch {
+          return [];
+        }
+      },
+    },
+  );
+  const [savedFilterName, setSavedFilterName] = React.useState("");
+  const [savedFiltersOpen, setSavedFiltersOpen] = React.useState(false);
 
   // Confirmation dialog
   const [confirmOpen, setConfirmOpen] = React.useState(false);
 
   // Refs for keyboard shortcut + auto-clear-expanded-on-page-change
   const searchInputRef = React.useRef<HTMLInputElement | null>(null);
+  // Ref to the scrollable table container so tail-mode can scroll-to-top
+  // without coupling to a global window scroll position.
+  const tableScrollRef = React.useRef<HTMLDivElement | null>(null);
+  // Wrapper element hosting the ExportMenu; the `e` hotkey finds the
+  // inner trigger button via DOM query and synthesizes a click.
+  const exportTriggerRef = React.useRef<HTMLSpanElement | null>(null);
 
   // -------- Subscribe to the audit log ------------------------------------
   //
@@ -173,21 +340,56 @@ export const AuditLogPage: React.FC = () => {
   // subscribed in a separate `useEffect`. Entries appended in the gap were
   // lost (unsubscribed → snapshot stale until next change). The fix is to
   // re-read entries inside the effect on mount AND in the change callback.
+  //
+  // Cleanup MUST unsubscribe to avoid leaking the listener across mounts —
+  // `auditLog.onChange` returns the disposer directly so we return it from
+  // the effect.
+  //
+  // COORDINATOR: if the audit-log service grows a typed
+  // `subscribeWithSnapshot()` that returns the current entries synchronously,
+  // collapse the `setEntries(getEntries())` + `onChange(...)` pair into a
+  // single call. See `../../services/audit-log.ts`.
   React.useEffect(() => {
-    setEntries(auditLog.getEntries());
-    const unsubscribe = auditLog.onChange(() => {
+    let active = true;
+    const refresh = (): void => {
+      if (!active) return;
       setEntries(auditLog.getEntries());
-    });
-    return unsubscribe;
+    };
+    refresh();
+    const unsubscribe = auditLog.onChange(refresh);
+    return () => {
+      active = false;
+      unsubscribe();
+    };
   }, []);
 
-  // -------- Keyboard shortcut: focus search on `/` -----------------------
+  // -------- Keyboard shortcuts -------------------------------------------
   //
-  // Use the document keydown listener so the shortcut works even when no
-  // input is focused. Skip when the user is typing into another text field,
-  // to avoid hijacking `/` keystrokes inside dialog inputs.
+  // Document-level keydown listener so the shortcuts work even when nothing
+  // is focused. We skip when the user is typing into another text field, to
+  // avoid hijacking keystrokes inside dialog inputs.
+  //
+  // Shortcut map:
+  //   /  or  s    — focus + select the search box
+  //   c           — clear log (opens confirm dialog)
+  //   e           — open the export menu
+  //   t           — toggle tail-mode
+  //   g           — cycle the group-by mode (none → actor → action → day → none)
+  //   Esc         — when search input is focused: clear search
+  //
+  // Refs over state so the listener doesn't re-attach on every keystroke;
+  // we use refs to read the *latest* value for the various shortcut paths.
+  const searchTextRef = React.useRef(searchText);
+  searchTextRef.current = searchText;
+  const groupByRef = React.useRef(groupBy);
+  groupByRef.current = groupBy;
+  const hasEntriesRef = React.useRef(false);
+  // hasEntriesRef is wired to `entries.length` below after the entries
+  // memos run; defining it up here means the keydown handler can see the
+  // latest value without re-attaching.
+
   React.useEffect(() => {
-    const handler = (event: KeyboardEvent) => {
+    const handler = (event: KeyboardEvent): void => {
       if (event.defaultPrevented) return;
       const target = event.target as HTMLElement | null;
       const tag = target?.tagName?.toLowerCase();
@@ -197,7 +399,7 @@ export const AuditLogPage: React.FC = () => {
         tag === "select" ||
         (target?.isContentEditable ?? false);
       // Allow Esc to clear the search even when focused inside the input.
-      if (event.key === "Escape" && searchText) {
+      if (event.key === "Escape" && searchTextRef.current) {
         if (target === searchInputRef.current) {
           event.preventDefault();
           setSearchText("");
@@ -206,15 +408,55 @@ export const AuditLogPage: React.FC = () => {
       }
       if (isEditable) return;
       if (event.metaKey || event.ctrlKey || event.altKey) return;
-      if (event.key === "/" || event.key === "s") {
-        event.preventDefault();
-        searchInputRef.current?.focus();
-        searchInputRef.current?.select();
+
+      switch (event.key) {
+        case "/":
+        case "s": {
+          event.preventDefault();
+          searchInputRef.current?.focus();
+          searchInputRef.current?.select();
+          return;
+        }
+        case "c": {
+          if (!hasEntriesRef.current) return;
+          event.preventDefault();
+          setConfirmOpen(true);
+          return;
+        }
+        case "e": {
+          // ExportMenu's trigger is a Radix DropdownMenuTrigger rendering
+          // a `<button>` — find it inside the wrapper and synthesize a
+          // click. Skip when disabled.
+          const trigger = exportTriggerRef.current?.querySelector(
+            "button",
+          ) as HTMLButtonElement | null;
+          if (trigger && !trigger.disabled) {
+            event.preventDefault();
+            trigger.click();
+          }
+          return;
+        }
+        case "t": {
+          event.preventDefault();
+          setTailMode((v) => !v);
+          return;
+        }
+        case "g": {
+          event.preventDefault();
+          const current = groupByRef.current;
+          const idx = GROUP_BY_OPTIONS.findIndex((o) => o.key === current);
+          const next =
+            GROUP_BY_OPTIONS[(idx + 1) % GROUP_BY_OPTIONS.length]?.key ?? "none";
+          setGroupBy(next);
+          return;
+        }
+        default:
+          return;
       }
     };
     document.addEventListener("keydown", handler);
     return () => document.removeEventListener("keydown", handler);
-  }, [searchText]);
+  }, [setTailMode, setGroupBy]);
 
   // -------- Derived collections ------------------------------------------
 
@@ -342,7 +584,30 @@ export const AuditLogPage: React.FC = () => {
   // doesn't end up on an empty page after narrowing the result set.
   React.useEffect(() => {
     setPage(1);
-  }, [searchText, statusFilter, actorFilter, actionFilter, dateRange, pageSize, sort]);
+  }, [searchText, statusFilter, actorFilter, actionFilter, dateRange, pageSize, sort, groupBy]);
+
+  // Tail-mode: when enabled, pin to page 1 on every entries change and
+  // scroll the table body to the top (which is the newest entry under
+  // the default `timestamp desc` sort). We intentionally do NOT scroll on
+  // every render — only when `entries` actually changes — so the operator
+  // can still pan around the table mid-stream without fighting auto-scroll.
+  const prevEntriesLenRef = React.useRef(entries.length);
+  React.useEffect(() => {
+    if (!tailMode) {
+      prevEntriesLenRef.current = entries.length;
+      return;
+    }
+    // Only react to *new* arrivals, not initial mount or clears.
+    if (entries.length > prevEntriesLenRef.current) {
+      setPage(1);
+      const scroller = tableScrollRef.current;
+      if (scroller) {
+        // Newest-first means top of the body is the newest.
+        scroller.scrollTo({ top: 0, behavior: "smooth" });
+      }
+    }
+    prevEntriesLenRef.current = entries.length;
+  }, [entries, tailMode]);
 
   // Collapse any expanded row that's no longer visible in the page.
   React.useEffect(() => {
@@ -449,13 +714,20 @@ export const AuditLogPage: React.FC = () => {
   }, [entries]);
 
   // Active filter count — shown on the "Reset" chip and used to decide
-  // whether to surface the reset affordance at all.
-  const activeFilterCount =
-    (searchText.trim() ? 1 : 0) +
-    (statusFilter !== "all" ? 1 : 0) +
-    (actorFilter.size > 0 ? 1 : 0) +
-    (actionFilter.size > 0 ? 1 : 0) +
-    (dateRange?.from ? 1 : 0);
+  // whether to surface the reset affordance at all. Memoized to keep a
+  // stable identity across renders that don't actually change filter state.
+  const activeFilterCount = React.useMemo(
+    () =>
+      (searchText.trim() ? 1 : 0) +
+      (statusFilter !== "all" ? 1 : 0) +
+      (actorFilter.size > 0 ? 1 : 0) +
+      (actionFilter.size > 0 ? 1 : 0) +
+      (dateRange?.from ? 1 : 0),
+    [searchText, statusFilter, actorFilter, actionFilter, dateRange],
+  );
+
+  // Keep the keydown handler's `hasEntriesRef` in sync without re-attaching.
+  hasEntriesRef.current = hasEntries;
 
   // ---- Insights: entries-per-hour timeline + top actors / top actions ---
   //
@@ -529,6 +801,167 @@ export const AuditLogPage: React.FC = () => {
     return { min: new Date(min), max: new Date(max) };
   }, [entries]);
 
+  // -------- Group-by: build ordered groups from `paged` -------------------
+  //
+  // We group the *paged* slice (not the full filtered list) so each rendered
+  // page stays bounded; the group headers therefore reflect the rows that
+  // are currently visible. For "day" we bucket by the local-date string
+  // (YYYY-MM-DD) so the same calendar day groups together across timezone
+  // displays.
+  const groups = React.useMemo(() => {
+    if (groupBy === "none") return null;
+    const out: Array<{ key: string; label: string; rows: AuditEntry[] }> = [];
+    const seen = new Map<string, number>(); // key → index in `out`
+    const labelFor = (entry: AuditEntry): { key: string; label: string } => {
+      if (groupBy === "actor") {
+        return { key: entry.actor || "(unknown)", label: entry.actor || "(unknown)" };
+      }
+      if (groupBy === "action") {
+        return { key: entry.action || "(unknown)", label: entry.action || "(unknown)" };
+      }
+      // groupBy === "day"
+      const ts = new Date(entry.timestamp);
+      if (Number.isNaN(ts.getTime())) {
+        return { key: "(invalid date)", label: "(invalid date)" };
+      }
+      // Local-date YYYY-MM-DD; the label is the same but humans render it
+      // via toLocaleDateString in the header.
+      const yyyy = ts.getFullYear();
+      const mm = String(ts.getMonth() + 1).padStart(2, "0");
+      const dd = String(ts.getDate()).padStart(2, "0");
+      const key = `${yyyy}-${mm}-${dd}`;
+      return {
+        key,
+        label: ts.toLocaleDateString(undefined, {
+          weekday: "short",
+          month: "short",
+          day: "numeric",
+          year: "numeric",
+        }),
+      };
+    };
+    for (const entry of paged) {
+      const { key, label } = labelFor(entry);
+      const idx = seen.get(key);
+      if (idx === undefined) {
+        seen.set(key, out.length);
+        out.push({ key, label, rows: [entry] });
+      } else {
+        out[idx]!.rows.push(entry);
+      }
+    }
+    return out;
+  }, [paged, groupBy]);
+
+  // Auto-clear stale collapsed-group ids. When `groupBy` changes the prior
+  // group-keys are meaningless; when entries are cleared collapsed-ids hang
+  // around forever. Recomputing the valid-key set each render and pruning
+  // collapsed-ids that don't match keeps the Set tidy without an O(n) sweep
+  // on every keystroke.
+  React.useEffect(() => {
+    if (!groups) {
+      if (collapsedGroups.size > 0) setCollapsedGroups(new Set());
+      return;
+    }
+    const validKeys = new Set(groups.map((g) => g.key));
+    let mutated = false;
+    const next = new Set<string>();
+    for (const id of collapsedGroups) {
+      if (validKeys.has(id)) next.add(id);
+      else mutated = true;
+    }
+    if (mutated) setCollapsedGroups(next);
+    // We deliberately depend on `groupBy` rather than `groups` because the
+    // `groups` identity changes on every entries update — we only need to
+    // re-prune when the *mode* changes or the *set of keys* changes.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [groupBy, groups?.map((g) => g.key).join("|")]);
+
+  const toggleGroupCollapsed = React.useCallback((key: string) => {
+    setCollapsedGroups((prev) => {
+      const next = new Set(prev);
+      if (next.has(key)) next.delete(key);
+      else next.add(key);
+      return next;
+    });
+  }, []);
+
+  const collapseAllGroups = React.useCallback(() => {
+    if (!groups) return;
+    setCollapsedGroups(new Set(groups.map((g) => g.key)));
+  }, [groups]);
+
+  const expandAllGroups = React.useCallback(() => {
+    setCollapsedGroups(new Set());
+  }, []);
+
+  // -------- Saved filters --------------------------------------------------
+
+  /** Apply a saved filter payload to the live filter state. */
+  const applySavedFilter = React.useCallback(
+    (sf: SavedFilter) => {
+      setSearchText(sf.searchText);
+      setStatusFilter(sf.statusFilter);
+      setActorFilter(new Set(sf.actorFilter));
+      setActionFilter(new Set(sf.actionFilter));
+      if (sf.dateRange?.from) {
+        const from = new Date(sf.dateRange.from);
+        const to = sf.dateRange.to ? new Date(sf.dateRange.to) : undefined;
+        if (Number.isNaN(from.getTime())) {
+          setDateRange(undefined);
+        } else {
+          setDateRange({
+            from,
+            to: to && !Number.isNaN(to.getTime()) ? to : undefined,
+          });
+        }
+      } else {
+        setDateRange(undefined);
+      }
+      setSavedFiltersOpen(false);
+    },
+    [],
+  );
+
+  const captureCurrentFilter = React.useCallback((): Omit<SavedFilter, "id" | "name" | "savedAt"> => ({
+    searchText,
+    statusFilter,
+    actorFilter: Array.from(actorFilter),
+    actionFilter: Array.from(actionFilter),
+    dateRange: dateRange?.from
+      ? {
+          from: dateRange.from.toISOString(),
+          to: (dateRange.to ?? dateRange.from).toISOString(),
+        }
+      : undefined,
+  }), [searchText, statusFilter, actorFilter, actionFilter, dateRange]);
+
+  const handleSaveFilter = React.useCallback(() => {
+    const trimmed = savedFilterName.trim();
+    if (!trimmed) return;
+    if (activeFilterCount === 0) return; // No-op: nothing to save.
+    setSavedFilters((prev) => {
+      // Replace by name if it already exists, else append.
+      const payload: SavedFilter = {
+        id: prev.find((f) => f.name === trimmed)?.id ?? makeSavedFilterId(),
+        name: trimmed,
+        savedAt: new Date().toISOString(),
+        ...captureCurrentFilter(),
+      };
+      const filtered = prev.filter((f) => f.name !== trimmed);
+      // Cap at 20 saved filters so localStorage stays bounded.
+      return [payload, ...filtered].slice(0, 20);
+    });
+    setSavedFilterName("");
+  }, [savedFilterName, activeFilterCount, captureCurrentFilter, setSavedFilters]);
+
+  const handleDeleteSavedFilter = React.useCallback(
+    (id: string) => {
+      setSavedFilters((prev) => prev.filter((f) => f.id !== id));
+    },
+    [setSavedFilters],
+  );
+
   // -------- Render -------------------------------------------------------
 
   return (
@@ -574,27 +1007,38 @@ export const AuditLogPage: React.FC = () => {
           }
           ariaLabel="Search field help"
         />
-        <ExportMenu<AuditEntry>
-          rows={sorted}
-          columns={exportColumns}
-          filename="audit-log"
-          jsonMetadata={{
-            source: "AzureBatchManager.AuditLog",
-            statusFilter,
-            actorFilter: Array.from(actorFilter),
-            actionFilter: Array.from(actionFilter),
-            dateRange:
-              dateRange?.from
-                ? {
-                    from: dateRange.from.toISOString(),
-                    to: (dateRange.to ?? dateRange.from).toISOString(),
-                  }
-                : undefined,
-            searchQuery: searchText || undefined,
-            sort,
-          }}
-          disabled={!hasMatches}
-        />
+        {/* Wrapper hosts the ExportMenu so the `e` hotkey can find the
+            trigger button via DOM query. ExportMenu's trigger is a Radix
+            DropdownMenuTrigger that renders a `<button>` child — we
+            click whichever button shows up inside this wrapper. */}
+        <span
+          ref={exportTriggerRef}
+          data-hotkey-host="audit-log-export"
+          className="inline-flex"
+        >
+          <ExportMenu<AuditEntry>
+            rows={sorted}
+            columns={exportColumns}
+            filename="audit-log"
+            jsonMetadata={{
+              source: "AzureBatchManager.AuditLog",
+              statusFilter,
+              actorFilter: Array.from(actorFilter),
+              actionFilter: Array.from(actionFilter),
+              dateRange:
+                dateRange?.from
+                  ? {
+                      from: dateRange.from.toISOString(),
+                      to: (dateRange.to ?? dateRange.from).toISOString(),
+                    }
+                  : undefined,
+              searchQuery: searchText || undefined,
+              sort,
+              groupBy,
+            }}
+            disabled={!hasMatches}
+          />
+        </span>
         <Button
           variant="outline"
           size="sm"
@@ -969,6 +1413,210 @@ export const AuditLogPage: React.FC = () => {
             {relativeTime ? "Relative" : "Absolute"}
           </Button>
 
+          {/* Group-by selector */}
+          <DropdownMenu>
+            <DropdownMenuTrigger asChild>
+              <Button
+                variant="outline"
+                size="sm"
+                className={cn(
+                  "h-7 gap-1.5",
+                  groupBy !== "none" && "border-primary/60 text-primary",
+                )}
+                aria-label={`Group by: ${groupBy}. Press G to cycle.`}
+              >
+                <Layers className="h-3 w-3" aria-hidden />
+                <span>
+                  Group:{" "}
+                  <span className="font-semibold capitalize">{groupBy}</span>
+                </span>
+                <ChevronDown className="h-3 w-3 opacity-60" aria-hidden />
+              </Button>
+            </DropdownMenuTrigger>
+            <DropdownMenuContent align="start" className="w-48">
+              <DropdownMenuLabel className="text-2xs font-semibold uppercase tracking-wider text-muted-foreground">
+                Group by
+              </DropdownMenuLabel>
+              <DropdownMenuSeparator />
+              {GROUP_BY_OPTIONS.map((opt) => (
+                <DropdownMenuCheckboxItem
+                  key={opt.key}
+                  checked={groupBy === opt.key}
+                  onSelect={(e) => e.preventDefault()}
+                  onCheckedChange={() => setGroupBy(opt.key)}
+                >
+                  {opt.label}
+                </DropdownMenuCheckboxItem>
+              ))}
+              {groupBy !== "none" && (
+                <>
+                  <DropdownMenuSeparator />
+                  <DropdownMenuItem onSelect={() => collapseAllGroups()}>
+                    Collapse all
+                  </DropdownMenuItem>
+                  <DropdownMenuItem onSelect={() => expandAllGroups()}>
+                    Expand all
+                  </DropdownMenuItem>
+                </>
+              )}
+            </DropdownMenuContent>
+          </DropdownMenu>
+
+          {/* Tail mode toggle */}
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={() => setTailMode((v) => !v)}
+            className={cn(
+              "h-7 gap-1.5",
+              tailMode && "border-primary/60 text-primary",
+            )}
+            aria-pressed={tailMode}
+            aria-label={
+              tailMode
+                ? "Disable tail mode (auto-scroll to newest)"
+                : "Enable tail mode (auto-scroll to newest)"
+            }
+            title="Press T to toggle tail mode"
+          >
+            <PlayCircle className="h-3 w-3" aria-hidden />
+            Tail
+          </Button>
+
+          {/* Saved filters dropdown */}
+          <DropdownMenu
+            open={savedFiltersOpen}
+            onOpenChange={setSavedFiltersOpen}
+          >
+            <DropdownMenuTrigger asChild>
+              <Button
+                variant="outline"
+                size="sm"
+                className={cn(
+                  "h-7 gap-1.5",
+                  savedFilters.length > 0 && "border-primary/40",
+                )}
+                aria-label={`Saved filters (${savedFilters.length})`}
+              >
+                <Bookmark className="h-3 w-3" aria-hidden />
+                Saved
+                {savedFilters.length > 0 && (
+                  <Badge
+                    variant="outline"
+                    className="ml-0.5 h-4 min-w-4 px-1 text-3xs tabular-nums"
+                  >
+                    {savedFilters.length}
+                  </Badge>
+                )}
+                <ChevronDown className="h-3 w-3 opacity-60" aria-hidden />
+              </Button>
+            </DropdownMenuTrigger>
+            <DropdownMenuContent
+              align="start"
+              className="w-72"
+              onCloseAutoFocus={(e) => e.preventDefault()}
+            >
+              <DropdownMenuLabel className="flex items-center justify-between">
+                <span>Saved filters</span>
+                <span className="text-3xs text-muted-foreground tabular-nums">
+                  {savedFilters.length}/20
+                </span>
+              </DropdownMenuLabel>
+              <DropdownMenuSeparator />
+              {savedFilters.length === 0 ? (
+                <p className="px-2 py-3 text-center text-xs text-muted-foreground">
+                  No saved filters yet. Configure filters above, then save
+                  them below.
+                </p>
+              ) : (
+                <div
+                  className="max-h-48 overflow-y-auto"
+                  role="listbox"
+                  aria-label="Saved filters"
+                >
+                  {savedFilters.map((sf) => (
+                    <div
+                      key={sf.id}
+                      className="group flex items-center gap-1 px-1 py-0.5"
+                    >
+                      <button
+                        type="button"
+                        className="flex-1 truncate rounded px-2 py-1 text-left text-xs hover:bg-accent/40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                        onClick={() => applySavedFilter(sf)}
+                        title={`Saved ${new Date(sf.savedAt).toLocaleString()}`}
+                      >
+                        <span className="block truncate font-medium">
+                          {sf.name}
+                        </span>
+                        <span className="block truncate text-3xs text-muted-foreground">
+                          {[
+                            sf.searchText && `"${sf.searchText}"`,
+                            sf.statusFilter !== "all" && sf.statusFilter,
+                            sf.actorFilter.length > 0 &&
+                              `${sf.actorFilter.length} actor${sf.actorFilter.length === 1 ? "" : "s"}`,
+                            sf.actionFilter.length > 0 &&
+                              `${sf.actionFilter.length} action${sf.actionFilter.length === 1 ? "" : "s"}`,
+                            sf.dateRange?.from && "date range",
+                          ]
+                            .filter(Boolean)
+                            .join(" · ") || "no filters"}
+                        </span>
+                      </button>
+                      <button
+                        type="button"
+                        onClick={(e) => {
+                          e.preventDefault();
+                          e.stopPropagation();
+                          handleDeleteSavedFilter(sf.id);
+                        }}
+                        aria-label={`Delete saved filter ${sf.name}`}
+                        className="inline-flex h-6 w-6 items-center justify-center rounded text-muted-foreground opacity-0 transition hover:bg-destructive/10 hover:text-destructive focus-visible:opacity-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring group-hover:opacity-100"
+                      >
+                        <X className="h-3 w-3" aria-hidden />
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              )}
+              <DropdownMenuSeparator />
+              <div className="flex items-center gap-1 px-2 py-1.5">
+                <Input
+                  value={savedFilterName}
+                  onChange={(e) => setSavedFilterName(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter") {
+                      e.preventDefault();
+                      handleSaveFilter();
+                    }
+                  }}
+                  placeholder="Filter name..."
+                  className="h-7 text-xs"
+                  aria-label="Saved filter name"
+                  disabled={activeFilterCount === 0}
+                />
+                <Button
+                  type="button"
+                  variant="default"
+                  size="sm"
+                  onClick={handleSaveFilter}
+                  disabled={
+                    activeFilterCount === 0 || !savedFilterName.trim()
+                  }
+                  className="h-7 shrink-0 gap-1 px-2 text-xs"
+                  aria-label="Save current filter"
+                >
+                  <BookmarkPlus className="h-3 w-3" aria-hidden />
+                  Save
+                </Button>
+              </div>
+              {activeFilterCount === 0 && (
+                <p className="px-2 pb-2 text-3xs text-muted-foreground">
+                  Configure at least one filter to save.
+                </p>
+              )}
+            </DropdownMenuContent>
+          </DropdownMenu>
+
           {/* Reset all filters */}
           {activeFilterCount > 0 && (
             <Button
@@ -1145,169 +1793,136 @@ export const AuditLogPage: React.FC = () => {
           />
         )
       ) : (
-        <div className="overflow-x-auto rounded-md border border-border bg-card">
-          <Table>
-            <TableHeader>
-              <TableRow className="hover:bg-transparent">
-                {/* Expand column */}
-                <TableHead className="w-8" aria-label="Expand row" />
-                <SortableHead
-                  label="Timestamp"
-                  sortKey="timestamp"
-                  sort={sort}
-                  onToggle={toggleSort}
-                />
-                <SortableHead
-                  label="Actor"
-                  sortKey="actor"
-                  sort={sort}
-                  onToggle={toggleSort}
-                />
-                <SortableHead
-                  label="Action"
-                  sortKey="action"
-                  sort={sort}
-                  onToggle={toggleSort}
-                />
-                <SortableHead
-                  label="Target"
-                  sortKey="target"
-                  sort={sort}
-                  onToggle={toggleSort}
-                />
-                <SortableHead
-                  label="Status"
-                  sortKey="status"
-                  sort={sort}
-                  onToggle={toggleSort}
-                />
-              </TableRow>
-            </TableHeader>
-            <TableBody>
-              {paged.map((entry) => {
-                const isExpanded = expandedId === entry.id;
-                const hasExpandable =
-                  Boolean(entry.details) || Boolean(entry.error);
-                return (
-                  <React.Fragment key={entry.id}>
-                    <TableRow
-                      data-state={isExpanded ? "selected" : undefined}
-                      className={cn(
-                        hasExpandable && "cursor-pointer",
-                        isExpanded && "bg-muted/40",
-                      )}
-                      onClick={
-                        hasExpandable
-                          ? () => handleRowToggle(entry.id)
-                          : undefined
-                      }
-                    >
-                      <TableCell className="w-8 p-0 text-center align-middle">
-                        {hasExpandable ? (
-                          <button
-                            type="button"
-                            onClick={(e) => {
-                              e.stopPropagation();
-                              handleRowToggle(entry.id);
-                            }}
-                            aria-label={
-                              isExpanded ? "Collapse details" : "Expand details"
-                            }
-                            aria-expanded={isExpanded}
-                            className="inline-flex h-6 w-6 items-center justify-center rounded text-muted-foreground transition-colors hover:bg-accent/30 hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+        <div className="rounded-md border border-border bg-card">
+          {/* Scrollable container — bound the table height so tail-mode
+              has something to scroll. `max-h-[70vh]` keeps the table tall
+              on big monitors but still lets the rest of the page (insights,
+              pagination footer) breathe. */}
+          <div
+            ref={tableScrollRef}
+            className="max-h-[70vh] overflow-x-auto overflow-y-auto"
+            role="region"
+            aria-label="Audit log entries"
+            tabIndex={0}
+          >
+            <Table>
+              <TableHeader>
+                <TableRow className="hover:bg-transparent">
+                  {/* Expand column */}
+                  <TableHead className="w-8" aria-label="Expand row" />
+                  <SortableHead
+                    label="Timestamp"
+                    sortKey="timestamp"
+                    sort={sort}
+                    onToggle={toggleSort}
+                  />
+                  <SortableHead
+                    label="Actor"
+                    sortKey="actor"
+                    sort={sort}
+                    onToggle={toggleSort}
+                  />
+                  <SortableHead
+                    label="Action"
+                    sortKey="action"
+                    sort={sort}
+                    onToggle={toggleSort}
+                  />
+                  <SortableHead
+                    label="Target"
+                    sortKey="target"
+                    sort={sort}
+                    onToggle={toggleSort}
+                  />
+                  <SortableHead
+                    label="Status"
+                    sortKey="status"
+                    sort={sort}
+                    onToggle={toggleSort}
+                  />
+                </TableRow>
+              </TableHeader>
+              <TableBody>
+                {groups
+                  ? groups.map((group) => {
+                      const isCollapsed = collapsedGroups.has(group.key);
+                      return (
+                        <React.Fragment key={`grp:${group.key}`}>
+                          <TableRow
+                            className="cursor-pointer bg-surface-sunken/40 hover:bg-surface-sunken/60"
+                            onClick={() => toggleGroupCollapsed(group.key)}
+                            data-group-header
                           >
-                            {isExpanded ? (
-                              <ChevronDown
-                                className="h-3.5 w-3.5"
-                                aria-hidden
-                              />
-                            ) : (
-                              <ChevronRight
-                                className="h-3.5 w-3.5"
-                                aria-hidden
-                              />
+                            <TableCell
+                              colSpan={6}
+                              className="py-1.5 align-middle"
+                            >
+                              <div className="flex items-center gap-2">
+                                <button
+                                  type="button"
+                                  onClick={(e) => {
+                                    e.stopPropagation();
+                                    toggleGroupCollapsed(group.key);
+                                  }}
+                                  aria-label={
+                                    isCollapsed
+                                      ? `Expand group ${group.label}`
+                                      : `Collapse group ${group.label}`
+                                  }
+                                  aria-expanded={!isCollapsed}
+                                  className="inline-flex h-5 w-5 items-center justify-center rounded text-muted-foreground hover:bg-accent/40 hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                                >
+                                  {isCollapsed ? (
+                                    <ChevronRight
+                                      className="h-3.5 w-3.5"
+                                      aria-hidden
+                                    />
+                                  ) : (
+                                    <ChevronDown
+                                      className="h-3.5 w-3.5"
+                                      aria-hidden
+                                    />
+                                  )}
+                                </button>
+                                <span className="text-2xs font-semibold uppercase tracking-wider text-muted-foreground">
+                                  {groupBy}
+                                </span>
+                                <span
+                                  className="truncate font-mono text-xs text-foreground"
+                                  title={group.label}
+                                >
+                                  {group.label}
+                                </span>
+                                <Badge
+                                  variant="outline"
+                                  className="ml-1 h-4 min-w-4 px-1 text-3xs tabular-nums"
+                                >
+                                  {group.rows.length}
+                                </Badge>
+                              </div>
+                            </TableCell>
+                          </TableRow>
+                          {!isCollapsed &&
+                            group.rows.map((entry) =>
+                              renderEntryRows(entry, {
+                                expandedId,
+                                relativeTime,
+                                handleRowToggle,
+                              }),
                             )}
-                          </button>
-                        ) : (
-                          <span
-                            className="inline-block h-1 w-1 rounded-full bg-muted-foreground/30"
-                            aria-hidden
-                          />
-                        )}
-                      </TableCell>
-                      <TableCell className="whitespace-nowrap font-mono text-xs text-muted-foreground tabular-nums">
-                        <span
-                          title={
-                            relativeTime
-                              ? formatDateTime(entry.timestamp)
-                              : entry.timestamp
-                          }
-                        >
-                          {relativeTime
-                            ? formatRelativeTime(entry.timestamp)
-                            : formatDateTime(entry.timestamp)}
-                        </span>
-                      </TableCell>
-                      <TableCell
-                        className="text-sm text-foreground"
-                        onClick={(e) => e.stopPropagation()}
-                      >
-                        <CopyableText value={entry.actor} />
-                      </TableCell>
-                      <TableCell
-                        className="text-sm font-medium text-primary"
-                        onClick={(e) => e.stopPropagation()}
-                      >
-                        <CopyableText
-                          value={entry.action}
-                          display={
-                            <span className="font-mono text-xs">
-                              {entry.action}
-                            </span>
-                          }
-                        />
-                      </TableCell>
-                      <TableCell
-                        className="text-sm text-foreground"
-                        onClick={(e) => e.stopPropagation()}
-                      >
-                        {entry.target ? (
-                          <CopyableText
-                            value={entry.target}
-                            mono={entry.target.length > 20}
-                          />
-                        ) : (
-                          <span className="text-muted-foreground/60">—</span>
-                        )}
-                      </TableCell>
-                      <TableCell>
-                        <Badge
-                          variant={
-                            entry.status === "success"
-                              ? "success"
-                              : "destructive"
-                          }
-                          className="capitalize"
-                        >
-                          {entry.status}
-                        </Badge>
-                      </TableCell>
-                    </TableRow>
-                    {isExpanded && (
-                      <TableRow
-                        className="bg-muted/20 hover:bg-muted/20"
-                        aria-label="Row details"
-                      >
-                        <TableCell colSpan={6} className="p-0">
-                          <RowDetails entry={entry} />
-                        </TableCell>
-                      </TableRow>
+                        </React.Fragment>
+                      );
+                    })
+                  : paged.map((entry) =>
+                      renderEntryRows(entry, {
+                        expandedId,
+                        relativeTime,
+                        handleRowToggle,
+                      }),
                     )}
-                  </React.Fragment>
-                );
-              })}
-            </TableBody>
-          </Table>
+              </TableBody>
+            </Table>
+          </div>
 
           {/* Pagination footer */}
           <div className="flex flex-wrap items-center justify-between gap-3 border-t border-border bg-surface-sunken/30 px-3 py-2">
@@ -1335,7 +1950,7 @@ export const AuditLogPage: React.FC = () => {
                 <span>Rows per page</span>
                 <Select
                   value={String(pageSize)}
-                  onValueChange={(v) => setPageSize(Number(v) as PageSize)}
+                  onValueChange={(v) => setPageSizeRaw(coercePageSize(v))}
                 >
                   <SelectTrigger
                     className="h-7 w-16 text-xs"
@@ -1416,6 +2031,135 @@ export const AuditLogPage: React.FC = () => {
 };
 
 // ---------------------------------------------------------------------------
+// Row renderer — shared between flat-list and grouped views.
+// ---------------------------------------------------------------------------
+
+interface RenderEntryRowsContext {
+  expandedId: string | null;
+  relativeTime: boolean;
+  handleRowToggle: (id: string) => void;
+}
+
+/**
+ * Render the main row + (optional) expanded-details row for one audit entry.
+ * Pulled out of the JSX so the grouped renderer and the flat renderer can
+ * share it without duplicating ~70 lines of cell markup.
+ */
+function renderEntryRows(
+  entry: AuditEntry,
+  ctx: RenderEntryRowsContext,
+): React.ReactElement {
+  const { expandedId, relativeTime, handleRowToggle } = ctx;
+  const isExpanded = expandedId === entry.id;
+  const hasExpandable = Boolean(entry.details) || Boolean(entry.error);
+  return (
+    <React.Fragment key={entry.id}>
+      <TableRow
+        data-state={isExpanded ? "selected" : undefined}
+        className={cn(
+          hasExpandable && "cursor-pointer",
+          isExpanded && "bg-muted/40",
+        )}
+        onClick={
+          hasExpandable ? () => handleRowToggle(entry.id) : undefined
+        }
+      >
+        <TableCell className="w-8 p-0 text-center align-middle">
+          {hasExpandable ? (
+            <button
+              type="button"
+              onClick={(e) => {
+                e.stopPropagation();
+                handleRowToggle(entry.id);
+              }}
+              aria-label={
+                isExpanded ? "Collapse details" : "Expand details"
+              }
+              aria-expanded={isExpanded}
+              className="inline-flex h-6 w-6 items-center justify-center rounded text-muted-foreground transition-colors hover:bg-accent/30 hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+            >
+              {isExpanded ? (
+                <ChevronDown className="h-3.5 w-3.5" aria-hidden />
+              ) : (
+                <ChevronRight className="h-3.5 w-3.5" aria-hidden />
+              )}
+            </button>
+          ) : (
+            <span
+              className="inline-block h-1 w-1 rounded-full bg-muted-foreground/30"
+              aria-hidden
+            />
+          )}
+        </TableCell>
+        <TableCell className="whitespace-nowrap font-mono text-xs text-muted-foreground tabular-nums">
+          <span
+            title={
+              relativeTime
+                ? formatDateTime(entry.timestamp)
+                : entry.timestamp
+            }
+          >
+            {relativeTime
+              ? formatRelativeTime(entry.timestamp)
+              : formatDateTime(entry.timestamp)}
+          </span>
+        </TableCell>
+        <TableCell
+          className="text-sm text-foreground"
+          onClick={(e) => e.stopPropagation()}
+        >
+          <CopyableText value={entry.actor} />
+        </TableCell>
+        <TableCell
+          className="text-sm font-medium text-primary"
+          onClick={(e) => e.stopPropagation()}
+        >
+          <CopyableText
+            value={entry.action}
+            display={
+              <span className="font-mono text-xs">{entry.action}</span>
+            }
+          />
+        </TableCell>
+        <TableCell
+          className="text-sm text-foreground"
+          onClick={(e) => e.stopPropagation()}
+        >
+          {entry.target ? (
+            <CopyableText
+              value={entry.target}
+              mono={entry.target.length > 20}
+            />
+          ) : (
+            <span className="text-muted-foreground/60">—</span>
+          )}
+        </TableCell>
+        <TableCell>
+          <Badge
+            variant={
+              entry.status === "success" ? "success" : "destructive"
+            }
+            className="capitalize"
+          >
+            {entry.status}
+          </Badge>
+        </TableCell>
+      </TableRow>
+      {isExpanded && (
+        <TableRow
+          className="bg-muted/20 hover:bg-muted/20"
+          aria-label="Row details"
+        >
+          <TableCell colSpan={6} className="p-0">
+            <RowDetails entry={entry} />
+          </TableCell>
+        </TableRow>
+      )}
+    </React.Fragment>
+  );
+}
+
+// ---------------------------------------------------------------------------
 // Sortable column header
 // ---------------------------------------------------------------------------
 
@@ -1486,6 +2230,14 @@ const RowDetails: React.FC<RowDetailsProps> = ({ entry }) => {
     () => (entry.details ? JSON.stringify(entry.details, null, 2) : ""),
     [entry.details],
   );
+  // Per-row toggle: pretty/raw JSON. Pretty (default) shows the standard
+  // 2-space-indented JSON; raw shows the compact single-line form which
+  // is friendlier for grep / paste.
+  const [rawJson, setRawJson] = React.useState(false);
+  const detailsCompact = React.useMemo(
+    () => (entry.details ? JSON.stringify(entry.details) : ""),
+    [entry.details],
+  );
   return (
     <div className="border-l-2 border-primary/40 bg-surface-sunken/40 px-4 py-3">
       <div className="grid gap-3 sm:grid-cols-2">
@@ -1516,10 +2268,34 @@ const RowDetails: React.FC<RowDetailsProps> = ({ entry }) => {
             <span className="text-2xs font-semibold uppercase tracking-wider text-muted-foreground">
               Details (JSON)
             </span>
-            <CopyButton value={detailsJson} alwaysVisible iconSize={12} />
+            <div className="flex items-center gap-1.5">
+              <button
+                type="button"
+                onClick={() => setRawJson((v) => !v)}
+                className={cn(
+                  "rounded px-1.5 py-0.5 text-3xs font-medium uppercase tracking-wider transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring",
+                  rawJson
+                    ? "bg-primary/15 text-primary"
+                    : "text-muted-foreground hover:bg-muted/40 hover:text-foreground",
+                )}
+                aria-pressed={rawJson}
+                aria-label={
+                  rawJson
+                    ? "Show pretty-printed JSON"
+                    : "Show raw single-line JSON"
+                }
+              >
+                {rawJson ? "Raw" : "Pretty"}
+              </button>
+              <CopyButton
+                value={rawJson ? detailsCompact : detailsJson}
+                alwaysVisible
+                iconSize={12}
+              />
+            </div>
           </div>
           <pre className="m-0 mt-1.5 max-h-72 overflow-auto whitespace-pre-wrap break-words font-mono text-xs leading-relaxed text-foreground/90">
-            {detailsJson}
+            {rawJson ? detailsCompact : detailsJson}
           </pre>
         </div>
       )}

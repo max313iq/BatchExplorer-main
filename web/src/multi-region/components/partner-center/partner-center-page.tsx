@@ -28,7 +28,7 @@ import * as React from "react";
 import {
   AlertTriangle,
   CheckCircle2,
-  Download,
+  Clock,
   ExternalLink,
   Handshake,
   Link2,
@@ -61,7 +61,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
-import { cn, downloadCsv, downloadJson } from "@/lib/utils";
+import { cn } from "@/lib/utils";
 
 import {
   getActiveTenant,
@@ -70,6 +70,7 @@ import {
 } from "../../auth/msal-auth";
 import { resolveActiveTenantId } from "../../auth/perform-tenant-switch";
 import { useArmToken } from "../../auth/use-arm-token";
+import { usePersistedState } from "../../hooks/use-persisted-state";
 import { modKeyLabel, useShortcut } from "../../hooks/use-shortcut";
 import { useTenantChange } from "../../hooks/use-tenant-change";
 import { auditLog } from "../../services/audit-log";
@@ -89,9 +90,10 @@ import {
 } from "../../services/partner-center-service";
 import { useMultiRegionState, useMultiRegionStore } from "../../store/store-context";
 
+import { useDashboardOutletContext } from "../page-router";
 import { ConfirmationDialog } from "../shared/confirmation-dialog";
 import { CopyableText, CopyButton } from "../shared/copy-button";
-import { EmptyState } from "../shared/empty-state";
+import { ExportMenu, type ExportColumn } from "../shared/export-menu";
 import { InfoTooltip } from "../shared/info-tooltip";
 import { PageHeader } from "../shared/page-header";
 import { SignInRequired } from "../shared/sign-in-required";
@@ -99,9 +101,21 @@ import { SummaryStatItem } from "../shared/summary-stat-item";
 import { type PageKey } from "../shared/sidebar-nav";
 import { TokenExpiryBadge } from "../shared/token-expiry-badge";
 
+// COORDINATOR: `EmptyState` was imported but unused in the historical page;
+// dropped to keep this file self-contained and lint-clean. Re-add if a
+// future enhancement needs the shared empty layout.
+
 const ACTIVE_ACCOUNT_KEY = "partner-center:active-account";
 const PARTNER_ID_KEY = "partner-center:last-partner-id";
+const PREFERRED_MPN_KEY = "partner-center:preferred-mpn";
 const PARTNER_ID_RE = /^\d{6,10}$/;
+/**
+ * Probes whose `lastRunAt` is older than this are flagged as "stale". The
+ * threshold (24h) mirrors CSP partner-of-record reconciliation cadence —
+ * a probe answer older than a day is no longer trustworthy for billing
+ * attribution decisions.
+ */
+const STALE_PROBE_MS = 24 * 60 * 60 * 1000;
 
 /**
  * Truncate the middle of a long opaque id (tenantId, GUID, etc.) so it
@@ -117,6 +131,12 @@ function truncateMiddle(value: string, head = 8, tail = 4): string {
 }
 
 export interface PartnerCenterPageProps {
+  /**
+   * Legacy navigation callback retained for backward compat with the
+   * `<PartnerCenterPage onNavigate={...}/>` adapter in page-router. New
+   * call sites should rely on `useDashboardOutletContext().navigateToPage`
+   * directly. When both are present, `navigateToPage` wins.
+   */
   onNavigate?: (k: PageKey) => void;
 }
 
@@ -130,6 +150,26 @@ interface CandidateAccount {
 type ProbeKey = "csp" | "mpn" | "legalBusiness" | "pal";
 
 const ALL_PROBES: ProbeKey[] = ["csp", "mpn", "legalBusiness", "pal"];
+
+/**
+ * Row shape exported via `ExportMenu`. Hoisted to module scope so the
+ * `ExportColumn<ExportRow>` generic resolves to a stable identity across
+ * renders (declaring an interface inside the component body works at the
+ * TS level but creates a fresh type identity per render — fine for
+ * erasable types but unnecessarily noisy in editor inlay hints).
+ */
+interface ExportRow {
+  probe: ProbeKey;
+  label: string;
+  outcome: string;
+  summary: string;
+  httpStatus: number | null;
+  errorCode: string | null;
+  detail: string | null;
+  data: unknown;
+  ranAt: string | null;
+  stale: boolean;
+}
 
 interface ProbeState {
   csp: ProbeResult<CspCustomerSummary> | null;
@@ -184,6 +224,27 @@ export const PartnerCenterPage: React.FC<PartnerCenterPageProps> = ({
   const azureAccounts = state.azureAccounts ?? [];
 
   /* ───────────────────────────────────────────────────────────────────
+   * Navigation. Prefer the path-based `navigateToPage` from the
+   * dashboard outlet context (the canonical wiring); fall back to the
+   * legacy `onNavigate(pageKey)` prop for storybook / standalone
+   * mounts and for the back-compat adapter in page-router. The cast
+   * tolerates rendering outside an Outlet (returns `undefined`).
+   * ─────────────────────────────────────────────────────────────────── */
+  const outletCtx = useDashboardOutletContext() as unknown as
+    | { navigateToPage?: (path: string) => void }
+    | undefined;
+  const navigateTo = React.useCallback(
+    (key: PageKey) => {
+      if (outletCtx?.navigateToPage) {
+        outletCtx.navigateToPage(key.startsWith("/") ? key : `/${key}`);
+        return;
+      }
+      onNavigate?.(key);
+    },
+    [outletCtx, onNavigate],
+  );
+
+  /* ───────────────────────────────────────────────────────────────────
    * Candidate accounts. Every signed-in Azure account is a candidate
    * — Partner Center membership lives at the *tenant* level so the
    * operator picks "as which signed-in identity should I run this
@@ -212,7 +273,15 @@ export const PartnerCenterPage: React.FC<PartnerCenterPageProps> = ({
   React.useEffect(() => {
     if (candidates.length === 0) return;
     if (!candidates.some((c) => c.homeAccountId === accountId)) {
-      setAccountId(candidates[0]!.homeAccountId);
+      const next = candidates[0]!.homeAccountId;
+      setAccountId(next);
+      // Mirror the auto-selection to sessionStorage so a reload picks up
+      // the same default rather than re-running this effect.
+      try {
+        sessionStorage.setItem(ACTIVE_ACCOUNT_KEY, next);
+      } catch {
+        /* ignore */
+      }
     }
   }, [candidates, accountId]);
 
@@ -492,27 +561,54 @@ export const PartnerCenterPage: React.FC<PartnerCenterPageProps> = ({
    * dep — important because otherwise the `useShortcut` registrations
    * below would re-bind every keystroke.
    * ─────────────────────────────────────────────────────────────────── */
-  const [partnerId, setPartnerId] = React.useState<string>(() => {
-    try {
-      return localStorage.getItem(PARTNER_ID_KEY) ?? "";
-    } catch {
-      return "";
-    }
-  });
+  const [partnerId, setPartnerId] = usePersistedState<string>(
+    PARTNER_ID_KEY,
+    "",
+    {
+      // Keep the raw-string legacy shape (no envelope wrapping) so older
+      // installs hydrate their last-typed Partner ID without a migration
+      // pass — `localStorage.getItem` previously returned the raw value.
+      deserialize: (raw) => raw,
+      serialize: (v) => v,
+    },
+  );
   const partnerIdRef = React.useRef(partnerId);
   React.useEffect(() => {
     partnerIdRef.current = partnerId;
   }, [partnerId]);
 
-  const handlePartnerIdChange = React.useCallback((v: string) => {
-    setPartnerId(v);
-    try {
-      localStorage.setItem(PARTNER_ID_KEY, v);
-    } catch {
-      /* ignore */
-    }
-  }, []);
+  const handlePartnerIdChange = React.useCallback(
+    (v: string) => setPartnerId(v),
+    [setPartnerId],
+  );
   const partnerIdValid = PARTNER_ID_RE.test(partnerId.trim());
+
+  /* ───────────────────────────────────────────────────────────────────
+   * Enhancement #1 — persisted "preferred MPN" filter.
+   *
+   * Operators in multi-tenant CSP estates spend most of their day staring
+   * at the SAME partner's customers. Persisting the MPN id (independent
+   * of the in-flight Partner ID field above) lets us:
+   *   - highlight the matching tenant in the CSP customer sample
+   *   - pre-populate the Partner ID input on first paint when empty
+   *   - flag a "this isn't my partner" mismatch when the MPN probe
+   *     comes back with a different mpnId
+   *
+   * Stored under its own key so toggling it doesn't churn the working
+   * Partner ID typed into the link/unlink form.
+   * ─────────────────────────────────────────────────────────────────── */
+  const [preferredMpn, setPreferredMpn] = usePersistedState<string>(
+    PREFERRED_MPN_KEY,
+    "",
+    {
+      deserialize: (raw) => raw,
+      serialize: (v) => v,
+    },
+  );
+  const [mpnFilterOn, setMpnFilterOn] = usePersistedState<boolean>(
+    `${PREFERRED_MPN_KEY}:on`,
+    false,
+  );
 
   const [linking, setLinking] = React.useState(false);
   const [pendingLink, setPendingLink] = React.useState(false);
@@ -731,10 +827,18 @@ export const PartnerCenterPage: React.FC<PartnerCenterPageProps> = ({
    * Probe-results export. Captures the four probe slots + their parsed
    * data, exporting one row per probe so the JSON / CSV files match
    * what the operator just saw on screen.
+   *
+   * Enhancement #3 — unified ExportMenu (CSV + JSON in one dropdown)
+   * replaces the previous pair of inline buttons. The accessor callbacks
+   * mirror what the on-screen badges show so a CSV opened in Excel and
+   * the UI never disagree.
    * ─────────────────────────────────────────────────────────────────── */
-  const exportRows = React.useMemo(() => {
+
+  const exportRows: ExportRow[] = React.useMemo(() => {
+    const now = Date.now();
     return ALL_PROBES.map((k) => {
       const r = probes[k];
+      const ranAtMs = lastRunAt[k];
       return {
         probe: k,
         label: PROBE_LABEL[k],
@@ -744,47 +848,50 @@ export const PartnerCenterPage: React.FC<PartnerCenterPageProps> = ({
         errorCode: r?.code ?? null,
         detail: r?.detail ?? null,
         data: r?.data ?? null,
-        ranAt: lastRunAt[k] ? new Date(lastRunAt[k]!).toISOString() : null,
+        ranAt: ranAtMs ? new Date(ranAtMs).toISOString() : null,
+        stale: ranAtMs != null && now - ranAtMs > STALE_PROBE_MS,
       };
     });
   }, [probes, lastRunAt]);
 
-  const handleExportJson = React.useCallback(() => {
-    const stamp = new Date().toISOString().slice(0, 19).replace(/[:T]/g, "-");
-    const payload = {
-      exportedAt: new Date().toISOString(),
+  const exportColumns: ExportColumn<ExportRow>[] = React.useMemo(
+    () => [
+      { header: "Probe", accessor: (r) => r.probe },
+      { header: "Label", accessor: (r) => r.label },
+      { header: "Outcome", accessor: (r) => r.outcome },
+      { header: "Summary", accessor: (r) => r.summary },
+      { header: "HTTP status", accessor: (r) => r.httpStatus ?? "" },
+      { header: "Error code", accessor: (r) => r.errorCode ?? "" },
+      { header: "Ran at", accessor: (r) => r.ranAt ?? "" },
+      { header: "Stale (>24h)", accessor: (r) => (r.stale ? "yes" : "") },
+      { header: "Detail", accessor: (r) => r.detail ?? "" },
+    ],
+    [],
+  );
+
+  const exportMetadata: Record<string, unknown> = React.useMemo(
+    () => ({
       tenantId: getActiveTenantIdForSelected() ?? account?.tenantId ?? null,
       account: account?.username ?? null,
       partnerId: partnerId.trim() || null,
-      rows: exportRows,
-    };
-    downloadJson(`partner-center-probes-${stamp}.json`, payload);
-  }, [account, exportRows, getActiveTenantIdForSelected, partnerId]);
+      preferredMpn: preferredMpn.trim() || null,
+    }),
+    [account, getActiveTenantIdForSelected, partnerId, preferredMpn],
+  );
 
-  const handleExportCsv = React.useCallback(() => {
-    const stamp = new Date().toISOString().slice(0, 19).replace(/[:T]/g, "-");
-    const headers = [
-      "Probe",
-      "Label",
-      "Outcome",
-      "Summary",
-      "HTTP status",
-      "Error code",
-      "Ran at",
-      "Detail",
-    ];
-    const rows = exportRows.map((r) => [
-      r.probe,
-      r.label,
-      r.outcome,
-      r.summary,
-      r.httpStatus ?? "",
-      r.errorCode ?? "",
-      r.ranAt ?? "",
-      r.detail ?? "",
-    ]);
-    downloadCsv(`partner-center-probes-${stamp}.csv`, headers, rows);
-  }, [exportRows]);
+  /* ───────────────────────────────────────────────────────────────────
+   * Enhancement #5 — stale-probe detector.
+   *
+   * A probe that hasn't been re-run in >24h is no longer trustworthy for
+   * partner-of-record / billing-attribution decisions. We surface a
+   * small "Stale" pill on the row + a banner-level count, and the CSV
+   * export carries a dedicated column so the operator can filter on it
+   * downstream.
+   * ─────────────────────────────────────────────────────────────────── */
+  const staleCount = React.useMemo(
+    () => exportRows.filter((r) => r.stale).length,
+    [exportRows],
+  );
 
   /* ───────────────────────────────────────────────────────────────────
    * Keyboard shortcuts (page-scoped, suppressed while typing in an
@@ -830,7 +937,7 @@ export const PartnerCenterPage: React.FC<PartnerCenterPageProps> = ({
         <SignInRequired
           whatYouCantDo="Probe Partner Center capability"
           why="an Azure account whose tenant has CSP, MPN, or Partner Admin Link associations"
-          onNavigate={onNavigate}
+          onNavigate={(k) => navigateTo(k)}
         />
       </div>
     );
@@ -859,6 +966,20 @@ export const PartnerCenterPage: React.FC<PartnerCenterPageProps> = ({
   // True when at least one probe ran AND none of them passed — almost
   // always means "wrong tenant" or "needs Token Importer".
   const allFailed = hasAnyResult && counts.pass === 0;
+
+  // Derived MPN match state — used by the preferred-MPN filter chip and
+  // by the MPN probe row to flag "this isn't the partner you usually
+  // operate as". Trimmed because operators paste with stray whitespace.
+  const trimmedPreferredMpn = preferredMpn.trim();
+  const observedMpnId =
+    probes.mpn?.outcome === "pass"
+      ? (probes.mpn.data as MpnProfileSummary | null | undefined)?.mpnId ?? ""
+      : "";
+  const mpnMismatch =
+    mpnFilterOn &&
+    !!trimmedPreferredMpn &&
+    !!observedMpnId &&
+    observedMpnId !== trimmedPreferredMpn;
 
   return (
     <div className="flex flex-col gap-4 py-4">
@@ -906,7 +1027,7 @@ export const PartnerCenterPage: React.FC<PartnerCenterPageProps> = ({
         </div>
       </PageHeader>
 
-      <div className="grid grid-cols-2 gap-2 sm:grid-cols-3 lg:grid-cols-6">
+      <div className="grid grid-cols-2 gap-2 sm:grid-cols-3 lg:grid-cols-7">
         <SummaryStatItem label="Probes run" value={`${ranCount}/4`} compact />
         <SummaryStatItem
           label="Pass"
@@ -933,10 +1054,31 @@ export const PartnerCenterPage: React.FC<PartnerCenterPageProps> = ({
           compact
         />
         <SummaryStatItem
-          label="Tenant"
-          value={truncateMiddle(account?.tenantId ?? "", 8, 4)}
+          label="Stale (>24h)"
+          value={staleCount}
+          tone={staleCount > 0 ? "warning" : "muted"}
+          hint={staleCount > 0 ? "re-run for fresh data" : undefined}
           compact
         />
+        <div
+          className="group/copy flex flex-col justify-center gap-0.5 rounded-md border border-border/60 bg-card/40 px-3 py-2"
+          aria-label="Active tenant id"
+        >
+          <span className="text-3xs font-semibold uppercase tracking-wider text-muted-foreground">
+            Tenant
+          </span>
+          <div className="flex items-center gap-1">
+            <code className="truncate font-mono text-xs text-foreground">
+              {truncateMiddle(account?.tenantId ?? "", 8, 4) || "—"}
+            </code>
+            {account?.tenantId ? (
+              <CopyButton
+                value={account.tenantId}
+                ariaLabel={`Copy tenant id ${account.tenantId}`}
+              />
+            ) : null}
+          </div>
+        </div>
       </div>
 
       {allFailed && (
@@ -956,6 +1098,66 @@ export const PartnerCenterPage: React.FC<PartnerCenterPageProps> = ({
           </AlertDescription>
         </Alert>
       )}
+
+      {/* Enhancement #1 — persisted "preferred MPN" filter. The chip
+          row toggles a soft filter that, when on, highlights the
+          configured MPN id in the MPN probe row and warns when the
+          observed MPN differs (likely wrong tenant). */}
+      <div
+        className="flex flex-wrap items-center gap-2 rounded-md border border-border bg-card/40 px-3 py-2 text-2xs"
+        role="region"
+        aria-label="Preferred MPN filter"
+      >
+        <span className="font-semibold uppercase tracking-wider text-muted-foreground">
+          Preferred MPN
+        </span>
+        <Input
+          value={preferredMpn}
+          onChange={(e) => setPreferredMpn(e.target.value)}
+          placeholder="e.g. 1234567"
+          inputMode="numeric"
+          autoComplete="off"
+          aria-label="Preferred MPN id (sticky filter)"
+          className="h-7 w-32 font-mono text-xs"
+        />
+        <Button
+          type="button"
+          variant={mpnFilterOn ? "default" : "outline"}
+          size="sm"
+          className="h-7 px-2"
+          aria-pressed={mpnFilterOn}
+          onClick={() => setMpnFilterOn((on) => !on)}
+          disabled={!trimmedPreferredMpn}
+          title={
+            !trimmedPreferredMpn
+              ? "Enter an MPN id first"
+              : mpnFilterOn
+                ? "Disable preferred-MPN check"
+                : "Highlight the configured MPN in probe results"
+          }
+        >
+          {mpnFilterOn ? "Filter on" : "Filter off"}
+        </Button>
+        {trimmedPreferredMpn && partnerId.trim() !== trimmedPreferredMpn && (
+          <Button
+            type="button"
+            variant="ghost"
+            size="sm"
+            className="h-7 px-2 text-3xs"
+            onClick={() => handlePartnerIdChange(trimmedPreferredMpn)}
+            aria-label="Use the preferred MPN as the working Partner ID"
+          >
+            Use as Partner ID
+          </Button>
+        )}
+        {mpnMismatch && (
+          <span className="ml-auto inline-flex items-center gap-1 rounded border border-warning/40 bg-warning/10 px-1.5 py-0.5 font-medium text-warning">
+            <AlertTriangle className="h-3 w-3" aria-hidden />
+            MPN mismatch: observed{" "}
+            <code className="font-mono">{observedMpnId}</code>
+          </span>
+        )}
+      </div>
 
       <Card className="border-border bg-card shadow-sm">
         <CardHeader className="pb-3">
@@ -978,30 +1180,15 @@ export const PartnerCenterPage: React.FC<PartnerCenterPageProps> = ({
               </CardDescription>
             </div>
             <div className="flex flex-wrap items-center gap-1.5">
-              <Button
-                type="button"
-                variant="outline"
-                size="sm"
-                onClick={handleExportJson}
+              <ExportMenu<ExportRow>
+                rows={exportRows}
+                columns={exportColumns}
+                filename="partner-center-probes"
+                jsonMetadata={exportMetadata}
                 disabled={!hasAnyResult}
-                aria-label="Export probe results as JSON"
-                title="Export current probe results to JSON"
-              >
-                <Download className="h-3.5 w-3.5" />
-                JSON
-              </Button>
-              <Button
-                type="button"
-                variant="outline"
-                size="sm"
-                onClick={handleExportCsv}
-                disabled={!hasAnyResult}
-                aria-label="Export probe results as CSV"
-                title="Export current probe results to CSV"
-              >
-                <Download className="h-3.5 w-3.5" />
-                CSV
-              </Button>
+                rowCount={ranCount}
+                label="Export"
+              />
             </div>
           </div>
         </CardHeader>
@@ -1062,6 +1249,10 @@ export const PartnerCenterPage: React.FC<PartnerCenterPageProps> = ({
             onRun={() => void runProbe("csp")}
             disabled={!account}
             lastRunAt={lastRunAt.csp}
+            stale={
+              lastRunAt.csp != null &&
+              Date.now() - lastRunAt.csp > STALE_PROBE_MS
+            }
             renderExtra={(r) => {
               if (r.outcome !== "pass" || !r.data) return null;
               const data = r.data as CspCustomerSummary;
@@ -1092,10 +1283,22 @@ export const PartnerCenterPage: React.FC<PartnerCenterPageProps> = ({
             onRun={() => void runProbe("mpn")}
             disabled={!account}
             lastRunAt={lastRunAt.mpn}
+            stale={
+              lastRunAt.mpn != null &&
+              Date.now() - lastRunAt.mpn > STALE_PROBE_MS
+            }
             renderExtra={(r) => {
               if (r.outcome !== "pass" || !r.data) return null;
               const data = r.data as MpnProfileSummary;
               if (!data.mpnId) return null;
+              const isPreferred =
+                mpnFilterOn &&
+                !!trimmedPreferredMpn &&
+                data.mpnId === trimmedPreferredMpn;
+              const isPreferredMismatch =
+                mpnFilterOn &&
+                !!trimmedPreferredMpn &&
+                data.mpnId !== trimmedPreferredMpn;
               return (
                 <div className="flex flex-wrap items-center gap-2 text-2xs text-muted-foreground">
                   <span>
@@ -1105,6 +1308,16 @@ export const PartnerCenterPage: React.FC<PartnerCenterPageProps> = ({
                   {data.profileType && (
                     <Badge variant="outline" className="text-3xs">
                       {data.profileType}
+                    </Badge>
+                  )}
+                  {isPreferred && (
+                    <Badge variant="success" className="text-3xs">
+                      preferred MPN ✓
+                    </Badge>
+                  )}
+                  {isPreferredMismatch && (
+                    <Badge variant="warning" className="text-3xs">
+                      ≠ preferred {trimmedPreferredMpn}
                     </Badge>
                   )}
                   {data.mpnId !== partnerId.trim() && (
@@ -1132,6 +1345,10 @@ export const PartnerCenterPage: React.FC<PartnerCenterPageProps> = ({
             onRun={() => void runProbe("legalBusiness")}
             disabled={!account}
             lastRunAt={lastRunAt.legalBusiness}
+            stale={
+              lastRunAt.legalBusiness != null &&
+              Date.now() - lastRunAt.legalBusiness > STALE_PROBE_MS
+            }
             renderExtra={(r) => {
               if (r.outcome !== "pass" || !r.data) return null;
               const data = r.data as LegalBusinessProfileSummary;
@@ -1152,6 +1369,10 @@ export const PartnerCenterPage: React.FC<PartnerCenterPageProps> = ({
             onRun={() => void runProbe("pal")}
             disabled={!account || !partnerIdValid}
             lastRunAt={lastRunAt.pal}
+            stale={
+              lastRunAt.pal != null &&
+              Date.now() - lastRunAt.pal > STALE_PROBE_MS
+            }
             requiredHint={
               !partnerIdValid
                 ? "Enter a 6–10 digit Partner ID below to enable this probe."
@@ -1358,6 +1579,12 @@ interface ProbeRowProps {
   lastRunAt: number | null;
   /** Optional secondary hint shown when `disabled` is true (e.g. PAL needs an id). */
   requiredHint?: string;
+  /**
+   * When true, the row renders a "Stale" pill — the probe answer is older
+   * than `STALE_PROBE_MS` and likely needs re-running before the operator
+   * makes an attribution decision.
+   */
+  stale?: boolean;
   /** Optional render extension: per-probe extra info on pass (counts, etc.). */
   renderExtra?: (result: ProbeResult) => React.ReactNode;
 }
@@ -1372,6 +1599,7 @@ const ProbeRow: React.FC<ProbeRowProps> = ({
   disabled,
   lastRunAt,
   requiredHint,
+  stale = false,
   renderExtra,
 }) => {
   const badge = outcomeBadge(result?.outcome);
@@ -1407,6 +1635,15 @@ const ProbeRow: React.FC<ProbeRowProps> = ({
             title={new Date(lastRunAt).toLocaleString()}
           >
             ran {formatRelative(lastRunAt)}
+          </span>
+        )}
+        {stale && (
+          <span
+            className="inline-flex items-center gap-1 rounded border border-warning/40 bg-warning/10 px-1 py-0.5 text-3xs font-medium text-warning"
+            title="Probe result is older than 24h — re-run for fresh data"
+          >
+            <Clock className="h-2.5 w-2.5" aria-hidden />
+            Stale
           </span>
         )}
         <Badge variant={badge.variant} className="ml-auto text-2xs">

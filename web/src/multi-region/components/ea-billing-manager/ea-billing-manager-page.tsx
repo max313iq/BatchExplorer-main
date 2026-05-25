@@ -22,8 +22,11 @@
  * a checklist.
  */
 import * as React from "react";
-import { useNavigate } from "react-router-dom";
 import { useSearchParams } from "react-router-dom";
+// COORDINATOR: canonical navigation contract — use `navigateToPage` from
+// `useDashboardOutletContext()` (path-based) instead of `useNavigate`
+// directly. This keeps every page funneled through the page-router's
+// wrapper so a future swap of router implementation is one-edit.
 import {
   AlertTriangle,
   BadgeCheck,
@@ -168,7 +171,9 @@ import { TokenExpiryBadge } from "../shared/token-expiry-badge";
 
 import { useArmToken } from "../../auth/use-arm-token";
 import { useBeforeUnload } from "../../hooks/use-before-unload";
+import { usePersistedState } from "../../hooks/use-persisted-state";
 import { useTenantChange } from "../../hooks/use-tenant-change";
+import { useDashboardOutletContext } from "../page-router";
 
 const STORAGE_ACCOUNT = "ea-billing-manager:account";
 const STORAGE_BILLING_ACCOUNT = "ea-billing-manager:billing-account";
@@ -219,7 +224,10 @@ interface SourceAccount {
 export const EaBillingManagerPage: React.FC = () => {
   const state = useMultiRegionState();
   const store = useMultiRegionStore();
-  const navigate = useNavigate();
+  // Path-based navigation via the dashboard outlet's helper — keeps
+  // cross-page links funnelled through one router shim instead of
+  // each page calling `useNavigate` directly.
+  const { navigateToPage } = useDashboardOutletContext();
   const azureAccounts = state.azureAccounts ?? [];
 
   /* ----- Account + billing account pickers ------------------------- */
@@ -446,7 +454,7 @@ export const EaBillingManagerPage: React.FC = () => {
         <SignInRequired
           whatYouCantDo="Manage EA billing"
           why="an EA-billing-capable account (enrollment owner / department admin)"
-          onNavigate={(k: PageKey) => navigate(`/${k}`)}
+          onNavigate={(k: PageKey) => navigateToPage(`/${k}`)}
         />
       </div>
     );
@@ -673,6 +681,24 @@ export const EaBillingManagerPage: React.FC = () => {
           key={remountKey}
           armToken={armToken}
           billingAccountName={billingAccountName}
+          onDrillDown={(deptName) => {
+            // Drill-down: route to the Department Admin workspace so the
+            // operator can manage account owners / EAs inside this dept.
+            // We log the navigation so the audit trail captures the
+            // explicit decision to leave the manager page.
+            auditLog.record({
+              actor: account?.username ?? "",
+              action: "drill_down_department",
+              target: deptName,
+              status: "success",
+              details: {
+                page: "ea-billing-manager",
+                billingAccountName,
+                navigatedTo: "/department-admin",
+              },
+            });
+            navigateToPage("/department-admin");
+          }}
         />
       )}
       {tab === "enrollment" && (
@@ -2927,23 +2953,43 @@ const RoleAssignmentsTab: React.FC<{
 const DepartmentsTab: React.FC<{
   armToken: string;
   billingAccountName: string;
-}> = ({ armToken, billingAccountName }) => {
+  /**
+   * Drill-down callback — invoked when the operator clicks a department
+   * row. The parent translates this into a path-based navigation via
+   * the page-router contract (see `navigateToPage` in the outlet).
+   */
+  onDrillDown?: (departmentName: string) => void;
+}> = ({ armToken, billingAccountName, onDrillDown }) => {
   const depts = useAsyncLoad<EaDepartment[]>(
     () => listEaDepartments(billingAccountName, armToken),
     [armToken, billingAccountName],
   );
   const [search, setSearch] = React.useState("");
+  // Persisted "hide departments with fewer than N enrollment accounts"
+  // threshold — drives the threshold filter chip below. Persisted across
+  // reloads via use-persisted-state so the operator's filter sticks
+  // between sessions per Design Contract §10 (no scattered localStorage).
+  const [hideUnderEa, setHideUnderEa] = usePersistedState<number>(
+    "ea-billing-manager:depts:hide-under-ea",
+    0,
+    { version: 1 },
+  );
   const filtered = React.useMemo(() => {
     const list = depts.data ?? [];
     const q = search.trim().toLowerCase();
-    if (!q) return list;
-    return list.filter((d) =>
-      [d.departmentName, d.name, d.costCenter, d.status]
+    return list.filter((d) => {
+      if (hideUnderEa > 0) {
+        const ea =
+          typeof d.enrollmentAccounts === "number" ? d.enrollmentAccounts : 0;
+        if (ea < hideUnderEa) return false;
+      }
+      if (!q) return true;
+      return [d.departmentName, d.name, d.costCenter, d.status]
         .join(" ")
         .toLowerCase()
-        .includes(q),
-    );
-  }, [depts.data, search]);
+        .includes(q);
+    });
+  }, [depts.data, search, hideUnderEa]);
   return (
     <TabCard
       title="Departments"
@@ -3012,6 +3058,49 @@ const DepartmentsTab: React.FC<{
           aria-label="Filter departments"
         />
       </div>
+      {/* Persisted threshold chip — hides departments with too few EAs
+          to focus on the larger cost-center buckets. Backed by
+          use-persisted-state so the filter survives reloads. */}
+      <div
+        className="flex flex-wrap items-center gap-1"
+        role="group"
+        aria-label="Department size threshold"
+      >
+        <span className="text-2xs uppercase tracking-wider text-muted-foreground">
+          Hide depts with fewer than
+        </span>
+        {[0, 1, 5, 10].map((n) => (
+          <button
+            key={n}
+            type="button"
+            role="radio"
+            aria-checked={hideUnderEa === n}
+            onClick={() => setHideUnderEa(n)}
+            className={cn(
+              "rounded-full border px-2.5 py-0.5 text-2xs transition-colors",
+              "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring",
+              hideUnderEa === n
+                ? "border-primary bg-primary/15 text-foreground"
+                : "border-border text-muted-foreground hover:bg-muted/40",
+            )}
+          >
+            {n === 0 ? "Off" : `${n} EAs`}
+          </button>
+        ))}
+        {hideUnderEa > 0 && (
+          <span className="text-2xs text-muted-foreground">
+            ·{" "}
+            {(depts.data ?? []).filter((d) => {
+              const ea =
+                typeof d.enrollmentAccounts === "number"
+                  ? d.enrollmentAccounts
+                  : 0;
+              return ea < hideUnderEa;
+            }).length}{" "}
+            hidden
+          </span>
+        )}
+      </div>
       {depts.loading ? (
         <SkeletonLoader variant="list" rows={3} />
       ) : depts.error ? (
@@ -3032,7 +3121,10 @@ const DepartmentsTab: React.FC<{
           {filtered.map((d) => (
             <li
               key={d.id}
-              className="flex flex-wrap items-center gap-2 rounded-md border border-border px-2 py-1.5 text-xs"
+              className={cn(
+                "flex flex-wrap items-center gap-2 rounded-md border border-border px-2 py-1.5 text-xs",
+                onDrillDown && "transition-colors hover:bg-muted/30",
+              )}
             >
               <Layers className="h-3.5 w-3.5 text-muted-foreground" />
               <span className="font-medium">{d.departmentName}</span>
@@ -3052,6 +3144,20 @@ const DepartmentsTab: React.FC<{
                   {d.enrollmentAccounts} enrollment account
                   {d.enrollmentAccounts === 1 ? "" : "s"}
                 </span>
+              )}
+              {onDrillDown && (
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="sm"
+                  className="h-6 text-2xs focus-visible:ring-2 focus-visible:ring-ring"
+                  onClick={() => onDrillDown(d.name)}
+                  aria-label={`Open Department Admin for ${d.departmentName}`}
+                  title="Open Department Admin workspace for this department"
+                >
+                  Manage
+                  <ChevronRight className="h-3 w-3" aria-hidden />
+                </Button>
               )}
             </li>
           ))}
@@ -6038,6 +6144,79 @@ const COST_TIMEFRAMES = [
 const COST_GRANULARITIES = ["None", "Daily", "Monthly"] as const;
 const COST_TYPES = ["ActualCost", "AmortizedCost", "Usage"] as const;
 
+/**
+ * Compact, dependency-free SVG sparkline for date-bucketed cost series.
+ *
+ * Why inline:
+ * - No chart library in the bundle — the rest of the page is hand-rolled
+ *   SVG / CSS too, so adding one for ~50 lines is overkill.
+ * - The shape is stable across re-renders because we memoize the
+ *   normalized point string in the parent and only pass primitives in.
+ *
+ * Accessibility: rendered with `role="img"` and an `aria-label`
+ * carrying the min / max / latest value so screen readers get the gist
+ * without needing to walk the SVG path.
+ */
+const Sparkline: React.FC<{
+  series: ReadonlyArray<{ date: string; value: number }>;
+  currency: string;
+  width?: number;
+  height?: number;
+}> = React.memo(({ series, currency, width = 240, height = 40 }) => {
+  // Guard rails — if the parent passed something degenerate we render
+  // an empty placeholder rather than crash on divide-by-zero.
+  if (!series || series.length < 2) {
+    return (
+      <span className="text-2xs text-muted-foreground">
+        sparkline unavailable
+      </span>
+    );
+  }
+  const values = series.map((s) => s.value);
+  const min = Math.min(...values);
+  const max = Math.max(...values);
+  const range = max - min || 1;
+  const last = values[values.length - 1] ?? 0;
+  const stepX = width / (series.length - 1);
+  const points = series
+    .map((s, i) => {
+      const x = i * stepX;
+      // Invert Y so higher value renders higher on screen.
+      const y = height - ((s.value - min) / range) * height;
+      return `${x.toFixed(1)},${y.toFixed(1)}`;
+    })
+    .join(" ");
+  const fmt = (n: number) =>
+    n.toLocaleString(undefined, { maximumFractionDigits: 2 });
+  return (
+    <svg
+      width={width}
+      height={height}
+      viewBox={`0 0 ${width} ${height}`}
+      role="img"
+      aria-label={`Spend sparkline — min ${fmt(min)} ${currency}, max ${fmt(max)} ${currency}, latest ${fmt(last)} ${currency}, ${series.length} buckets`}
+      className="text-primary"
+    >
+      <polyline
+        fill="none"
+        stroke="currentColor"
+        strokeWidth={1.5}
+        strokeLinejoin="round"
+        strokeLinecap="round"
+        points={points}
+      />
+      {/* Last-point dot — anchors the eye to "current" */}
+      <circle
+        cx={(series.length - 1) * stepX}
+        cy={height - ((last - min) / range) * height}
+        r={2}
+        fill="currentColor"
+      />
+    </svg>
+  );
+});
+Sparkline.displayName = "EaBillingManagerSparkline";
+
 const CostTab: React.FC<{
   armToken: string;
   billingAccountName: string;
@@ -6053,6 +6232,16 @@ const CostTab: React.FC<{
   const [result, setResult] = React.useState<CostQueryResult | null>(null);
   const [loading, setLoading] = React.useState(false);
   const [error, setError] = React.useState<string | null>(null);
+  // Persisted "hide low-spend rows below $X" filter — drives a chip
+  // strip beneath the result table so an EA admin can focus on the
+  // big-ticket buckets. Persisted across reloads. Per Design Contract
+  // §10: use the use-persisted-state shim instead of touching
+  // localStorage directly.
+  const [minSpend, setMinSpend] = usePersistedState<number>(
+    "ea-billing-manager:cost:min-spend",
+    0,
+    { version: 1 },
+  );
 
   // Best-effort detection of the "cost" and "currency" columns so we
   // can render a sortable, summable view. Cost Management returns column
@@ -6092,6 +6281,49 @@ const CostTab: React.FC<{
     }
     return "";
   }, [result, currencyColumnIndex]);
+
+  /**
+   * Threshold-filtered rows. When `minSpend > 0`, drop any row whose
+   * detected cost column is below the threshold. Memoized so a re-render
+   * triggered by an unrelated state change doesn't re-walk the row set.
+   * When the cost column can't be detected, the filter is a no-op (we
+   * fall back to the full set so the operator still sees every row).
+   */
+  const filteredRows = React.useMemo(() => {
+    if (!result) return [];
+    if (minSpend <= 0 || costColumnIndex < 0) return result.rows;
+    return result.rows.filter((row) => {
+      const v = row[costColumnIndex];
+      return typeof v === "number" && Number.isFinite(v) && v >= minSpend;
+    });
+  }, [result, minSpend, costColumnIndex]);
+
+  /**
+   * Sparkline data — assembled when granularity is Daily or Monthly and
+   * the response carries a date-like column. Aggregates total cost per
+   * date bucket across all groups; produces an ordered series the
+   * `Sparkline` component renders inline.
+   */
+  const sparklineSeries = React.useMemo(() => {
+    if (!result || granularity === "None" || costColumnIndex < 0) return null;
+    const dateColIdx = result.columns.findIndex(
+      (c) => /date|month|day/i.test(c.name),
+    );
+    if (dateColIdx < 0) return null;
+    const buckets = new Map<string, number>();
+    for (const row of result.rows) {
+      const date = row[dateColIdx];
+      const cost = row[costColumnIndex];
+      if (typeof date !== "string" && typeof date !== "number") continue;
+      if (typeof cost !== "number" || !Number.isFinite(cost)) continue;
+      const key = String(date);
+      buckets.set(key, (buckets.get(key) ?? 0) + cost);
+    }
+    if (buckets.size < 2) return null; // sparkline needs at least 2 points
+    return Array.from(buckets.entries())
+      .sort(([a], [b]) => a.localeCompare(b))
+      .map(([date, value]) => ({ date, value }));
+  }, [result, granularity, costColumnIndex]);
 
   const run = React.useCallback(async () => {
     setLoading(true);
@@ -6246,7 +6478,11 @@ const CostTab: React.FC<{
           >
             <SummaryStatItem
               label="Rows"
-              value={result.rows.length}
+              value={`${filteredRows.length}${
+                filteredRows.length !== result.rows.length
+                  ? ` / ${result.rows.length}`
+                  : ""
+              }`}
               compact
             />
             {costColumnIndex >= 0 && (
@@ -6259,9 +6495,43 @@ const CostTab: React.FC<{
                 tone="info"
               />
             )}
+            {/* KPI: top single-row spend — answers "what's our biggest
+                cost driver right now?" without needing to sort the
+                table by hand. */}
+            {costColumnIndex >= 0 && filteredRows.length > 0 && (
+              <SummaryStatItem
+                label="Top row"
+                value={`${(
+                  filteredRows.reduce((max, row) => {
+                    const v = row[costColumnIndex];
+                    return typeof v === "number" && v > max ? v : max;
+                  }, 0)
+                ).toLocaleString(undefined, { maximumFractionDigits: 2 })} ${detectedCurrency}`}
+                compact
+                tone="warning"
+              />
+            )}
+            {/* Sparkline appears only when granularity≠None and the
+                response carries a date column the helper recognised. */}
+            {sparklineSeries && (
+              <div
+                className="flex flex-col items-start gap-0.5"
+                aria-label="Spend trend sparkline"
+              >
+                <span className="text-2xs uppercase tracking-wider text-muted-foreground">
+                  Trend ({sparklineSeries.length} pts)
+                </span>
+                <Sparkline
+                  series={sparklineSeries}
+                  currency={detectedCurrency}
+                />
+              </div>
+            )}
             <div className="ml-auto">
               <ExportMenu<readonly (string | number)[]>
-                rows={result.rows}
+                // Export the FILTERED view so CSV matches what the
+                // operator is looking at, not the unfiltered raw set.
+                rows={filteredRows}
                 columns={result.columns.map((col, idx) => ({
                   header: col.name,
                   accessor: (row: readonly (string | number)[]) => {
@@ -6272,10 +6542,42 @@ const CostTab: React.FC<{
                   },
                 }))}
                 filename={`ea-cost-${billingAccountName}-${timeframe}-${groupBy}`}
-                rowCount={result.rows.length}
+                rowCount={filteredRows.length}
               />
             </div>
           </div>
+          {/* Threshold chip strip — drives the persisted minSpend filter. */}
+          {costColumnIndex >= 0 && (
+            <div
+              className="flex flex-wrap items-center gap-1"
+              role="group"
+              aria-label="Minimum-spend threshold filter"
+            >
+              <span className="text-2xs uppercase tracking-wider text-muted-foreground">
+                Hide rows under
+              </span>
+              {[0, 10, 100, 1000, 10000].map((n) => (
+                <button
+                  key={n}
+                  type="button"
+                  role="radio"
+                  aria-checked={minSpend === n}
+                  onClick={() => setMinSpend(n)}
+                  className={cn(
+                    "rounded-full border px-2.5 py-0.5 text-2xs transition-colors",
+                    "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring",
+                    minSpend === n
+                      ? "border-primary bg-primary/15 text-foreground"
+                      : "border-border text-muted-foreground hover:bg-muted/40",
+                  )}
+                >
+                  {n === 0
+                    ? "Off"
+                    : `${n.toLocaleString()} ${detectedCurrency}`}
+                </button>
+              ))}
+            </div>
+          )}
           <div className="overflow-x-auto">
             <table className="w-full text-2xs">
               <thead>
@@ -6289,7 +6591,7 @@ const CostTab: React.FC<{
                 </tr>
               </thead>
               <tbody>
-                {result.rows.slice(0, 200).map((row, ri) => (
+                {filteredRows.slice(0, 200).map((row, ri) => (
                   <tr key={ri} className="border-b border-border/40 hover:bg-muted/20">
                     {row.map((cell, ci) => (
                       <td
@@ -6327,10 +6629,17 @@ const CostTab: React.FC<{
                 </tfoot>
               )}
             </table>
-            {result.rows.length > 200 && (
+            {filteredRows.length > 200 && (
               <p className="mt-2 text-2xs text-muted-foreground">
-                Truncated to first 200 of {result.rows.length} rows. Total above
-                is computed from the full result set.
+                Truncated to first 200 of {filteredRows.length} rows
+                {minSpend > 0 ? " (after threshold filter)" : ""}. Total
+                above is computed from the full unfiltered set.
+              </p>
+            )}
+            {minSpend > 0 && filteredRows.length === 0 && (
+              <p className="mt-2 text-2xs text-warning">
+                No rows pass the {minSpend.toLocaleString()} {detectedCurrency} threshold —
+                lower the floor to see results.
               </p>
             )}
           </div>

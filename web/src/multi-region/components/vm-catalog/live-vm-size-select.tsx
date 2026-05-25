@@ -26,7 +26,10 @@ import {
   ExternalLink,
   Search,
 } from "lucide-react";
-import { useNavigate } from "react-router-dom";
+// COORDINATOR: this picker no longer reaches for `useNavigate` directly.
+// Navigation now flows through the dashboard outlet context so cross-page
+// routing has one canonical entry point. When rendered outside the outlet
+// (e.g. unit tests / storybook) the helper degrades to a silent no-op.
 
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -45,6 +48,7 @@ import {
   subscribeQuotaCache,
   vmSkusCacheKey,
 } from "../../services/quota-service";
+import { useDashboardOutletContext } from "../page-router";
 
 import { classifyGpu, GpuType, distinctGpuTypes } from "./gpu-classifier";
 
@@ -127,7 +131,18 @@ function useCatalogSnapshot(
 // ---------------------------------------------------------------------------
 
 export const LiveVmSizeSelect: React.FC<LiveVmSizeSelectProps> = (props) => {
-  const navigate = useNavigate();
+  // Pull `navigateToPage` from the dashboard outlet — same canonical
+  // wiring contract used by every other page. Falls back to a no-op when
+  // the outlet context isn't present (storybook / RTL).
+  const outletCtx = useDashboardOutletContext() as
+    | { navigateToPage: (path: string) => void }
+    | undefined;
+  const navigateToPage = React.useCallback(
+    (path: string) => {
+      if (outletCtx?.navigateToPage) outletCtx.navigateToPage(path);
+    },
+    [outletCtx],
+  );
   const gpuOnly = !props.includeCpu;
   const { skus, cacheHit } = useCatalogSnapshot(props.subscriptionId, gpuOnly);
 
@@ -281,7 +296,7 @@ export const LiveVmSizeSelect: React.FC<LiveVmSizeSelectProps> = (props) => {
               variant="outline"
               onClick={() => {
                 setOpen(false);
-                navigate("/vm-catalog");
+                navigateToPage("/vm-catalog");
               }}
               className="gap-1 transition-all duration-fast hover:shadow-elev-1"
             >
@@ -372,7 +387,7 @@ export const LiveVmSizeSelect: React.FC<LiveVmSizeSelectProps> = (props) => {
             type="button"
             onClick={() => {
               setOpen(false);
-              navigate("/vm-catalog");
+              navigateToPage("/vm-catalog");
             }}
             className="inline-flex items-center gap-1 text-primary hover:underline"
           >

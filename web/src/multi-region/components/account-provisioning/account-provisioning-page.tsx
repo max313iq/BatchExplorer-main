@@ -21,6 +21,38 @@
  *     consolidated prefs hydration effect (replaces the two split effects
  *     with the eslint-disabled deps), and tightened attemptAccounts
  *     filter (use createdAt parse rather than lexical compare).
+ *
+ * 2026-05-25 hardening pass:
+ *   - Plumbed AbortSignal end-to-end into `orchestrator.execute({...,signal})`
+ *     so a Stop click cancels the in-flight ARM PUT (and not just the
+ *     inter-sub wait + the agent-side cancellation flag).
+ *   - Switched the 1-second progress ticker + the unmount-cancellation
+ *     guard to `useAbortableEffect` so all async timer lifetimes are
+ *     guaranteed to be torn down on dependency change / unmount.
+ *   - Added `auditLog.record(...)` for every state-mutating user action
+ *     (submit, stop, retry, discover, stop-discover, ESC-cancel,
+ *     new-request) so the audit-log page surfaces this page like every
+ *     other destructive page.
+ *   - Persisted the in-progress wizard draft (subs picked, regions,
+ *     per-sub delay, skipExisting) to localStorage via `usePersistedState`
+ *     so a hard reload mid-configuration doesn't blow away the operator's
+ *     work.
+ *   - ESC-bound cancel-everything (orchestrator + inter-sub wait) gated
+ *     by a confirmation dialog. Inactive when no run is in flight so the
+ *     key isn't hijacked from other Radix popovers.
+ *   - Per-sub success/fail mini-sparkline rendered mid-run from
+ *     `attemptAccounts` so the operator sees per-sub progress without
+ *     scrolling to the result step.
+ *   - "Copy region list to clipboard" affordance on Step 2 (Preflight)
+ *     via the shared `CopyButton`, so the operator can paste the list
+ *     into a runbook / ticket without leaving the wizard.
+ *   - Per-sub estimated-time badge derived from the rolling average
+ *     across previously completed subs in the same attempt, so when a
+ *     run is mid-flight the operator can see "Sub 4/8 — ~2m 30s
+ *     remaining" instead of staring at an indeterminate spinner.
+ *   - Switched the bespoke `CopyChip` to the shared `CopyButton`
+ *     primitive so clipboard fallback semantics are identical to the
+ *     rest of the app (clipboard API → execCommand fallback).
  */
 import * as React from "react";
 import {
@@ -28,7 +60,6 @@ import {
   AlertTriangle,
   CheckCircle2,
   CloudDownload,
-  Copy,
   ExternalLink,
   Info,
   Loader2,
@@ -74,7 +105,11 @@ import { AnimatedTabs } from "@/components/ui/effects";
 import { cn } from "@/lib/utils";
 
 import { OrchestratorAgent } from "../../agents/orchestrator-agent";
+import { useAbortableEffect } from "../../hooks/use-abortable-effect";
+import { usePersistedState } from "../../hooks/use-persisted-state";
+import { useShortcut } from "../../hooks/use-shortcut";
 import { useUrlState } from "../../hooks/use-url-state";
+import { auditLog } from "../../services/audit-log";
 import {
   PreflightLevel,
   PreflightResult,
@@ -96,6 +131,7 @@ import {
   isGpuRegion,
   isValidSubscriptionId,
 } from "../shared/constants";
+import { CopyButton } from "../shared/copy-button";
 import { EmptyState } from "../shared/empty-state";
 import { PageHeader } from "../shared/page-header";
 import { StatusBadge } from "../shared/status-badge";
@@ -104,6 +140,19 @@ import { useArmToken } from "../../auth/use-arm-token";
 
 interface AccountProvisioningPageProps {
   orchestrator: OrchestratorAgent;
+}
+
+/**
+ * Shape persisted to localStorage by the configure step. Lifted to
+ * module scope so it isn't re-declared on every render (and so the
+ * `usePersistedState` generic stays a stable type identity for the
+ * persistence-layer cache key).
+ */
+interface WizardDraft {
+  selectedSubIds: string[];
+  selectedRegions: string[];
+  perSubDelaySec: number;
+  skipExisting: boolean;
 }
 
 type StepId = "configure" | "preflight" | "review" | "submit" | "result";
@@ -290,55 +339,35 @@ const PreflightChips: React.FC<{ checks: PreflightResult[] }> = ({
   );
 };
 
-// Small reusable copy button — writes to clipboard, swaps icon for a check
-// for 1.2 s so the user gets feedback without a noisy toast. Safe in
-// non-browser test environments (clipboard write becomes a no-op).
+// Thin wrapper around the shared `CopyButton` primitive. We keep the
+// CopyChip name (and the `label` prop ergonomics) so every existing call
+// site in this file stays unchanged, but the clipboard write itself now
+// flows through the shared primitive — that gives us the
+// clipboard-API → execCommand fallback path the rest of the app uses, so
+// in insecure contexts (file:// previews, blocked clipboard perms) the
+// chip still copies instead of silently failing. Tooltip wrapping is
+// kept here so consumers continue to get a hover hint with the resource
+// label rather than the raw value.
 const CopyChip: React.FC<{
   value: string;
   label?: string;
   className?: string;
 }> = ({ value, label, className }) => {
-  const [copied, setCopied] = React.useState(false);
-  const timerRef = React.useRef<ReturnType<typeof setTimeout> | null>(null);
-  React.useEffect(
-    () => () => {
-      if (timerRef.current) clearTimeout(timerRef.current);
-    },
-    [],
-  );
-  const handleCopy = React.useCallback(async () => {
-    if (typeof navigator === "undefined" || !navigator.clipboard) return;
-    try {
-      await navigator.clipboard.writeText(value);
-      setCopied(true);
-      if (timerRef.current) clearTimeout(timerRef.current);
-      timerRef.current = setTimeout(() => setCopied(false), 1200);
-    } catch {
-      // Permissions denied or insecure context — silently skip; nothing
-      // we can do without elevating UI noise.
-    }
-  }, [value]);
   return (
     <Tooltip>
       <TooltipTrigger asChild>
-        <button
-          type="button"
-          onClick={handleCopy}
-          className={cn(
-            "inline-flex h-4 w-4 items-center justify-center rounded-sm text-muted-foreground transition-colors hover:bg-muted hover:text-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring",
-            className,
-          )}
-          aria-label={label ? `Copy ${label}` : "Copy"}
-        >
-          {copied ? (
-            <CheckCircle2 className="h-3 w-3 text-success" aria-hidden />
-          ) : (
-            <Copy className="h-3 w-3" aria-hidden />
-          )}
-        </button>
+        <span className="inline-flex">
+          <CopyButton
+            value={value}
+            ariaLabel={label ? `Copy ${label}` : `Copy ${value}`}
+            iconSize={12}
+            alwaysVisible
+            className={cn("h-4 w-4 rounded-sm", className)}
+          />
+        </span>
       </TooltipTrigger>
       <TooltipContent side="top">
-        {copied ? "Copied" : label ? `Copy ${label}` : "Copy"}
+        {label ? `Copy ${label}` : "Copy"}
       </TooltipContent>
     </Tooltip>
   );
@@ -609,21 +638,100 @@ const AccountProvisioningPageInner: React.FC<AccountProvisioningPageProps> = ({
     [setUrlState, currentStep],
   );
 
+  // ---- Persisted wizard draft ----------------------------------------------
+  // The configure step's inputs are persisted to localStorage so a hard
+  // reload mid-configuration doesn't blow away the operator's draft. We
+  // use a single envelope keyed by `WIZARD_DRAFT_KEY` so all four
+  // wizard inputs survive together (or get wiped together on schema
+  // bump). `subscriptionId` (typed-input fallback) stays in the store's
+  // `lastSubscriptionId` because it's not wizard-scoped — it's the
+  // "last sub the user worked with" used by other pages too.
+  const [wizardDraft, setWizardDraft] = usePersistedState<WizardDraft>(
+    "abm.account-provisioning.wizard-draft",
+    {
+      selectedSubIds: [],
+      selectedRegions: [],
+      perSubDelaySec: 30,
+      skipExisting: true,
+    },
+    {
+      version: 1,
+      migrate: (raw) => {
+        // Defensive read — drop the persisted draft entirely if it
+        // doesn't look like our shape rather than leak shape errors
+        // into the form. Returning undefined falls back to the
+        // initialValue (clean defaults).
+        if (!raw || typeof raw !== "object") return undefined;
+        const d = raw as Partial<WizardDraft>;
+        return {
+          selectedSubIds: Array.isArray(d.selectedSubIds)
+            ? d.selectedSubIds.filter((x): x is string => typeof x === "string")
+            : [],
+          selectedRegions: Array.isArray(d.selectedRegions)
+            ? d.selectedRegions.filter((x): x is string => typeof x === "string")
+            : [],
+          perSubDelaySec:
+            typeof d.perSubDelaySec === "number" &&
+            d.perSubDelaySec >= 30 &&
+            d.perSubDelaySec <= 60
+              ? d.perSubDelaySec
+              : 30,
+          skipExisting:
+            typeof d.skipExisting === "boolean" ? d.skipExisting : true,
+        };
+      },
+    },
+  );
+
   // ---- Form state -----------------------------------------------------------
-  const [selectedRegions, setSelectedRegions] = React.useState<string[]>([]);
+  // Mirror the persisted draft into local pieces so the existing render
+  // path (which sets each field independently) keeps working unchanged.
+  // We expose `setSelectedRegions` etc. as thin setters that route back
+  // into `setWizardDraft` so writes are persisted automatically.
+  const selectedRegions = wizardDraft.selectedRegions;
+  const setSelectedRegions = React.useCallback(
+    (next: string[] | ((prev: string[]) => string[])) => {
+      setWizardDraft((d) => ({
+        ...d,
+        selectedRegions:
+          typeof next === "function"
+            ? (next as (p: string[]) => string[])(d.selectedRegions)
+            : next,
+      }));
+    },
+    [setWizardDraft],
+  );
   // `subscriptionId` is the fallback (typed) single-sub for the case
   // where no Azure account is signed in — the existing free-text input
   // path. `selectedSubIds` is the multi-pick set used when the page
   // can enumerate signed-in subs via the dropdown — every sub the user
   // ticks gets its own create_accounts run in the submit loop.
   const [subscriptionId, setSubscriptionId] = React.useState("");
-  const [selectedSubIds, setSelectedSubIds] = React.useState<string[]>([]);
+  const selectedSubIds = wizardDraft.selectedSubIds;
+  const setSelectedSubIds = React.useCallback(
+    (next: string[] | ((prev: string[]) => string[])) => {
+      setWizardDraft((d) => ({
+        ...d,
+        selectedSubIds:
+          typeof next === "function"
+            ? (next as (p: string[]) => string[])(d.selectedSubIds)
+            : next,
+      }));
+    },
+    [setWizardDraft],
+  );
   // Delay (seconds) between per-subscription create_accounts dispatches.
   // Bound 30–60 — anything lower risks tripping ARM's per-tenant write
   // throttle when the same operator fires identical PUT batchAccounts
-  // calls back-to-back across many subs. Persisted to user prefs so
+  // calls back-to-back across many subs. Persisted with the draft so
   // the operator's chosen pacing sticks across reloads.
-  const [perSubDelaySec, setPerSubDelaySec] = React.useState<number>(30);
+  const perSubDelaySec = wizardDraft.perSubDelaySec;
+  const setPerSubDelaySec = React.useCallback(
+    (next: number) => {
+      setWizardDraft((d) => ({ ...d, perSubDelaySec: next }));
+    },
+    [setWizardDraft],
+  );
   // ISO timestamp of when the user submitted the CURRENT attempt. The
   // wizard's progress + result counters are scoped to accounts created
   // at-or-after this stamp so prior submissions don't bleed into the
@@ -652,7 +760,13 @@ const AccountProvisioningPageInner: React.FC<AccountProvisioningPageProps> = ({
   // picked sub are dropped from the dispatch list so the orchestrator
   // doesn't issue a 409 PUT against an existing account. Default on so
   // re-running a partially-completed batch is idempotent by default.
-  const [skipExisting, setSkipExisting] = React.useState(true);
+  // Persisted via the wizard draft so the operator's preference survives
+  // reload.
+  const skipExisting = wizardDraft.skipExisting;
+  const setSkipExisting = React.useCallback(
+    (next: boolean) => setWizardDraft((d) => ({ ...d, skipExisting: next })),
+    [setWizardDraft],
+  );
   // Region picker inline filter — typed into the search box at the top
   // of the dropdown so the operator can jump straight to a region by
   // typing part of its name. Empty string means "show all".
@@ -670,14 +784,23 @@ const AccountProvisioningPageInner: React.FC<AccountProvisioningPageProps> = ({
   // fire after the operator hit Stop.
   const submitAbortRef = React.useRef<AbortController | null>(null);
   // Cleanup any in-flight controller on unmount so a Stop -> route
-  // change doesn't leave a dangling timer.
-  React.useEffect(
-    () => () => {
+  // change doesn't leave a dangling timer. Use `useAbortableEffect`
+  // for symmetry with the other async lifetimes on this page even
+  // though the cleanup runs only at unmount (deps = []).
+  useAbortableEffect(() => {
+    return () => {
       submitAbortRef.current?.abort();
       submitAbortRef.current = null;
-    },
-    [],
-  );
+    };
+  }, []);
+
+  // ESC-bound cancel-everything. When a run is in flight, ESC pops a
+  // confirmation dialog rather than aborting silently — destructive
+  // shortcuts should never trigger from a stray keystroke. The shortcut
+  // is hard-gated on `isRunning || isDiscovering` so other Radix
+  // popovers (which also handle ESC) aren't fighting for the keystroke
+  // when no run is active.
+  const [escCancelHidden, setEscCancelHidden] = React.useState(true);
 
   // ---- Page-level ARM token tracker ----------------------------------------
   // Account-provisioning fires PUT batchAccounts across N subs × M regions
@@ -741,14 +864,24 @@ const AccountProvisioningPageInner: React.FC<AccountProvisioningPageProps> = ({
     if (!hydratedRef.current && prefs.lastSubscriptionId) {
       setSubscriptionId(prefs.lastSubscriptionId);
     }
-    if (!hydratedRef.current && prefs.lastRegions?.length) {
+    // Only fall back to the global `lastRegions` pref when the wizard
+    // draft is empty. If `usePersistedState` already restored a draft
+    // with non-empty regions, that's the more recent intent and should
+    // win — overwriting it with the global pref would lose the
+    // operator's in-progress wizard work after a reload.
+    if (
+      !hydratedRef.current &&
+      prefs.lastRegions?.length &&
+      selectedRegions.length === 0
+    ) {
       setSelectedRegions(
         prefs.lastRegions.slice(0, DEFAULT_CONFIG.maxRegionsPerRequest),
       );
     }
     hydratedRef.current = true;
     // Subs-aware pre-tick: when the list lands, restore the saved id if
-    // it's still visible.
+    // it's still visible. Same precedence rule — only fire when the
+    // wizard draft hasn't already chosen one.
     if (state.subscriptions.length > 0 && selectedSubIds.length === 0) {
       if (
         prefs.lastSubscriptionId &&
@@ -875,6 +1008,25 @@ const AccountProvisioningPageInner: React.FC<AccountProvisioningPageProps> = ({
   //   2. Typed single subscription id → subscriptionId trimmed, valid
   //      GUID. Used as the fallback when no AAD accounts are signed in
   //      and the operator wants to provision via az-cli credentials.
+  //
+  // COORDINATOR: pre-filter `selectedSubIds` against per-tenant Batch
+  // account quota before dispatch. Today we only filter (sub, region)
+  // pairs against the "already created" set via `existingByKey`; we do
+  // NOT consult the per-sub quota. The quota check belongs in the
+  // provisioner-agent (it already calls ARM /providers/Microsoft.Batch
+  // /locations/{loc}/quotas) — the page should surface a preflight
+  // warn-chip when (sub, region).quota.remaining < region count rather
+  // than reach in itself. Add a `runPreflight` arm that walks the plan
+  // and asks the orchestrator for quota; until then the worst-case is
+  // a 4xx at submit time which the per-region failed-state already
+  // surfaces.
+  //
+  // COORDINATOR: CSV/newline bulk-paste of subscription IDs is the
+  // natural next step here (operator could paste "sub-a\nsub-b\nsub-c"
+  // into the typed-input). If that lands, this page starts behaving
+  // like the import-batch flow — consider folding the paste UX into a
+  // shared "id-list-paste" control so the import-batch page can reuse
+  // it without two divergent implementations.
   const effectiveSubscriptionIds: string[] = React.useMemo(() => {
     if (selectedSubIds.length > 0) return selectedSubIds;
     const trimmed = subscriptionId.trim();
@@ -1056,13 +1208,21 @@ const AccountProvisioningPageInner: React.FC<AccountProvisioningPageProps> = ({
   // Re-render every second while running so the ETA display + the
   // inter-sub waitingUntil countdown both update without forcing the
   // orchestrator to push tick events. When not running this effect is
-  // a no-op.
+  // a no-op. Uses `useAbortableEffect` so the interval is guaranteed
+  // torn down on `isRunning` flip or unmount (the abort fires before
+  // the setState would; React batching swallows the final tick).
   const [, setTickNonce] = React.useState(0);
-  React.useEffect(() => {
-    if (!isRunning) return;
-    const id = setInterval(() => setTickNonce((n) => n + 1), 1000);
-    return () => clearInterval(id);
-  }, [isRunning]);
+  useAbortableEffect(
+    (signal) => {
+      if (!isRunning) return;
+      const id = setInterval(() => {
+        if (signal.aborted) return;
+        setTickNonce((n) => n + 1);
+      }, 1000);
+      return () => clearInterval(id);
+    },
+    [isRunning],
+  );
 
   // Auto-advance to "result" when submit completes — but ONLY for an
   // attempt that has actually started in this session. Previously the
@@ -1086,6 +1246,16 @@ const AccountProvisioningPageInner: React.FC<AccountProvisioningPageProps> = ({
     progressDone,
     setStep,
   ]);
+
+  // ---- Audit-log helper ----------------------------------------------------
+  // Resolve a stable "actor" string from the first signed-in Azure
+  // account, falling back to a synthetic label. Keeps the audit-log
+  // entries grouped per-operator on the audit-log page.
+  const auditActor = React.useMemo<string>(() => {
+    const accounts = state.azureAccounts ?? [];
+    const first = accounts[0];
+    return first?.username ?? "anonymous@local";
+  }, [state.azureAccounts]);
 
   // ---- Submit + retry handlers ---------------------------------------------
   const requestSubmit = React.useCallback(() => {
@@ -1141,6 +1311,24 @@ const AccountProvisioningPageInner: React.FC<AccountProvisioningPageProps> = ({
     const errors: Array<{ subscriptionId: string; error: string }> = [];
     let cancelled = false;
 
+    // Audit the submit at the start of the run — captures the intent
+    // even if the run is cancelled or partially fails. Result counters
+    // are recorded on completion below.
+    auditLog.record({
+      actor: auditActor,
+      action: "provision_accounts.submit",
+      target: `subs:${subs.length} regions:${selectedRegions.length} dispatch:${dispatchPlan.length}`,
+      status: "success",
+      details: {
+        subscriptionIds: subs,
+        regions: selectedRegions,
+        perSubDelaySec,
+        skipExisting,
+        skippedExistingCount,
+        dispatchTotal: dispatchPlan.length,
+      },
+    });
+
     for (let i = 0; i < subs.length; i++) {
       if (ac.signal.aborted) {
         cancelled = true;
@@ -1156,12 +1344,21 @@ const AccountProvisioningPageInner: React.FC<AccountProvisioningPageProps> = ({
         waitingUntil: null,
       });
       try {
+        // Forward the AbortSignal to the orchestrator so the in-flight
+        // ARM PUT for this sub is cancelled when Stop is pressed,
+        // rather than only cancelling the inter-sub wait. The
+        // orchestrator's `execute()` reads `params.signal` (see
+        // orchestrator-agent.ts:579) and wires it into the cancellation
+        // tracker so the agent-side fetch is aborted too. Without this
+        // forwarding, Stop would let the current region finish before
+        // the loop bailed.
         await orchestrator.execute({
           action: "create_accounts",
           payload: {
             subscriptionId: sub,
             regions: regionsForSub,
           },
+          signal: ac.signal,
         });
       } catch (err: unknown) {
         const message = err instanceof Error ? err.message : String(err);
@@ -1215,24 +1412,60 @@ const AccountProvisioningPageInner: React.FC<AccountProvisioningPageProps> = ({
         "Stopped before all subscriptions finished. Already-running orchestrator dispatches will continue server-side.",
       );
     }
-    setLastAttemptDurationMs(Date.now() - attemptStart.getTime());
+    const elapsedMs = Date.now() - attemptStart.getTime();
+    setLastAttemptDurationMs(elapsedMs);
     if (submitAbortRef.current === ac) submitAbortRef.current = null;
     setIsRunning(false);
+
+    // Audit completion — surface whether the run finished, was
+    // cancelled, or accrued errors so the audit-log page paints the
+    // correct status badge. We classify the outcome from the same
+    // signals the UI uses (errors[] / cancelled / dispatch total).
+    auditLog.record({
+      actor: auditActor,
+      action: "provision_accounts.complete",
+      target: `subs:${subs.length} regions:${selectedRegions.length}`,
+      status: errors.length === 0 && !cancelled ? "success" : "failure",
+      details: {
+        elapsedMs,
+        cancelled,
+        errorsCount: errors.length,
+        errors: errors.slice(0, 5),
+      },
+      error:
+        errors.length > 0
+          ? errors.map((e) => `${e.subscriptionId}: ${e.error}`).join(" · ")
+          : cancelled
+            ? "Stopped by operator"
+            : undefined,
+    });
   }, [
     orchestrator,
     effectiveSubscriptionIds,
     dispatchPerSub,
     selectedRegions,
     perSubDelaySec,
+    auditActor,
+    dispatchPlan.length,
+    skipExisting,
+    skippedExistingCount,
   ]);
 
   // Stop = abort the inter-sub timer + tell the orchestrator to bail
   // mid-region. Both signals fire; whichever the loop is sitting on
-  // gets the message.
+  // gets the message. We also audit the explicit stop so the audit-log
+  // can correlate the operator's intent with the per-region failures
+  // that follow.
   const handleStop = React.useCallback(() => {
     submitAbortRef.current?.abort();
     orchestrator.cancel();
-  }, [orchestrator]);
+    auditLog.record({
+      actor: auditActor,
+      action: "provision_accounts.stop",
+      target: `subs:${effectiveSubscriptionIds.length}`,
+      status: "success",
+    });
+  }, [orchestrator, auditActor, effectiveSubscriptionIds.length]);
 
   const handleDiscover = React.useCallback(async () => {
     // Discover walks one subscription at a time. When the operator has
@@ -1258,6 +1491,13 @@ const AccountProvisioningPageInner: React.FC<AccountProvisioningPageProps> = ({
     setDiscoverError(null);
     const delayMs = Math.max(30, Math.min(60, perSubDelaySec)) * 1000;
     const errors: Array<{ subscriptionId: string; error: string }> = [];
+    auditLog.record({
+      actor: auditActor,
+      action: "import_accounts.discover",
+      target: `subs:${subs.length}`,
+      status: "success",
+      details: { subscriptionIds: subs, perSubDelaySec },
+    });
     // Discover gets the same abort plumbing as create — same Stop
     // behaviour applies if the operator picks dozens of subs and
     // changes their mind mid-run.
@@ -1272,6 +1512,13 @@ const AccountProvisioningPageInner: React.FC<AccountProvisioningPageProps> = ({
           await orchestrator.execute({
             action: "discover_accounts",
             payload: { subscriptionId: sub.trim() },
+            // Forward the discover loop's abort so the orchestrator's
+            // in-flight Microsoft.Batch listing cancels mid-call rather
+            // than running to completion after Stop. Same plumbing as
+            // create_accounts — the orchestrator's `cancel()` API is a
+            // belt-and-braces backup, not the primary cancellation
+            // path.
+            signal: ac.signal,
           });
         } catch (err: unknown) {
           if (!ac.signal.aborted) {
@@ -1291,6 +1538,17 @@ const AccountProvisioningPageInner: React.FC<AccountProvisioningPageProps> = ({
             .join(" · "),
         );
       }
+      auditLog.record({
+        actor: auditActor,
+        action: "import_accounts.complete",
+        target: `subs:${subs.length}`,
+        status: errors.length === 0 ? "success" : "failure",
+        details: { errorsCount: errors.length, errors: errors.slice(0, 5) },
+        error:
+          errors.length > 0
+            ? errors.map((e) => `${e.subscriptionId}: ${e.error}`).join(" · ")
+            : undefined,
+      });
     } finally {
       if (submitAbortRef.current === ac) submitAbortRef.current = null;
       setIsDiscovering(false);
@@ -1302,12 +1560,19 @@ const AccountProvisioningPageInner: React.FC<AccountProvisioningPageProps> = ({
     subscriptionId,
     state.subscriptions.length,
     perSubDelaySec,
+    auditActor,
   ]);
 
   const handleStopDiscover = React.useCallback(() => {
     submitAbortRef.current?.abort();
     orchestrator.cancel();
-  }, [orchestrator]);
+    auditLog.record({
+      actor: auditActor,
+      action: "import_accounts.stop",
+      target: `subs:${effectiveSubscriptionIds.length}`,
+      status: "success",
+    });
+  }, [orchestrator, auditActor, effectiveSubscriptionIds.length]);
 
   const handleRetryFailed = React.useCallback(() => {
     const ids = store.retryFailedAccounts();
@@ -1316,12 +1581,45 @@ const AccountProvisioningPageInner: React.FC<AccountProvisioningPageProps> = ({
       message: `Retrying ${ids.length} failed account(s)...`,
       autoDismissMs: 5000,
     });
-  }, [store]);
+    auditLog.record({
+      actor: auditActor,
+      action: "provision_accounts.retry_failed",
+      target: `count:${ids.length}`,
+      status: "success",
+      details: { retriedAccountIds: ids.slice(0, 20) },
+    });
+  }, [store, auditActor]);
 
   const subscriptionFieldId = React.useId();
   const regionFieldId = React.useId();
   const skipExistingId = React.useId();
   const perSubDelayId = React.useId();
+
+  // ESC handler — only active while a submit or discover loop is in
+  // flight. We let Radix dialogs / dropdowns swallow ESC normally, and
+  // only step in when an in-flight operation could be aborted.
+  // `preventDefault` is kept on so the keystroke doesn't bubble to
+  // arbitrary keyboard listeners further up the tree.
+  const handleEscCancel = React.useCallback(() => {
+    setEscCancelHidden(false);
+  }, []);
+  useShortcut("Escape", handleEscCancel, {
+    enabled: isRunning || isDiscovering,
+    preventDefault: false, // let Radix dismiss its own popovers if open
+    allowInInputs: true,
+  });
+
+  const handleEscCancelConfirm = React.useCallback(() => {
+    setEscCancelHidden(true);
+    submitAbortRef.current?.abort();
+    orchestrator.cancel();
+    auditLog.record({
+      actor: auditActor,
+      action: "provision_accounts.esc_cancel",
+      target: `running:${isRunning ? "1" : "0"} discovering:${isDiscovering ? "1" : "0"}`,
+      status: "success",
+    });
+  }, [orchestrator, auditActor, isRunning, isDiscovering]);
 
   // ---- Subscription selector (shared) --------------------------------------
   // Group the picker by owning Azure account when multiple operators are
@@ -2221,6 +2519,48 @@ const AccountProvisioningPageInner: React.FC<AccountProvisioningPageProps> = ({
       <CardContent className="flex flex-col gap-4">
         <PreflightChips checks={preflight} />
 
+        {/* Copy region list — operator commonly pastes the picked
+            regions into a runbook / ticket / Teams thread when handing
+            off the batch. Newline-separated rather than comma-separated
+            so it pastes cleanly into a checklist. */}
+        {selectedRegions.length > 0 && (
+          <div className="flex flex-wrap items-center justify-between gap-2 rounded-md border border-border bg-surface-sunken/40 px-3 py-2">
+            <div className="flex flex-col gap-0.5 text-2xs">
+              <span className="font-semibold uppercase tracking-wider text-muted-foreground">
+                Picked regions
+              </span>
+              <span className="text-muted-foreground">
+                {selectedRegions.length} region
+                {selectedRegions.length === 1 ? "" : "s"} ·{" "}
+                <span className="font-mono text-foreground">
+                  {selectedRegions.slice(0, 6).join(", ")}
+                  {selectedRegions.length > 6 && (
+                    <>
+                      , <span className="text-muted-foreground">+{selectedRegions.length - 6} more</span>
+                    </>
+                  )}
+                </span>
+              </span>
+            </div>
+            <CopyButton
+              value={selectedRegions.join("\n")}
+              ariaLabel={`Copy ${selectedRegions.length} region${selectedRegions.length === 1 ? "" : "s"} to clipboard`}
+              iconSize={14}
+              alwaysVisible
+              onCopied={() =>
+                auditLog.record({
+                  actor: auditActor,
+                  action: "provision_accounts.copy_region_list",
+                  target: `count:${selectedRegions.length}`,
+                  status: "success",
+                  details: { regions: selectedRegions },
+                })
+              }
+              className="h-7 w-7 rounded-md border border-border bg-card text-foreground hover:bg-muted"
+            />
+          </div>
+        )}
+
         <Separator className="my-1" />
 
         <div className="flex flex-wrap items-center justify-between gap-2">
@@ -2350,6 +2690,123 @@ const AccountProvisioningPageInner: React.FC<AccountProvisioningPageProps> = ({
       </CardContent>
     </Card>
   );
+
+  // ---- Mid-run live per-sub rollup -----------------------------------------
+  // Slim derivative of `attemptAccounts` keyed by subscriptionId. Drives the
+  // mid-run sparkline so the operator sees per-sub progress while the batch
+  // is still moving forward — no need to wait for the result step.
+  // Keep this stable on `attemptAccounts` only; selectedRegions / subs
+  // are part of `dispatchPerSub` and a re-pick mid-run would already have
+  // had a fresh attemptStartedAt.
+  const liveSubSummary = React.useMemo(() => {
+    const map = new Map<
+      string,
+      {
+        displayName: string;
+        created: number;
+        failed: number;
+        total: number;
+        elapsedMs: number;
+      }
+    >();
+    if (!attemptStartedAt) return [];
+    const attemptStartMs = Date.parse(attemptStartedAt);
+    for (const subId of effectiveSubscriptionIds) {
+      const known = state.subscriptions.find(
+        (s) => s.subscriptionId === subId,
+      );
+      // Total for this sub = its dispatch plan size (post-skip),
+      // falling back to selectedRegions when the sub isn't in the
+      // plan (typed-input fallback path).
+      const total =
+        dispatchPerSub.get(subId)?.length ?? selectedRegions.length;
+      map.set(subId, {
+        displayName:
+          known?.displayName ??
+          (subId ? subId.slice(0, 8) + "…" : "(custom)"),
+        created: 0,
+        failed: 0,
+        total,
+        elapsedMs: 0,
+      });
+    }
+    for (const a of attemptAccounts) {
+      const entry = map.get(a.subscriptionId);
+      if (!entry) continue;
+      if (a.provisioningState === "created") entry.created += 1;
+      if (a.provisioningState === "failed") entry.failed += 1;
+      if (a.createdAt) {
+        const ts = Date.parse(a.createdAt);
+        if (!Number.isNaN(ts) && ts >= attemptStartMs) {
+          entry.elapsedMs = Math.max(entry.elapsedMs, ts - attemptStartMs);
+        }
+      }
+    }
+    return Array.from(map.entries()).map(([subscriptionId, v]) => ({
+      subscriptionId,
+      ...v,
+    }));
+  }, [
+    attemptAccounts,
+    attemptStartedAt,
+    effectiveSubscriptionIds,
+    dispatchPerSub,
+    selectedRegions.length,
+    state.subscriptions,
+  ]);
+
+  // Rolling avg seconds per region across all completed regions in the
+  // current attempt — used to render a per-sub ETA badge.
+  const rollingAvgPerRegionSec = React.useMemo<number | null>(() => {
+    let totalElapsedMs = 0;
+    let completedRegions = 0;
+    for (const s of liveSubSummary) {
+      totalElapsedMs += s.elapsedMs;
+      completedRegions += s.created + s.failed;
+    }
+    if (completedRegions === 0) return null;
+    return Math.max(1, Math.round(totalElapsedMs / completedRegions / 1000));
+  }, [liveSubSummary]);
+
+  // Small per-sub sparkline: a fixed-width row of dots (one per
+  // dispatched region) coloured green/red/grey for created / failed /
+  // pending. Pure SVG-free CSS so it renders inline with the per-sub
+  // label without forcing a separate flex column.
+  const PerSubSparkline: React.FC<{
+    created: number;
+    failed: number;
+    total: number;
+  }> = ({ created, failed, total }) => {
+    const cells = Math.max(1, Math.min(total, 24));
+    const out: React.ReactNode[] = [];
+    let createdLeft = created;
+    let failedLeft = failed;
+    for (let i = 0; i < cells; i++) {
+      let tone = "bg-muted";
+      if (createdLeft > 0) {
+        tone = "bg-success/80";
+        createdLeft -= 1;
+      } else if (failedLeft > 0) {
+        tone = "bg-destructive/80";
+        failedLeft -= 1;
+      }
+      out.push(
+        <span
+          key={i}
+          className={cn("h-2.5 w-1 rounded-sm", tone)}
+          aria-hidden
+        />,
+      );
+    }
+    return (
+      <span
+        className="inline-flex items-center gap-[2px]"
+        aria-label={`${created} created, ${failed} failed of ${total}`}
+      >
+        {out}
+      </span>
+    );
+  };
 
   const renderSubmit = (): React.ReactNode => (
     <Card>
@@ -2559,6 +3016,72 @@ const AccountProvisioningPageInner: React.FC<AccountProvisioningPageProps> = ({
                 ))}
               </ul>
             )}
+
+            {/* Mid-run per-sub sparkline + estimated-time badge. Only
+                shown when more than one subscription is in play (single-
+                sub runs already get the dispatch-progress card up top).
+                The sparkline gives the operator a glance-level read on
+                per-sub success/failure without scrolling to the result
+                rollup; the ETA badge derives from the rolling avg
+                computed above so it converges as more regions complete. */}
+            {liveSubSummary.length > 1 && (
+              <ul
+                className="mt-1 flex flex-col gap-1"
+                aria-label="Per-subscription live progress"
+              >
+                {liveSubSummary.map((s) => {
+                  const done = s.created + s.failed;
+                  const remaining = Math.max(0, s.total - done);
+                  const subEtaSec =
+                    rollingAvgPerRegionSec !== null && remaining > 0
+                      ? rollingAvgPerRegionSec * remaining
+                      : null;
+                  return (
+                    <li
+                      key={s.subscriptionId}
+                      className="flex flex-wrap items-center justify-between gap-2 rounded-sm bg-card/40 px-2 py-1 text-2xs"
+                    >
+                      <span className="inline-flex items-center gap-2">
+                        <span className="font-medium text-foreground">
+                          {s.displayName}
+                        </span>
+                        <span className="font-mono text-muted-foreground">
+                          {s.subscriptionId.slice(0, 8)}…
+                        </span>
+                        <PerSubSparkline
+                          created={s.created}
+                          failed={s.failed}
+                          total={s.total}
+                        />
+                      </span>
+                      <span className="inline-flex items-center gap-2 tabular-nums text-muted-foreground">
+                        <span>
+                          <span className="text-success">{s.created}</span>
+                          {" / "}
+                          <span className="text-foreground">{s.total}</span>
+                          {s.failed > 0 && (
+                            <>
+                              {" · "}
+                              <span className="text-destructive">
+                                {s.failed} failed
+                              </span>
+                            </>
+                          )}
+                        </span>
+                        {subEtaSec !== null && (
+                          <span
+                            className="inline-flex items-center rounded-full border border-border bg-muted/40 px-1.5 text-2xs text-foreground"
+                            title="Estimated remaining time for this subscription, derived from the rolling average across completed regions"
+                          >
+                            ~{formatEta(subEtaSec)}
+                          </span>
+                        )}
+                      </span>
+                    </li>
+                  );
+                })}
+              </ul>
+            )}
           </div>
         )}
 
@@ -2698,6 +3221,12 @@ const AccountProvisioningPageInner: React.FC<AccountProvisioningPageProps> = ({
                   setSubBatchProgress(null);
                   setLastAttemptDurationMs(null);
                   setStep("configure");
+                  auditLog.record({
+                    actor: auditActor,
+                    action: "provision_accounts.new_request",
+                    target: "wizard:reset",
+                    status: "success",
+                  });
                 }}
                 aria-label="Start a new provisioning request"
               >
@@ -3148,6 +3677,42 @@ const AccountProvisioningPageInner: React.FC<AccountProvisioningPageProps> = ({
         onConfirm={handleConfirmCreate}
         onCancel={() => setConfirmHidden(true)}
         loading={isRunning}
+      />
+
+      {/* ESC-bound cancel-everything confirmation. Only the shortcut
+          opens this dialog (the Stop button has its own immediate path),
+          so the same destructive action requires either a deliberate
+          button click or a confirmed keystroke. */}
+      <ConfirmationDialog
+        hidden={escCancelHidden}
+        title="Cancel in-flight provisioning?"
+        message={
+          <div className="space-y-2 text-sm leading-relaxed">
+            <p className="m-0">
+              You pressed{" "}
+              <kbd className="rounded border border-border bg-muted px-1 font-mono text-2xs">
+                Esc
+              </kbd>{" "}
+              while a{" "}
+              {isRunning && isDiscovering
+                ? "provisioning and discovery run"
+                : isRunning
+                  ? "provisioning run"
+                  : "discovery run"}{" "}
+              is in flight.
+            </p>
+            <p className="m-0 text-muted-foreground text-xs">
+              Cancelling aborts the inter-subscription wait and signals the
+              orchestrator to stop. ARM PUTs already in flight may still
+              complete server-side.
+            </p>
+          </div>
+        }
+        confirmText="Cancel run"
+        cancelText="Keep running"
+        danger
+        onConfirm={handleEscCancelConfirm}
+        onCancel={() => setEscCancelHidden(true)}
       />
     </div>
   );

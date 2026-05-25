@@ -19,7 +19,6 @@ import {
   ChevronRight,
   ChevronsUpDown,
   ClipboardPaste,
-  Copy,
   Download,
   ExternalLink,
   FileSignature,
@@ -124,12 +123,16 @@ import {
 } from "../../store/store-context";
 
 import { useArmToken } from "../../auth/use-arm-token";
+import { useAbortableEffect } from "../../hooks/use-abortable-effect";
+import { usePersistedState } from "../../hooks/use-persisted-state";
 import { useTenantChange } from "../../hooks/use-tenant-change";
 import { ConfirmationDialog } from "../shared/confirmation-dialog";
+import { CopyButton } from "../shared/copy-button";
 import { EmptyState } from "../shared/empty-state";
 import { ErrorBoundary } from "../shared/error-boundary";
 import { PageHeader } from "../shared/page-header";
 import { SkeletonLoader } from "../shared/skeleton-loader";
+import { SummaryStatItem } from "../shared/summary-stat-item";
 import { TokenExpiryBadge } from "../shared/token-expiry-badge";
 
 const ACTIVE_KEY_STORAGE = "ea-subscription:active-account";
@@ -654,48 +657,34 @@ interface CopyableIdProps {
 }
 
 /**
- * Small inline pill that displays a (possibly long) ID and copies it to
- * the clipboard on click, surfacing a 1.2s "Copied" affordance. Used in
- * the success result panel so the user can paste the new subscription
- * GUID into other tools.
+ * Small inline pill that displays a (possibly long) ID with an inline
+ * click-to-copy affordance. The pill wraps the value and delegates the
+ * copy interaction to the shared `<CopyButton>` so the legacy
+ * `document.execCommand("copy")` fallback works in sandboxed iframes
+ * where `navigator.clipboard` is blocked.
+ *
+ * COORDINATOR: the page previously embedded a local `CopyableId` that
+ * implemented its own clipboard dance — replaced with the shared
+ * `CopyButton` from `../shared/copy-button` so the fallback is
+ * consistent with every other page that copies a GUID.
  */
-const CopyableId: React.FC<CopyableIdProps> = ({ value, label }) => {
-  const [copied, setCopied] = React.useState(false);
-  const handleCopy = React.useCallback(() => {
-    if (!value) return;
-    try {
-      const nav: Navigator | undefined =
-        typeof navigator !== "undefined" ? navigator : undefined;
-      if (nav?.clipboard?.writeText) {
-        void nav.clipboard.writeText(value);
-        setCopied(true);
-        window.setTimeout(() => setCopied(false), 1200);
-      }
-    } catch {
-      /* clipboard may be unavailable in sandboxed contexts */
-    }
-  }, [value]);
-  return (
-    <button
-      type="button"
-      onClick={handleCopy}
-      aria-label={label ? `Copy ${label}` : "Copy ID"}
-      className={cn(
-        "inline-flex items-center gap-1.5 rounded-md border border-border bg-surface-sunken px-2 py-1 font-mono text-2xs text-foreground",
-        "transition-all duration-200 ease-out hover:border-primary/60 hover:bg-accent/5",
-        "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-1 focus-visible:ring-offset-background",
-      )}
-    >
-      <span className="truncate">{value}</span>
-      {copied ? (
-        <Check className="h-3 w-3 shrink-0 text-success" aria-hidden />
-      ) : (
-        <Copy className="h-3 w-3 shrink-0 opacity-60" aria-hidden />
-      )}
-      <span className="sr-only">{copied ? "Copied" : "Click to copy"}</span>
-    </button>
-  );
-};
+const CopyableId: React.FC<CopyableIdProps> = ({ value, label }) => (
+  <span
+    className={cn(
+      "group/copy inline-flex items-center gap-1.5 rounded-md border border-border bg-surface-sunken px-2 py-1 font-mono text-2xs text-foreground",
+      "transition-all duration-200 ease-out hover:border-primary/60 hover:bg-accent/5",
+      "focus-within:outline-none focus-within:ring-2 focus-within:ring-ring focus-within:ring-offset-1 focus-within:ring-offset-background",
+    )}
+  >
+    <span className="truncate">{value}</span>
+    <CopyButton
+      value={value}
+      ariaLabel={label ? `Copy ${label}` : `Copy ${value}`}
+      iconSize={12}
+      alwaysVisible
+    />
+  </span>
+);
 
 const recipientSchema = z.object({
   key: z.string(),
@@ -767,17 +756,23 @@ const EaSubscriptionPageInner: React.FC<EaSubscriptionPageProps> = ({
     [azureAccounts],
   );
 
-  React.useEffect(() => {
-    let cancelled = false;
-    setDiscoveringEa(true);
-    (async () => {
+  // EA-capability probe — runs every signed-in account through the billing
+  // API so we can render only the EA-capable ones. Uses `useAbortableEffect`
+  // so an in-flight probe is dropped if `accountKey` changes mid-flight
+  // (e.g. a parallel sign-in completes) — the signal short-circuits the
+  // setState calls below. `probeEaCapability` itself does not accept a
+  // signal yet, so we still let any pending HTTPs finish but discard the
+  // result if the effect was torn down.
+  useAbortableEffect(
+    async (signal) => {
+      setDiscoveringEa(true);
       const next: Record<
         string,
         { hasEa: boolean; billingAccountCount: number }
       > = {};
       await Promise.allSettled(
         azureAccounts.map(async (a) => {
-          if (!a.homeAccountId) return;
+          if (signal.aborted || !a.homeAccountId) return;
           const tenantId = getActiveTenant(a.homeAccountId) ?? a.tenantId;
           if (!tenantId) {
             next[a.homeAccountId] = { hasEa: false, billingAccountCount: 0 };
@@ -788,25 +783,25 @@ const EaSubscriptionPageInner: React.FC<EaSubscriptionPageProps> = ({
               a.homeAccountId,
               tenantId,
             );
+            if (signal.aborted) return;
             const cap = await probeEaCapability(token);
+            if (signal.aborted) return;
             next[a.homeAccountId] = {
               hasEa: cap.hasEa,
               billingAccountCount: cap.billingAccountCount,
             };
           } catch {
+            if (signal.aborted) return;
             next[a.homeAccountId] = { hasEa: false, billingAccountCount: 0 };
           }
         }),
       );
-      if (!cancelled) {
-        setEaCapabilityMap(next);
-        setDiscoveringEa(false);
-      }
-    })();
-    return () => {
-      cancelled = true;
-    };
-  }, [accountKey, azureAccounts]);
+      if (signal.aborted) return;
+      setEaCapabilityMap(next);
+      setDiscoveringEa(false);
+    },
+    [accountKey, azureAccounts],
+  );
 
   const eaAccounts: EaAccount[] = React.useMemo(() => {
     return azureAccounts
@@ -852,6 +847,17 @@ const EaSubscriptionPageInner: React.FC<EaSubscriptionPageProps> = ({
     } catch {
       /* sessionStorage may be unavailable in some sandboxed contexts */
     }
+    // Audit the active-account switch so the timeline shows which EA
+    // identity was in scope when subsequent billing / submission events
+    // landed. Previously this was silent — making post-mortem of a wrong-
+    // account submission much harder.
+    auditLog.record({
+      actor: key,
+      action: "ea_subscription_select_account",
+      target: key,
+      status: "success",
+      details: { homeAccountId: key },
+    });
   }, []);
 
   const activeAccount: EaAccount | null = React.useMemo(
@@ -1331,13 +1337,27 @@ const EaSubscriptionPageInner: React.FC<EaSubscriptionPageProps> = ({
   const removeRecipient = React.useCallback(
     (key: string) => {
       const prev = form.getValues("recipients");
+      const removed = prev.find((r) => r.key === key);
       form.setValue(
         "recipients",
         prev.filter((r) => r.key !== key),
         { shouldValidate: true },
       );
+      if (removed) {
+        auditLog.record({
+          actor: activeAccount?.username ?? "anonymous",
+          action: "ea_subscription_remove_recipient",
+          target: removed.ownerObjectId,
+          status: "success",
+          details: {
+            tenantId: removed.tenantId,
+            source: removed.source,
+            displayLabel: removed.displayLabel,
+          },
+        });
+      }
     },
-    [form],
+    [form, activeAccount],
   );
 
   const [pickerOpen, setPickerOpen] = React.useState(false);
@@ -1582,6 +1602,28 @@ const EaSubscriptionPageInner: React.FC<EaSubscriptionPageProps> = ({
     return selectedRecipients;
   }, [selfAssign, selfAssignRecipient, selectedRecipients]);
 
+  // Pre-computed per-batch stats for the KPI tile row above the
+  // Provisioning Summary. Memoized off `effectiveRecipients` so the four
+  // tiles don't re-derive on every keystroke in the alias / display-name
+  // inputs.
+  const recipientStats = React.useMemo(() => {
+    const callerTid = activeAccount?.tenantId.toLowerCase() ?? "";
+    let crossTenant = 0;
+    let disabled = 0;
+    const tenantSet = new Set<string>();
+    for (const r of effectiveRecipients) {
+      tenantSet.add(r.tenantId);
+      if (callerTid && r.tenantId.toLowerCase() !== callerTid) crossTenant += 1;
+      if (r.enabled === false) disabled += 1;
+    }
+    return {
+      total: effectiveRecipients.length,
+      crossTenant,
+      disabled,
+      tenantSpan: tenantSet.size,
+    };
+  }, [effectiveRecipients, activeAccount]);
+
   // Auto-derive a default alias + display name from the first recipient
   // so the zod-required fields populate even when the user does not type
   // anything. Users may still override.
@@ -1770,9 +1812,18 @@ const EaSubscriptionPageInner: React.FC<EaSubscriptionPageProps> = ({
   // Adjustable concurrency. 1 = strictly serial (lowest pressure on EA
   // billing API), 5 = parallel up to 5 (faster but more likely to trip
   // throttles on large enrollments).
-  const [concurrencyChoice, setConcurrencyChoice] = React.useState<
+  //
+  // Persisted via `usePersistedState` (localStorage) so a power-user who
+  // always runs 5 doesn't have to re-select after every reload. The
+  // versioned envelope makes future migrations (e.g. add a "10" option)
+  // safe — older payloads fall back to the default.
+  const [concurrencyChoice, setConcurrencyChoice] = usePersistedState<
     "1" | "3" | "5"
-  >("3");
+  >("ea-subscription:concurrency", "3", {
+    version: 1,
+    migrate: (raw) =>
+      raw === "1" || raw === "3" || raw === "5" ? raw : undefined,
+  });
 
   // Track which recipient keys should be re-run on the next submit. When
   // empty, performSubmit runs against every effective recipient. When
@@ -3824,6 +3875,87 @@ const EaSubscriptionPageInner: React.FC<EaSubscriptionPageProps> = ({
             </Card>
           )}
 
+          {/*
+            KPI tile strip — at-a-glance recipient breakdown right above the
+            Provisioning Summary so the operator can sanity-check the batch
+            shape (total, cross-tenant share, disabled rows, tenant span)
+            before committing irreversible billing operations.
+          */}
+          {leafSelectionReady && recipientStats.total > 0 && (
+            <div
+              className="flex flex-wrap gap-2"
+              role="group"
+              aria-label="Recipient batch summary"
+            >
+              <SummaryStatItem
+                label="Total"
+                value={recipientStats.total}
+                hint={
+                  recipientStats.total === 1
+                    ? "subscription"
+                    : "subscriptions"
+                }
+                tone="info"
+                compact
+              />
+              <SummaryStatItem
+                label="Cross-tenant"
+                value={recipientStats.crossTenant}
+                hint={
+                  recipientStats.crossTenant > 0
+                    ? "needs accept"
+                    : "same tenant"
+                }
+                tone={recipientStats.crossTenant > 0 ? "warning" : "muted"}
+                compact
+              />
+              <SummaryStatItem
+                label="Disabled"
+                value={recipientStats.disabled}
+                hint={
+                  recipientStats.disabled > 0 ? "may 400" : "all enabled"
+                }
+                tone={recipientStats.disabled > 0 ? "destructive" : "muted"}
+                compact
+              />
+              <SummaryStatItem
+                label="Tenants"
+                value={recipientStats.tenantSpan}
+                hint={
+                  recipientStats.tenantSpan > 1
+                    ? "multi-tenant"
+                    : "single"
+                }
+                tone={recipientStats.tenantSpan > 1 ? "warning" : "muted"}
+                compact
+              />
+              {totalInFlight > 0 && (
+                <>
+                  <SummaryStatItem
+                    label="Succeeded"
+                    value={successResults.length}
+                    hint={
+                      submitting
+                        ? "in batch"
+                        : completedCount === totalInFlight
+                          ? "complete"
+                          : "running"
+                    }
+                    tone="success"
+                    compact
+                  />
+                  <SummaryStatItem
+                    label="Failed"
+                    value={failureCount}
+                    hint={failureCount > 0 ? "see below" : "none"}
+                    tone={failureCount > 0 ? "destructive" : "muted"}
+                    compact
+                  />
+                </>
+              )}
+            </div>
+          )}
+
           {leafSelectionReady && (
             <Card>
               <CardHeader>
@@ -4055,7 +4187,12 @@ const EaSubscriptionPageInner: React.FC<EaSubscriptionPageProps> = ({
                 )}
 
                 {batchErrors.length > 0 && (
-                  <Alert variant="destructive">
+                  <Alert
+                    variant="destructive"
+                    role="alert"
+                    aria-live="assertive"
+                    aria-atomic="false"
+                  >
                     <AlertCircle className="h-4 w-4" />
                     <AlertDescription>
                       <p className="mb-1 font-medium">

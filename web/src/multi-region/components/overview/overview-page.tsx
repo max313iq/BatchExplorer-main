@@ -18,16 +18,22 @@
  * Keyboard shortcuts:
  *   - `r`  → Refresh all (when no input focused)
  *   - `/`  → Focus the unused-quota search box (when the table is visible)
+ *   - `1`  → Navigate to Accounts (Batch account list)
+ *   - `2`  → Navigate to Pool Info (per-pool details)
+ *   - `3`  → Navigate to Nodes (compute-node grid)
  */
 import * as React from "react";
 import { useNavigate } from "react-router-dom";
 import {
   AlertCircle,
   Boxes,
+  CheckCircle2,
   ChevronDown,
   ChevronRight,
   Cpu,
   Download,
+  Eye,
+  EyeOff,
   HardDrive,
   Layers,
   Loader2,
@@ -65,8 +71,10 @@ import { cn, formatNumber } from "@/lib/utils";
 
 import { OrchestratorAgent } from "../../agents/orchestrator-agent";
 import { useArmToken } from "../../auth/use-arm-token";
+import { usePersistedState } from "../../hooks/use-persisted-state";
 import { useShortcut } from "../../hooks/use-shortcut";
 import { useUrlState } from "../../hooks/use-url-state";
+import { auditLog } from "../../services/audit-log";
 import { MultiRegionStore } from "../../store/multi-region-store";
 import {
   useDashboardStats,
@@ -74,6 +82,7 @@ import {
 } from "../../store/store-context";
 import { QuotaSuggestion } from "../../store/store-types";
 
+import { useDashboardOutletContext } from "../page-router";
 import { ConfirmationDialog } from "../shared/confirmation-dialog";
 import { CopyButton } from "../shared/copy-button";
 import { DataTable, DataTableColumn } from "../shared/enhanced-table";
@@ -86,6 +95,7 @@ import { PageKey } from "../shared/sidebar-nav";
 import { RegionHealthChart } from "../shared/region-health-chart";
 import { SkeletonLoader } from "../shared/skeleton-loader";
 import { StatusBadge } from "../shared/status-badge";
+import { SummaryStatItem } from "../shared/summary-stat-item";
 import { TokenExpiryBadge } from "../shared/token-expiry-badge";
 
 // ---------------------------------------------------------------------------
@@ -1056,9 +1066,31 @@ interface UnusedQuotaSectionProps {
   searchInputRef: React.RefObject<HTMLInputElement>;
 }
 
+/**
+ * Structured outcome of the most-recent `auto_create_pools_from_quota` run.
+ * Surfaced inline (above the table) so operators see exactly how many pools
+ * succeeded vs failed without combing the activity log — important for the
+ * partial-success case where the orchestrator returns `status: "partial"`
+ * with `summary: { created, failed, total }`.
+ */
+interface AutoCreateOutcome {
+  status: "completed" | "partial" | "failed";
+  created: number;
+  failed: number;
+  total: number;
+  /** Distinct regions touched — useful for the rollback-suggestion text. */
+  regions: string[];
+  /** Timestamp the orchestrator finished. */
+  finishedAt: string;
+}
+
 const UnusedQuotaSection: React.FC<UnusedQuotaSectionProps> = ({
   orchestrator,
-  store,
+  // `store` is retained on the props bag for backward compat with the
+  // caller's wiring; all write-through happens via the `auditLog` singleton
+  // (which is bound to the store at app boot), so the prop is unused here.
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
+  store: _store,
   searchQuery,
   onSearchQueryChange,
   searchInputRef,
@@ -1074,12 +1106,31 @@ const UnusedQuotaSection: React.FC<UnusedQuotaSectionProps> = ({
   // the orchestrator notification path. Cleared on the next successful run.
   const [detectError, setDetectError] = React.useState<string | null>(null);
   const [createError, setCreateError] = React.useState<string | null>(null);
+  // Partial-success / rollback report — pinned above the table after every
+  // auto-create attempt. The orchestrator returns
+  // `status: "completed"|"partial"|"failed"` and a summary with per-row
+  // counts; we render that as a colour-coded banner with explicit guidance
+  // when failures occurred (manual review since the orchestrator does not
+  // currently roll back successfully-created pools — see COORDINATOR note).
+  const [outcome, setOutcome] = React.useState<AutoCreateOutcome | null>(null);
 
   // Track unmount so we don't update state from a stale async path.
   const aliveRef = React.useRef(true);
+  // Per-action AbortControllers so a rapid re-click cancels the in-flight
+  // request rather than racing it. The `creating` / `detecting` flags also
+  // gate the UI, but a controller is the only way to actually stop work
+  // mid-flight if the user navigates away.
+  const detectAbortRef = React.useRef<AbortController | null>(null);
+  const createAbortRef = React.useRef<AbortController | null>(null);
   React.useEffect(
     () => () => {
       aliveRef.current = false;
+      // Cancel any in-flight orchestrator calls on unmount — without this,
+      // a user navigating away mid-detect would still trigger the
+      // "setState on unmounted component" warning AND keep the agent
+      // worker busy until the underlying ARM call finally returns.
+      detectAbortRef.current?.abort();
+      createAbortRef.current?.abort();
     },
     [],
   );
@@ -1135,51 +1186,94 @@ const UnusedQuotaSection: React.FC<UnusedQuotaSectionProps> = ({
   }, [selectedIds, visibleIds]);
 
   const handleDetect = React.useCallback(async () => {
+    // Re-entry guard — the button is also `disabled` while detecting, but
+    // a keyboard or programmatic invoker could still slip through.
+    if (detecting) return;
+    // Cancel any prior in-flight detect (rapid re-click). The agent honours
+    // the signal threaded through `params.signal`.
+    detectAbortRef.current?.abort();
+    const controller = new AbortController();
+    detectAbortRef.current = controller;
+
     setDetecting(true);
     setSuggestions([]);
     setSelectedIds(new Set());
     setDetectError(null);
+    // Clearing the prior outcome on a fresh detect — the suggestions about
+    // to land may not match the previous run.
+    setOutcome(null);
+    // COORDINATOR: services/audit-log singleton bridges to store via
+    // `bindAuditLogToStore`, so a single `auditLog.record` writes through
+    // to `state.auditEntries`. We use the singleton here (canonical path)
+    // and skip the direct `store.addAuditEntry` duplicate.
+    const target = `${state.accountInfos.length} accounts`;
     try {
       const result = await orchestrator.execute({
         action: "detect_unused_quota",
         payload: {},
+        signal: controller.signal,
       });
-      if (!aliveRef.current) return;
+      if (!aliveRef.current || controller.signal.aborted) return;
       const items = (result.summary as Record<string, unknown>)
         ?.suggestions as QuotaSuggestion[] | undefined;
       setSuggestions(items ?? []);
-      store.addAuditEntry({
-        id: `audit-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-        timestamp: new Date().toISOString(),
+      auditLog.record({
         actor: "overview-page",
         action: "detect_unused_quota",
-        target: `${state.accountInfos.length} accounts`,
+        target,
         status: "success",
         details: { suggestionCount: items?.length ?? 0 },
       });
     } catch (e) {
-      if (!aliveRef.current) return;
+      if (!aliveRef.current || controller.signal.aborted) return;
       const msg = e instanceof Error ? e.message : String(e);
       setDetectError(msg);
-      store.addAuditEntry({
-        id: `audit-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-        timestamp: new Date().toISOString(),
+      auditLog.record({
         actor: "overview-page",
         action: "detect_unused_quota",
-        target: `${state.accountInfos.length} accounts`,
+        target,
         status: "failure",
         error: msg,
       });
     } finally {
-      if (aliveRef.current) setDetecting(false);
+      if (aliveRef.current && detectAbortRef.current === controller) {
+        setDetecting(false);
+        detectAbortRef.current = null;
+      }
     }
-  }, [orchestrator, store, state.accountInfos.length]);
+  }, [detecting, orchestrator, state.accountInfos.length]);
 
   const performAutoCreate = React.useCallback(async () => {
+    // Hard re-entry guard — closing-and-reopening the confirm dialog while
+    // a prior run is still in flight would otherwise double-submit. The
+    // primary button has `disabled={... || creating}` but the dialog's
+    // own confirm button passes through.
+    if (creating) return;
     const selected = filteredRows.filter((r) => effectiveSelection.has(r.rowId));
     if (selected.length === 0) return;
+    // Cancel any prior in-flight auto-create. In practice gated by `creating`
+    // but defensive against accidental double-dispatch (e.g. via debugger).
+    createAbortRef.current?.abort();
+    const controller = new AbortController();
+    createAbortRef.current = controller;
+
     setCreating(true);
     setCreateError(null);
+    const distinctRegions = Array.from(new Set(selected.map((s) => s.region)));
+    const startTarget = `${selected.length} pools across ${distinctRegions.length} regions`;
+    // COORDINATOR: write the destructive-action audit *before* the agent
+    // dispatch so even a hung orchestrator leaves a paper-trail. The
+    // singleton bridges to `state.auditEntries`.
+    auditLog.record({
+      actor: "overview-page",
+      action: "auto_create_pools_from_quota:start",
+      target: startTarget,
+      status: "success",
+      details: {
+        poolCount: selected.length,
+        regions: distinctRegions,
+      },
+    });
     try {
       // Strip row-only fields before handing the payload to the orchestrator.
       const payload: QuotaSuggestion[] = selected.map((r) => ({
@@ -1193,32 +1287,68 @@ const UnusedQuotaSection: React.FC<UnusedQuotaSectionProps> = ({
         maxLpNodes: r.maxLpNodes,
         maxDedicatedNodes: r.maxDedicatedNodes,
       }));
-      await orchestrator.execute({
+      const result = await orchestrator.execute({
         action: "auto_create_pools_from_quota",
         payload: { suggestions: payload },
+        signal: controller.signal,
       });
-      if (!aliveRef.current) return;
+      if (!aliveRef.current || controller.signal.aborted) return;
+
+      // Surface the orchestrator's structured summary so partial-success
+      // is unambiguous. The agent returns
+      // `summary: { created, failed, total }` and `status` in
+      // {"completed","partial","failed"} — fall back to derived counts if
+      // the shape ever drifts.
+      const summary = (result.summary ?? {}) as Record<string, unknown>;
+      const created = Number(summary.created) || 0;
+      const failed = Number(summary.failed) || 0;
+      const total = Number(summary.total) || selected.length;
+      const status: AutoCreateOutcome["status"] =
+        result.status === "partial" ||
+        result.status === "failed" ||
+        result.status === "completed"
+          ? result.status
+          : failed === 0
+            ? "completed"
+            : created === 0
+              ? "failed"
+              : "partial";
+      setOutcome({
+        status,
+        created,
+        failed,
+        total,
+        regions: distinctRegions,
+        finishedAt: new Date().toISOString(),
+      });
       // Selection no longer makes sense once provisioning kicked off.
       setSelectedIds(new Set());
-      store.addAuditEntry({
-        id: `audit-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-        timestamp: new Date().toISOString(),
+      auditLog.record({
         actor: "overview-page",
         action: "auto_create_pools_from_quota",
-        target: `${selected.length} pools across ${new Set(selected.map((s) => s.region)).size} regions`,
-        status: "success",
+        target: `${created}/${total} pools created across ${distinctRegions.length} regions`,
+        status: status === "failed" ? "failure" : "success",
         details: {
-          poolCount: selected.length,
-          regions: Array.from(new Set(selected.map((s) => s.region))),
+          orchestratorStatus: status,
+          created,
+          failed,
+          total,
+          regions: distinctRegions,
         },
       });
     } catch (e) {
-      if (!aliveRef.current) return;
+      if (!aliveRef.current || controller.signal.aborted) return;
       const msg = e instanceof Error ? e.message : String(e);
       setCreateError(msg);
-      store.addAuditEntry({
-        id: `audit-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-        timestamp: new Date().toISOString(),
+      setOutcome({
+        status: "failed",
+        created: 0,
+        failed: selected.length,
+        total: selected.length,
+        regions: distinctRegions,
+        finishedAt: new Date().toISOString(),
+      });
+      auditLog.record({
         actor: "overview-page",
         action: "auto_create_pools_from_quota",
         target: `${selected.length} pools`,
@@ -1226,9 +1356,12 @@ const UnusedQuotaSection: React.FC<UnusedQuotaSectionProps> = ({
         error: msg,
       });
     } finally {
-      if (aliveRef.current) setCreating(false);
+      if (aliveRef.current && createAbortRef.current === controller) {
+        setCreating(false);
+        createAbortRef.current = null;
+      }
     }
-  }, [orchestrator, store, filteredRows, effectiveSelection]);
+  }, [creating, orchestrator, filteredRows, effectiveSelection]);
 
   const handleAutoCreateConfirmed = React.useCallback(async () => {
     setConfirmOpen(false);
@@ -1490,6 +1623,119 @@ const UnusedQuotaSection: React.FC<UnusedQuotaSectionProps> = ({
         </div>
       )}
 
+      {/*
+       * Partial-success / rollback report — surfaces after every auto-create
+       * run. We do NOT auto-rollback successful pools (the agent does not
+       * currently support compensating deletes — see COORDINATOR note) but
+       * the report explicitly lists the failed regions so the operator can
+       * decide whether to manually delete the succeeded pools too. This is
+       * the missing UI for the agent's `status: "partial"` return value.
+       *
+       * COORDINATOR: a true rollback (delete-on-partial-fail) belongs in
+       * the orchestrator so it can run with the same auth/abort context as
+       * the create. Until that lands, this banner is the trail.
+       */}
+      {outcome && (
+        <div
+          role="status"
+          aria-live="polite"
+          className={cn(
+            "mb-3 flex flex-col gap-1.5 rounded-md border p-2.5 text-xs",
+            outcome.status === "completed"
+              ? cn(
+                  TONE_CLASSES.success.border,
+                  TONE_CLASSES.success.bgSubtle,
+                )
+              : outcome.status === "partial"
+                ? cn(
+                    TONE_CLASSES.warning.border,
+                    TONE_CLASSES.warning.bgSubtle,
+                  )
+                : cn(
+                    TONE_CLASSES.destructive.border,
+                    TONE_CLASSES.destructive.bgSubtle,
+                  ),
+          )}
+        >
+          <div className="flex items-start gap-2">
+            {outcome.status === "completed" ? (
+              <CheckCircle2
+                className={cn(
+                  "h-3.5 w-3.5 shrink-0",
+                  TONE_CLASSES.success.text,
+                )}
+                aria-hidden
+              />
+            ) : (
+              <AlertCircle
+                className={cn(
+                  "h-3.5 w-3.5 shrink-0",
+                  outcome.status === "partial"
+                    ? TONE_CLASSES.warning.text
+                    : TONE_CLASSES.destructive.text,
+                )}
+                aria-hidden
+              />
+            )}
+            <span className="flex-1">
+              <span
+                className={cn(
+                  "font-semibold",
+                  outcome.status === "completed"
+                    ? TONE_CLASSES.success.text
+                    : outcome.status === "partial"
+                      ? TONE_CLASSES.warning.text
+                      : TONE_CLASSES.destructive.text,
+                )}
+              >
+                {outcome.status === "completed"
+                  ? "Auto-create complete"
+                  : outcome.status === "partial"
+                    ? "Auto-create partially succeeded"
+                    : "Auto-create failed"}
+              </span>{" "}
+              <span className="text-muted-foreground">
+                {outcome.created}/{outcome.total} pool
+                {outcome.total === 1 ? "" : "s"} created
+                {outcome.failed > 0 && (
+                  <>
+                    {" "}
+                    (<span className={TONE_CLASSES.destructive.text}>
+                      {outcome.failed} failed
+                    </span>)
+                  </>
+                )}
+                {" "}across {outcome.regions.length} region
+                {outcome.regions.length === 1 ? "" : "s"}
+              </span>
+            </span>
+            <button
+              type="button"
+              onClick={() => setOutcome(null)}
+              className="rounded p-0.5 text-muted-foreground hover:bg-accent/40 hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+              aria-label="Dismiss auto-create report"
+            >
+              <X className="h-3 w-3" aria-hidden />
+            </button>
+          </div>
+          {outcome.status === "partial" && (
+            <p className="m-0 pl-5 text-2xs text-muted-foreground">
+              The {outcome.created} pool{outcome.created === 1 ? "" : "s"} that
+              succeeded are live and consuming quota. Review the agent log for
+              the failure reasons before retrying — repeated runs will
+              auto-skip regions whose VM SKU has been blacklisted.
+            </p>
+          )}
+          {outcome.status === "failed" && outcome.created === 0 && (
+            <p className="m-0 pl-5 text-2xs text-muted-foreground">
+              No pools were created — common causes: ARM permissions, VM SKU
+              unavailable in region, or upstream quota race. Re-detect and try
+              again, or open the activity log for per-row error detail.
+            </p>
+          )}
+        </div>
+      )}
+
       {rows.length > 0 && (
         <div className="flex flex-col gap-3">
           {/* Toolbar — search + bulk-select helpers + export. Pressing
@@ -1728,6 +1974,13 @@ const UnusedQuotaSection: React.FC<UnusedQuotaSectionProps> = ({
 export interface OverviewPageProps {
   orchestrator: OrchestratorAgent;
   store: MultiRegionStore;
+  /**
+   * Legacy navigation prop kept for backward-compat with the route adapter
+   * in `page-router.tsx`. New call sites should rely on the
+   * `navigateToPage(path)` helper pulled from `useDashboardOutletContext()`
+   * (used internally below). The adapter still threads this prop through,
+   * so existing callers keep working unchanged.
+   */
   onNavigate: (key: PageKey) => void;
 }
 
@@ -1746,8 +1999,46 @@ const OverviewPageInner: React.FC<OverviewPageProps> = ({
   const stats = useDashboardStats();
   const state = useMultiRegionState();
   const navigate = useNavigate();
+  // Path-based nav from context — the migration target. We keep the legacy
+  // `onNavigate(PageKey)` prop accepted (route adapter still threads it
+  // through) and adopt a single `navTo` helper internally so we can swap
+  // call sites incrementally without touching the router.
+  //
+  // The hook's signature is `DashboardOutletContext` (non-null), but
+  // react-router returns `null` when rendered outside an `<Outlet>` (tests,
+  // standalone storybook). Treat it as potentially-undefined and fall back
+  // to the legacy prop in that case.
+  const outletContext = useDashboardOutletContext() as
+    | ReturnType<typeof useDashboardOutletContext>
+    | null
+    | undefined;
+  const navigateToPage = outletContext?.navigateToPage;
+  const navTo = React.useCallback(
+    (key: PageKey) => {
+      // Prefer the context helper (canonical path-based nav). Fall back to
+      // the legacy prop for tests / call sites that render this page
+      // outside the router shell.
+      if (navigateToPage) {
+        navigateToPage(key);
+      } else {
+        onNavigate(key);
+      }
+    },
+    [navigateToPage, onNavigate],
+  );
+
   const [refreshing, setRefreshing] = React.useState(false);
   const [cardErrors, setCardErrors] = React.useState<CardErrorMap>({});
+
+  // Persisted "hide healthy regions" filter — survives reload because an
+  // operator triaging an outage wants the noisy 95% healthy regions out of
+  // the way until the incident is resolved. Versioned envelope so we can
+  // evolve the shape without rehydration crashes.
+  const [hideHealthyRegions, setHideHealthyRegions] = usePersistedState<boolean>(
+    "overview.hideHealthyRegions",
+    false,
+    { version: 1 },
+  );
 
   // Single URL-state bag — collapsing every flag into one record keeps the
   // url-state hook's effect dependency stable and the URL ordering tidy.
@@ -1832,6 +2123,49 @@ const OverviewPageInner: React.FC<OverviewPageProps> = ({
     }));
   }, [state.accountInfos, state.accounts]);
 
+  // Per-account quota summary — counts accounts that have any free quota
+  // available, alongside the per-account averages. Surfaces above the
+  // cluster-health grid via `SummaryStatItem` so an operator can see
+  // "30 of 42 accounts have spare LP cores" without scrolling to the
+  // Unused Quota table.
+  const accountQuotaSummary = React.useMemo(() => {
+    const totalAccounts = state.accountInfos.length;
+    let withFreeLp = 0;
+    let withFreeDedicated = 0;
+    let totalFreeLp = 0;
+    let totalFreeDedicated = 0;
+    for (const a of state.accountInfos) {
+      if (a.lowPriorityCoresFree > 0) {
+        withFreeLp += 1;
+        totalFreeLp += a.lowPriorityCoresFree;
+      }
+      if (a.dedicatedCoresFree > 0) {
+        withFreeDedicated += 1;
+        totalFreeDedicated += a.dedicatedCoresFree;
+      }
+    }
+    return {
+      totalAccounts,
+      withFreeLp,
+      withFreeDedicated,
+      totalFreeLp,
+      totalFreeDedicated,
+      avgFreeLpPerAccount:
+        withFreeLp > 0 ? Math.round(totalFreeLp / withFreeLp) : 0,
+    };
+  }, [state.accountInfos]);
+
+  // Hide-healthy filter — apply to the cluster-health grid AND the region-
+  // health hover list. Healthy = healthy === total (every account in the
+  // region is up). Empty regions (`total === 0`) are also considered
+  // "uninteresting" and hidden when the filter is on.
+  const visibleRegionHealthRows = React.useMemo(() => {
+    if (!hideHealthyRegions) return regionHealthRows;
+    return regionHealthRows.filter(
+      (r) => r.total === 0 || r.healthy !== r.total,
+    );
+  }, [regionHealthRows, hideHealthyRegions]);
+
   // Sparkline data derived from the rolling history buffer. One series per
   // KPI card — kept in this single useMemo so the buffer is walked once
   // per re-render instead of five times. Guard against legacy session
@@ -1905,19 +2239,36 @@ const OverviewPageInner: React.FC<OverviewPageProps> = ({
     [orchestrator],
   );
 
+  // AbortController for the parallel refresh. Re-clicking Refresh while a
+  // run is in flight cancels the prior one (the button is disabled, but a
+  // keyboard hotkey could still slip through).
+  const refreshAbortRef = React.useRef<AbortController | null>(null);
+
   const handleRefreshAll = React.useCallback(async () => {
+    if (refreshing) return;
+    refreshAbortRef.current?.abort();
+    const controller = new AbortController();
+    refreshAbortRef.current = controller;
+
     setRefreshing(true);
     // Run both refresh actions concurrently and collect outcomes via
     // `Promise.allSettled` so a slow pool refresh doesn't block account-
     // info from starting. Previously they were awaited sequentially,
     // doubling the wall-clock for a typical refresh.
-    const auditId = `audit-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
     try {
       const [poolRes, acctRes] = await Promise.allSettled([
-        orchestrator.execute({ action: "refresh_pool_info", payload: {} }),
-        orchestrator.execute({ action: "refresh_account_info", payload: {} }),
+        orchestrator.execute({
+          action: "refresh_pool_info",
+          payload: {},
+          signal: controller.signal,
+        }),
+        orchestrator.execute({
+          action: "refresh_account_info",
+          payload: {},
+          signal: controller.signal,
+        }),
       ]);
-      if (!aliveRef.current) return;
+      if (!aliveRef.current || controller.signal.aborted) return;
       const nextErrors: CardErrorMap = {};
       if (poolRes.status === "rejected") {
         const msg =
@@ -1938,9 +2289,11 @@ const OverviewPageInner: React.FC<OverviewPageProps> = ({
       setCardErrors(nextErrors);
       const allOk =
         poolRes.status === "fulfilled" && acctRes.status === "fulfilled";
-      store.addAuditEntry({
-        id: auditId,
-        timestamp: new Date().toISOString(),
+      // COORDINATOR: services/audit-log singleton bridges to the store; one
+      // call writes through to `state.auditEntries`. Previous code wrote
+      // directly via `store.addAuditEntry` — equivalent but bypassed the
+      // singleton's correlation tracking.
+      auditLog.record({
         actor: "overview-page",
         action: "refresh_all",
         target: `${state.accounts.length} accounts, ${state.pools.length} pools`,
@@ -1954,9 +2307,21 @@ const OverviewPageInner: React.FC<OverviewPageProps> = ({
           : `pool=${poolRes.status} account=${acctRes.status}`,
       });
     } finally {
-      if (aliveRef.current) setRefreshing(false);
+      if (aliveRef.current && refreshAbortRef.current === controller) {
+        setRefreshing(false);
+        refreshAbortRef.current = null;
+      }
     }
-  }, [orchestrator, store, state.accounts.length, state.pools.length]);
+  }, [refreshing, orchestrator, state.accounts.length, state.pools.length]);
+
+  // Cancel any in-flight refresh on unmount — the per-section refs in
+  // `UnusedQuotaSection` already do this for detect/create.
+  React.useEffect(
+    () => () => {
+      refreshAbortRef.current?.abort();
+    },
+    [],
+  );
 
   const handleRangeChange = React.useCallback(
     (next: string) => {
@@ -2018,6 +2383,26 @@ const OverviewPageInner: React.FC<OverviewPageProps> = ({
     { enabled: true, preventDefault: true },
   );
 
+  // Number-key hotkeys for fast triage navigation — overview is the landing
+  // page right after `/azure-accounts`, so the most common next click is
+  // one of three deeper pages. `1` → accounts, `2` → pools, `3` → nodes.
+  // Bare digits (no modifiers) intentionally — the sidebar Alt+1..9 nav
+  // covers the modifier-protected variant; these mirror "vim-style" quick
+  // jumps and are blocked while focus is inside an input by the hook's
+  // default `allowInInputs: false`.
+  useShortcut("1", () => navTo("accounts"), {
+    enabled: true,
+    preventDefault: false,
+  });
+  useShortcut("2", () => navTo("pool-info"), {
+    enabled: true,
+    preventDefault: false,
+  });
+  useShortcut("3", () => navTo("nodes"), {
+    enabled: true,
+    preventDefault: false,
+  });
+
   const isLoading = refreshing || state.accounts.length === 0;
   const isEmptyState =
     !refreshing &&
@@ -2052,7 +2437,7 @@ const OverviewPageInner: React.FC<OverviewPageProps> = ({
         <div className="relative z-10">
           <PageHeader
             title="Multi-Region Manager"
-            description="Cross-region snapshot of accounts, pools, and node health. Use the range toggle to scope trends. Press R to refresh, / to filter unused quota."
+            description="Cross-region snapshot of accounts, pools, and node health. Use the range toggle to scope trends. Hotkeys: R refresh · / filter unused quota · 1 accounts · 2 pools · 3 nodes."
           >
             {/* Quiet until < 10 min from expiry; click to force-refresh
                 BEFORE drilling into an ARM-heavy KPI (Accounts / Pools /
@@ -2116,7 +2501,7 @@ const OverviewPageInner: React.FC<OverviewPageProps> = ({
           action={{
             label: "Go to Azure Accounts",
             icon: LogIn,
-            onClick: () => onNavigate("azure-accounts"),
+            onClick: () => navTo("azure-accounts"),
           }}
         />
       )}
@@ -2138,7 +2523,7 @@ const OverviewPageInner: React.FC<OverviewPageProps> = ({
             title="Accounts"
             info="Discovered Batch accounts across all signed-in Azure tenants. Click to drill into provisioning state."
             tone="primary"
-            onClick={() => onNavigate("accounts")}
+            onClick={() => navTo("accounts")}
             error={cardErrors.accounts ?? null}
             onRetry={() =>
               retryAction("refresh_account_info", ["accounts", "accountInfo"])
@@ -2166,7 +2551,7 @@ const OverviewPageInner: React.FC<OverviewPageProps> = ({
             title="Pools"
             info="Batch pools the manager is tracking. Failed pools can be reset via the Quick Actions panel below. Click to inspect per-pool details and resize state."
             tone="info"
-            onClick={() => onNavigate("pool-info")}
+            onClick={() => navTo("pool-info")}
             error={cardErrors.pools ?? null}
             onRetry={() => retryAction("refresh_pool_info", ["pools", "nodes"])}
             trend={trendByCard.pools}
@@ -2192,7 +2577,7 @@ const OverviewPageInner: React.FC<OverviewPageProps> = ({
             title="Nodes"
             info="Compute nodes inside the tracked pools. Issues = nodes in unusable / starttask-failed / offline / unknown / preempted states."
             tone="warning"
-            onClick={() => onNavigate("nodes")}
+            onClick={() => navTo("nodes")}
             error={cardErrors.nodes ?? null}
             onRetry={() => retryAction("refresh_pool_info", ["pools", "nodes"])}
             trend={trendByCard.runningNodes}
@@ -2221,7 +2606,7 @@ const OverviewPageInner: React.FC<OverviewPageProps> = ({
                 title="Dedicated Cores"
                 info="Sum of in-use dedicated cores vs. quota across all tracked accounts. Click to inspect per-account breakdown."
                 tone="info"
-                onClick={() => onNavigate("account-info")}
+                onClick={() => navTo("account-info")}
                 error={cardErrors.accountInfo ?? null}
                 onRetry={() =>
                   retryAction("refresh_account_info", [
@@ -2248,7 +2633,7 @@ const OverviewPageInner: React.FC<OverviewPageProps> = ({
                 title="Low Priority Cores"
                 info="Sum of in-use low-priority cores vs. quota. Unused LP capacity is the primary input to the Unused Quota detector below."
                 tone="primary"
-                onClick={() => onNavigate("account-info")}
+                onClick={() => navTo("account-info")}
                 error={cardErrors.accountInfo ?? null}
                 onRetry={() =>
                   retryAction("refresh_account_info", [
@@ -2270,22 +2655,101 @@ const OverviewPageInner: React.FC<OverviewPageProps> = ({
         </div>
       )}
 
+      {/*
+       * Per-account quota summary — at-a-glance counts of accounts with
+       * free LP / Dedicated cores PLUS the totals. Sits above the
+       * cluster-health grid because the operator triage flow is:
+       *   1. Spot accounts with idle cores (this row)
+       *   2. Drill into the Unused Quota detector below to act on them
+       *   3. Use Cluster Health to confirm the chosen region is up
+       * Hidden when account info hasn't been refreshed yet — empty row
+       * would be misleading noise.
+       */}
+      {accountQuotaSummary.totalAccounts > 0 && (
+        <div
+          role="group"
+          aria-label="Per-account quota summary"
+          className="flex flex-wrap gap-2"
+        >
+          <SummaryStatItem
+            label="Accounts"
+            value={accountQuotaSummary.totalAccounts}
+            hint="discovered"
+          />
+          <SummaryStatItem
+            label="LP free"
+            value={accountQuotaSummary.withFreeLp}
+            hint={`of ${accountQuotaSummary.totalAccounts} accounts`}
+            tone={accountQuotaSummary.withFreeLp > 0 ? "success" : "muted"}
+          />
+          <SummaryStatItem
+            label="LP cores idle"
+            value={accountQuotaSummary.totalFreeLp}
+            hint={
+              accountQuotaSummary.withFreeLp > 0
+                ? `≈ ${accountQuotaSummary.avgFreeLpPerAccount} / account`
+                : "none"
+            }
+            tone={accountQuotaSummary.totalFreeLp > 0 ? "info" : "muted"}
+          />
+          <SummaryStatItem
+            label="Dedicated free"
+            value={accountQuotaSummary.withFreeDedicated}
+            hint={`of ${accountQuotaSummary.totalAccounts} accounts`}
+            tone={
+              accountQuotaSummary.withFreeDedicated > 0 ? "success" : "muted"
+            }
+          />
+          <SummaryStatItem
+            label="Dedicated cores idle"
+            value={accountQuotaSummary.totalFreeDedicated}
+            tone={
+              accountQuotaSummary.totalFreeDedicated > 0 ? "info" : "muted"
+            }
+          />
+        </div>
+      )}
+
       {/* Cluster Health — at-a-glance traffic light per region */}
       {regionHealthRows.length > 0 && (
         <div className="flex flex-col gap-1">
-          <div className="flex justify-end">
+          <div className="flex items-center justify-end gap-2">
             <Button
               variant="ghost"
               size="sm"
               className="text-2xs text-muted-foreground hover:text-foreground"
-              onClick={() => onNavigate("monitoring")}
+              onClick={() => setHideHealthyRegions((v) => !v)}
+              aria-pressed={hideHealthyRegions}
+              aria-label={
+                hideHealthyRegions
+                  ? "Show all regions including healthy"
+                  : "Hide healthy regions"
+              }
+              title={
+                hideHealthyRegions
+                  ? "Showing only degraded / down regions"
+                  : "Click to hide regions where every account is healthy"
+              }
+            >
+              {hideHealthyRegions ? (
+                <Eye className="h-3.5 w-3.5" aria-hidden />
+              ) : (
+                <EyeOff className="h-3.5 w-3.5" aria-hidden />
+              )}
+              {hideHealthyRegions ? "Show all regions" : "Hide healthy"}
+            </Button>
+            <Button
+              variant="ghost"
+              size="sm"
+              className="text-2xs text-muted-foreground hover:text-foreground"
+              onClick={() => navTo("monitoring")}
               aria-label="Open Monitoring page for deeper region telemetry"
             >
               Open Monitoring →
             </Button>
           </div>
           <ClusterHealthCard
-            regions={regionHealthRows}
+            regions={visibleRegionHealthRows}
             historyHealthy={sparkSeries.healthyRegions}
             historyUnhealthy={sparkSeries.unhealthyRegions}
             onDrillDown={handleRegionDrillDown}
@@ -2294,6 +2758,19 @@ const OverviewPageInner: React.FC<OverviewPageProps> = ({
             statusFilter={regionStatus}
             onStatusFilterChange={handleRegionStatus}
           />
+          {hideHealthyRegions &&
+            visibleRegionHealthRows.length < regionHealthRows.length && (
+              <p className="m-0 pl-1 text-2xs text-muted-foreground">
+                Hiding{" "}
+                {regionHealthRows.length - visibleRegionHealthRows.length}{" "}
+                healthy region
+                {regionHealthRows.length - visibleRegionHealthRows.length ===
+                1
+                  ? ""
+                  : "s"}
+                . This preference is persisted across reloads.
+              </p>
+            )}
         </div>
       )}
 
@@ -2310,9 +2787,15 @@ const OverviewPageInner: React.FC<OverviewPageProps> = ({
               </span>
             )}
           </div>
-          {regionHealthRows.length === 0 ? (
+          {visibleRegionHealthRows.length === 0 ? (
             isLoading ? (
               <SkeletonLoader variant="list" rows={3} />
+            ) : hideHealthyRegions && regionHealthRows.length > 0 ? (
+              <EmptyState
+                icon={Server}
+                title="All regions healthy"
+                description="Every region has all accounts healthy. Toggle ‘Show all regions’ above to see the full grid."
+              />
             ) : (
               <EmptyState
                 icon={Server}
@@ -2322,7 +2805,7 @@ const OverviewPageInner: React.FC<OverviewPageProps> = ({
             )
           ) : (
             <HoverList
-              items={regionHealthRows
+              items={visibleRegionHealthRows
                 .slice()
                 .sort((a, b) => b.total - a.total)}
               getKey={(r) => r.name}
@@ -2342,7 +2825,7 @@ const OverviewPageInner: React.FC<OverviewPageProps> = ({
             variant="ghost"
             size="sm"
             className="text-2xs text-muted-foreground hover:text-foreground"
-            onClick={() => onNavigate("unused-quota")}
+            onClick={() => navTo("unused-quota")}
             aria-label="Open the full Unused Quota page"
           >
             Open Unused Quota page →
@@ -2377,7 +2860,7 @@ const OverviewPageInner: React.FC<OverviewPageProps> = ({
             Bulk operations on the current session
           </span>
         </div>
-        <QuickActions store={store} onNavigate={onNavigate} />
+        <QuickActions store={store} onNavigate={navTo} />
       </Card>
 
       {/* Recent Activity */}

@@ -25,7 +25,6 @@
  * accidentally builds a new workflow on top of the dying endpoint.
  */
 import * as React from "react";
-import { useNavigate } from "react-router-dom";
 import {
   AlertTriangle,
   ArrowRight,
@@ -33,8 +32,8 @@ import {
   Building2,
   Check,
   CheckCircle2,
-  Clipboard,
   Crown,
+  Eraser,
   ExternalLink,
   History,
   Info,
@@ -42,6 +41,7 @@ import {
   Plus,
   RefreshCw,
   RotateCcw,
+  Save,
   Sparkles,
   Terminal,
   Trash2,
@@ -76,7 +76,10 @@ import {
 } from "../../auth/msal-auth";
 import { resolveActiveTenantId } from "../../auth/perform-tenant-switch";
 import { useArmToken } from "../../auth/use-arm-token";
+import { useAbortableEffect } from "../../hooks/use-abortable-effect";
+import { usePersistedState } from "../../hooks/use-persisted-state";
 import { useTenantChange } from "../../hooks/use-tenant-change";
+import { useUrlState } from "../../hooks/use-url-state";
 import { auditLog } from "../../services/audit-log";
 import {
   createLegacyEaSubscription,
@@ -91,12 +94,18 @@ import {
   useMultiRegionStore,
 } from "../../store/store-context";
 
+// COORDINATOR: page consumes the dashboard outlet context (orchestrator,
+// store, navigateToPage) instead of calling `useNavigate` directly — the
+// shared `navigateToPage` already resolves PageKey strings to canonical
+// paths and is what page-router promises every page.
+import { useDashboardOutletContext } from "../page-router";
 import { ConfirmationDialog } from "../shared/confirmation-dialog";
 import { CopyButton, CopyableText } from "../shared/copy-button";
 import { EmptyState } from "../shared/empty-state";
 import { ExportMenu } from "../shared/export-menu";
 import { InfoTooltip } from "../shared/info-tooltip";
 import { PageHeader } from "../shared/page-header";
+import { StatusBadge } from "../shared/status-badge";
 import { SummaryStatItem } from "../shared/summary-stat-item";
 import { TokenExpiryBadge } from "../shared/token-expiry-badge";
 
@@ -109,6 +118,10 @@ const STORAGE_EA = "legacy-ea-sub:enrollment-account";
 const STORAGE_MANUAL_GUID = "legacy-ea-sub:manual-guid";
 const STORAGE_HISTORY = "legacy-ea-sub:session-history";
 const STORAGE_ACK = "legacy-ea-sub:deprecation-acknowledged";
+// localStorage-backed (NOT sessionStorage) — survives full reload, so an
+// operator who refreshes mid-fill keeps their draft.
+const STORAGE_DRAFT = "legacy-ea-sub:draft";
+const STORAGE_DRAFT_VERSION = 1;
 
 // Per-EA subscription cap that ARM enforces on the 2018-03-01-preview
 // path. Canceled / transferred / deleted subs still count toward it.
@@ -150,6 +163,31 @@ interface SessionEntry {
   ownerCount: number;
   outcome: "success" | "failure";
   error?: string;
+}
+
+/** Reload-survivable draft of the in-progress create form. Persisted to
+ *  localStorage via `usePersistedState` — operator who hits F5 mid-fill
+ *  gets the displayName / offer / owners back. EA selection lives in
+ *  sessionStorage already because it's a per-tab pick. */
+interface LegacyEaDraft {
+  displayName: string;
+  offerType: "MS-AZR-0017P" | "MS-AZR-0148P";
+  owners: string[];
+  /** ISO timestamp of when the draft was last touched — surfaces in the
+   *  draft-restored banner so the operator can decide whether the saved
+   *  values are still meaningful. */
+  updatedAt: string;
+}
+
+const DRAFT_EMPTY: LegacyEaDraft = {
+  displayName: "",
+  offerType: "MS-AZR-0017P",
+  owners: [],
+  updatedAt: "",
+};
+
+function isDraftMeaningful(d: LegacyEaDraft): boolean {
+  return d.displayName.trim().length > 0 || d.owners.length > 0;
 }
 
 /** Submit-time error classification — drives which targeted help panel
@@ -325,7 +363,11 @@ function timeAgo(iso: string): string {
 export const LegacyEaSubCreatorPage: React.FC = () => {
   const state = useMultiRegionState();
   const store = useMultiRegionStore();
-  const navigate = useNavigate();
+  // COORDINATOR: use the path-based navigator from the dashboard outlet
+  // context rather than calling `useNavigate()` directly. `navigateToPage`
+  // accepts either a PageKey or a literal path and is what page-router
+  // promises every page consumes.
+  const { navigateToPage } = useDashboardOutletContext();
   const azureAccounts = state.azureAccounts ?? [];
 
   /* ----- Account picker ------------------------------------------ */
@@ -444,27 +486,32 @@ export const LegacyEaSubCreatorPage: React.FC = () => {
   // gives strict last-writer-wins ordering across overlapping runs.
   const runIdRef = React.useRef(0);
 
-  React.useEffect(() => {
-    if (!account) {
-      setArmToken(null);
-      setEas([]);
-      return;
-    }
-    let cancelled = false;
-    const myRunId = ++runIdRef.current;
-    const actor = account.username;
-    setEaLoading(true);
-    setEaError(null);
-    (async () => {
+  // Migrated to `useAbortableEffect` so on unmount / dep-change the signal
+  // is aborted automatically. The two service helpers don't accept a
+  // signal arg directly, but the post-resolution `signal.aborted` guards
+  // still prevent stale-write races (runIdRef preserves last-writer-wins
+  // ordering across overlapping refreshes; the signal handles teardown).
+  useAbortableEffect(
+    async (signal) => {
+      if (!account) {
+        setArmToken(null);
+        setEas([]);
+        return;
+      }
+      const myRunId = ++runIdRef.current;
+      const actor = account.username;
+      const tenantId = account.tenantId;
+      setEaLoading(true);
+      setEaError(null);
       try {
         // Tenant arg omitted so we pick up the operator's current active
         // tenant (was pinning to account.tenantId / the account's HOME
         // tenant — pre-switch).
         const tok = await getArmTokenForAccount(account.homeAccountId);
-        if (cancelled || myRunId !== runIdRef.current) return;
+        if (signal.aborted || myRunId !== runIdRef.current) return;
         setArmToken(tok);
         const list = await listLegacyEnrollmentAccounts(tok);
-        if (cancelled || myRunId !== runIdRef.current) return;
+        if (signal.aborted || myRunId !== runIdRef.current) return;
         setEas(list);
         if (list.length === 1 && enrollmentAccountId !== list[0]!.name) {
           setEnrollmentAccountId(list[0]!.name);
@@ -478,12 +525,12 @@ export const LegacyEaSubCreatorPage: React.FC = () => {
         auditLog.record({
           actor,
           action: "list_legacy_enrollment_accounts",
-          target: account.tenantId,
+          target: tenantId,
           status: "success",
           details: { count: list.length },
         });
       } catch (err) {
-        if (cancelled || myRunId !== runIdRef.current) return;
+        if (signal.aborted || myRunId !== runIdRef.current) return;
         const msg = err instanceof Error ? err.message : String(err);
         setEaError(msg);
         setEas([]);
@@ -500,19 +547,19 @@ export const LegacyEaSubCreatorPage: React.FC = () => {
         auditLog.record({
           actor,
           action: "list_legacy_enrollment_accounts",
-          target: account.tenantId,
+          target: tenantId,
           status: "failure",
           error: msg,
         });
       } finally {
-        if (!cancelled && myRunId === runIdRef.current) setEaLoading(false);
+        if (!signal.aborted && myRunId === runIdRef.current) {
+          setEaLoading(false);
+        }
       }
-    })();
-    return () => {
-      cancelled = true;
-    };
+    },
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [account?.homeAccountId, account?.tenantId, listSeq]);
+    [account?.homeAccountId, account?.tenantId, listSeq],
+  );
 
   const selectedEa = React.useMemo(() => {
     // In manual mode the synthetic row stands in for a listed one —
@@ -528,13 +575,106 @@ export const LegacyEaSubCreatorPage: React.FC = () => {
     return eas.find((e) => e.name === enrollmentAccountId) ?? null;
   }, [manualMode, manualInput, eas, enrollmentAccountId]);
 
-  /* ----- Form state ---------------------------------------------- */
-  const [displayName, setDisplayName] = React.useState("");
-  const [offerType, setOfferType] = React.useState<
-    "MS-AZR-0017P" | "MS-AZR-0148P"
-  >("MS-AZR-0017P");
-  const [owners, setOwners] = React.useState<string[]>([]);
+  /* ----- Form state (draft survives full reload) ----------------- */
+  // Persisted draft so a mid-fill reload doesn't lose the displayName /
+  // offer / owners. Versioned envelope via `usePersistedState` so a future
+  // shape change can migrate cleanly. The EA selection itself is in
+  // sessionStorage (intentionally per-tab) — only the form *content*
+  // survives a hard reload.
+  const [draft, setDraft, resetDraft] = usePersistedState<LegacyEaDraft>(
+    STORAGE_DRAFT,
+    DRAFT_EMPTY,
+    {
+      version: STORAGE_DRAFT_VERSION,
+      migrate: (raw) => {
+        if (typeof raw !== "object" || raw === null) return undefined;
+        const r = raw as Partial<LegacyEaDraft>;
+        return {
+          displayName: typeof r.displayName === "string" ? r.displayName : "",
+          offerType:
+            r.offerType === "MS-AZR-0148P" ? "MS-AZR-0148P" : "MS-AZR-0017P",
+          owners: Array.isArray(r.owners)
+            ? r.owners.filter(
+                (o): o is string => typeof o === "string" && UUID_RE.test(o),
+              )
+            : [],
+          updatedAt: typeof r.updatedAt === "string" ? r.updatedAt : "",
+        };
+      },
+    },
+  );
+  // Snapshot of the draft as it was on first mount — used by the "draft
+  // restored" banner so we only nag the operator once per page-visit, not
+  // on every keystroke (which would also rewrite `updatedAt`).
+  const draftOnMountRef = React.useRef<LegacyEaDraft>(draft);
+  const [draftBannerDismissed, setDraftBannerDismissed] = React.useState(false);
+
+  const displayName = draft.displayName;
+  const offerType = draft.offerType;
+  const owners = draft.owners;
+  const setDisplayName = React.useCallback(
+    (next: string) => {
+      setDraft((prev) => ({
+        ...prev,
+        displayName: next,
+        updatedAt: new Date().toISOString(),
+      }));
+    },
+    [setDraft],
+  );
+  const setOfferType = React.useCallback(
+    (next: "MS-AZR-0017P" | "MS-AZR-0148P") => {
+      setDraft((prev) => ({
+        ...prev,
+        offerType: next,
+        updatedAt: new Date().toISOString(),
+      }));
+    },
+    [setDraft],
+  );
+  const setOwners = React.useCallback(
+    (updater: React.SetStateAction<string[]>) => {
+      setDraft((prev) => ({
+        ...prev,
+        owners:
+          typeof updater === "function"
+            ? (updater as (prev: string[]) => string[])(prev.owners)
+            : updater,
+        updatedAt: new Date().toISOString(),
+      }));
+    },
+    [setDraft],
+  );
   const [ownerInput, setOwnerInput] = React.useState("");
+
+  // URL-state for the offer type so a deep link / shared URL can pre-set
+  // it. Wins over the persisted draft only on first mount (subsequent
+  // changes flow draft -> URL via a side-effect below).
+  const [urlFilter, setUrlFilter] = useUrlState(
+    { offer: "" },
+    { replace: true, keys: ["offer"] },
+  );
+  React.useEffect(() => {
+    // Hydrate offer type from the URL exactly once on mount when it's
+    // present and valid.
+    const u = String(urlFilter.offer ?? "");
+    if (u === "MS-AZR-0017P" || u === "MS-AZR-0148P") {
+      if (u !== draft.offerType) setOfferType(u);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+  React.useEffect(() => {
+    // Mirror draft.offerType -> URL so a refresh / share preserves it,
+    // but only once the URL is already participating (URL contains the
+    // key or the operator has changed offer type away from the default).
+    // This keeps the URL clean for first-time visitors who never touch
+    // the offer-type select.
+    const offerInUrl = typeof urlFilter.offer === "string" && urlFilter.offer.length > 0;
+    if (!offerInUrl && draft.offerType === "MS-AZR-0017P") return;
+    if (urlFilter.offer !== draft.offerType) {
+      setUrlFilter({ offer: draft.offerType });
+    }
+  }, [draft.offerType, urlFilter.offer, setUrlFilter]);
 
   const addOwner = React.useCallback(() => {
     const v = ownerInput.trim().toLowerCase();
@@ -545,15 +685,18 @@ export const LegacyEaSubCreatorPage: React.FC = () => {
     }
     setOwners((prev) => [...prev, v]);
     setOwnerInput("");
-  }, [ownerInput, owners]);
+  }, [ownerInput, owners, setOwners]);
 
-  const removeOwner = React.useCallback((oid: string) => {
-    setOwners((prev) => prev.filter((o) => o !== oid));
-  }, []);
+  const removeOwner = React.useCallback(
+    (oid: string) => {
+      setOwners((prev) => prev.filter((o) => o !== oid));
+    },
+    [setOwners],
+  );
 
   const clearOwners = React.useCallback(() => {
     setOwners([]);
-  }, []);
+  }, [setOwners]);
 
   const displayNameTrimmed = displayName.trim();
   const displayNameTooLong = displayNameTrimmed.length > DISPLAY_NAME_MAX;
@@ -625,6 +768,76 @@ export const LegacyEaSubCreatorPage: React.FC = () => {
     !displayNameEmpty &&
     !displayNameTooLong &&
     deprecationAck;
+
+  /** Aggregate list of reasons a draft would fail to submit right now.
+   *  Used by the always-visible validation banner so the operator sees a
+   *  full checklist of remaining work without having to click Submit and
+   *  read a one-line tooltip. Empty array = the draft would post. */
+  const validationIssues = React.useMemo(() => {
+    const issues: { id: string; severity: "error" | "warn"; text: string }[] =
+      [];
+    if (!account) {
+      issues.push({
+        id: "account",
+        severity: "error",
+        text: "Pick a signed-in Azure account.",
+      });
+    }
+    if (!armToken) {
+      issues.push({
+        id: "token",
+        severity: "warn",
+        text: "Waiting for ARM token to acquire — usually a second or two.",
+      });
+    }
+    if (!selectedEa) {
+      issues.push({
+        id: "ea",
+        severity: "error",
+        text: manualMode
+          ? "Paste a valid enrollment-account GUID above."
+          : "Pick an enrollment account from the list above.",
+      });
+    }
+    if (displayNameEmpty) {
+      issues.push({
+        id: "name",
+        severity: "error",
+        text: "Display name is required.",
+      });
+    } else if (displayNameTooLong) {
+      issues.push({
+        id: "name-long",
+        severity: "error",
+        text: `Display name must be ${DISPLAY_NAME_MAX} characters or fewer (currently ${displayNameTrimmed.length}).`,
+      });
+    }
+    if (!deprecationAck) {
+      issues.push({
+        id: "ack",
+        severity: "warn",
+        text: "Acknowledge the deprecation banner at the top.",
+      });
+    }
+    if (ownerInput.trim().length > 0 && !UUID_RE.test(ownerInput.trim())) {
+      issues.push({
+        id: "owner-pending",
+        severity: "warn",
+        text: "Pending owner input isn't a valid AAD object id — fix or clear it before submitting.",
+      });
+    }
+    return issues;
+  }, [
+    account,
+    armToken,
+    selectedEa,
+    manualMode,
+    displayNameEmpty,
+    displayNameTooLong,
+    displayNameTrimmed.length,
+    deprecationAck,
+    ownerInput,
+  ]);
 
   /** Why submit is disabled — surfaces inline so the disabled state
    *  doesn't feel mysterious. Empty when the button is usable. */
@@ -755,16 +968,25 @@ export const LegacyEaSubCreatorPage: React.FC = () => {
 
   /** Reset the form to its initial empty state — preserves the picked
    *  source account, enrollment-account selection, and history. Wires
-   *  the "Reset" button under the result card. */
+   *  the "Reset" button under the result card. Also clears the
+   *  localStorage-persisted draft so a subsequent reload starts clean. */
   const resetForm = React.useCallback(() => {
-    setDisplayName("");
-    setOfferType("MS-AZR-0017P");
-    setOwners([]);
+    resetDraft();
     setOwnerInput("");
     setSubmitError(null);
     setErrorClass(ERROR_CLASS_EMPTY);
     setResult(null);
-  }, []);
+    draftOnMountRef.current = DRAFT_EMPTY;
+    setDraftBannerDismissed(true);
+  }, [resetDraft]);
+
+  /** Drop the persisted draft without disturbing anything else — wires
+   *  the "Discard draft" button in the restored-draft banner. */
+  const discardDraft = React.useCallback(() => {
+    resetDraft();
+    draftOnMountRef.current = DRAFT_EMPTY;
+    setDraftBannerDismissed(true);
+  }, [resetDraft]);
 
   /** Jump-to-modern helper — used by the deprecation banner and the
    *  CAIN ("Commerce Account Is Null") recovery panel. Sends the
@@ -799,8 +1021,9 @@ export const LegacyEaSubCreatorPage: React.FC = () => {
     } catch {
       /* sessionStorage unavailable — non-fatal */
     }
-    navigate("/ea-sub-quick");
-  }, [account?.homeAccountId, selectedEa, navigate]);
+    // COORDINATOR: path-based nav via outlet context (NOT useNavigate).
+    navigateToPage("/ea-sub-quick");
+  }, [account?.homeAccountId, selectedEa, navigateToPage]);
 
   /**
    * CAIN auto-pivot countdown. When the legacy endpoint returns
@@ -1055,6 +1278,88 @@ export const LegacyEaSubCreatorPage: React.FC = () => {
           increase it on this path.
         </AlertDescription>
       </Alert>
+
+      {/* Quick-jump nudge — most operators should be on ea-sub-quick /
+          ea-subscription rather than this page. Promote those buttons so
+          they're impossible to miss while staying out of the way once the
+          operator dismisses the deprecation banner. */}
+      <Alert variant="warning" role="region" aria-label="Recommended pages">
+        <ArrowRight className="h-3.5 w-3.5" />
+        <AlertDescription className="flex flex-wrap items-center gap-2 text-2xs">
+          <span>
+            <strong>Use a modern flow instead?</strong> For new work the{" "}
+            <code className="font-mono">/ea-sub-quick</code> page wraps
+            the alias API and is what should be used for new automations.{" "}
+            <code className="font-mono">/ea-subscription</code> gives the
+            full alias-API form (cross-tenant owners, workload flag,
+            etc.). This page exists only for runbooks pinned to the
+            legacy 2018-03-01-preview shape.
+          </span>
+          <span className="ml-auto flex flex-wrap gap-1">
+            <Button
+              type="button"
+              size="sm"
+              variant="outline"
+              className="h-7 text-2xs"
+              onClick={() => navigateToPage("/ea-sub-quick")}
+              aria-label="Open EA Sub Quick"
+            >
+              <Sparkles className="h-3 w-3" /> EA Sub Quick
+            </Button>
+            <Button
+              type="button"
+              size="sm"
+              variant="outline"
+              className="h-7 text-2xs"
+              onClick={() => navigateToPage("/ea-subscription")}
+              aria-label="Open EA Subscription (full alias form)"
+            >
+              <BadgeCheck className="h-3 w-3" /> EA Subscription
+            </Button>
+          </span>
+        </AlertDescription>
+      </Alert>
+
+      {/* Draft-restored banner — only renders when a meaningful draft was
+          loaded from localStorage on mount and the operator hasn't yet
+          dismissed it or interacted with the form. */}
+      {isDraftMeaningful(draftOnMountRef.current) && !draftBannerDismissed && (
+        <Alert>
+          <Save className="h-3.5 w-3.5" />
+          <AlertDescription className="flex flex-wrap items-center gap-2 text-2xs">
+            <span>
+              <strong>Draft restored.</strong> Display name / offer /
+              owners were carried over from your last session
+              {draftOnMountRef.current.updatedAt
+                ? ` (saved ${timeAgo(draftOnMountRef.current.updatedAt)})`
+                : ""}
+              .
+            </span>
+            <div className="ml-auto flex gap-1">
+              <Button
+                type="button"
+                size="sm"
+                variant="ghost"
+                className="h-7 text-2xs"
+                onClick={() => setDraftBannerDismissed(true)}
+                aria-label="Keep restored draft and dismiss banner"
+              >
+                Keep
+              </Button>
+              <Button
+                type="button"
+                size="sm"
+                variant="outline"
+                className="h-7 text-2xs"
+                onClick={discardDraft}
+                aria-label="Discard restored draft"
+              >
+                <Eraser className="h-3 w-3" /> Discard draft
+              </Button>
+            </div>
+          </AlertDescription>
+        </Alert>
+      )}
 
       {/* ----- Scope picker -------------------------------------- */}
       <Card>
@@ -1773,6 +2078,50 @@ export const LegacyEaSubCreatorPage: React.FC = () => {
                   </Alert>
                 )}
 
+              {/* Pre-submit validation banner — surfaces every reason the
+                  current draft can't be submitted, in priority order, so
+                  the operator doesn't have to click Submit + read a tooltip
+                  to find out. Hidden once the draft is fully valid. */}
+              {validationIssues.length > 0 && (
+                <Alert
+                  variant={
+                    validationIssues.some((i) => i.severity === "error")
+                      ? "warning"
+                      : "default"
+                  }
+                  role="status"
+                  aria-live="polite"
+                  aria-label="Pre-submit validation"
+                >
+                  <AlertTriangle className="h-3.5 w-3.5" />
+                  <AlertDescription className="flex flex-col gap-1 text-2xs">
+                    <span>
+                      <strong>Almost ready.</strong>{" "}
+                      {validationIssues.length === 1
+                        ? "One thing left:"
+                        : `${validationIssues.length} things left:`}
+                    </span>
+                    <ul
+                      className="ml-4 list-disc"
+                      aria-label="Outstanding validation issues"
+                    >
+                      {validationIssues.map((i) => (
+                        <li
+                          key={i.id}
+                          className={
+                            i.severity === "error"
+                              ? "text-destructive"
+                              : "text-muted-foreground"
+                          }
+                        >
+                          {i.text}
+                        </li>
+                      ))}
+                    </ul>
+                  </AlertDescription>
+                </Alert>
+              )}
+
               <div className="flex flex-wrap items-center gap-2">
                 <Button
                   type="button"
@@ -1781,6 +2130,7 @@ export const LegacyEaSubCreatorPage: React.FC = () => {
                   disabled={!canSubmit}
                   loading={submitting}
                   aria-label="Create EA subscription"
+                  aria-disabled={!canSubmit}
                   title={submitBlockedReason || undefined}
                 >
                   {!submitting && <CheckCircle2 />}
@@ -1792,6 +2142,17 @@ export const LegacyEaSubCreatorPage: React.FC = () => {
                     aria-live="polite"
                   >
                     {submitBlockedReason}
+                  </span>
+                )}
+                {/* Lightweight "draft saved" indicator so the operator
+                    knows their inputs survive a reload. */}
+                {(displayNameTrimmed.length > 0 || owners.length > 0) && (
+                  <span
+                    className="ml-auto inline-flex items-center gap-1 text-2xs text-muted-foreground"
+                    aria-label="Draft is saved locally"
+                    title="Form contents are saved in this browser and will be restored after a reload."
+                  >
+                    <Save className="h-3 w-3" aria-hidden /> draft saved
                   </span>
                 )}
               </div>
@@ -2021,32 +2382,29 @@ export const LegacyEaSubCreatorPage: React.FC = () => {
                     <RotateCcw className="h-3.5 w-3.5" /> Create another
                   </Button>
                   {result.subscriptionId && (
-                    <Button
-                      type="button"
-                      variant="ghost"
-                      size="sm"
-                      onClick={() => {
-                        // Best-effort write; CopyButton already handles
-                        // its own fallback so we use document.execCommand
-                        // path via the shared util by re-using CopyButton
-                        // would mean a click — easier to just write
-                        // directly here.
-                        try {
-                          void navigator.clipboard.writeText(
-                            result.subscriptionId!,
-                          );
+                    // Use the shared CopyButton (handles async-API +
+                    // execCommand fallback + "Copied" pulse + cleanup
+                    // timeout) so this page doesn't reinvent clipboard
+                    // handling. The onCopied hook surfaces a toast for
+                    // parity with the previous bespoke button.
+                    <span
+                      className="inline-flex items-center gap-1 text-2xs"
+                      aria-label="Copy subscription id action"
+                    >
+                      <CopyButton
+                        value={result.subscriptionId}
+                        ariaLabel="Copy subscription id to clipboard"
+                        alwaysVisible
+                        iconSize={14}
+                        onCopied={(v) =>
                           store.addNotification({
                             type: "success",
-                            message: `Copied subscription id ${result.subscriptionId}.`,
-                          });
-                        } catch {
-                          /* ignore */
+                            message: `Copied subscription id ${v}.`,
+                          })
                         }
-                      }}
-                      aria-label="Copy subscription id to clipboard"
-                    >
-                      <Clipboard className="h-3.5 w-3.5" /> Copy ID
-                    </Button>
+                      />
+                      Copy ID
+                    </span>
                   )}
                 </div>
               </CardContent>
@@ -2070,22 +2428,18 @@ export const LegacyEaSubCreatorPage: React.FC = () => {
             </CardDescription>
           </CardHeader>
           <CardContent className="flex flex-col gap-1.5">
-            {recentEntries.map((e, idx) => (
+            {recentEntries.map((e) => (
+              // Stable key: timestamp + display name + sub id (when
+              // present) — unique within a session even if two entries
+              // share the same timestamp at second resolution.
               <div
-                key={`${e.timestamp}-${idx}`}
+                key={`${e.timestamp}|${e.displayName}|${e.subscriptionId ?? "x"}`}
                 className="flex flex-wrap items-center gap-2 rounded-md border border-border/60 bg-card/50 px-2 py-1 text-2xs"
               >
-                <Badge
-                  variant={e.outcome === "success" ? "success" : "destructive"}
-                  className="text-[10px]"
-                >
-                  {e.outcome === "success" ? (
-                    <Check className="mr-0.5 h-2.5 w-2.5" />
-                  ) : (
-                    <XCircle className="mr-0.5 h-2.5 w-2.5" />
-                  )}
-                  {e.outcome}
-                </Badge>
+                <StatusBadge
+                  status={e.outcome === "success" ? "success" : "error"}
+                  label={e.outcome}
+                />
                 <span className="font-medium" title={e.displayName}>
                   {e.displayName}
                 </span>
@@ -2236,7 +2590,8 @@ export const LegacyEaSubCreatorPage: React.FC = () => {
             type="button"
             variant="outline"
             size="sm"
-            onClick={() => navigate("/ea-subscription")}
+            onClick={() => navigateToPage("/ea-subscription")}
+            aria-label="Open Modern Create EA Sub (alias API)"
           >
             <BadgeCheck className="h-3.5 w-3.5" /> Modern Create EA Sub
             (alias API)
@@ -2245,7 +2600,17 @@ export const LegacyEaSubCreatorPage: React.FC = () => {
             type="button"
             variant="outline"
             size="sm"
-            onClick={() => navigate("/department-admin")}
+            onClick={() => navigateToPage("/ea-sub-quick")}
+            aria-label="Open EA Sub Quick"
+          >
+            <Sparkles className="h-3.5 w-3.5" /> EA Sub Quick
+          </Button>
+          <Button
+            type="button"
+            variant="outline"
+            size="sm"
+            onClick={() => navigateToPage("/department-admin")}
+            aria-label="Open Department Admin"
           >
             <Building2 className="h-3.5 w-3.5" /> Department Admin
           </Button>
@@ -2253,7 +2618,8 @@ export const LegacyEaSubCreatorPage: React.FC = () => {
             type="button"
             variant="outline"
             size="sm"
-            onClick={() => navigate("/ea-billing-manager")}
+            onClick={() => navigateToPage("/ea-billing-manager")}
+            aria-label="Open EA Billing Manager"
           >
             <Crown className="h-3.5 w-3.5" /> EA Billing Manager
           </Button>

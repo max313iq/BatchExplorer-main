@@ -87,10 +87,12 @@ import {
 } from "@/components/ui/table";
 import { cn, formatNumber, pluralize } from "@/lib/utils";
 
+import { usePersistedState } from "../../hooks/use-persisted-state";
 import { useUrlState } from "../../hooks/use-url-state";
 import { useMultiRegionState } from "../../store/store-context";
 import { PoolInfo } from "../../store/store-types";
 import { AZURE_REGIONS, isGpuRegion } from "../shared/constants";
+import { CopyButton } from "../shared/copy-button";
 import { EmptyState } from "../shared/empty-state";
 import { ErrorBoundary } from "../shared/error-boundary";
 import { ExportMenu, ExportColumn } from "../shared/export-menu";
@@ -292,6 +294,12 @@ function gpuTypeBadgeClass(gpuType: string): string {
 
 function parseScenarioPriority(raw: string): ScenarioPriority {
   return raw === "lowpriority" ? "lowpriority" : "dedicated";
+}
+
+// useUrlState's value union is `string | string[] | undefined`; this page's
+// keys are all scalars so coerce to string defensively.
+function asStr(v: string | string[] | undefined): string {
+  return typeof v === "string" ? v : "";
 }
 
 function clampInt(
@@ -502,134 +510,58 @@ function getGpuTypeOptions(): string[] {
   return out;
 }
 
-/** Best-effort write to the system clipboard. Returns true on success. */
-async function writeToClipboard(value: string): Promise<boolean> {
-  if (
-    typeof navigator !== "undefined" &&
-    navigator.clipboard?.writeText !== undefined
-  ) {
-    try {
-      await navigator.clipboard.writeText(value);
-      return true;
-    } catch {
-      /* fall through */
-    }
-  }
-  if (typeof document === "undefined") return false;
-  try {
-    const ta = document.createElement("textarea");
-    ta.value = value;
-    ta.setAttribute("readonly", "");
-    ta.style.position = "absolute";
-    ta.style.left = "-9999px";
-    document.body.appendChild(ta);
-    ta.select();
-    const ok = document.execCommand("copy");
-    document.body.removeChild(ta);
-    return ok;
-  } catch {
-    return false;
-  }
-}
+// COORDINATOR: a shared `writeToClipboard` already lives in
+// `../shared/copy-button.tsx`. We deliberately do NOT duplicate it here —
+// the share-link button uses <CopyButton /> instead so the
+// clipboard-fallback dance has a single source of truth.
 
 // ---------------------------------------------------------------------------
-// localStorage-backed saved scenarios
+// localStorage-backed migration helpers for saved scenarios / speed overrides
+// / section prefs. All persistence is routed through `usePersistedState`; the
+// helpers below are pure validators consumed by the hook's `migrate` callback.
 // ---------------------------------------------------------------------------
-function loadSavedScenarios(): SavedScenario[] {
-  if (typeof window === "undefined") return [];
-  try {
-    const raw = window.localStorage.getItem(SAVED_SCENARIOS_KEY);
-    if (!raw) return [];
-    const parsed = JSON.parse(raw);
-    if (!Array.isArray(parsed)) return [];
-    return parsed
-      .filter(
-        (item): item is SavedScenario =>
-          item != null &&
-          typeof item === "object" &&
-          typeof (item as SavedScenario).name === "string" &&
-          typeof (item as SavedScenario).scenario === "object",
-      )
-      .slice(0, 50); // sane cap so the menu never explodes
-  } catch {
-    return [];
-  }
+function sanitizeSavedScenarios(raw: unknown): SavedScenario[] {
+  if (!Array.isArray(raw)) return [];
+  return raw
+    .filter(
+      (item): item is SavedScenario =>
+        item != null &&
+        typeof item === "object" &&
+        typeof (item as SavedScenario).name === "string" &&
+        typeof (item as SavedScenario).scenario === "object" &&
+        (item as SavedScenario).scenario != null,
+    )
+    .slice(0, 50);
 }
 
-function persistSavedScenarios(items: SavedScenario[]): void {
-  if (typeof window === "undefined") return;
-  try {
-    window.localStorage.setItem(SAVED_SCENARIOS_KEY, JSON.stringify(items));
-  } catch {
-    /* quota or disabled storage — silently ignore */
-  }
-}
-
-function loadSpeedOverrides(): Record<string, number> {
-  if (typeof window === "undefined") return {};
-  try {
-    const raw = window.localStorage.getItem(SPEED_OVERRIDES_KEY);
-    if (!raw) return {};
-    const parsed = JSON.parse(raw);
-    if (parsed == null || typeof parsed !== "object") return {};
-    const out: Record<string, number> = {};
-    for (const [k, v] of Object.entries(parsed as Record<string, unknown>)) {
-      if (typeof v === "number" && Number.isFinite(v) && v >= 0) {
-        out[k] = v;
-      }
+function sanitizeSpeedOverrides(raw: unknown): Record<string, number> {
+  if (raw == null || typeof raw !== "object") return {};
+  const out: Record<string, number> = {};
+  for (const [k, v] of Object.entries(raw as Record<string, unknown>)) {
+    if (typeof v === "number" && Number.isFinite(v) && v >= 0) {
+      out[k] = v;
     }
-    return out;
-  } catch {
-    return {};
   }
+  return out;
 }
 
-function persistSpeedOverrides(speeds: Map<string, number>): void {
-  if (typeof window === "undefined") return;
-  try {
-    const obj: Record<string, number> = {};
-    for (const [k, v] of speeds) obj[k] = v;
-    window.localStorage.setItem(SPEED_OVERRIDES_KEY, JSON.stringify(obj));
-  } catch {
-    /* ignore */
-  }
-}
-
-function loadSectionPrefs(): SectionPrefs {
-  if (typeof window === "undefined") return DEFAULT_SECTION_PREFS;
-  try {
-    const raw = window.localStorage.getItem(SECTIONS_PREF_KEY);
-    if (!raw) return DEFAULT_SECTION_PREFS;
-    const parsed = JSON.parse(raw);
-    if (parsed == null || typeof parsed !== "object") {
-      return DEFAULT_SECTION_PREFS;
-    }
-    return {
-      showLivePools:
-        typeof (parsed as SectionPrefs).showLivePools === "boolean"
-          ? (parsed as SectionPrefs).showLivePools
-          : DEFAULT_SECTION_PREFS.showLivePools,
-      showVmReference:
-        typeof (parsed as SectionPrefs).showVmReference === "boolean"
-          ? (parsed as SectionPrefs).showVmReference
-          : DEFAULT_SECTION_PREFS.showVmReference,
-      showRecommendation:
-        typeof (parsed as SectionPrefs).showRecommendation === "boolean"
-          ? (parsed as SectionPrefs).showRecommendation
-          : DEFAULT_SECTION_PREFS.showRecommendation,
-    };
-  } catch {
-    return DEFAULT_SECTION_PREFS;
-  }
-}
-
-function persistSectionPrefs(prefs: SectionPrefs): void {
-  if (typeof window === "undefined") return;
-  try {
-    window.localStorage.setItem(SECTIONS_PREF_KEY, JSON.stringify(prefs));
-  } catch {
-    /* ignore */
-  }
+function sanitizeSectionPrefs(raw: unknown): SectionPrefs {
+  if (raw == null || typeof raw !== "object") return DEFAULT_SECTION_PREFS;
+  const p = raw as Partial<SectionPrefs>;
+  return {
+    showLivePools:
+      typeof p.showLivePools === "boolean"
+        ? p.showLivePools
+        : DEFAULT_SECTION_PREFS.showLivePools,
+    showVmReference:
+      typeof p.showVmReference === "boolean"
+        ? p.showVmReference
+        : DEFAULT_SECTION_PREFS.showVmReference,
+    showRecommendation:
+      typeof p.showRecommendation === "boolean"
+        ? p.showRecommendation
+        : DEFAULT_SECTION_PREFS.showRecommendation,
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -727,6 +659,89 @@ interface ScenarioFormProps {
   compareTo?: ScenarioResult;
 }
 
+// Number-input debounce in ms. Long enough that typing "10000" doesn't
+// rebuild the recommendation table on every digit, short enough that the
+// result panel feels live.
+const NUMBER_INPUT_DEBOUNCE_MS = 220;
+
+interface DebouncedNumberInputProps {
+  id: string;
+  value: string;
+  min: number;
+  max: number;
+  step?: number;
+  inputMode?: "numeric" | "decimal";
+  ariaLabel: string;
+  className?: string;
+  placeholder?: string;
+  onCommit: (next: string) => void;
+}
+
+/**
+ * Number <Input /> that buffers keystrokes locally and pushes the committed
+ * value to the parent after `NUMBER_INPUT_DEBOUNCE_MS`. Keeps the input
+ * responsive while the (potentially expensive) recommendation table waits
+ * for the user to stop typing.
+ */
+const DebouncedNumberInput: React.FC<DebouncedNumberInputProps> = ({
+  id,
+  value,
+  min,
+  max,
+  step = 1,
+  inputMode = "numeric",
+  ariaLabel,
+  className,
+  placeholder,
+  onCommit,
+}) => {
+  const [local, setLocal] = React.useState<string>(value);
+  const timerRef = React.useRef<ReturnType<typeof setTimeout> | null>(null);
+  // Keep local in sync if the parent value changes from outside (preset,
+  // saved-scenario apply, reset, compare seed).
+  React.useEffect(() => {
+    setLocal(value);
+  }, [value]);
+  React.useEffect(
+    () => () => {
+      if (timerRef.current) clearTimeout(timerRef.current);
+    },
+    [],
+  );
+  const flush = React.useCallback(
+    (next: string) => {
+      if (timerRef.current) clearTimeout(timerRef.current);
+      onCommit(next);
+    },
+    [onCommit],
+  );
+  const onChange = React.useCallback(
+    (e: React.ChangeEvent<HTMLInputElement>) => {
+      const next = e.target.value;
+      setLocal(next);
+      if (timerRef.current) clearTimeout(timerRef.current);
+      timerRef.current = setTimeout(() => onCommit(next), NUMBER_INPUT_DEBOUNCE_MS);
+    },
+    [onCommit],
+  );
+  return (
+    <Input
+      id={id}
+      type="number"
+      inputMode={inputMode}
+      min={min}
+      max={max}
+      step={step}
+      value={local}
+      onChange={onChange}
+      onBlur={() => flush(local)}
+      className={className}
+      aria-label={ariaLabel}
+      placeholder={placeholder}
+    />
+  );
+};
+
 const SCENARIO_TONE_BORDER: Record<ScenarioFormProps["tone"], string> = {
   primary: "border-t-4 border-t-primary",
   info: "border-t-4 border-t-info",
@@ -821,17 +836,16 @@ const ScenarioForm: React.FC<ScenarioFormProps> = ({
                 size={11}
               />
             </Label>
-            <Input
+            <DebouncedNumberInput
               id={`${idPrefix}-count`}
-              type="number"
               inputMode="numeric"
               min={1}
               max={MAX_GPU_COUNT}
               step={1}
               value={String(scenario.count)}
-              onChange={(e) => onChange({ count: e.target.value })}
+              onCommit={(v) => onChange({ count: v })}
               className="text-right font-semibold tabular-nums transition-shadow duration-200 ease-out focus-visible:ring-2 focus-visible:ring-primary/40 motion-reduce:transition-none"
-              aria-label="GPU count"
+              ariaLabel="GPU count"
             />
           </div>
           <div className="flex flex-col gap-1">
@@ -870,17 +884,16 @@ const ScenarioForm: React.FC<ScenarioFormProps> = ({
                 size={11}
               />
             </Label>
-            <Input
+            <DebouncedNumberInput
               id={`${idPrefix}-hours`}
-              type="number"
               inputMode="decimal"
               min={0}
               max={MAX_HOURS}
               step={1}
               value={String(scenario.hours)}
-              onChange={(e) => onChange({ hours: e.target.value })}
+              onCommit={(v) => onChange({ hours: v })}
               className="text-right font-semibold tabular-nums transition-shadow duration-200 ease-out focus-visible:ring-2 focus-visible:ring-primary/40 motion-reduce:transition-none"
-              aria-label="Total runtime hours"
+              ariaLabel="Total runtime hours"
             />
           </div>
           <div className="flex flex-col gap-1">
@@ -1140,20 +1153,21 @@ const CostBreakdownCard: React.FC<{
 // ---------------------------------------------------------------------------
 
 const TargetWorkCard: React.FC<{
-  scenario: Scenario;
   result: ScenarioResult;
   targetGnos: string;
   onChange: (v: string) => void;
-}> = ({ scenario, result, targetGnos, onChange }) => {
+}> = ({ result, targetGnos, onChange }) => {
   const targetN = clampFloat(targetGnos, 0, MAX_TARGET_WORK_GNOS, 0);
   const totalSpeedMnos = result.totalSpeedMnos; // Mnos/s
   // hours = Gnos × 1000 (→ Mnos) ÷ (Mnos/s) ÷ 3600 (→ hours)
-  const hoursNeeded =
-    targetN > 0 && totalSpeedMnos > 0
-      ? (targetN * 1000) / (totalSpeedMnos * 3600)
-      : 0;
+  const hoursNeeded = React.useMemo(
+    () =>
+      targetN > 0 && totalSpeedMnos > 0
+        ? (targetN * 1000) / (totalSpeedMnos * 3600)
+        : 0,
+    [targetN, totalSpeedMnos],
+  );
   const projectedCost = hoursNeeded * result.hourlyRate;
-  void scenario;
 
   return (
     <Card className="border-border bg-card shadow-sm">
@@ -1172,17 +1186,17 @@ const TargetWorkCard: React.FC<{
           <Label htmlFor="target-gnos" className="text-xs">
             Target work (Gnos)
           </Label>
-          <Input
+          <DebouncedNumberInput
             id="target-gnos"
-            type="number"
             inputMode="decimal"
             min={0}
             max={MAX_TARGET_WORK_GNOS}
             step={1}
-            placeholder="e.g. 1000"
             value={targetGnos}
-            onChange={(e) => onChange(e.target.value)}
+            onCommit={onChange}
+            placeholder="e.g. 1000"
             className="w-[160px] text-right font-semibold tabular-nums"
+            ariaLabel="Target work in Gnos"
           />
         </div>
         <div className="flex flex-col gap-1">
@@ -1854,23 +1868,44 @@ const GpuCalculatorPageInner: React.FC = () => {
     target: "", // Gnos target for the reverse-calc card
   });
 
-  const compareOn = urlState.compare === "1";
+  const compareOn = asStr(urlState.compare) === "1";
 
-  const rawA: ScenarioState = {
-    gpu: (urlState["a.gpu"] as string) || "",
-    count: (urlState["a.count"] as string) || String(DEFAULT_COUNT),
-    region: (urlState["a.region"] as string) || DEFAULT_REGION,
-    hours: (urlState["a.hours"] as string) || String(DEFAULT_HOURS),
-    priority: (urlState["a.priority"] as string) || DEFAULT_PRIORITY,
-  };
-  const rawB: ScenarioState = {
-    gpu: (urlState["b.gpu"] as string) || "",
-    count: (urlState["b.count"] as string) || String(DEFAULT_COUNT),
-    region: (urlState["b.region"] as string) || DEFAULT_REGION,
-    hours: (urlState["b.hours"] as string) || String(DEFAULT_HOURS),
-    priority: (urlState["b.priority"] as string) || DEFAULT_PRIORITY,
-  };
-  const targetGnos = (urlState["target"] as string) || "";
+  // Memoize the raw scenario records so downstream useMemo dependencies (e.g.
+  // recommendation cards keyed on `scenario`) don't re-fire every render just
+  // because we built a new object literal.
+  const rawA = React.useMemo<ScenarioState>(
+    () => ({
+      gpu: asStr(urlState["a.gpu"]),
+      count: asStr(urlState["a.count"]) || String(DEFAULT_COUNT),
+      region: asStr(urlState["a.region"]) || DEFAULT_REGION,
+      hours: asStr(urlState["a.hours"]) || String(DEFAULT_HOURS),
+      priority: asStr(urlState["a.priority"]) || DEFAULT_PRIORITY,
+    }),
+    [
+      urlState["a.gpu"],
+      urlState["a.count"],
+      urlState["a.region"],
+      urlState["a.hours"],
+      urlState["a.priority"],
+    ],
+  );
+  const rawB = React.useMemo<ScenarioState>(
+    () => ({
+      gpu: asStr(urlState["b.gpu"]),
+      count: asStr(urlState["b.count"]) || String(DEFAULT_COUNT),
+      region: asStr(urlState["b.region"]) || DEFAULT_REGION,
+      hours: asStr(urlState["b.hours"]) || String(DEFAULT_HOURS),
+      priority: asStr(urlState["b.priority"]) || DEFAULT_PRIORITY,
+    }),
+    [
+      urlState["b.gpu"],
+      urlState["b.count"],
+      urlState["b.region"],
+      urlState["b.hours"],
+      urlState["b.priority"],
+    ],
+  );
+  const targetGnos = asStr(urlState["target"]);
 
   const updateScenario = React.useCallback(
     (group: "a" | "b", patch: Partial<ScenarioState>) => {
@@ -1883,6 +1918,15 @@ const GpuCalculatorPageInner: React.FC = () => {
       setUrlState(next as Partial<typeof urlState>);
     },
     [setUrlState],
+  );
+
+  const updateScenarioA = React.useCallback(
+    (patch: Partial<ScenarioState>) => updateScenario("a", patch),
+    [updateScenario],
+  );
+  const updateScenarioB = React.useCallback(
+    (patch: Partial<ScenarioState>) => updateScenario("b", patch),
+    [updateScenario],
   );
 
   const setTargetGnos = React.useCallback(
@@ -1970,16 +2014,23 @@ const GpuCalculatorPageInner: React.FC = () => {
   // ----- Editable GPU speeds (drives all calculations) ---------------------
   // Speeds are seeded from defaults, then overlaid with anything the operator
   // previously stored in localStorage so a returning visitor doesn't have to
-  // re-enter their per-GPU benchmark numbers on every page load.
-  const [speeds, setSpeeds] = React.useState<Map<string, number>>(() => {
+  // re-enter their per-GPU benchmark numbers on every page load. The
+  // persisted shape is a plain `{ gpuType: speed }` map so the encoded JSON
+  // stays human-readable in DevTools (Map serializes weirdly).
+  const [speedOverrides, setSpeedOverrides] = usePersistedState<
+    Record<string, number>
+  >(SPEED_OVERRIDES_KEY, {}, {
+    version: 1,
+    migrate: (raw) => sanitizeSpeedOverrides(raw),
+  });
+
+  // Merge defaults + overrides into a render-stable Map keyed by gpuType.
+  const speeds = React.useMemo<Map<string, number>>(() => {
     const m = new Map<string, number>();
     for (const s of DEFAULT_GPU_SPEEDS) m.set(s.gpuType, s.defaultSpeed);
-    const overrides = loadSpeedOverrides();
-    for (const [k, v] of Object.entries(overrides)) {
-      m.set(k, v);
-    }
+    for (const [k, v] of Object.entries(speedOverrides)) m.set(k, v);
     return m;
-  });
+  }, [speedOverrides]);
 
   const [validation, setValidation] = React.useState<SpeedValidation>({
     invalid: [],
@@ -1987,60 +2038,68 @@ const GpuCalculatorPageInner: React.FC = () => {
     rawInputs: new Map(),
   });
 
-  const updateSpeed = (gpuType: string, value: string) => {
-    const trimmed = (value ?? "").trim();
-    const num = parseFloat(trimmed);
-    const isInvalid = trimmed === "" || isNaN(num) || num < 0;
-    const isExtreme = !isInvalid && num > MAX_REASONABLE_SPEED;
+  const updateSpeed = React.useCallback(
+    (gpuType: string, value: string) => {
+      const trimmed = (value ?? "").trim();
+      const num = parseFloat(trimmed);
+      const isInvalid = trimmed === "" || isNaN(num) || num < 0;
+      const isExtreme = !isInvalid && num > MAX_REASONABLE_SPEED;
 
-    setValidation((prev) => {
-      const nextInvalid = new Set(prev.invalid);
-      const nextExtreme = new Set(prev.extreme);
-      const nextRaw = new Map(prev.rawInputs);
-      nextRaw.set(gpuType, trimmed);
-      if (isInvalid) nextInvalid.add(gpuType);
-      else nextInvalid.delete(gpuType);
-      if (isExtreme) nextExtreme.add(gpuType);
-      else nextExtreme.delete(gpuType);
-      return {
-        invalid: Array.from(nextInvalid),
-        extreme: Array.from(nextExtreme),
-        rawInputs: nextRaw,
-      };
-    });
-
-    if (!isInvalid && !isExtreme) {
-      setSpeeds((prev) => {
-        const next = new Map(prev);
-        next.set(gpuType, num);
-        persistSpeedOverrides(next);
-        return next;
+      setValidation((prev) => {
+        const nextInvalid = new Set(prev.invalid);
+        const nextExtreme = new Set(prev.extreme);
+        const nextRaw = new Map(prev.rawInputs);
+        nextRaw.set(gpuType, trimmed);
+        if (isInvalid) nextInvalid.add(gpuType);
+        else nextInvalid.delete(gpuType);
+        if (isExtreme) nextExtreme.add(gpuType);
+        else nextExtreme.delete(gpuType);
+        return {
+          invalid: Array.from(nextInvalid),
+          extreme: Array.from(nextExtreme),
+          rawInputs: nextRaw,
+        };
       });
-    }
-  };
 
-  const resetSpeeds = React.useCallback(() => {
-    const m = new Map<string, number>();
-    for (const s of DEFAULT_GPU_SPEEDS) m.set(s.gpuType, s.defaultSpeed);
-    setSpeeds(m);
-    persistSpeedOverrides(m);
-    setValidation({ invalid: [], extreme: [], rawInputs: new Map() });
-  }, []);
-
-  // ----- Saved scenarios (localStorage) ------------------------------------
-  const [savedScenarios, setSavedScenarios] = React.useState<SavedScenario[]>(
-    () => loadSavedScenarios(),
+      if (!isInvalid && !isExtreme) {
+        setSpeedOverrides((prev) => ({ ...prev, [gpuType]: num }));
+      }
+    },
+    [setSpeedOverrides],
   );
 
-  const saveCurrentScenario = React.useCallback(() => {
-    if (typeof window === "undefined") return;
+  const resetSpeeds = React.useCallback(() => {
+    setSpeedOverrides({});
+    setValidation({ invalid: [], extreme: [], rawInputs: new Map() });
+  }, [setSpeedOverrides]);
+
+  // ----- Saved scenarios (persisted) ---------------------------------------
+  const [savedScenarios, setSavedScenarios] = usePersistedState<
+    SavedScenario[]
+  >(SAVED_SCENARIOS_KEY, [], {
+    version: 1,
+    migrate: (raw) => sanitizeSavedScenarios(raw),
+  });
+
+  // Inline-name dialog state replaces window.prompt — non-blocking and
+  // doesn't get suppressed by every modern browser's anti-modal heuristics.
+  const [saveNameDraft, setSaveNameDraft] = React.useState<string | null>(
+    null,
+  );
+
+  const beginSaveScenario = React.useCallback(() => {
     if (!rawA.gpu) return;
     const suggested = `${rawA.gpu} ×${clampInt(rawA.count, 1, MAX_GPU_COUNT, 1)} @ ${rawA.region}`;
-    // eslint-disable-next-line no-alert
-    const input = window.prompt("Save scenario as:", suggested);
-    if (input == null) return;
-    const name = input.trim();
-    if (!name) return;
+    setSaveNameDraft(suggested);
+  }, [rawA]);
+
+  const commitSaveScenario = React.useCallback(() => {
+    if (saveNameDraft == null) return;
+    const name = saveNameDraft.trim();
+    if (!name || !rawA.gpu) {
+      setSaveNameDraft(null);
+      return;
+    }
     const next: SavedScenario = {
       name,
       scenario: { ...rawA },
@@ -2048,11 +2107,14 @@ const GpuCalculatorPageInner: React.FC = () => {
     };
     setSavedScenarios((prev) => {
       const filtered = prev.filter((s) => s.name !== name);
-      const updated = [next, ...filtered].slice(0, 50);
-      persistSavedScenarios(updated);
-      return updated;
+      return [next, ...filtered].slice(0, 50);
     });
-  }, [rawA]);
+    setSaveNameDraft(null);
+  }, [saveNameDraft, rawA, setSavedScenarios]);
+
+  const cancelSaveScenario = React.useCallback(() => {
+    setSaveNameDraft(null);
+  }, []);
 
   const applySavedScenario = React.useCallback(
     (s: SavedScenario) => {
@@ -2067,27 +2129,27 @@ const GpuCalculatorPageInner: React.FC = () => {
     [setUrlState],
   );
 
-  const deleteSavedScenario = React.useCallback((name: string) => {
-    setSavedScenarios((prev) => {
-      const updated = prev.filter((s) => s.name !== name);
-      persistSavedScenarios(updated);
-      return updated;
-    });
-  }, []);
+  const deleteSavedScenario = React.useCallback(
+    (name: string) => {
+      setSavedScenarios((prev) => prev.filter((s) => s.name !== name));
+    },
+    [setSavedScenarios],
+  );
 
   // ----- Section visibility prefs ------------------------------------------
-  const [sectionPrefs, setSectionPrefs] = React.useState<SectionPrefs>(() =>
-    loadSectionPrefs(),
+  const [sectionPrefs, setSectionPrefs] = usePersistedState<SectionPrefs>(
+    SECTIONS_PREF_KEY,
+    DEFAULT_SECTION_PREFS,
+    {
+      version: 1,
+      migrate: (raw) => sanitizeSectionPrefs(raw),
+    },
   );
   const updateSectionPref = React.useCallback(
     (patch: Partial<SectionPrefs>) => {
-      setSectionPrefs((prev) => {
-        const next = { ...prev, ...patch };
-        persistSectionPrefs(next);
-        return next;
-      });
+      setSectionPrefs((prev) => ({ ...prev, ...patch }));
     },
-    [],
+    [setSectionPrefs],
   );
 
   // ----- Live pool data view -----------------------------------------------
@@ -2123,30 +2185,51 @@ const GpuCalculatorPageInner: React.FC = () => {
   const allVms = React.useMemo(() => getAllVmSizes(), []);
 
   // ----- Resolved scenarios + their results --------------------------------
-  const scenarioA = resolveScenario(rawA);
-  const scenarioB = compareOn ? resolveScenario(rawB) : null;
-  const resultA = scenarioA ? computeScenarioResult(scenarioA, speeds) : null;
-  const resultB = scenarioB ? computeScenarioResult(scenarioB, speeds) : null;
+  // Memoize so a non-scenario re-render (e.g. validation flash, sectionPrefs
+  // toggle) doesn't churn the recommendation table's expensive useMemo.
+  const scenarioA = React.useMemo(() => resolveScenario(rawA), [rawA]);
+  const scenarioB = React.useMemo(
+    () => (compareOn ? resolveScenario(rawB) : null),
+    [compareOn, rawB],
+  );
+  const resultA = React.useMemo(
+    () => (scenarioA ? computeScenarioResult(scenarioA, speeds) : null),
+    [scenarioA, speeds],
+  );
+  const resultB = React.useMemo(
+    () => (scenarioB ? computeScenarioResult(scenarioB, speeds) : null),
+    [scenarioB, speeds],
+  );
 
-  // ----- Copy share link ---------------------------------------------------
-  const [linkCopied, setLinkCopied] = React.useState(false);
-  const linkCopiedTimer = React.useRef<ReturnType<typeof setTimeout> | null>(
-    null,
-  );
-  React.useEffect(
-    () => () => {
-      if (linkCopiedTimer.current) clearTimeout(linkCopiedTimer.current);
-    },
-    [],
-  );
-  const copyShareLink = React.useCallback(async () => {
-    if (typeof window === "undefined") return;
-    const ok = await writeToClipboard(window.location.href);
-    if (!ok) return;
-    setLinkCopied(true);
-    if (linkCopiedTimer.current) clearTimeout(linkCopiedTimer.current);
-    linkCopiedTimer.current = setTimeout(() => setLinkCopied(false), 1500);
-  }, []);
+  // ----- Share link + formatted-result clipboard payloads ------------------
+  // The <CopyButton /> from shared/copy-button.tsx owns the clipboard dance
+  // and the "Copied" success flash — we just feed it strings.
+  const shareLinkValue =
+    typeof window !== "undefined" ? window.location.href : "";
+
+  const formattedSummary = React.useMemo<string>(() => {
+    if (!scenarioA || !resultA) return "";
+    const lines: string[] = [
+      `GPU calculator — Scenario A`,
+      `  ${scenarioA.gpu} ×${scenarioA.count} @ ${scenarioA.region} (${scenarioA.priority}, ${scenarioA.hours}h)`,
+      `  Speed:        ${formatSpeed(resultA.totalSpeedMnos)}`,
+      `  Hourly rate:  ${formatCurrency(resultA.hourlyRate)}`,
+      `  Total cost:   ${formatCurrency(resultA.totalCost)}`,
+      `  $/Gnos:       ${formatCurrencyCompact(resultA.costPerGnos)}`,
+      `  Work window:  ${formatNumber(Math.round(resultA.workInWindowGnos))} Gnos`,
+    ];
+    if (scenarioB && resultB) {
+      lines.push(
+        ``,
+        `Scenario B`,
+        `  ${scenarioB.gpu} ×${scenarioB.count} @ ${scenarioB.region} (${scenarioB.priority}, ${scenarioB.hours}h)`,
+        `  Speed:        ${formatSpeed(resultB.totalSpeedMnos)}`,
+        `  Hourly rate:  ${formatCurrency(resultB.hourlyRate)}`,
+        `  Total cost:   ${formatCurrency(resultB.totalCost)}`,
+      );
+    }
+    return lines.join("\n");
+  }, [scenarioA, resultA, scenarioB, resultB]);
 
   // ----- Export rows -------------------------------------------------------
   // Two flat row-shapes — one for the scenario card, one for the per-region
@@ -2276,25 +2359,38 @@ const GpuCalculatorPageInner: React.FC = () => {
       >
         {scenarioA && (
           <>
+            {/*
+              COORDINATOR: <CopyButton /> from shared/copy-button.tsx owns the
+              clipboard dance + success flash. We wrap it with a label span so
+              the page-header keeps a consistent "Copy link" affordance.
+            */}
+            <span className="inline-flex items-center gap-1.5 rounded-md border border-border bg-card px-2.5 py-1.5 text-xs font-medium text-foreground shadow-sm">
+              <LinkIcon className="h-3.5 w-3.5" aria-hidden />
+              Share link
+              <CopyButton
+                value={shareLinkValue}
+                ariaLabel="Copy a shareable link to this scenario"
+                alwaysVisible
+                iconSize={13}
+              />
+            </span>
+            {formattedSummary && (
+              <span className="inline-flex items-center gap-1.5 rounded-md border border-border bg-card px-2.5 py-1.5 text-xs font-medium text-foreground shadow-sm">
+                <Calculator className="h-3.5 w-3.5" aria-hidden />
+                Copy summary
+                <CopyButton
+                  value={formattedSummary}
+                  ariaLabel="Copy the formatted calculation summary"
+                  alwaysVisible
+                  iconSize={13}
+                />
+              </span>
+            )}
             <Button
               type="button"
               variant="outline"
               size="sm"
-              onClick={copyShareLink}
-              aria-label="Copy a shareable link to this scenario"
-            >
-              {linkCopied ? (
-                <Check aria-hidden />
-              ) : (
-                <LinkIcon aria-hidden />
-              )}
-              {linkCopied ? "Copied" : "Copy link"}
-            </Button>
-            <Button
-              type="button"
-              variant="outline"
-              size="sm"
-              onClick={saveCurrentScenario}
+              onClick={beginSaveScenario}
               aria-label="Save current scenario A under a name"
             >
               <BookmarkPlus aria-hidden />
@@ -2318,7 +2414,11 @@ const GpuCalculatorPageInner: React.FC = () => {
                     Saved scenarios
                   </DropdownMenuLabel>
                   <DropdownMenuSeparator />
-                  {savedScenarios.map((s) => (
+                  {[...savedScenarios]
+                    .sort((a, b) =>
+                      (b.savedAt ?? "").localeCompare(a.savedAt ?? ""),
+                    )
+                    .map((s) => (
                     <DropdownMenuItem
                       key={s.name}
                       onSelect={() => applySavedScenario(s)}
@@ -2340,8 +2440,14 @@ const GpuCalculatorPageInner: React.FC = () => {
                       </span>
                       <button
                         type="button"
+                        // Stop both pointerdown (Radix's chosen activation
+                        // event) and click so deleting an item doesn't
+                        // also fire the surrounding DropdownMenuItem's
+                        // onSelect → applySavedScenario.
+                        onPointerDown={(e) => e.stopPropagation()}
                         onClick={(e) => {
                           e.stopPropagation();
+                          e.preventDefault();
                           deleteSavedScenario(s.name);
                         }}
                         aria-label={`Delete saved scenario ${s.name}`}
@@ -2464,6 +2570,60 @@ const GpuCalculatorPageInner: React.FC = () => {
         )}
       </PageHeader>
 
+      {/* Inline "save scenario as" prompt -- replaces window.prompt() so the
+          flow works under browser modal-suppression heuristics and is
+          keyboard-driven (Enter to save, Esc to cancel). */}
+      {saveNameDraft != null && (
+        <Card
+          role="dialog"
+          aria-label="Save scenario"
+          className="border-primary/30 bg-card shadow-sm"
+        >
+          <CardContent className="flex flex-wrap items-end gap-3 p-4">
+            <div className="flex flex-1 flex-col gap-1">
+              <Label htmlFor="save-scenario-name" className="text-xs">
+                Save scenario as
+              </Label>
+              <Input
+                id="save-scenario-name"
+                autoFocus
+                value={saveNameDraft}
+                onChange={(e) => setSaveNameDraft(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") {
+                    e.preventDefault();
+                    commitSaveScenario();
+                  } else if (e.key === "Escape") {
+                    e.preventDefault();
+                    cancelSaveScenario();
+                  }
+                }}
+                aria-label="Scenario name"
+                placeholder="e.g. H100 ×8 baseline"
+              />
+            </div>
+            <Button
+              type="button"
+              size="sm"
+              onClick={commitSaveScenario}
+              disabled={!saveNameDraft.trim()}
+              aria-label="Save scenario"
+            >
+              <Check aria-hidden /> Save
+            </Button>
+            <Button
+              type="button"
+              variant="ghost"
+              size="sm"
+              onClick={cancelSaveScenario}
+              aria-label="Cancel saving scenario"
+            >
+              <X aria-hidden /> Cancel
+            </Button>
+          </CardContent>
+        </Card>
+      )}
+
       {/* Workload presets --------------------------------------------------- */}
       <PresetChipRow onPick={applyPreset} activeId={activePresetId} />
 
@@ -2491,7 +2651,7 @@ const GpuCalculatorPageInner: React.FC = () => {
             scenario={scenarioA}
             result={resultA!}
             gpuOptions={gpuOptions}
-            onChange={(p) => updateScenario("a", p)}
+            onChange={updateScenarioA}
             tone="primary"
             compareTo={compareOn && resultB ? resultB : undefined}
           />
@@ -2501,7 +2661,7 @@ const GpuCalculatorPageInner: React.FC = () => {
               scenario={scenarioB}
               result={resultB!}
               gpuOptions={gpuOptions}
-              onChange={(p) => updateScenario("b", p)}
+              onChange={updateScenarioB}
               onRemove={disableCompare}
               tone="info"
               compareTo={resultA ?? undefined}
@@ -2519,7 +2679,6 @@ const GpuCalculatorPageInner: React.FC = () => {
             speeds={speeds}
           />
           <TargetWorkCard
-            scenario={scenarioA}
             result={resultA}
             targetGnos={targetGnos}
             onChange={setTargetGnos}

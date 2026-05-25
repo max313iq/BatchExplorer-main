@@ -923,3 +923,181 @@ export function tallySeverities(
   }
   return out;
 }
+
+// ---------------------------------------------------------------------------
+// Baseline snapshot / drift (Enhancement #1)
+// ---------------------------------------------------------------------------
+
+/**
+ * Persisted snapshot envelope — what we stash in localStorage so the operator
+ * can compare "what does my tenant look like NOW" vs "what was approved last
+ * audit". One snapshot per tenant id (we key the persisted-state hook with
+ * the tenant id), kept deliberately small (no raw Graph payloads).
+ */
+export interface BaselineSnapshot {
+  tenantId: string;
+  tenantDisplayName: string;
+  capturedAt: string; // ISO timestamp
+  // Map<BaselineCheckId, { severity, summary }>
+  findings: Record<
+    BaselineCheckId,
+    { severity: BaselineSeverity; summary: string }
+  >;
+}
+
+/** "Compared to last saved snapshot" status for a single check. */
+export type FindingDriftStatus =
+  | "no-baseline"
+  | "match"
+  | "improved"
+  | "regressed"
+  | "summary-changed";
+
+/** Per-check drift result. */
+export interface FindingDrift {
+  status: FindingDriftStatus;
+  /** Snapshot's recorded severity, if any. */
+  baselineSeverity: BaselineSeverity | null;
+  /** Snapshot's recorded summary, if any. */
+  baselineSummary: string | null;
+}
+
+/**
+ * Compare a freshly-collected set of findings against a saved snapshot.
+ * Returns a per-id drift map. The page renders a drift chip / row tint
+ * based on the result.
+ */
+export function diffAgainstSnapshot(
+  findings: BaselineFinding[],
+  snapshot: BaselineSnapshot | null,
+): Map<BaselineCheckId, FindingDrift> {
+  const out = new Map<BaselineCheckId, FindingDrift>();
+  if (!snapshot) {
+    for (const f of findings) {
+      out.set(f.id, {
+        status: "no-baseline",
+        baselineSeverity: null,
+        baselineSummary: null,
+      });
+    }
+    return out;
+  }
+  for (const f of findings) {
+    const prev = snapshot.findings[f.id];
+    if (!prev) {
+      out.set(f.id, {
+        status: "no-baseline",
+        baselineSeverity: null,
+        baselineSummary: null,
+      });
+      continue;
+    }
+    const sevDelta = SEVERITY_RANK[f.severity] - SEVERITY_RANK[prev.severity];
+    let status: FindingDriftStatus;
+    if (sevDelta > 0) status = "regressed";
+    else if (sevDelta < 0) status = "improved";
+    else if (prev.summary !== f.summary) status = "summary-changed";
+    else status = "match";
+    out.set(f.id, {
+      status,
+      baselineSeverity: prev.severity,
+      baselineSummary: prev.summary,
+    });
+  }
+  return out;
+}
+
+/**
+ * Build a snapshot envelope from the current finding set. Strips the
+ * heavy `raw` Graph payloads so localStorage stays under the ~5MB quota.
+ */
+export function buildSnapshot(
+  tenantId: string,
+  tenantDisplayName: string,
+  findings: BaselineFinding[],
+): BaselineSnapshot {
+  const out: BaselineSnapshot["findings"] = {
+    "security-defaults": { severity: "unknown", summary: "" },
+    "guest-invite-policy": { severity: "unknown", summary: "" },
+    "default-user-permissions": { severity: "unknown", summary: "" },
+    "domains-federation": { severity: "unknown", summary: "" },
+    "onprem-sync": { severity: "unknown", summary: "" },
+    "password-protection": { severity: "unknown", summary: "" },
+  };
+  for (const f of findings) {
+    out[f.id] = { severity: f.severity, summary: f.summary };
+  }
+  return {
+    tenantId,
+    tenantDisplayName,
+    capturedAt: new Date().toISOString(),
+    findings: out,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Entra portal deep links (Enhancement #5)
+// ---------------------------------------------------------------------------
+
+/**
+ * Per-finding deep link into the Microsoft Entra admin portal. We hand-pick
+ * the most useful blade per check rather than punting to a search. These
+ * URLs are stable / documented and survive portal redesigns (the Entra
+ * portal redirects old `aad.portal.azure.com` paths to `entra.microsoft.com`).
+ */
+export function portalLinkForFinding(
+  id: BaselineCheckId,
+  tenantId: string,
+): { href: string; label: string } {
+  const t = encodeURIComponent(tenantId);
+  switch (id) {
+    case "security-defaults":
+      return {
+        href: `https://entra.microsoft.com/${t}/#view/Microsoft_AAD_IAM/SecurityMenuBlade/~/Properties`,
+        label: "Open Entra ID → Properties (Security defaults)",
+      };
+    case "guest-invite-policy":
+      return {
+        href: `https://entra.microsoft.com/${t}/#view/Microsoft_AAD_IAM/CompanyRelationshipsMenuBlade/~/Settings`,
+        label: "Open External Identities → Collaboration settings",
+      };
+    case "default-user-permissions":
+      return {
+        href: `https://entra.microsoft.com/${t}/#view/Microsoft_AAD_UsersAndTenants/UserManagementMenuBlade/~/UserSettings`,
+        label: "Open Users → User settings",
+      };
+    case "domains-federation":
+      return {
+        href: `https://entra.microsoft.com/${t}/#view/Microsoft_AAD_IAM/DomainsList.ReactView`,
+        label: "Open Domains",
+      };
+    case "onprem-sync":
+      return {
+        href: `https://entra.microsoft.com/${t}/#view/Microsoft_AAD_IAM/EntraConnectMenuBlade/~/Overview`,
+        label: "Open Microsoft Entra Connect → Health",
+      };
+    case "password-protection":
+      return {
+        href: `https://entra.microsoft.com/${t}/#view/Microsoft_AAD_IAM/AuthenticationMethodsMenuBlade/~/PasswordProtection`,
+        label: "Open Authentication methods → Password protection",
+      };
+  }
+}
+
+/**
+ * Per-SP deep link to the Enterprise application or App registration blade.
+ * We default to the Enterprise apps view because the spec is "operator
+ * checks an SP" — and that view shows credentials + role assignments
+ * without requiring app-owner permissions.
+ */
+export function portalLinkForServicePrincipal(
+  appId: string,
+  tenantId: string,
+): { href: string; label: string } {
+  const t = encodeURIComponent(tenantId);
+  const a = encodeURIComponent(appId);
+  return {
+    href: `https://entra.microsoft.com/${t}/#view/Microsoft_AAD_IAM/ManagedAppMenuBlade/~/Credentials/objectId//appId/${a}`,
+    label: "Open in Entra portal (Enterprise applications)",
+  };
+}

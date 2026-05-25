@@ -100,7 +100,13 @@ import {
   listAccessibleTenants,
 } from "../../auth/msal-auth";
 import { useArmToken } from "../../auth/use-arm-token";
+import { usePersistedState } from "../../hooks/use-persisted-state";
 import { useTenantChange } from "../../hooks/use-tenant-change";
+
+// COORDINATOR: invite-user has CSV paste, consider import-batch — the bulk
+// CSV-paste affordance added below (operator pastes
+// "email[,displayName[,message]]" rows) is import-shaped. If a generic
+// import-batch page appears later, share the parser via a shared util.
 import {
   assignSubscriptionRole,
   AZURE_ROLE_OWNER,
@@ -118,7 +124,7 @@ import {
   useMultiRegionStore,
 } from "../../store/store-context";
 import { ConfirmationDialog } from "../shared/confirmation-dialog";
-import { CopyableText } from "../shared/copy-button";
+import { CopyableText, CopyButton } from "../shared/copy-button";
 import { EmptyState } from "../shared/empty-state";
 import { ExportMenu, type ExportColumn } from "../shared/export-menu";
 import { InfoTooltip } from "../shared/info-tooltip";
@@ -178,6 +184,40 @@ const STORAGE_REDIRECT_URL = "invite-user:redirect-url";
 const STORAGE_CONCURRENCY = "invite-user:concurrency";
 const STORAGE_SEND_EMAIL = "invite-user:send-email";
 const STORAGE_GRANT_OWNER = "invite-user:grant-owner";
+
+/**
+ * localStorage key for saved invite-templates. Templates persist across
+ * reloads (unlike the sessionStorage prefs above) so operators can keep
+ * a catalogue of common (redirect, message, send-email, grant-owner)
+ * combinations between sessions. Persisted via `usePersistedState` with
+ * schema versioning so the shape can evolve.
+ */
+const STORAGE_TEMPLATES = "invite-user:templates";
+const TEMPLATES_SCHEMA_VERSION = 1;
+
+/**
+ * Saved invite template. Stored in localStorage via `usePersistedState`.
+ * Templates are operator-local (no cross-device sync) — they capture the
+ * subset of form fields most worth recalling, NOT the recipient list.
+ */
+interface InviteTemplate {
+  /** Stable identity for React keys and lookup. */
+  id: string;
+  /** Operator-facing label. */
+  name: string;
+  /** Optional default display name applied per recipient. */
+  displayName: string;
+  /** Redirect URL recipients land on after consent. */
+  redirectUrl: string;
+  /** Custom message body for the Microsoft email (when sendEmail is on). */
+  customMessage: string;
+  /** Whether Microsoft sends the templated invitation email. */
+  sendEmail: boolean;
+  /** Whether the Owner-grant follow-up is queued by default. */
+  grantOwner: boolean;
+  /** ISO timestamp the template was saved (for "Saved on …" UI). */
+  savedAt: string;
+}
 
 // ---------------------------------------------------------------------------
 // Types
@@ -386,6 +426,149 @@ function parseEmailList(raw: string): {
     }
   }
   return { valid, invalid, duplicates: Array.from(duplicateSet) };
+}
+
+// ---------------------------------------------------------------------------
+// CSV paste parser
+// ---------------------------------------------------------------------------
+
+/**
+ * Per-row override carried alongside an email in CSV-paste mode. Operators
+ * who want per-recipient display-name or custom-message text use the CSV
+ * panel rather than the plain textarea. Optional fields fall back to the
+ * page-level defaults at submit time.
+ */
+interface CsvInviteRow {
+  email: string;
+  displayName?: string;
+  customMessage?: string;
+}
+
+/**
+ * Parse a CSV-ish block into `{ rows, invalid, duplicates }`.
+ *
+ * Accepted shapes (header is auto-detected — first row with the literal
+ * "email" cell is treated as a header):
+ *
+ *   email
+ *   email,displayName
+ *   email,displayName,customMessage
+ *
+ * Separator is `,` OR `;` — chosen by whichever appears MORE in the first
+ * non-empty line (so semicolon-locale Excel exports work without
+ * conversion). Cells may be `"`-quoted to embed the separator or a
+ * newline. Duplicates are dedup'd case-insensitively, keeping the first
+ * non-empty override for each address (so a later row with a richer
+ * displayName supersedes an earlier bare one).
+ *
+ * This is intentionally not a full RFC-4180 parser — embedded newlines
+ * inside quoted cells aren't supported (rare for invite payloads and
+ * complicates the streaming chip preview). The parser DOES handle
+ * `""`-escaped quote characters inside a quoted cell.
+ */
+function parseCsvInvites(raw: string): {
+  rows: CsvInviteRow[];
+  invalid: string[];
+  duplicates: string[];
+} {
+  const trimmed = raw.trim();
+  if (!trimmed) return { rows: [], invalid: [], duplicates: [] };
+
+  const lines = trimmed.split(/\r?\n/).filter((l) => l.trim().length > 0);
+  if (lines.length === 0) return { rows: [], invalid: [], duplicates: [] };
+
+  // Separator detection — count `,` vs `;` in the first non-empty row,
+  // pick the more frequent one. Default to `,` on a tie.
+  const first = lines[0]!;
+  const commaCount = (first.match(/,/g) || []).length;
+  const semiCount = (first.match(/;/g) || []).length;
+  const sep = semiCount > commaCount ? ";" : ",";
+
+  const splitRow = (line: string): string[] => {
+    const out: string[] = [];
+    let cur = "";
+    let inQuote = false;
+    for (let i = 0; i < line.length; i += 1) {
+      const ch = line[i];
+      if (inQuote) {
+        if (ch === '"' && line[i + 1] === '"') {
+          cur += '"';
+          i += 1;
+        } else if (ch === '"') {
+          inQuote = false;
+        } else {
+          cur += ch;
+        }
+      } else if (ch === '"') {
+        inQuote = true;
+      } else if (ch === sep) {
+        out.push(cur);
+        cur = "";
+      } else {
+        cur += ch;
+      }
+    }
+    out.push(cur);
+    return out.map((c) => c.trim());
+  };
+
+  // Header detection — first row whose first cell == "email" (case-insens.).
+  const firstCells = splitRow(first);
+  const hasHeader =
+    firstCells.length > 0 &&
+    firstCells[0]!.toLowerCase().replace(/[_\s]/g, "") === "email";
+  const colIndex = { email: 0, displayName: 1, customMessage: 2 };
+  if (hasHeader) {
+    for (let i = 0; i < firstCells.length; i += 1) {
+      const k = firstCells[i]!.toLowerCase().replace(/[_\s]/g, "");
+      if (k === "email") colIndex.email = i;
+      else if (k === "displayname" || k === "name") colIndex.displayName = i;
+      else if (
+        k === "message" ||
+        k === "custommessage" ||
+        k === "customizedmessagebody"
+      ) {
+        colIndex.customMessage = i;
+      }
+    }
+  }
+
+  const dataLines = hasHeader ? lines.slice(1) : lines;
+  const seen = new Map<string, number>(); // lower-email → index in rows[]
+  const duplicateSet = new Set<string>();
+  const rows: CsvInviteRow[] = [];
+  const invalid: string[] = [];
+
+  for (const line of dataLines) {
+    const cells = splitRow(line);
+    const email = (cells[colIndex.email] ?? "").trim();
+    if (!email) continue;
+    if (!EMAIL_REGEX.test(email) || email.length > 254) {
+      invalid.push(email);
+      continue;
+    }
+    const lower = email.toLowerCase();
+    const dn = (cells[colIndex.displayName] ?? "").trim();
+    const cm = (cells[colIndex.customMessage] ?? "").trim();
+    const existing = seen.get(lower);
+    if (existing !== undefined) {
+      duplicateSet.add(email);
+      // Upgrade earlier row with non-empty overrides from the later one
+      // (operator's intent: more-specific entry wins).
+      const prev = rows[existing]!;
+      if (!prev.displayName && dn) prev.displayName = dn;
+      if (!prev.customMessage && cm) prev.customMessage = cm;
+      continue;
+    }
+    seen.set(lower, rows.length);
+    rows.push({
+      email,
+      displayName: dn || undefined,
+      customMessage: cm || undefined,
+    });
+  }
+
+  return { rows, invalid, duplicates: Array.from(duplicateSet) };
 }
 
 // ---------------------------------------------------------------------------
@@ -737,6 +920,17 @@ export const InviteUserPage: React.FC = () => {
   const [suppressedEmails, setSuppressedEmails] = React.useState<Set<string>>(
     () => new Set(),
   );
+  /**
+   * Per-recipient overrides sourced from the CSV-paste panel — lowercase
+   * email → { displayName?, customMessage? }. When set, these supersede
+   * the page-level defaults for that specific recipient at submit time.
+   * Cleared by the "Clear" action on the recipient textarea.
+   */
+  const [csvOverrides, setCsvOverrides] = React.useState<
+    Record<string, { displayName?: string; customMessage?: string }>
+  >({});
+  const [showCsvPaste, setShowCsvPaste] = React.useState(false);
+  const [csvPasteText, setCsvPasteText] = React.useState("");
   const [displayName, setDisplayName] = React.useState("");
   const [customMessage, setCustomMessage] = React.useState("");
   const [redirectUrl, setRedirectUrl] = React.useState(() => {
@@ -788,6 +982,33 @@ export const InviteUserPage: React.FC = () => {
   }, [selectedSubscriptionId]);
 
   // -------------------------------------------------------------------------
+  // Saved templates (localStorage, cross-session)
+  //
+  // The state declarations live here (alongside other persisted form prefs).
+  // The callbacks that capture `selectedInviter` are defined further below
+  // — see the "Saved templates — callbacks" block — so they can reference
+  // `selectedInviter` after it's declared.
+  // -------------------------------------------------------------------------
+  /**
+   * Catalogue of saved (redirectUrl, customMessage, sendEmail, grantOwner,
+   * displayName) tuples. Operators apply a template to fill the form in
+   * one click — useful when the same invite blurb is reused weekly /
+   * for the same product line. The recipient list is intentionally NOT
+   * captured (different invitees every time).
+   */
+  const [savedTemplates, setSavedTemplates] = usePersistedState<
+    InviteTemplate[]
+  >(STORAGE_TEMPLATES, [], {
+    version: TEMPLATES_SCHEMA_VERSION,
+    syncAcrossTabs: true,
+  });
+  const [showTemplateSaver, setShowTemplateSaver] = React.useState(false);
+  const [templateNameDraft, setTemplateNameDraft] = React.useState("");
+  const [templateToDelete, setTemplateToDelete] = React.useState<string | null>(
+    null,
+  );
+
+  // -------------------------------------------------------------------------
   // Submit-side state
   // -------------------------------------------------------------------------
   const [submitting, setSubmitting] = React.useState(false);
@@ -829,6 +1050,97 @@ export const InviteUserPage: React.FC = () => {
   const armTokenTracker = useArmToken(
     selectedInviter?.homeAccountId,
     selectedInviter?.tenantId,
+  );
+
+  // -------------------------------------------------------------------------
+  // Saved templates — callbacks (placed after `selectedInviter` so they can
+  // reference the inviter's username in the audit log).
+  // -------------------------------------------------------------------------
+  const applyTemplate = React.useCallback(
+    (tpl: InviteTemplate) => {
+      setDisplayName(tpl.displayName);
+      setRedirectUrl(tpl.redirectUrl);
+      setCustomMessage(tpl.customMessage);
+      setSendEmail(tpl.sendEmail);
+      setGrantOwner(tpl.grantOwner);
+      store.addNotification({
+        type: "info",
+        message: `Applied template "${tpl.name}".`,
+      });
+      auditLog.record({
+        actor: selectedInviter?.username ?? "(unknown)",
+        action: "invite_template_applied",
+        target: tpl.id,
+        status: "success",
+        details: { templateName: tpl.name },
+      });
+    },
+    [store, selectedInviter?.username],
+  );
+
+  const saveCurrentAsTemplate = React.useCallback(() => {
+    const name = templateNameDraft.trim();
+    if (!name) return;
+    const tpl: InviteTemplate = {
+      id:
+        typeof crypto !== "undefined" && "randomUUID" in crypto
+          ? crypto.randomUUID()
+          : `tpl_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+      name,
+      displayName,
+      redirectUrl,
+      customMessage,
+      sendEmail,
+      grantOwner,
+      savedAt: new Date().toISOString(),
+    };
+    setSavedTemplates((prev) => {
+      // De-dup by name — overwriting a same-name template is the most
+      // common operator intent (iterating on an existing draft).
+      const filtered = prev.filter((t) => t.name !== name);
+      return [tpl, ...filtered];
+    });
+    setShowTemplateSaver(false);
+    setTemplateNameDraft("");
+    store.addNotification({
+      type: "success",
+      message: `Saved template "${name}".`,
+    });
+    auditLog.record({
+      actor: selectedInviter?.username ?? "(unknown)",
+      action: "invite_template_saved",
+      target: tpl.id,
+      status: "success",
+      details: { templateName: name, sendEmail, grantOwner },
+    });
+  }, [
+    templateNameDraft,
+    displayName,
+    redirectUrl,
+    customMessage,
+    sendEmail,
+    grantOwner,
+    setSavedTemplates,
+    store,
+    selectedInviter?.username,
+  ]);
+
+  const deleteTemplate = React.useCallback(
+    (id: string) => {
+      setSavedTemplates((prev) => prev.filter((t) => t.id !== id));
+      setTemplateToDelete(null);
+      store.addNotification({
+        type: "info",
+        message: "Template deleted.",
+      });
+      auditLog.record({
+        actor: selectedInviter?.username ?? "(unknown)",
+        action: "invite_template_deleted",
+        target: id,
+        status: "success",
+      });
+    },
+    [setSavedTemplates, store, selectedInviter?.username],
   );
 
   // Reload subscription list when inviter (or its destination tenant)
@@ -898,6 +1210,17 @@ export const InviteUserPage: React.FC = () => {
     );
     return { ...raw, activeValid };
   }, [inviteeEmails, suppressedEmails]);
+
+  /**
+   * Memoized preview of the CSV-paste textarea. Recomputed on every
+   * keystroke (cheap for typical pastes; the panel only renders when
+   * `showCsvPaste` is true) and reused by the Append/Replace handlers
+   * so they don't pay the parsing cost a second time.
+   */
+  const csvPreview = React.useMemo(
+    () => parseCsvInvites(csvPasteText),
+    [csvPasteText],
+  );
 
   /** Heuristic warnings for the active recipients (e.g. onmicrosoft.com). */
   const recipientWarnings = React.useMemo(() => {
@@ -1189,6 +1512,13 @@ export const InviteUserPage: React.FC = () => {
         redirectUrl: string;
         grantOwner: boolean;
         subscriptionId: string;
+        /**
+         * Optional per-recipient overrides sourced from the CSV-paste
+         * panel. When present, supersedes the page-level defaults for
+         * THIS row (and only this row) — lets one batch mix per-invitee
+         * display names / messages with shared redirect + send-email.
+         */
+        rowOverrides?: { displayName?: string; customMessage?: string };
       },
     ): Promise<void> => {
       if (cancelledRef.current) {
@@ -1202,6 +1532,13 @@ export const InviteUserPage: React.FC = () => {
         return;
       }
       updateRow(row.rowId, { invite: { state: "running" } });
+
+      // Per-recipient overrides win over page-level defaults. Empty / undefined
+      // overrides fall through.
+      const effDisplayName =
+        opts.rowOverrides?.displayName?.trim() || opts.displayName;
+      const effCustomMessage =
+        opts.rowOverrides?.customMessage?.trim() || opts.customMessage;
 
       // --- Invite step ----------------------------------------------------
       // `inviter.tenantId` is the EXACT tenant the operator picked from
@@ -1231,12 +1568,12 @@ export const InviteUserPage: React.FC = () => {
           inviter.tenantId,
           {
             invitedUserEmailAddress: row.email,
-            invitedUserDisplayName: opts.displayName.trim() || undefined,
+            invitedUserDisplayName: effDisplayName.trim() || undefined,
             inviteRedirectUrl: opts.redirectUrl.trim(),
             sendInvitationMessage: opts.sendEmail,
             customizedMessageBody:
-              opts.sendEmail && opts.customMessage.trim()
-                ? opts.customMessage.trim()
+              opts.sendEmail && effCustomMessage.trim()
+                ? effCustomMessage.trim()
                 : undefined,
           },
           graphToken,
@@ -1443,7 +1780,13 @@ export const InviteUserPage: React.FC = () => {
       concurrency,
       () => cancelledRef.current,
       async (row) => {
-        await processOneRow(row, selectedInviter, opts);
+        // Look up per-recipient overrides from the CSV-paste panel, if any.
+        // Lowercase keying matches `parseCsvInvites`'s storage convention.
+        const override = csvOverrides[row.email.toLowerCase()];
+        await processOneRow(row, selectedInviter, {
+          ...opts,
+          rowOverrides: override,
+        });
       },
     );
 
@@ -1506,6 +1849,7 @@ export const InviteUserPage: React.FC = () => {
     grantOwner,
     selectedSubscriptionId,
     concurrency,
+    csvOverrides,
     processOneRow,
     store,
   ]);
@@ -1542,6 +1886,7 @@ export const InviteUserPage: React.FC = () => {
             redirectUrl,
             grantOwner,
             subscriptionId: selectedSubscriptionId,
+            rowOverrides: csvOverrides[target.email.toLowerCase()],
           });
         } else if (ownerFailed && inviteSucceeded) {
           // Owner-grant-only retry — re-grant against the already-invited
@@ -1630,6 +1975,7 @@ export const InviteUserPage: React.FC = () => {
       customMessage,
       redirectUrl,
       selectedSubscriptionId,
+      csvOverrides,
       processOneRow,
       updateRow,
     ],
@@ -1799,6 +2145,7 @@ export const InviteUserPage: React.FC = () => {
   const resetForm = React.useCallback(() => {
     setInviteeEmails("");
     setSuppressedEmails(new Set());
+    setCsvOverrides({});
     setDisplayName("");
     setCustomMessage("");
     setError(null);
@@ -2001,24 +2348,273 @@ export const InviteUserPage: React.FC = () => {
                   ariaLabel="About bulk email input"
                 />
               </Label>
-              {(parsedEmails.valid.length > 0 || inviteeEmails.length > 0) && (
+              <div className="flex items-center gap-1">
                 <Button
                   type="button"
                   variant="ghost"
                   size="xs"
-                  onClick={() => {
-                    setInviteeEmails("");
-                    setSuppressedEmails(new Set());
-                  }}
+                  onClick={() => setShowCsvPaste((v) => !v)}
                   disabled={submitting}
                   className="text-2xs"
-                  aria-label="Clear all recipients"
+                  aria-pressed={showCsvPaste}
+                  aria-expanded={showCsvPaste}
+                  aria-controls="invite-csv-paste-panel"
+                  aria-label={
+                    showCsvPaste
+                      ? "Hide CSV paste panel"
+                      : "Paste recipients from CSV (email, displayName, message)"
+                  }
+                  title="Paste a CSV with per-recipient display names and messages"
                 >
-                  <Trash2 />
-                  Clear
+                  <Filter />
+                  CSV paste
                 </Button>
-              )}
+                {(parsedEmails.valid.length > 0 || inviteeEmails.length > 0) && (
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="xs"
+                    onClick={() => {
+                      setInviteeEmails("");
+                      setSuppressedEmails(new Set());
+                      setCsvOverrides({});
+                    }}
+                    disabled={submitting}
+                    className="text-2xs"
+                    aria-label="Clear all recipients"
+                  >
+                    <Trash2 />
+                    Clear
+                  </Button>
+                )}
+              </div>
             </div>
+
+            {/* CSV-paste panel — power-user affordance for batches with
+                per-recipient display names + custom messages. Distinct from
+                the textarea so the textarea stays a simple "paste a wall
+                of emails" surface. */}
+            {showCsvPaste && (
+              <div
+                id="invite-csv-paste-panel"
+                className="flex flex-col gap-2 rounded-md border border-primary/30 bg-primary/5 p-3"
+                role="region"
+                aria-label="CSV paste"
+              >
+                <div className="flex items-center justify-between gap-2">
+                  <span className="flex items-center gap-1.5 text-xs font-medium">
+                    <Filter className="h-3.5 w-3.5 text-primary" />
+                    Bulk CSV paste
+                    <InfoTooltip
+                      size={12}
+                      content={
+                        <div className="space-y-1.5">
+                          <p className="m-0 text-xs">
+                            Paste rows of{" "}
+                            <code className="font-mono">
+                              email[,displayName[,message]]
+                            </code>
+                            . First row is treated as a header if its first
+                            cell is <code className="font-mono">email</code>.
+                            Separator auto-detects between <code>,</code> and{" "}
+                            <code>;</code> (Excel locale-aware).
+                          </p>
+                          <p className="m-0 text-xs">
+                            Per-recipient values supersede the form-level
+                            defaults for THAT row. Recipients without
+                            overrides fall back to Display name + Custom
+                            message below.
+                          </p>
+                        </div>
+                      }
+                      ariaLabel="About CSV paste"
+                    />
+                  </span>
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="xs"
+                    onClick={() => setShowCsvPaste(false)}
+                    className="h-6 text-2xs"
+                    aria-label="Close CSV paste panel"
+                  >
+                    <X />
+                  </Button>
+                </div>
+                <textarea
+                  id="invite-csv-paste"
+                  value={csvPasteText}
+                  onChange={(e) => setCsvPasteText(e.target.value)}
+                  placeholder={
+                    "email,displayName,message\nalice@example.com,Alice Smith,Welcome to the team\nbob@example.com,Bob Jones,"
+                  }
+                  rows={5}
+                  spellCheck={false}
+                  className="min-h-[110px] w-full rounded-md border border-input bg-background px-3 py-2 font-mono text-xs ring-offset-background placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50"
+                  disabled={submitting}
+                  aria-label="CSV rows to import as recipients"
+                  aria-describedby="invite-csv-paste-help"
+                />
+                <p
+                  id="invite-csv-paste-help"
+                  className="text-2xs text-muted-foreground"
+                >
+                  {(() => {
+                    if (csvPasteText.trim().length === 0) {
+                      return "Empty.";
+                    }
+                    const bits: string[] = [];
+                    bits.push(
+                      `${csvPreview.rows.length} valid row${csvPreview.rows.length === 1 ? "" : "s"}`,
+                    );
+                    if (csvPreview.invalid.length > 0) {
+                      bits.push(
+                        `${csvPreview.invalid.length} invalid skipped`,
+                      );
+                    }
+                    if (csvPreview.duplicates.length > 0) {
+                      bits.push(
+                        `${csvPreview.duplicates.length} duplicate${csvPreview.duplicates.length === 1 ? "" : "s"} merged`,
+                      );
+                    }
+                    const withDn = csvPreview.rows.filter(
+                      (r) => r.displayName,
+                    ).length;
+                    const withCm = csvPreview.rows.filter(
+                      (r) => r.customMessage,
+                    ).length;
+                    if (withDn > 0) bits.push(`${withDn} display names`);
+                    if (withCm > 0) bits.push(`${withCm} custom messages`);
+                    return bits.join(" · ");
+                  })()}
+                </p>
+                <div className="flex flex-wrap gap-2">
+                  <Button
+                    type="button"
+                    size="sm"
+                    variant="default"
+                    className="h-7 text-2xs"
+                    disabled={
+                      submitting || csvPasteText.trim().length === 0
+                    }
+                    onClick={() => {
+                      if (csvPreview.rows.length === 0) {
+                        store.addNotification({
+                          type: "warning",
+                          message:
+                            "CSV paste: no valid rows. Check the header row and email column.",
+                        });
+                        return;
+                      }
+                      // Merge CSV rows INTO the existing textarea (additive).
+                      // Replace mode is opt-in via "Replace" button below.
+                      const existing = parseEmailList(inviteeEmails).valid;
+                      const merged = new Map<string, string>();
+                      for (const e of existing) {
+                        merged.set(e.toLowerCase(), e);
+                      }
+                      for (const r of csvPreview.rows) {
+                        merged.set(r.email.toLowerCase(), r.email);
+                      }
+                      setInviteeEmails(Array.from(merged.values()).join("\n"));
+                      // Build the override map — only entries that actually
+                      // have a displayName or customMessage are stored.
+                      setCsvOverrides((prev) => {
+                        const next = { ...prev };
+                        for (const r of csvPreview.rows) {
+                          if (r.displayName || r.customMessage) {
+                            next[r.email.toLowerCase()] = {
+                              displayName: r.displayName,
+                              customMessage: r.customMessage,
+                            };
+                          }
+                        }
+                        return next;
+                      });
+                      store.addNotification({
+                        type: "success",
+                        message: `CSV: imported ${csvPreview.rows.length} row${csvPreview.rows.length === 1 ? "" : "s"}${
+                          csvPreview.invalid.length > 0
+                            ? ` (${csvPreview.invalid.length} invalid skipped)`
+                            : ""
+                        }.`,
+                      });
+                    }}
+                  >
+                    <Plus />
+                    Append to recipients
+                  </Button>
+                  <Button
+                    type="button"
+                    size="sm"
+                    variant="outline"
+                    className="h-7 text-2xs"
+                    disabled={
+                      submitting || csvPasteText.trim().length === 0
+                    }
+                    onClick={() => {
+                      if (csvPreview.rows.length === 0) {
+                        store.addNotification({
+                          type: "warning",
+                          message:
+                            "CSV paste: no valid rows to replace with.",
+                        });
+                        return;
+                      }
+                      setInviteeEmails(
+                        csvPreview.rows.map((r) => r.email).join("\n"),
+                      );
+                      setSuppressedEmails(new Set());
+                      const overrides: typeof csvOverrides = {};
+                      for (const r of csvPreview.rows) {
+                        if (r.displayName || r.customMessage) {
+                          overrides[r.email.toLowerCase()] = {
+                            displayName: r.displayName,
+                            customMessage: r.customMessage,
+                          };
+                        }
+                      }
+                      setCsvOverrides(overrides);
+                      store.addNotification({
+                        type: "success",
+                        message: `CSV: replaced recipients with ${csvPreview.rows.length} row${csvPreview.rows.length === 1 ? "" : "s"}.`,
+                      });
+                    }}
+                  >
+                    Replace recipients
+                  </Button>
+                  <Button
+                    type="button"
+                    size="sm"
+                    variant="ghost"
+                    className="h-7 text-2xs"
+                    onClick={() => setCsvPasteText("")}
+                    disabled={submitting || csvPasteText.length === 0}
+                  >
+                    Clear paste box
+                  </Button>
+                  {Object.keys(csvOverrides).length > 0 && (
+                    <span className="ml-auto inline-flex items-center gap-1 text-2xs text-muted-foreground">
+                      <Pencil className="h-3 w-3" aria-hidden />
+                      {Object.keys(csvOverrides).length} per-recipient
+                      override{Object.keys(csvOverrides).length === 1
+                        ? ""
+                        : "s"}{" "}
+                      active
+                      <button
+                        type="button"
+                        onClick={() => setCsvOverrides({})}
+                        disabled={submitting}
+                        className="rounded px-1 underline hover:text-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+                        aria-label="Clear all per-recipient CSV overrides"
+                      >
+                        clear
+                      </button>
+                    </span>
+                  )}
+                </div>
+              </div>
+            )}
             <textarea
               id="invite-emails"
               autoComplete="off"
@@ -2075,7 +2671,12 @@ export const InviteUserPage: React.FC = () => {
                 className="flex flex-wrap gap-1.5 rounded-md border border-dashed border-border bg-muted/20 p-2"
               >
                 {parsedEmails.valid.map((email) => {
-                  const isSuppressed = suppressedEmails.has(email.toLowerCase());
+                  const lower = email.toLowerCase();
+                  const isSuppressed = suppressedEmails.has(lower);
+                  const override = csvOverrides[lower];
+                  const hasOverride =
+                    !!override &&
+                    (!!override.displayName || !!override.customMessage);
                   return (
                     <span
                       key={email}
@@ -2085,11 +2686,22 @@ export const InviteUserPage: React.FC = () => {
                           ? "border-border bg-muted/50 text-muted-foreground line-through"
                           : "border-success/30 bg-success/10 text-success"
                       }`}
+                      title={
+                        hasOverride
+                          ? `Per-recipient override${override.displayName ? ` · displayName="${override.displayName}"` : ""}${override.customMessage ? ` · customMessage set` : ""}`
+                          : undefined
+                      }
                     >
                       <Mail className="h-3 w-3 shrink-0" aria-hidden />
                       <code className="truncate font-mono text-2xs">
                         {email}
                       </code>
+                      {hasOverride && !isSuppressed && (
+                        <Pencil
+                          className="h-2.5 w-2.5 shrink-0 text-primary"
+                          aria-label="Has per-recipient CSV override"
+                        />
+                      )}
                       <button
                         type="button"
                         onClick={() => {
@@ -2527,6 +3139,169 @@ export const InviteUserPage: React.FC = () => {
                   You must hold Owner or User Access Administrator on this
                   subscription for the grant to succeed.
                 </p>
+              </div>
+            )}
+          </div>
+
+          {/* ---------- Saved templates ------------------------------- */}
+          <div
+            className="flex flex-col gap-2 rounded-md border border-border/60 bg-muted/30 p-3"
+            role="region"
+            aria-label="Saved invite templates"
+          >
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <span className="flex items-center gap-1.5 text-2xs font-medium uppercase tracking-wide text-muted-foreground">
+                <Sparkles className="h-3 w-3" aria-hidden />
+                Saved templates
+                <InfoTooltip
+                  size={12}
+                  content="Save the current Display name, redirect URL, custom message, Send-email, and Owner-grant settings as a named template. Apply any saved template in one click. Templates are operator-local (localStorage) — recipients are NOT captured."
+                  ariaLabel="About saved templates"
+                />
+              </span>
+              <div className="flex flex-wrap items-center gap-1.5">
+                {savedTemplates.length > 0 && (
+                  <DropdownMenu>
+                    <DropdownMenuTrigger asChild>
+                      <Button
+                        type="button"
+                        variant="outline"
+                        size="sm"
+                        className="h-7 text-2xs"
+                        disabled={submitting}
+                        aria-label="Apply a saved invite template"
+                      >
+                        Apply…
+                        <ChevronDown className="ml-1 h-3 w-3" />
+                      </Button>
+                    </DropdownMenuTrigger>
+                    <DropdownMenuContent align="end" className="max-w-[320px]">
+                      <DropdownMenuLabel className="text-2xs">
+                        {savedTemplates.length} saved
+                      </DropdownMenuLabel>
+                      <DropdownMenuSeparator />
+                      {savedTemplates.map((tpl) => (
+                        <DropdownMenuItem
+                          key={tpl.id}
+                          onSelect={() => applyTemplate(tpl)}
+                          className="flex flex-col items-start gap-0.5"
+                          aria-label={`Apply template ${tpl.name}`}
+                        >
+                          <span className="flex w-full items-center justify-between gap-2 text-xs font-medium">
+                            <span className="truncate">{tpl.name}</span>
+                            <button
+                              type="button"
+                              onClick={(e) => {
+                                e.preventDefault();
+                                e.stopPropagation();
+                                setTemplateToDelete(tpl.id);
+                              }}
+                              className="ml-2 inline-flex h-5 w-5 items-center justify-center rounded text-muted-foreground hover:bg-destructive/20 hover:text-destructive focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+                              aria-label={`Delete template ${tpl.name}`}
+                              title="Delete template"
+                            >
+                              <Trash2 className="h-3 w-3" aria-hidden />
+                            </button>
+                          </span>
+                          <span className="flex flex-wrap gap-1 text-3xs text-muted-foreground">
+                            {tpl.sendEmail && (
+                              <Badge variant="outline" className="text-3xs">
+                                emails
+                              </Badge>
+                            )}
+                            {tpl.grantOwner && (
+                              <Badge variant="outline" className="text-3xs">
+                                +Owner
+                              </Badge>
+                            )}
+                            <span className="truncate">
+                              → {tpl.redirectUrl.replace(/^https?:\/\//, "")}
+                            </span>
+                          </span>
+                        </DropdownMenuItem>
+                      ))}
+                    </DropdownMenuContent>
+                  </DropdownMenu>
+                )}
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="sm"
+                  className="h-7 text-2xs"
+                  disabled={submitting}
+                  onClick={() => {
+                    setTemplateNameDraft("");
+                    setShowTemplateSaver(true);
+                  }}
+                  aria-label="Save current form values as a template"
+                >
+                  <Plus />
+                  Save current
+                </Button>
+              </div>
+            </div>
+            {savedTemplates.length === 0 ? (
+              <p className="text-2xs text-muted-foreground">
+                No templates yet. Configure redirect URL, custom message,
+                send-email and Owner-grant, then click <em>Save current</em>{" "}
+                to capture the combination.
+              </p>
+            ) : (
+              <p className="text-2xs text-muted-foreground">
+                {savedTemplates.length} template
+                {savedTemplates.length === 1 ? "" : "s"} saved. Apply one to
+                fill the form below.
+              </p>
+            )}
+            {showTemplateSaver && (
+              <div className="flex flex-wrap items-center gap-2 rounded-md border border-border bg-background p-2">
+                <Label
+                  htmlFor="invite-template-name"
+                  className="text-2xs font-medium"
+                >
+                  Template name
+                </Label>
+                <Input
+                  id="invite-template-name"
+                  value={templateNameDraft}
+                  onChange={(e) => setTemplateNameDraft(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter") {
+                      e.preventDefault();
+                      saveCurrentAsTemplate();
+                    } else if (e.key === "Escape") {
+                      setShowTemplateSaver(false);
+                      setTemplateNameDraft("");
+                    }
+                  }}
+                  placeholder='e.g. "Q3 vendor onboarding"'
+                  autoFocus
+                  className="h-7 max-w-[260px] flex-1 text-xs"
+                  aria-label="Template name"
+                />
+                <Button
+                  type="button"
+                  size="sm"
+                  variant="default"
+                  className="h-7 text-2xs"
+                  onClick={saveCurrentAsTemplate}
+                  disabled={templateNameDraft.trim().length === 0}
+                >
+                  <Check />
+                  Save
+                </Button>
+                <Button
+                  type="button"
+                  size="sm"
+                  variant="ghost"
+                  className="h-7 text-2xs"
+                  onClick={() => {
+                    setShowTemplateSaver(false);
+                    setTemplateNameDraft("");
+                  }}
+                >
+                  Cancel
+                </Button>
               </div>
             )}
           </div>
@@ -3211,6 +3986,31 @@ export const InviteUserPage: React.FC = () => {
         }}
         onCancel={() => setShowBulkGrantConfirm(false)}
       />
+
+      {/* ===================================================================
+          Delete-template confirmation
+          =================================================================== */}
+      <ConfirmationDialog
+        hidden={templateToDelete === null}
+        title="Delete saved template?"
+        message={
+          <p className="text-sm">
+            Removing{" "}
+            <strong>
+              {savedTemplates.find((t) => t.id === templateToDelete)?.name ??
+                ""}
+            </strong>
+            . Other tabs viewing this page will update automatically. Form
+            values currently on screen are not affected.
+          </p>
+        }
+        confirmText="Delete template"
+        danger
+        onConfirm={() => {
+          if (templateToDelete) deleteTemplate(templateToDelete);
+        }}
+        onCancel={() => setTemplateToDelete(null)}
+      />
     </div>
   );
 };
@@ -3393,13 +4193,25 @@ const ResultRow: React.FC<ResultRowProps> = ({
 
       {inviteOk && redeemUrl && (
         <div className="flex items-stretch gap-2">
-          <Input
-            readOnly
-            value={redeemUrl}
-            className="font-mono text-2xs"
-            onFocus={(e) => e.currentTarget.select()}
-            aria-label={`Redemption URL for ${o.email}`}
-          />
+          {/* group/copy lets the shared CopyButton fade in on hover/focus
+              and stay visible on tab — matches the convention used by
+              CopyableText across the codebase. */}
+          <div className="group/copy relative flex flex-1 items-center">
+            <Input
+              readOnly
+              value={redeemUrl}
+              className="pr-8 font-mono text-2xs"
+              onFocus={(e) => e.currentTarget.select()}
+              aria-label={`Redemption URL for ${o.email}`}
+            />
+            <span className="absolute right-1.5 top-1/2 -translate-y-1/2">
+              <CopyButton
+                value={redeemUrl}
+                iconSize={12}
+                ariaLabel={`Copy redemption URL for ${o.email} (hover)`}
+              />
+            </span>
+          </div>
           <Button
             type="button"
             variant="default"

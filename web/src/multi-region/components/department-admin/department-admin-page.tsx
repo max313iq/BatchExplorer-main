@@ -43,6 +43,13 @@
  *     mutated and routing happens.
  */
 import * as React from "react";
+// COORDINATOR: this page uses react-router's `useNavigate` directly,
+// matching the dominant pattern across the multi-region pages (overview,
+// gpu-calculator, pool-info, etc.). The canonical wiring contract prefers
+// `useDashboardOutletContext().navigateToPage`, which is a thin wrapper
+// over the same hook. If the contract migrates to mandate the wrapper,
+// swap this import + every `navigate(...)` call site below in one pass
+// across all pages — do not touch only this file.
 import { useNavigate } from "react-router-dom";
 import {
   AlertTriangle,
@@ -88,6 +95,7 @@ import { getArmTokenForAccount } from "../../auth/msal-auth";
 import { resolveActiveTenantId } from "../../auth/perform-tenant-switch";
 import { useArmToken } from "../../auth/use-arm-token";
 import { useTenantChange } from "../../hooks/use-tenant-change";
+import { useUrlState } from "../../hooks/use-url-state";
 import {
   listDepartmentBillingSubscriptions,
   listDepartmentEnrollmentAccounts,
@@ -110,6 +118,7 @@ import { ConfirmationDialog } from "../shared/confirmation-dialog";
 import { CopyableText, CopyButton } from "../shared/copy-button";
 import { EmptyState } from "../shared/empty-state";
 import { ExportMenu } from "../shared/export-menu";
+import { FilterChipRow } from "../shared/filter-chip-row";
 import { InfoTooltip } from "../shared/info-tooltip";
 import { PageHeader } from "../shared/page-header";
 import { SkeletonLoader } from "../shared/skeleton-loader";
@@ -142,6 +151,7 @@ interface SourceAccount {
 type EaStatusFilter = "all" | "active" | "inactive";
 type SubsViewMode = "grouped" | "flat";
 type EaSortKey = "name" | "subs" | "status" | "owner";
+type EaRecencyFilter = "any" | "last7";
 
 const STATUS_NORMALIZED: Record<string, EaStatusFilter> = {
   active: "active",
@@ -156,6 +166,27 @@ const STATUS_NORMALIZED: Record<string, EaStatusFilter> = {
 function normalizeStatus(s: string | undefined): EaStatusFilter {
   if (!s) return "active";
   return STATUS_NORMALIZED[s.toLowerCase()] ?? "active";
+}
+
+// Window for the "added recently" smart filter — keep this in sync with
+// the chip label below. Seven calendar days matches the corresponding
+// review cadence in the EA Billing Manager page.
+const RECENT_WINDOW_MS = 7 * 24 * 60 * 60 * 1000;
+
+/**
+ * Returns true when `startDate` (ISO-8601, as returned by the EA billing
+ * REST API) is within the last RECENT_WINDOW_MS. Invalid / missing values
+ * are conservatively treated as NOT recent — we'd rather under-flag than
+ * mislead an operator into thinking an old EA was newly added.
+ */
+function isRecentlyAdded(
+  startDate: string | undefined,
+  nowMs: number,
+): boolean {
+  if (!startDate) return false;
+  const ts = Date.parse(startDate);
+  if (Number.isNaN(ts)) return false;
+  return nowMs - ts <= RECENT_WINDOW_MS && ts <= nowMs;
 }
 
 export const DepartmentAdminPage: React.FC = () => {
@@ -376,6 +407,34 @@ export const DepartmentAdminPage: React.FC = () => {
     () => depts.find((d) => d.name === departmentName) ?? null,
     [depts, departmentName],
   );
+
+  // Audit a department selection (separate from the list calls below so a
+  // pivot+return doesn't fire a redundant "switch" event). We only record
+  // when the picked dept actually changes within the current BA scope.
+  const lastAuditedDeptRef = React.useRef<string>("");
+  const actorUsernameForDeptSelect = account?.username ?? "anonymous";
+  React.useEffect(() => {
+    if (!billingAccountName || !departmentName) return;
+    const key = `${billingAccountName}::${departmentName}`;
+    if (lastAuditedDeptRef.current === key) return;
+    lastAuditedDeptRef.current = key;
+    auditLog.record({
+      actor: actorUsernameForDeptSelect,
+      action: "select_department_scope",
+      target: `ba:${billingAccountName} dept:${departmentName}`,
+      status: "success",
+      details: {
+        billingAccountName,
+        departmentName,
+        departmentDisplayName: selectedDept?.departmentName ?? null,
+      },
+    });
+  }, [
+    billingAccountName,
+    departmentName,
+    selectedDept?.departmentName,
+    actorUsernameForDeptSelect,
+  ]);
 
   /* ----- Enrollment accounts in the chosen department ------------ */
   const [eas, setEas] = React.useState<EaEnrollmentAccount[]>([]);
@@ -661,17 +720,70 @@ export const DepartmentAdminPage: React.FC = () => {
   ]);
   const cancelPivot = React.useCallback(() => setPendingPivot(null), []);
 
-  /* ----- Filters & sort ------------------------------------------ */
-  const [search, setSearch] = React.useState("");
-  const [eaStatusFilter, setEaStatusFilter] =
-    React.useState<EaStatusFilter>("all");
-  const [eaSortKey, setEaSortKey] = React.useState<EaSortKey>("name");
-  // Independent search box for the subscriptions list.
-  const [subsSearch, setSubsSearch] = React.useState("");
-  const [subsStatusFilter, setSubsStatusFilter] =
-    React.useState<string>("all");
-  const [subsViewMode, setSubsViewMode] =
-    React.useState<SubsViewMode>("grouped");
+  /* ----- Filters & sort ------------------------------------------
+   * All filter/view state lives in the URL so a department admin can
+   * bookmark or share a filtered view (e.g. "all idle EAs sorted by
+   * subscription count"). The hook is initialised with the same
+   * defaults the page used to hard-code in useState — behaviour is
+   * unchanged for any deep link that omits the params.
+   */
+  const [urlFilters, setUrlFilters] = useUrlState({
+    eaSearch: "",
+    eaStatus: "all",
+    eaSort: "name",
+    eaRecency: "any",
+    subsSearch: "",
+    subsStatus: "all",
+    subsView: "grouped",
+  });
+  const search = (urlFilters.eaSearch as string) ?? "";
+  const setSearch = React.useCallback(
+    (v: string) => setUrlFilters({ eaSearch: v }),
+    [setUrlFilters],
+  );
+  const eaStatusFilter: EaStatusFilter =
+    (urlFilters.eaStatus as EaStatusFilter) || "all";
+  const setEaStatusFilter = React.useCallback(
+    (v: EaStatusFilter) => setUrlFilters({ eaStatus: v }),
+    [setUrlFilters],
+  );
+  const eaSortKey: EaSortKey = (urlFilters.eaSort as EaSortKey) || "name";
+  const setEaSortKey = React.useCallback(
+    (v: EaSortKey) => setUrlFilters({ eaSort: v }),
+    [setUrlFilters],
+  );
+  const eaRecencyFilter: EaRecencyFilter =
+    (urlFilters.eaRecency as EaRecencyFilter) || "any";
+  const setEaRecencyFilter = React.useCallback(
+    (v: EaRecencyFilter) => setUrlFilters({ eaRecency: v }),
+    [setUrlFilters],
+  );
+  const subsSearch = (urlFilters.subsSearch as string) ?? "";
+  const setSubsSearch = React.useCallback(
+    (v: string) => setUrlFilters({ subsSearch: v }),
+    [setUrlFilters],
+  );
+  const subsStatusFilter = (urlFilters.subsStatus as string) || "all";
+  const setSubsStatusFilter = React.useCallback(
+    (v: string) => setUrlFilters({ subsStatus: v }),
+    [setUrlFilters],
+  );
+  const subsViewMode: SubsViewMode =
+    (urlFilters.subsView as SubsViewMode) || "grouped";
+  const setSubsViewMode = React.useCallback(
+    (v: SubsViewMode) => setUrlFilters({ subsView: v }),
+    [setUrlFilters],
+  );
+
+  // "Now" snapshot used by the recency filter. Frozen per-render so
+  // sorting and filtering stay stable inside the same render pass. The
+  // 60s tick keeps the chip's counter fresh enough without forcing a
+  // re-render on every keystroke.
+  const [nowMs, setNowMs] = React.useState(() => Date.now());
+  React.useEffect(() => {
+    const id = window.setInterval(() => setNowMs(Date.now()), 60_000);
+    return () => window.clearInterval(id);
+  }, []);
 
   // Distinct status values across the dept's subs — drives the status
   // dropdown so we don't have to hardcode the Azure billing taxonomy.
@@ -683,14 +795,40 @@ export const DepartmentAdminPage: React.FC = () => {
     return Array.from(set).sort();
   }, [allSubs]);
 
+  // Pre-compute the recent set once per (eas, nowMs) so the filter memo
+  // doesn't have to re-call Date.parse for every EA on every keystroke.
+  const recentlyAddedEaIds = React.useMemo(() => {
+    const ids = new Set<string>();
+    for (const e of eas) {
+      if (isRecentlyAdded(e.startDate, nowMs)) ids.add(e.id);
+    }
+    return ids;
+  }, [eas, nowMs]);
+
   const filteredEas = React.useMemo(() => {
     const q = search.trim().toLowerCase();
     const filtered = eas.filter((e) => {
       if (eaStatusFilter !== "all") {
         if (normalizeStatus(e.status) !== eaStatusFilter) return false;
       }
+      if (eaRecencyFilter === "last7" && !recentlyAddedEaIds.has(e.id)) {
+        return false;
+      }
       if (!q) return true;
-      return [e.displayName, e.name, e.accountOwner ?? "", e.costCenter ?? ""]
+      // Smart-search: name + display name + owner + cost center + any
+      // subscription id grouped under this EA. The sub-id branch lets an
+      // operator paste a subscription GUID and surface its owning EA
+      // without leaving the page.
+      const subIds = (subsByEaDisplayName.get(e.displayName) ?? [])
+        .map((s) => s.subscriptionId ?? "")
+        .join(" ");
+      return [
+        e.displayName,
+        e.name,
+        e.accountOwner ?? "",
+        e.costCenter ?? "",
+        subIds,
+      ]
         .join(" ")
         .toLowerCase()
         .includes(q);
@@ -723,7 +861,15 @@ export const DepartmentAdminPage: React.FC = () => {
         break;
     }
     return sorted;
-  }, [eas, search, eaStatusFilter, eaSortKey, subsByEaDisplayName]);
+  }, [
+    eas,
+    search,
+    eaStatusFilter,
+    eaSortKey,
+    eaRecencyFilter,
+    recentlyAddedEaIds,
+    subsByEaDisplayName,
+  ]);
 
   const filteredSubs = React.useMemo(() => {
     const q = subsSearch.trim().toLowerCase();
@@ -1294,6 +1440,15 @@ export const DepartmentAdminPage: React.FC = () => {
                     compact
                     tone={activeSubsCount > 0 ? "success" : "muted"}
                   />
+                  {recentlyAddedEaIds.size > 0 && (
+                    <SummaryStatItem
+                      label="Recent EAs"
+                      value={recentlyAddedEaIds.size}
+                      compact
+                      tone="info"
+                      hint="added last 7d"
+                    />
+                  )}
                   {orphanedSubs.length > 0 && (
                     <SummaryStatItem
                       label="Orphaned"
@@ -1382,6 +1537,7 @@ export const DepartmentAdminPage: React.FC = () => {
                       departmentName,
                       filterApplied: search || null,
                       statusFilter: eaStatusFilter,
+                      recencyFilter: eaRecencyFilter,
                       sort: eaSortKey,
                     }}
                   />
@@ -1405,9 +1561,9 @@ export const DepartmentAdminPage: React.FC = () => {
                     id="ea-search"
                     value={search}
                     onChange={(e) => setSearch(e.target.value)}
-                    placeholder="Name, owner, or cost center…"
+                    placeholder="Name, owner, cost center, or sub id…"
                     className="text-xs"
-                    aria-label="Filter enrollment accounts"
+                    aria-label="Filter enrollment accounts — searches across display name, EA id, owner, cost center, and any subscription id grouped under the EA"
                   />
                 </div>
                 <div className="flex flex-col gap-1">
@@ -1461,6 +1617,29 @@ export const DepartmentAdminPage: React.FC = () => {
                   </Select>
                 </div>
               </div>
+              {/* Quick chip — surfaces EAs whose `startDate` is within the
+                  last seven days, which mirrors the "recently added"
+                  review cadence in EA Billing Manager. The hint after
+                  the label is the live count so an operator knows
+                  whether toggling is worthwhile. */}
+              <FilterChipRow
+                label="Recency"
+                value={
+                  eaRecencyFilter === "last7"
+                    ? new Set(["last7"])
+                    : new Set<string>()
+                }
+                options={[
+                  {
+                    key: "last7",
+                    label: `Added in last 7 days (${recentlyAddedEaIds.size})`,
+                    tone: "info",
+                  },
+                ]}
+                onChange={(next) =>
+                  setEaRecencyFilter(next.has("last7") ? "last7" : "any")
+                }
+              />
               {eaLoading ? (
                 <SkeletonLoader variant="list" rows={4} />
               ) : eaError ? (
@@ -1531,6 +1710,20 @@ export const DepartmentAdminPage: React.FC = () => {
                               className="text-2xs"
                             >
                               {ea.status}
+                            </Badge>
+                          )}
+                          {recentlyAddedEaIds.has(ea.id) && (
+                            <Badge
+                              variant="outline"
+                              className="text-2xs border-info text-info"
+                              title={
+                                ea.startDate
+                                  ? `Onboarded ${ea.startDate}`
+                                  : "Onboarded within the last 7 days"
+                              }
+                              aria-label="This enrollment account was added in the last 7 days"
+                            >
+                              New
                             </Badge>
                           )}
                           {ea.costCenter && (

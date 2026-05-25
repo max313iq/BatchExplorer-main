@@ -56,6 +56,7 @@ import {
   CheckCircle2,
   ChevronDown,
   ChevronUp,
+  Clock,
   Loader2,
   RefreshCw,
   RotateCw,
@@ -119,10 +120,13 @@ import {
   useMultiRegionStore,
 } from "../../store/store-context";
 import type { AuditEntry } from "../../store/store-types";
+import { usePersistedState } from "../../hooks/use-persisted-state";
+import { useUrlState } from "../../hooks/use-url-state";
 import { ConfirmationDialog } from "../shared/confirmation-dialog";
 import { CopyButton, CopyableText } from "../shared/copy-button";
 import { EmptyState } from "../shared/empty-state";
 import { ExportMenu } from "../shared/export-menu";
+import type { ExportColumn } from "../shared/export-menu";
 import { InfoTooltip } from "../shared/info-tooltip";
 import { PageHeader } from "../shared/page-header";
 import { SummaryStatItem } from "../shared/summary-stat-item";
@@ -175,6 +179,26 @@ interface PrincipalRow {
   /** Final per-grant status during submission. */
   status: RowStatus;
 }
+
+/**
+ * Shape of the URL-shared selection state. Extends the open-ended
+ * `Record<string, string | string[] | undefined>` constraint that `useUrlState`
+ * requires so TypeScript accepts the type parameter without a cast.
+ */
+interface PregrantUrlState
+  extends Record<string, string | string[] | undefined> {
+  /** Selected billing-account name (matches `EaBillingAccount.name`). */
+  ba?: string;
+  /** Selected enrollment-account name (matches `EaEnrollmentAccount.name`). */
+  ea?: string;
+  /** Active tab — `undefined` collapses to the default "grant" tab. */
+  tab?: string;
+}
+const INITIAL_URL_STATE: PregrantUrlState = {
+  ba: undefined,
+  ea: undefined,
+  tab: undefined,
+};
 
 /** Build an initial blank principal row from raw text input. */
 function makeRow(input: string): PrincipalRow {
@@ -240,6 +264,42 @@ export const EaCreatorPregrantPage: React.FC = () => {
       setAccountId(candidates[0]!.homeAccountId);
     }
   }, [candidates, accountId]);
+
+  // -------------------------------------------------------------------------
+  // URL state — keep BA / EA / tab selection in the query string so operators
+  // can deep-link straight to a pregrant scope from chat or a runbook.
+  // -------------------------------------------------------------------------
+  const [urlState, setUrlState] = useUrlState<PregrantUrlState>(
+    INITIAL_URL_STATE,
+  );
+  const setBaParam = React.useCallback(
+    (name: string) => setUrlState({ ba: name || undefined }),
+    [setUrlState],
+  );
+  const setEaParam = React.useCallback(
+    (name: string) => setUrlState({ ea: name || undefined }),
+    [setUrlState],
+  );
+  const setTabParam = React.useCallback(
+    (value: string) =>
+      setUrlState({ tab: value === "grant" ? undefined : value }),
+    [setUrlState],
+  );
+  const activeTab =
+    urlState.tab === "existing" || urlState.tab === "activity"
+      ? urlState.tab
+      : "grant";
+
+  // -------------------------------------------------------------------------
+  // Persisted UI prefs — "show pending pregrants only" filter on the
+  // existing-assignments tab + the stale-pregrant threshold (days). Survives
+  // reload so the operator's saved view is sticky between sessions.
+  // -------------------------------------------------------------------------
+  const [creatorsOnlyFilter, setCreatorsOnlyFilter] = usePersistedState<boolean>(
+    "ea-creator-pregrant.creatorsOnly",
+    true,
+  );
+  const STALE_DAYS = 7;
   const account = React.useMemo(
     () => candidates.find((c) => c.homeAccountId === accountId) ?? null,
     [candidates, accountId],
@@ -294,19 +354,33 @@ export const EaCreatorPregrantPage: React.FC = () => {
     };
   }, [armToken, baReloadTick]);
 
-  const [billingAccountName, setBillingAccountName] = React.useState("");
+  const [billingAccountName, setBillingAccountName] = React.useState<string>(
+    () => urlState.ba ?? "",
+  );
   React.useEffect(() => {
     if (
       billingAccounts.length > 0 &&
       !billingAccounts.some((b) => b.name === billingAccountName)
     ) {
-      setBillingAccountName(billingAccounts[0]!.name);
+      // Prefer the URL-provided BA if it's now in the list (the list
+      // arrived after the URL was parsed); otherwise fall back to the
+      // first available BA.
+      const fromUrl = urlState.ba
+        ? billingAccounts.find((b) => b.name === urlState.ba)
+        : undefined;
+      setBillingAccountName(fromUrl ? fromUrl.name : billingAccounts[0]!.name);
     } else if (billingAccounts.length === 0 && billingAccountName) {
       // Clear stale selection if the BA list became empty (e.g. after
       // switching to an account without EA access).
       setBillingAccountName("");
     }
-  }, [billingAccounts, billingAccountName]);
+  }, [billingAccounts, billingAccountName, urlState.ba]);
+  // Keep the URL in sync whenever the operator picks a different BA.
+  React.useEffect(() => {
+    if (billingAccountName !== (urlState.ba ?? "")) {
+      setBaParam(billingAccountName);
+    }
+  }, [billingAccountName, urlState.ba, setBaParam]);
 
   // -------------------------------------------------------------------------
   // Enrollment accounts under the selected BA
@@ -340,14 +414,22 @@ export const EaCreatorPregrantPage: React.FC = () => {
     };
   }, [armToken, billingAccountName, eaReloadTick]);
 
-  const [eaName, setEaName] = React.useState("");
+  const [eaName, setEaName] = React.useState<string>(() => urlState.ea ?? "");
   React.useEffect(() => {
     if (eas.length > 0 && !eas.some((e) => e.name === eaName)) {
-      setEaName(eas[0]!.name);
+      const fromUrl = urlState.ea
+        ? eas.find((e) => e.name === urlState.ea)
+        : undefined;
+      setEaName(fromUrl ? fromUrl.name : eas[0]!.name);
     } else if (eas.length === 0 && eaName) {
       setEaName("");
     }
-  }, [eas, eaName]);
+  }, [eas, eaName, urlState.ea]);
+  React.useEffect(() => {
+    if (eaName !== (urlState.ea ?? "")) {
+      setEaParam(eaName);
+    }
+  }, [eaName, urlState.ea, setEaParam]);
 
   /** The enrollment-account ARM scope we'll write the grant against. */
   const enrollmentScope = React.useMemo(() => {
@@ -469,6 +551,42 @@ export const EaCreatorPregrantPage: React.FC = () => {
           ROLE_EA_SUBSCRIPTION_CREATOR.toLowerCase(),
       ),
     [existing],
+  );
+
+  /**
+   * "Stale" EaSubscriptionCreator assignments — older than STALE_DAYS, and
+   * the operator hasn't touched them in this session. We flag these so the
+   * operator can audit/garden long-lived grants. A missing `createdOn`
+   * (some EA APIs don't return it) is treated as "unknown" and excluded —
+   * we don't want false positives from missing-metadata rows.
+   */
+  const staleCreators = React.useMemo(() => {
+    const cutoff = Date.now() - STALE_DAYS * 24 * 60 * 60 * 1000;
+    return existingCreators.filter((a) => {
+      if (!a.createdOn) return false;
+      const t = Date.parse(a.createdOn);
+      return Number.isFinite(t) && t < cutoff;
+    });
+  }, [existingCreators]);
+
+  /**
+   * Filtered view of `existing` that the table will actually render — gated
+   * by the persisted "creators only" toggle. We keep `existing` (the raw
+   * list) as the source-of-truth so the stat counts above stay accurate.
+   */
+  const existingFiltered = React.useMemo(() => {
+    if (!creatorsOnlyFilter) return existing;
+    return existingCreators;
+  }, [creatorsOnlyFilter, existing, existingCreators]);
+
+  /**
+   * Memoized `Set` of stale-creator role-assignment ids so the row table
+   * doesn't reallocate a new Set on every render — keeps the render-cost
+   * proportional to the number of stale rows, not the table size.
+   */
+  const staleIdSet = React.useMemo(
+    () => new Set(staleCreators.map((s) => s.id)),
+    [staleCreators],
   );
 
   // -------------------------------------------------------------------------
@@ -678,6 +796,20 @@ export const EaCreatorPregrantPage: React.FC = () => {
    * accept an AbortSignal (they don't expose one through the service
    * layer), but we use this flag to stop scheduling more rows AND to skip
    * post-completion side-effects (notifications + audit records).
+   *
+   * // COORDINATOR: createEnrollmentAccountRoleAssignment,
+   * // deleteBillingRoleAssignment, listBillingRoleAssignments,
+   * // listEaBillingAccounts, listEnrollmentAccounts,
+   * // diagnoseCallerBillingRole and findUserByUpnOrMail in
+   * // services/arm-service.ts and services/graph-service.ts do not yet
+   * // accept an AbortSignal. The page protects itself with a per-effect
+   * // `cancelled` flag + `cancelFlagRef` for batch ops, but in-flight
+   * // network calls cannot actually be torn down on unmount or tenant
+   * // switch — the response just gets dropped on arrival. Threading
+   * // AbortSignal through each of these service entry points (and the
+   * // shared fetch helper they call) would let useAbortableEffect short-
+   * // circuit the network round-trip and would let "Cancel batch" abort
+   * // an outstanding role-assignment PUT instead of only the next one.
    */
   const cancelFlagRef = React.useRef<{ cancelled: boolean }>({
     cancelled: false,
@@ -1182,10 +1314,25 @@ export const EaCreatorPregrantPage: React.FC = () => {
             hint={eaName ? "right now" : ""}
             compact
           />
+          {staleCreators.length > 0 && (
+            <SummaryStatItem
+              label={`Stale > ${STALE_DAYS}d`}
+              value={staleCreators.length}
+              tone="warning"
+              hint="review for cleanup"
+              compact
+              ariaLabel={`Stale creators older than ${STALE_DAYS} days: ${staleCreators.length}`}
+              onClick={() => setTabParam("existing")}
+            />
+          )}
         </div>
       )}
 
-      <Tabs defaultValue="grant" className="space-y-3">
+      <Tabs
+        value={activeTab}
+        onValueChange={setTabParam}
+        className="space-y-3"
+      >
         <TabsList>
           <TabsTrigger value="grant">Grant</TabsTrigger>
           <TabsTrigger value="existing">
@@ -1584,24 +1731,88 @@ export const EaCreatorPregrantPage: React.FC = () => {
                     undo-able only by re-granting.
                   </CardDescription>
                 </div>
-                <Button
-                  type="button"
-                  variant="ghost"
-                  size="sm"
-                  onClick={() => setExistingReloadTick((t) => t + 1)}
-                  disabled={existingLoading || !armToken || !enrollmentScope}
-                  aria-label="Refresh existing assignments"
-                >
-                  {existingLoading ? (
-                    <Loader2 className="h-3 w-3 animate-spin" />
-                  ) : (
-                    <RefreshCw className="h-3 w-3" aria-hidden />
-                  )}
-                  Refresh
-                </Button>
+                <div className="flex flex-wrap items-center gap-2">
+                  <ExportMenu
+                    rows={existingFiltered}
+                    filename={
+                      eaName
+                        ? `ea-pregrant-matrix-${eaName}`
+                        : "ea-pregrant-matrix"
+                    }
+                    columns={MATRIX_EXPORT_COLUMNS}
+                    jsonMetadata={{
+                      page: "ea-creator-pregrant",
+                      billingAccountName,
+                      enrollmentAccountName: eaName,
+                      enrollmentScope,
+                      creatorsOnly: creatorsOnlyFilter,
+                      exportedFromTab: "existing",
+                    }}
+                    disabled={existingFiltered.length === 0}
+                  />
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="sm"
+                    onClick={() => setExistingReloadTick((t) => t + 1)}
+                    disabled={existingLoading || !armToken || !enrollmentScope}
+                    aria-label="Refresh existing assignments"
+                  >
+                    {existingLoading ? (
+                      <Loader2 className="h-3 w-3 animate-spin" />
+                    ) : (
+                      <RefreshCw className="h-3 w-3" aria-hidden />
+                    )}
+                    Refresh
+                  </Button>
+                </div>
               </div>
             </CardHeader>
-            <CardContent>
+            <CardContent className="space-y-3">
+              {/* Filter toolbar — persisted "creators only" toggle + stale hint. */}
+              {existing.length > 0 && (
+                <div
+                  className="flex flex-wrap items-center justify-between gap-2"
+                  role="toolbar"
+                  aria-label="Existing assignments filters"
+                >
+                  <div className="flex flex-wrap items-center gap-2 text-xs">
+                    <Button
+                      type="button"
+                      variant={creatorsOnlyFilter ? "secondary" : "outline"}
+                      size="xs"
+                      onClick={() => setCreatorsOnlyFilter((v) => !v)}
+                      aria-pressed={creatorsOnlyFilter}
+                      aria-label="Toggle: show EA Subscription Creator pregrants only"
+                    >
+                      <ShieldCheck
+                        className="h-3 w-3"
+                        aria-hidden
+                      />
+                      Pregrants only
+                      <span className="ml-1 rounded-full bg-background/70 px-1 text-2xs tabular-nums">
+                        {existingCreators.length}
+                      </span>
+                    </Button>
+                    <span className="text-2xs text-muted-foreground">
+                      {creatorsOnlyFilter
+                        ? `Hiding ${existing.length - existingCreators.length} non-creator role${existing.length - existingCreators.length === 1 ? "" : "s"}.`
+                        : `Showing all ${existing.length} role assignment${existing.length === 1 ? "" : "s"}.`}
+                    </span>
+                  </div>
+                  {staleCreators.length > 0 && (
+                    <Alert className="m-0 py-1.5 pr-3">
+                      <Clock className="h-3.5 w-3.5" aria-hidden />
+                      <AlertDescription className="text-2xs">
+                        {staleCreators.length} EA Subscription Creator
+                        {staleCreators.length === 1 ? " is" : "s are"} older
+                        than {STALE_DAYS} days — review whether they&apos;re
+                        still needed.
+                      </AlertDescription>
+                    </Alert>
+                  )}
+                </div>
+              )}
               {!enrollmentScope && (
                 <p className="text-xs text-muted-foreground">
                   Pick a billing account + enrollment account on the Grant
@@ -1626,9 +1837,22 @@ export const EaCreatorPregrantPage: React.FC = () => {
                     description="Either nobody has been granted a billing role here yet, or the granter lacks read access on billingRoleAssignments at this scope."
                   />
                 )}
-              {existing.length > 0 && (
+              {enrollmentScope &&
+                !existingError &&
+                !existingLoading &&
+                existing.length > 0 &&
+                existingFiltered.length === 0 && (
+                  <EmptyState
+                    icon={ShieldCheck}
+                    size="compact"
+                    title="No EA Subscription Creator assignments"
+                    description="Nobody currently holds EaSubscriptionCreator at this scope. Toggle 'Pregrants only' off to see other billing roles."
+                  />
+                )}
+              {existingFiltered.length > 0 && (
                 <ExistingAssignmentsList
-                  rows={existing}
+                  rows={existingFiltered}
+                  staleSet={staleIdSet}
                   onRevoke={setRevokeTarget}
                 />
               )}
@@ -2115,11 +2339,17 @@ const RowStatusBadge: React.FC<{ status: RowStatus }> = ({ status }) => {
 
 /** Existing-assignments list rendered as a lightweight table. */
 interface ExistingAssignmentsListProps {
-  rows: BillingRoleAssignmentSummary[];
+  rows: readonly BillingRoleAssignmentSummary[];
+  /**
+   * Set of role-assignment ids considered "stale" (older than the page's
+   * stale threshold). Empty when no rows qualify or `createdOn` is missing.
+   */
+  staleSet?: ReadonlySet<string>;
   onRevoke: (row: BillingRoleAssignmentSummary) => void;
 }
 const ExistingAssignmentsList: React.FC<ExistingAssignmentsListProps> = ({
   rows,
+  staleSet,
   onRevoke,
 }) => {
   return (
@@ -2143,6 +2373,7 @@ const ExistingAssignmentsList: React.FC<ExistingAssignmentsListProps> = ({
               EA_BILLING_ROLE_NAMES[r.roleDefinitionId.toLowerCase()] ??
               r.roleDefinitionName ??
               r.roleDefinitionId;
+            const isStale = !!staleSet?.has(r.id);
             return (
               <tr
                 key={r.id}
@@ -2156,6 +2387,16 @@ const ExistingAssignmentsList: React.FC<ExistingAssignmentsListProps> = ({
                     >
                       {friendly}
                     </Badge>
+                    {isStale && (
+                      <Badge
+                        variant="warning"
+                        className="gap-1 text-2xs"
+                        title="Older than the stale threshold — consider reviewing"
+                      >
+                        <Clock className="h-3 w-3" aria-hidden />
+                        Stale
+                      </Badge>
+                    )}
                   </div>
                 </td>
                 <td className="px-3 py-2">
@@ -2191,6 +2432,46 @@ const ExistingAssignmentsList: React.FC<ExistingAssignmentsListProps> = ({
     </div>
   );
 };
+
+/**
+ * Column descriptors for the pregrant-matrix export menu (existing-
+ * assignments tab). Headless — same accessor contract as ExportMenu's
+ * ExportColumn. We surface the full role-assignment ARM id so an operator
+ * who downloads the CSV can re-import / cross-reference downstream.
+ */
+const MATRIX_EXPORT_COLUMNS: readonly ExportColumn<BillingRoleAssignmentSummary>[] = [
+  {
+    header: "Role definition name",
+    accessor: (r) =>
+      EA_BILLING_ROLE_NAMES[r.roleDefinitionId.toLowerCase()] ??
+      r.roleDefinitionName ??
+      r.roleDefinitionId,
+  },
+  {
+    header: "Role definition id",
+    accessor: (r) => r.roleDefinitionId,
+  },
+  {
+    header: "Principal id",
+    accessor: (r) => r.principalId,
+  },
+  {
+    header: "Principal tenant id",
+    accessor: (r) => r.principalTenantId ?? "",
+  },
+  {
+    header: "Scope",
+    accessor: (r) => r.scope ?? "",
+  },
+  {
+    header: "Created (ISO)",
+    accessor: (r) => r.createdOn ?? "",
+  },
+  {
+    header: "Role assignment id",
+    accessor: (r) => r.id,
+  },
+];
 
 /** Recent-activity table rendered from the audit-log slice. */
 const RecentActivityList: React.FC<{ entries: readonly AuditEntry[] }> = ({

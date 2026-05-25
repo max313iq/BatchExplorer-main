@@ -60,7 +60,9 @@ import { OrchestratorAgent } from "../../agents/orchestrator-agent";
 import { getBatchTokenForAccount } from "../../auth/msal-auth";
 import { useArmToken } from "../../auth/use-arm-token";
 import { useAbortableEffect } from "../../hooks/use-abortable-effect";
+import { usePersistedState } from "../../hooks/use-persisted-state";
 import { useSearch } from "../../hooks/use-search";
+import { useShortcut } from "../../hooks/use-shortcut";
 import { useUrlState } from "../../hooks/use-url-state";
 import {
   type BatchNodeRemoteLoginSettings,
@@ -120,7 +122,8 @@ const ERROR_STATES: Set<NodeState> = new Set([
  * Transitional NodeStates. A node legitimately sits in one of these
  * states for a short window during pool ramp-up, reboot, reimage, or
  * scale-down. If a node lingers in a transitional state for longer than
- * STUCK_TRANSITIONAL_THRESHOLD_MS we flag it as "stuck" — typically a
+ * the operator-configurable `stuckThresholdMs` (default 15 min, see
+ * STUCK_THRESHOLD_DEFAULT_MIN), we flag it as "stuck" — typically a
  * symptom of a hung start-task, networking issue, or back-end deadlock,
  * and almost always resolvable by reimage or recreate.
  */
@@ -170,8 +173,23 @@ type QuickFilterKey =
 const AUTO_REFRESH_INTERVAL_MS = 30_000;
 const AUTO_RECOVERY_INTERVAL_MS = 60_000;
 
-/** Threshold past which a "transitioning" node is considered stuck. */
-const STUCK_TRANSITIONAL_THRESHOLD_MS = 15 * 60 * 1000;
+/**
+ * Default threshold past which a "transitioning" node is considered stuck.
+ * Operator-overridable at runtime via the slider in the toolbar; persisted
+ * via `usePersistedState`. Clamped to the [MIN, MAX] range below.
+ */
+const STUCK_THRESHOLD_DEFAULT_MIN = 15;
+const STUCK_THRESHOLD_MIN_MIN = 5;
+const STUCK_THRESHOLD_MAX_MIN = 60;
+const STUCK_THRESHOLD_STORAGE_KEY = "nodes-page.stuck-threshold-minutes";
+
+const clampStuckThreshold = (value: number): number => {
+  if (!Number.isFinite(value)) return STUCK_THRESHOLD_DEFAULT_MIN;
+  return Math.max(
+    STUCK_THRESHOLD_MIN_MIN,
+    Math.min(STUCK_THRESHOLD_MAX_MIN, Math.round(value)),
+  );
+};
 
 interface BulkActionResult {
   label: string;
@@ -261,6 +279,24 @@ const NodesPageInner: React.FC<NodesPageProps> = ({ orchestrator }) => {
    * Stored locally (not URL) because it's a one-tap UX shortcut, not a
    * shareable view. Reset on full filter clear. */
   const [quickFilter, setQuickFilter] = React.useState<QuickFilterKey>("all");
+
+  /** User-configurable stuck-node threshold (minutes). Persisted so the
+   * setting follows the operator across sessions. Clamped on read and
+   * write to defend against corrupted localStorage payloads. */
+  const [stuckThresholdMinRaw, setStuckThresholdMinRaw] =
+    usePersistedState<number>(
+      STUCK_THRESHOLD_STORAGE_KEY,
+      STUCK_THRESHOLD_DEFAULT_MIN,
+    );
+  const stuckThresholdMin = React.useMemo(
+    () => clampStuckThreshold(stuckThresholdMinRaw),
+    [stuckThresholdMinRaw],
+  );
+  const stuckThresholdMs = stuckThresholdMin * 60_000;
+  const setStuckThresholdMin = React.useCallback(
+    (value: number) => setStuckThresholdMinRaw(clampStuckThreshold(value)),
+    [setStuckThresholdMinRaw],
+  );
 
   /** Caller-friendly "copied selected node IDs" pulse for the toolbar. */
   const [copiedSelected, setCopiedSelected] = React.useState(false);
@@ -379,21 +415,39 @@ const NodesPageInner: React.FC<NodesPageProps> = ({ orchestrator }) => {
   );
 
   // ---- Refresh handler ------------------------------------------------------
+  // Tracks the most recent in-flight refresh AbortController so unmount /
+  // tenant-switch / a subsequent click can cancel an obsolete request.
+  const refreshAbortRef = React.useRef<AbortController | null>(null);
+  React.useEffect(
+    () => () => {
+      refreshAbortRef.current?.abort();
+    },
+    [],
+  );
   const handleRefreshNodes = React.useCallback(async () => {
     if (createdAccounts.length === 0) return;
+    // Cancel any previous in-flight refresh so timer-driven refresh storms
+    // (auto-refresh tick + manual click) don't queue up redundant ARM
+    // round-trips.
+    refreshAbortRef.current?.abort();
+    const ac = new AbortController();
+    refreshAbortRef.current = ac;
     setIsLoading(true);
     setError(null);
     try {
       await orchestrator.execute({
         action: "list_nodes",
         payload: { accountIds: createdAccounts.map((a) => a.id) },
+        signal: ac.signal,
       });
-      setLastRefreshedAt(Date.now());
+      if (!ac.signal.aborted) setLastRefreshedAt(Date.now());
     } catch (err: unknown) {
+      if (ac.signal.aborted) return;
       const message = err instanceof Error ? err.message : String(err);
       setError(message);
     } finally {
-      setIsLoading(false);
+      if (!ac.signal.aborted) setIsLoading(false);
+      if (refreshAbortRef.current === ac) refreshAbortRef.current = null;
     }
   }, [orchestrator, createdAccounts]);
 
@@ -465,10 +519,19 @@ const NodesPageInner: React.FC<NodesPageProps> = ({ orchestrator }) => {
 
   /**
    * Stuck-node detector — a node lingering in a transitional state past
-   * STUCK_TRANSITIONAL_THRESHOLD_MS. We treat `lastBootTime` as the most
-   * recent state-change anchor (it's the closest we get without a per-
-   * transition timestamp). When absent, we fall back to "no info" and
-   * EXCLUDE the node from the stuck set rather than flag a false-positive.
+   * the operator-configurable stuck threshold (default 15 min). We treat
+   * `lastBootTime` as the most recent state-change anchor (it's the
+   * closest we get without a per-transition timestamp). When absent OR
+   * invalid (NaN after Date.parse), we EXCLUDE the node from the stuck
+   * set rather than flag a false-positive. Same defensive parse used in
+   * `idleWasteNodes`.
+   *
+   * COORDINATOR: extract stuck-node-detector — duplicated with
+   * pool-creation page. Both pages walk `state.nodes`, filter on
+   * TRANSITIONAL_STATES + lastBootTime age, and sort oldest-first. A
+   * shared `useStuckNodes(nodes, thresholdMs)` hook (under
+   * `multi-region/hooks/`) would centralize the threshold, NaN handling,
+   * and the eslint-disable rationale on the deps array.
    */
   const stuckNodes = React.useMemo(() => {
     const now = Date.now();
@@ -476,19 +539,21 @@ const NodesPageInner: React.FC<NodesPageProps> = ({ orchestrator }) => {
       .filter((n) => {
         if (!TRANSITIONAL_STATES.has(n.state)) return false;
         if (!n.lastBootTime) return false;
-        const age = now - new Date(n.lastBootTime).getTime();
-        return age >= STUCK_TRANSITIONAL_THRESHOLD_MS;
+        const t = new Date(n.lastBootTime).getTime();
+        if (!Number.isFinite(t)) return false;
+        return now - t >= stuckThresholdMs;
       })
       .sort((a, b) => {
-        const ta = new Date(a.lastBootTime ?? 0).getTime();
-        const tb = new Date(b.lastBootTime ?? 0).getTime();
-        return ta - tb;
+        const ta = a.lastBootTime ? new Date(a.lastBootTime).getTime() : 0;
+        const tb = b.lastBootTime ? new Date(b.lastBootTime).getTime() : 0;
+        return (Number.isFinite(ta) ? ta : 0) - (Number.isFinite(tb) ? tb : 0);
       });
-    // We intentionally depend ONLY on state.nodes so this doesn't recompute
-    // every second. Recomputation cadence is governed by the parent now-tick
-    // re-render — the function captures `Date.now()` fresh each call.
+    // We intentionally depend ONLY on state.nodes + stuckThresholdMs so
+    // this doesn't recompute every second. Recomputation cadence is
+    // governed by the parent now-tick re-render — the function captures
+    // `Date.now()` fresh each call.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [state.nodes]);
+  }, [state.nodes, stuckThresholdMs]);
 
   const stuckIdSet = React.useMemo(
     () => new Set(stuckNodes.map((n) => n.id)),
@@ -656,17 +721,18 @@ const NodesPageInner: React.FC<NodesPageProps> = ({ orchestrator }) => {
   const idleWasteNodes = React.useMemo(() => {
     const now = Date.now();
     return state.nodes
-      .filter(
-        (n) =>
-          n.state === "idle" &&
-          (n.runningTasksCount ?? 0) === 0 &&
-          n.lastBootTime &&
-          now - new Date(n.lastBootTime).getTime() >= idleWasteThresholdMs,
-      )
+      .filter((n) => {
+        if (n.state !== "idle") return false;
+        if ((n.runningTasksCount ?? 0) !== 0) return false;
+        if (!n.lastBootTime) return false;
+        const t = new Date(n.lastBootTime).getTime();
+        if (!Number.isFinite(t)) return false;
+        return now - t >= idleWasteThresholdMs;
+      })
       .sort((a, b) => {
-        const ta = new Date(a.lastBootTime ?? 0).getTime();
-        const tb = new Date(b.lastBootTime ?? 0).getTime();
-        return ta - tb;
+        const ta = a.lastBootTime ? new Date(a.lastBootTime).getTime() : 0;
+        const tb = b.lastBootTime ? new Date(b.lastBootTime).getTime() : 0;
+        return (Number.isFinite(ta) ? ta : 0) - (Number.isFinite(tb) ? tb : 0);
       });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [state.nodes]);
@@ -703,6 +769,27 @@ const NodesPageInner: React.FC<NodesPageProps> = ({ orchestrator }) => {
     }
     if (changed) setSelection(next);
   }, [visibleNodes, selection]);
+
+  // ---- Bulk action abort controller ----------------------------------------
+  // Single in-flight bulk operation at a time (gated by `isActing`); when
+  // the page unmounts mid-bulk-reboot we abort so the orchestrator can
+  // short-circuit any pending per-node calls.
+  const bulkAbortRef = React.useRef<AbortController | null>(null);
+  React.useEffect(
+    () => () => {
+      bulkAbortRef.current?.abort();
+    },
+    [],
+  );
+  const beginBulkAction = React.useCallback((): AbortController => {
+    bulkAbortRef.current?.abort();
+    const ac = new AbortController();
+    bulkAbortRef.current = ac;
+    return ac;
+  }, []);
+  const endBulkAction = React.useCallback((ac: AbortController) => {
+    if (bulkAbortRef.current === ac) bulkAbortRef.current = null;
+  }, []);
 
   // ---- Bulk action result helper -------------------------------------------
   const computeBulkResult = React.useCallback(
@@ -788,6 +875,7 @@ const NodesPageInner: React.FC<NodesPageProps> = ({ orchestrator }) => {
       }
 
       const executeAction = async () => {
+        const ac = beginBulkAction();
         setIsActing(true);
         setError(null);
         setBulkResult(null);
@@ -803,6 +891,7 @@ const NodesPageInner: React.FC<NodesPageProps> = ({ orchestrator }) => {
           await orchestrator.execute({
             action: "bulk_node_action",
             payload: { actionType: action, nodeIds: ids },
+            signal: ac.signal,
           });
           const result = computeBulkResult(label, ids);
           setBulkResult(result);
@@ -839,6 +928,7 @@ const NodesPageInner: React.FC<NodesPageProps> = ({ orchestrator }) => {
         } finally {
           setIsActing(false);
           setBulkProgressMessage(null);
+          endBulkAction(ac);
         }
       };
 
@@ -855,9 +945,25 @@ const NodesPageInner: React.FC<NodesPageProps> = ({ orchestrator }) => {
           skippedCount > 0
             ? ` ${formatNumber(skippedCount)} selected node(s) will be skipped because they are in a non-actionable state.`
             : "";
+        // Per-state breakdown of the ACTIONABLE set, so operators see
+        // exactly what mix of states they're about to act on (e.g.
+        // "3 running, 2 idle, 1 starttaskfailed"). Sorted by count desc.
+        const stateCounts = new Map<NodeState, number>();
+        for (const n of actionable) {
+          stateCounts.set(n.state, (stateCounts.get(n.state) ?? 0) + 1);
+        }
+        const breakdown =
+          stateCounts.size > 0
+            ? " Breakdown: " +
+              Array.from(stateCounts.entries())
+                .sort((a, b) => b[1] - a[1])
+                .map(([s, n]) => `${formatNumber(n)} ${s}`)
+                .join(", ") +
+              "."
+            : "";
         showConfirmation(
           `${verbCap} ${formatNumber(ids.length)} node${ids.length === 1 ? "" : "s"}?`,
-          `${detail}${skipNote}`,
+          `${detail}${skipNote}${breakdown}`,
           verbCap,
           true,
           executeAction,
@@ -873,6 +979,8 @@ const NodesPageInner: React.FC<NodesPageProps> = ({ orchestrator }) => {
       showConfirmation,
       computeBulkResult,
       primaryAccount,
+      beginBulkAction,
+      endBulkAction,
     ],
   );
 
@@ -1119,6 +1227,7 @@ const NodesPageInner: React.FC<NodesPageProps> = ({ orchestrator }) => {
     }
 
     const executeDelete = async () => {
+      const ac = beginBulkAction();
       setIsActing(true);
       setError(null);
       setBulkResult(null);
@@ -1132,6 +1241,7 @@ const NodesPageInner: React.FC<NodesPageProps> = ({ orchestrator }) => {
         await orchestrator.execute({
           action: "delete_nodes",
           payload: { nodeIds: ids },
+          signal: ac.signal,
         });
         setBulkResult({
           label: "delete",
@@ -1170,12 +1280,34 @@ const NodesPageInner: React.FC<NodesPageProps> = ({ orchestrator }) => {
       } finally {
         setIsActing(false);
         setBulkProgressMessage(null);
+        endBulkAction(ac);
       }
     };
 
+    // Per-state breakdown shown in the dialog so the operator understands
+    // exactly which states they're deleting (delete is allowed in every
+    // state but the mix matters — deleting 5 running + 1 unusable is a
+    // very different operation from deleting 6 idle).
+    const stateCounts = new Map<NodeState, number>();
+    for (const id of ids) {
+      const node = state.nodes.find((n) => n.id === id);
+      if (node) {
+        stateCounts.set(node.state, (stateCounts.get(node.state) ?? 0) + 1);
+      }
+    }
+    const breakdown =
+      stateCounts.size > 0
+        ? " Breakdown: " +
+          Array.from(stateCounts.entries())
+            .sort((a, b) => b[1] - a[1])
+            .map(([s, n]) => `${formatNumber(n)} ${s}`)
+            .join(", ") +
+          "."
+        : "";
+
     showConfirmation(
       `Delete ${formatNumber(ids.length)} node${ids.length === 1 ? "" : "s"}?`,
-      `This will affect ${poolSet.size} pool(s). Running tasks on affected nodes will be requeued. This action cannot be undone.`,
+      `This will affect ${poolSet.size} pool(s). Running tasks on affected nodes will be requeued. This action cannot be undone.${breakdown}`,
       "Delete",
       true,
       executeDelete,
@@ -1186,6 +1318,8 @@ const NodesPageInner: React.FC<NodesPageProps> = ({ orchestrator }) => {
     orchestrator,
     showConfirmation,
     primaryAccount,
+    beginBulkAction,
+    endBulkAction,
   ]);
 
   // ---- Bulk recreate --------------------------------------------------------
@@ -1197,6 +1331,7 @@ const NodesPageInner: React.FC<NodesPageProps> = ({ orchestrator }) => {
     if (ids.length === 0) return;
 
     const executeRecreate = async () => {
+      const ac = beginBulkAction();
       setIsActing(true);
       setError(null);
       const actor = primaryAccount?.homeAccountId ?? "ui";
@@ -1204,6 +1339,7 @@ const NodesPageInner: React.FC<NodesPageProps> = ({ orchestrator }) => {
         await orchestrator.execute({
           action: "recreate_nodes",
           payload: { nodeIds: ids },
+          signal: ac.signal,
         });
         auditLog.record({
           actor,
@@ -1225,6 +1361,7 @@ const NodesPageInner: React.FC<NodesPageProps> = ({ orchestrator }) => {
         });
       } finally {
         setIsActing(false);
+        endBulkAction(ac);
       }
     };
 
@@ -1235,7 +1372,14 @@ const NodesPageInner: React.FC<NodesPageProps> = ({ orchestrator }) => {
       false,
       executeRecreate,
     );
-  }, [selectedIds, orchestrator, showConfirmation, primaryAccount]);
+  }, [
+    selectedIds,
+    orchestrator,
+    showConfirmation,
+    primaryAccount,
+    beginBulkAction,
+    endBulkAction,
+  ]);
 
   // ---- Recover preempted ----------------------------------------------------
   const handleRecoverPreempted = React.useCallback(() => {
@@ -1248,6 +1392,7 @@ const NodesPageInner: React.FC<NodesPageProps> = ({ orchestrator }) => {
     }
 
     const executeRecover = async () => {
+      const ac = beginBulkAction();
       setIsActing(true);
       setError(null);
       const actor = primaryAccount?.homeAccountId ?? "ui";
@@ -1255,6 +1400,7 @@ const NodesPageInner: React.FC<NodesPageProps> = ({ orchestrator }) => {
         await orchestrator.execute({
           action: "recover_preempted",
           payload: {},
+          signal: ac.signal,
         });
         auditLog.record({
           actor,
@@ -1276,6 +1422,7 @@ const NodesPageInner: React.FC<NodesPageProps> = ({ orchestrator }) => {
         });
       } finally {
         setIsActing(false);
+        endBulkAction(ac);
       }
     };
 
@@ -1288,7 +1435,14 @@ const NodesPageInner: React.FC<NodesPageProps> = ({ orchestrator }) => {
       false,
       executeRecover,
     );
-  }, [state.nodes, orchestrator, showConfirmation, primaryAccount]);
+  }, [
+    state.nodes,
+    orchestrator,
+    showConfirmation,
+    primaryAccount,
+    beginBulkAction,
+    endBulkAction,
+  ]);
 
   // ---- Bulk reimage of stuck nodes -----------------------------------------
   // One-click recovery for nodes flagged by the stuck-state detector. Uses
@@ -1299,6 +1453,7 @@ const NodesPageInner: React.FC<NodesPageProps> = ({ orchestrator }) => {
     const ids = stuckNodes.map((n) => n.id);
 
     const executeReimage = async () => {
+      const ac = beginBulkAction();
       setIsActing(true);
       setError(null);
       setBulkResult(null);
@@ -1312,6 +1467,7 @@ const NodesPageInner: React.FC<NodesPageProps> = ({ orchestrator }) => {
         await orchestrator.execute({
           action: "bulk_node_action",
           payload: { actionType: "reimage", nodeIds: ids },
+          signal: ac.signal,
         });
         const result = computeBulkResult("reimage stuck", ids);
         setBulkResult(result);
@@ -1347,6 +1503,7 @@ const NodesPageInner: React.FC<NodesPageProps> = ({ orchestrator }) => {
       } finally {
         setIsActing(false);
         setBulkProgressMessage(null);
+        endBulkAction(ac);
       }
     };
 
@@ -1354,7 +1511,7 @@ const NodesPageInner: React.FC<NodesPageProps> = ({ orchestrator }) => {
       `Reimage ${formatNumber(stuckNodes.length)} stuck node${
         stuckNodes.length === 1 ? "" : "s"
       }?`,
-      "These nodes have been transitioning for more than 15 minutes — typically a hung start-task or a back-end deadlock. Reimage restores the OS disk from the source image; any in-progress work is requeued.",
+      `These nodes have been transitioning for more than ${stuckThresholdMin} minute${stuckThresholdMin === 1 ? "" : "s"} — typically a hung start-task or a back-end deadlock. Reimage restores the OS disk from the source image; any in-progress work is requeued.`,
       "Reimage",
       true,
       executeReimage,
@@ -1365,6 +1522,9 @@ const NodesPageInner: React.FC<NodesPageProps> = ({ orchestrator }) => {
     showConfirmation,
     computeBulkResult,
     primaryAccount,
+    stuckThresholdMin,
+    beginBulkAction,
+    endBulkAction,
   ]);
 
   // ---- DataTable columns ---------------------------------------------------
@@ -1721,32 +1881,55 @@ const NodesPageInner: React.FC<NodesPageProps> = ({ orchestrator }) => {
       ? null
       : formatRelativeTime(new Date(lastRefreshedAt));
 
-  // ---- Keyboard shortcuts: / to focus search, Esc to clear ----------------
-  // Standard pattern from Gmail / GitHub. Guard against firing while the
-  // user is typing into another input or has a modifier key held — `/`
-  // is a real character somebody might want to type. We only intercept
-  // when no other input has focus.
+  // ---- Keyboard shortcuts -------------------------------------------------
+  // Standard pattern from Gmail / GitHub. `useShortcut` already guards
+  // against firing while focus is in an input/textarea/select/contentEditable
+  // (via its built-in isEditableTarget filter), so we don't need a manual
+  // tagName check anymore.
+  //
+  //   /        → focus + select the search input
+  //   Escape   → clear the search when the search input is focused
+  //   r        → reboot selected (if any actionable; confirmation dialog)
+  //   Delete   → delete selected (if any; confirmation dialog)
   const searchInputRef = React.useRef<HTMLInputElement | null>(null);
-  React.useEffect(() => {
-    const onKey = (e: KeyboardEvent) => {
-      const target = e.target as HTMLElement | null;
-      const tagName = target?.tagName?.toLowerCase();
-      const isEditable =
-        tagName === "input" ||
-        tagName === "textarea" ||
-        tagName === "select" ||
-        target?.isContentEditable;
-      if (e.key === "/" && !isEditable && !e.metaKey && !e.ctrlKey && !e.altKey) {
-        e.preventDefault();
-        searchInputRef.current?.focus();
-        searchInputRef.current?.select();
-      } else if (e.key === "Escape" && tagName === "input" && target === searchInputRef.current) {
+  useShortcut("/", () => {
+    searchInputRef.current?.focus();
+    searchInputRef.current?.select();
+  });
+  // Escape: bound to the search input element itself so the hotkey only
+  // fires when search has focus — otherwise we'd be capturing Escape from
+  // dialogs/menus which all have their own dismiss semantics.
+  useShortcut(
+    "Escape",
+    () => {
+      if (document.activeElement === searchInputRef.current) {
         search.setQuery("");
       }
-    };
-    document.addEventListener("keydown", onKey);
-    return () => document.removeEventListener("keydown", onKey);
-  }, [search]);
+    },
+    { allowInInputs: true, preventDefault: false },
+  );
+  // r → reboot selected. Disabled while no selection / a bulk op is in
+  // flight to avoid accidental double-firing (the hotkey can repeat).
+  useShortcut(
+    "r",
+    () => {
+      if (selection.size === 0 || isActing) return;
+      void handleNodeAction("reboot");
+    },
+    { enabled: selection.size > 0 && !isActing },
+  );
+  // Delete → delete selected (uses the same confirmation dialog as the
+  // toolbar button so the operator gets the per-state breakdown).
+  // Intentionally bound to "Delete" only — Backspace is too easy to
+  // trigger accidentally while focus is on a non-input element.
+  useShortcut(
+    "Delete",
+    () => {
+      if (selection.size === 0 || isActing) return;
+      handleDeleteNodes();
+    },
+    { enabled: selection.size > 0 && !isActing },
+  );
 
   // ---- Render branches ------------------------------------------------------
   const initialLoading = isLoading && state.nodes.length === 0;
@@ -2114,14 +2297,15 @@ const NodesPageInner: React.FC<NodesPageProps> = ({ orchestrator }) => {
           </div>
 
           {/* Stuck-state detector — surfaces nodes lingering in a
-              transitional state past STUCK_TRANSITIONAL_THRESHOLD_MS.
-              Almost always a hung start-task or a back-end deadlock;
-              reimage usually clears them. Single-click bulk recovery
-              via the "Reimage stuck" button. */}
+              transitional state past the operator-configurable
+              `stuckThresholdMs` (default 15 min). Almost always a hung
+              start-task or a back-end deadlock; reimage usually clears
+              them. Single-click bulk recovery via the "Reimage stuck"
+              button. */}
           <div className="rounded-md border border-border bg-card p-4">
             <div className="flex flex-wrap items-baseline justify-between gap-2">
               <h3 className="m-0 text-xs font-semibold uppercase tracking-wider text-muted-foreground">
-                Stuck nodes (&gt; 15 min)
+                Stuck nodes (&gt; {stuckThresholdMin} min)
               </h3>
               <span
                 className={cn(
@@ -2138,9 +2322,42 @@ const NodesPageInner: React.FC<NodesPageProps> = ({ orchestrator }) => {
                   : `${stuckNodes.length} stuck`}
               </span>
             </div>
+            {/* Operator-configurable threshold slider. Persisted via
+                usePersistedState so the choice follows the operator. The
+                native <input type="range"> is keyboard-accessible by
+                default (ArrowLeft / ArrowRight, PageUp / PageDown). */}
+            <div className="mt-2 flex items-center gap-2">
+              <Label
+                htmlFor="nodes-stuck-threshold"
+                className="text-2xs text-muted-foreground shrink-0"
+              >
+                Threshold
+              </Label>
+              <input
+                id="nodes-stuck-threshold"
+                type="range"
+                min={STUCK_THRESHOLD_MIN_MIN}
+                max={STUCK_THRESHOLD_MAX_MIN}
+                step={1}
+                value={stuckThresholdMin}
+                onChange={(e) =>
+                  setStuckThresholdMin(Number(e.currentTarget.value))
+                }
+                aria-label={`Stuck-node threshold in minutes; current value ${stuckThresholdMin}`}
+                aria-valuemin={STUCK_THRESHOLD_MIN_MIN}
+                aria-valuemax={STUCK_THRESHOLD_MAX_MIN}
+                aria-valuenow={stuckThresholdMin}
+                aria-valuetext={`${stuckThresholdMin} minute${stuckThresholdMin === 1 ? "" : "s"}`}
+                className="h-1 flex-1 cursor-pointer appearance-none rounded-full bg-muted accent-warning"
+              />
+              <span className="tabular-nums text-2xs text-muted-foreground w-12 text-right">
+                {stuckThresholdMin} min
+              </span>
+            </div>
             {stuckNodes.length === 0 ? (
               <p className="mt-2 text-2xs text-muted-foreground">
-                No nodes have been transitioning for more than 15 minutes —
+                No nodes have been transitioning for more than{" "}
+                {stuckThresholdMin} minute{stuckThresholdMin === 1 ? "" : "s"} —
                 ramp-up and reimage cycles look healthy.
               </p>
             ) : (
@@ -2265,13 +2482,13 @@ const NodesPageInner: React.FC<NodesPageProps> = ({ orchestrator }) => {
           label="Transitioning"
           value={summaryStats.transitioning}
           tone="warning"
-          tooltip="Nodes in creating, starting, rebooting, reimaging, leavingpool, or waiting-for-start-task. Brief is normal; > 15 min is flagged as stuck."
+          tooltip={`Nodes in creating, starting, rebooting, reimaging, leavingpool, or waiting-for-start-task. Brief is normal; > ${stuckThresholdMin} min is flagged as stuck.`}
         />
         <StatCard
           label="Stuck"
           value={summaryStats.stuck}
           tone={summaryStats.stuck > 0 ? "destructive" : undefined}
-          tooltip="Nodes transitioning for more than 15 minutes. Almost always a hung start-task; reimage usually clears them."
+          tooltip={`Nodes transitioning for more than ${stuckThresholdMin} minute${stuckThresholdMin === 1 ? "" : "s"}. Almost always a hung start-task; reimage usually clears them.`}
         />
         <StatCard
           label="Errors"
@@ -2562,8 +2779,9 @@ const NodesPageInner: React.FC<NodesPageProps> = ({ orchestrator }) => {
           fill; destructive actions are kept visually distinct. */}
       {hasSelection && (
         <div
-          role="region"
+          role="toolbar"
           aria-label="Bulk actions for selected nodes"
+          aria-orientation="horizontal"
           className="sticky bottom-0 z-20 -mx-1 flex flex-wrap items-center gap-2 rounded-lg border border-primary/30 bg-card/95 px-3 py-2 shadow-elev-2 backdrop-blur supports-[backdrop-filter]:bg-card/80 motion-safe:animate-in motion-safe:fade-in-0 motion-safe:slide-in-from-bottom-2 motion-safe:duration-200"
         >
           <span className="inline-flex items-center gap-2 rounded-full bg-primary/15 px-2.5 py-0.5 text-xs font-semibold text-primary">
@@ -2631,7 +2849,8 @@ const NodesPageInner: React.FC<NodesPageProps> = ({ orchestrator }) => {
                       ? "Reboot"
                       : `Reboot (${rebootable})`
                   }
-                  ariaLabel={`Reboot ${rebootable} actionable selected nodes`}
+                  ariaLabel={`Reboot ${rebootable} actionable selected nodes (keyboard shortcut: r)`}
+                  ariaKeyshortcuts="r"
                   onClick={() => handleNodeAction("reboot")}
                   disabled={isActing || rebootable === 0}
                   disabledReason={
@@ -2695,7 +2914,8 @@ const NodesPageInner: React.FC<NodesPageProps> = ({ orchestrator }) => {
                 <BulkActionButton
                   icon={Trash2}
                   label="Delete"
-                  ariaLabel={`Delete ${selectionCount} selected nodes`}
+                  ariaLabel={`Delete ${selectionCount} selected nodes (keyboard shortcut: Delete)`}
+                  ariaKeyshortcuts="Delete"
                   onClick={handleDeleteNodes}
                   disabled={isActing || selectionCount === 0}
                   tone="destructive"
@@ -3262,6 +3482,13 @@ interface BulkActionButtonProps {
   disabled?: boolean;
   disabledReason?: string;
   tone?: "primary-solid" | "destructive" | "warning";
+  /**
+   * Optional keyboard shortcut hint for screen readers (e.g. "r" or
+   * "Delete"). Renders as the standard `aria-keyshortcuts` attribute
+   * so assistive tech can announce the chord without us baking it into
+   * the visible label.
+   */
+  ariaKeyshortcuts?: string;
 }
 
 const TONE_TO_CLASS: Record<NonNullable<BulkActionButtonProps["tone"]>, string> = {
@@ -3280,6 +3507,7 @@ const BulkActionButton: React.FC<BulkActionButtonProps> = ({
   disabled,
   disabledReason,
   tone,
+  ariaKeyshortcuts,
 }) => {
   const isPrimary = tone === "primary-solid";
   const button = (
@@ -3290,6 +3518,7 @@ const BulkActionButton: React.FC<BulkActionButtonProps> = ({
       onClick={onClick}
       disabled={disabled}
       aria-label={ariaLabel}
+      aria-keyshortcuts={ariaKeyshortcuts}
       className={cn(
         "transition-colors duration-150 ease-out motion-reduce:transition-none",
         !isPrimary && tone ? TONE_TO_CLASS[tone] : undefined,

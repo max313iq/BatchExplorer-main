@@ -34,7 +34,6 @@
  *     export now captures startedAt + durations.
  */
 import * as React from "react";
-import { useNavigate } from "react-router-dom";
 import {
   AlertTriangle,
   ArrowRight,
@@ -86,8 +85,11 @@ import {
 } from "../../auth/msal-auth";
 import { resolveActiveTenantId } from "../../auth/perform-tenant-switch";
 import { useArmToken } from "../../auth/use-arm-token";
+import { useAbortableEffect } from "../../hooks/use-abortable-effect";
+import { usePersistedState } from "../../hooks/use-persisted-state";
 import { useTenantChange } from "../../hooks/use-tenant-change";
 import { auditLog } from "../../services/audit-log";
+import { useDashboardOutletContext } from "../page-router";
 import {
   changeSubscriptionTenant,
   listEaBillingAccounts,
@@ -377,10 +379,31 @@ function fmtDuration(ms: number | undefined): string {
   return `${m}m ${s % 60}s`;
 }
 
+/**
+ * Maximum number of "recently used target tenants" to keep in
+ * localStorage. The UI surfaces these as one-click pills above the
+ * destination-tenant Input so an operator who pivots between the same
+ * 2-3 tenants all day doesn't have to paste a GUID every time.
+ */
+const RECENT_DEST_TENANTS_MAX = 6;
+const STORAGE_RECENT_DEST_TENANTS = "sub-mover:recent-dest-tenants";
+
+interface RecentDestTenant {
+  readonly tenantId: string;
+  /** Optional human label, captured from the first time the operator used it. */
+  readonly label?: string;
+  /** ISO timestamp of the last successful use — drives MRU ordering. */
+  readonly lastUsedAt: string;
+}
+
 export const SubMoverPage: React.FC = () => {
   const state = useMultiRegionState();
   const store = useMultiRegionStore();
-  const navigate = useNavigate();
+  // COORDINATOR: canonical wiring contract — path-based navigation via
+  // the dashboard outlet context. Direct `useNavigate` was previously
+  // used inside this page; switching to the outlet helper keeps a single
+  // source of truth for page paths (and lets the shell intercept nav).
+  const { navigateToPage } = useDashboardOutletContext();
   const azureAccounts = state.azureAccounts ?? [];
 
   /* ----- Account picker ------------------------------------------- */
@@ -467,25 +490,24 @@ export const SubMoverPage: React.FC = () => {
     }
   }, []);
 
-  React.useEffect(() => {
-    if (!account) {
-      setArmToken(null);
-      setBillingAccounts([]);
-      return;
-    }
-    let cancelled = false;
-    setBaLoading(true);
-    setBaError(null);
-    (async () => {
+  useAbortableEffect(
+    async (signal) => {
+      if (!account) {
+        setArmToken(null);
+        setBillingAccounts([]);
+        return;
+      }
+      setBaLoading(true);
+      setBaError(null);
       try {
         // Tenant arg omitted so we pick up the operator's current active
         // tenant (was pinning to account.tenantId / the account's HOME
         // tenant — pre-switch).
         const tok = await getArmTokenForAccount(account.homeAccountId);
-        if (cancelled) return;
+        if (signal.aborted) return;
         setArmToken(tok);
         const list = await listEaBillingAccounts(tok);
-        if (cancelled) return;
+        if (signal.aborted) return;
         setBillingAccounts(list);
         if (list.length === 1 && billingAccountName !== list[0]!.name) {
           setBillingAccountName(list[0]!.name);
@@ -496,18 +518,20 @@ export const SubMoverPage: React.FC = () => {
           setBillingAccountName("");
         }
       } catch (err) {
-        if (cancelled) return;
-        setTokenError(err instanceof Error ? err.message : String(err));
-        setBaError(err instanceof Error ? err.message : String(err));
+        if (signal.aborted || isAbortError(err)) return;
+        const msg = err instanceof Error ? err.message : String(err);
+        setTokenError(msg);
+        setBaError(msg);
       } finally {
-        if (!cancelled) setBaLoading(false);
+        if (!signal.aborted) setBaLoading(false);
       }
-    })();
-    return () => {
-      cancelled = true;
-    };
+    },
+    // billingAccountName is intentionally NOT a dep — the auto-seed logic
+    // here only runs on account / tenant change, not on every operator
+    // pick of a billing account.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [account?.homeAccountId, account?.tenantId]);
+    [account?.homeAccountId, account?.tenantId],
+  );
 
   /* ----- Subscriptions + enrollment accounts (under billing acct) -- */
   const [subscriptions, setSubscriptions] = React.useState<EaBillingSubscription[]>([]);
@@ -521,43 +545,42 @@ export const SubMoverPage: React.FC = () => {
   const [reloadTick, setReloadTick] = React.useState(0);
   const reload = React.useCallback(() => setReloadTick((n) => n + 1), []);
 
-  React.useEffect(() => {
-    if (!armToken || !billingAccountName) {
-      setSubscriptions([]);
-      setEnrollmentAccounts([]);
-      return;
-    }
-    let cancelled = false;
-    setSubsLoading(true);
-    setEaLoading(true);
-    setSubsError(null);
-    setEaError(null);
-    listEaBillingSubscriptions(billingAccountName, armToken)
-      .then((list) => {
-        if (!cancelled) setSubscriptions(list);
-      })
-      .catch((err: unknown) => {
-        if (!cancelled)
+  useAbortableEffect(
+    (signal) => {
+      if (!armToken || !billingAccountName) {
+        setSubscriptions([]);
+        setEnrollmentAccounts([]);
+        return;
+      }
+      setSubsLoading(true);
+      setEaLoading(true);
+      setSubsError(null);
+      setEaError(null);
+      listEaBillingSubscriptions(billingAccountName, armToken)
+        .then((list) => {
+          if (!signal.aborted) setSubscriptions(list);
+        })
+        .catch((err: unknown) => {
+          if (signal.aborted || isAbortError(err)) return;
           setSubsError(err instanceof Error ? err.message : String(err));
-      })
-      .finally(() => {
-        if (!cancelled) setSubsLoading(false);
-      });
-    listEnrollmentAccounts(billingAccountName, armToken)
-      .then((list) => {
-        if (!cancelled) setEnrollmentAccounts(list);
-      })
-      .catch((err: unknown) => {
-        if (!cancelled)
+        })
+        .finally(() => {
+          if (!signal.aborted) setSubsLoading(false);
+        });
+      listEnrollmentAccounts(billingAccountName, armToken)
+        .then((list) => {
+          if (!signal.aborted) setEnrollmentAccounts(list);
+        })
+        .catch((err: unknown) => {
+          if (signal.aborted || isAbortError(err)) return;
           setEaError(err instanceof Error ? err.message : String(err));
-      })
-      .finally(() => {
-        if (!cancelled) setEaLoading(false);
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [armToken, billingAccountName, reloadTick]);
+        })
+        .finally(() => {
+          if (!signal.aborted) setEaLoading(false);
+        });
+    },
+    [armToken, billingAccountName, reloadTick],
+  );
 
   /* ----- Selection ------------------------------------------------ */
   const [search, setSearch] = React.useState("");
@@ -685,6 +708,91 @@ export const SubMoverPage: React.FC = () => {
       /* ignore */
     }
   }, []);
+
+  // ENHANCEMENT — Recently used target tenants. Persisted across browser
+  // sessions (this is cross-tab safe via `usePersistedState`), MRU-ordered,
+  // and capped at RECENT_DEST_TENANTS_MAX. Each entry remembers the last
+  // human label (typically the destination tenant's primary domain) so the
+  // pill row reads as something other than a raw GUID.
+  const [recentDestTenants, setRecentDestTenants] = usePersistedState<
+    ReadonlyArray<RecentDestTenant>
+  >(STORAGE_RECENT_DEST_TENANTS, [], {
+    syncAcrossTabs: true,
+    version: 1,
+    // Guard against shape drift (older versions stored bare strings).
+    migrate: (data, _v) => {
+      if (Array.isArray(data)) {
+        const seen = new Set<string>();
+        const out: RecentDestTenant[] = [];
+        for (const entry of data) {
+          if (typeof entry === "string" && UUID_RE.test(entry)) {
+            if (seen.has(entry)) continue;
+            seen.add(entry);
+            out.push({ tenantId: entry, lastUsedAt: new Date(0).toISOString() });
+          } else if (
+            entry &&
+            typeof entry === "object" &&
+            typeof (entry as RecentDestTenant).tenantId === "string" &&
+            UUID_RE.test((entry as RecentDestTenant).tenantId)
+          ) {
+            const e = entry as RecentDestTenant;
+            if (seen.has(e.tenantId)) continue;
+            seen.add(e.tenantId);
+            out.push({
+              tenantId: e.tenantId,
+              label: typeof e.label === "string" ? e.label : undefined,
+              lastUsedAt:
+                typeof e.lastUsedAt === "string"
+                  ? e.lastUsedAt
+                  : new Date(0).toISOString(),
+            });
+          }
+        }
+        return out.slice(0, RECENT_DEST_TENANTS_MAX);
+      }
+      return [];
+    },
+  });
+
+  /**
+   * Record a tenantId as "just used" — pushes it to the head of the MRU
+   * list, dedupes against prior entries, and truncates to the configured
+   * cap. Called on a successful changeTenant batch (not on accept-only
+   * runs, since accept doesn't prove the destination is real).
+   */
+  const noteRecentDestTenant = React.useCallback(
+    (tenantId: string, label?: string) => {
+      const trimmed = tenantId.trim();
+      if (!UUID_RE.test(trimmed)) return;
+      const lower = trimmed.toLowerCase();
+      setRecentDestTenants((prev) => {
+        const filtered = prev.filter(
+          (e) => e.tenantId.toLowerCase() !== lower,
+        );
+        const next: RecentDestTenant[] = [
+          {
+            tenantId: trimmed,
+            label,
+            lastUsedAt: new Date().toISOString(),
+          },
+          ...filtered,
+        ];
+        return next.slice(0, RECENT_DEST_TENANTS_MAX);
+      });
+    },
+    [setRecentDestTenants],
+  );
+
+  /** Remove a single tenant from the MRU list (per-pill "x" button). */
+  const forgetRecentDestTenant = React.useCallback(
+    (tenantId: string) => {
+      const lower = tenantId.toLowerCase();
+      setRecentDestTenants((prev) =>
+        prev.filter((e) => e.tenantId.toLowerCase() !== lower),
+      );
+    },
+    [setRecentDestTenants],
+  );
   /** Operator-tunable parallelism. 1 = legacy sequential behavior. */
   const [concurrency, setConcurrencyState] = React.useState<Concurrency>(() => {
     try {
@@ -714,6 +822,11 @@ export const SubMoverPage: React.FC = () => {
   const [results, setResults] = React.useState<RowResult[]>([]);
   // Confirmation dialog state (replaces the native window.confirm).
   const [confirmOpen, setConfirmOpen] = React.useState(false);
+  // Cancel-with-confirm: abort during an in-flight batch is destructive
+  // (already-accepted rows continue on Azure's side; pending rows are
+  // dropped), so we gate it behind a small modal instead of acting on the
+  // first click.
+  const [abortConfirmOpen, setAbortConfirmOpen] = React.useState(false);
   // Abort controller so the operator can cancel an in-flight batch — when
   // pollLros is enabled it ALSO cancels the in-flight poll fetches so the
   // operator doesn't have to wait minutes for the runner to drain.
@@ -1275,6 +1388,18 @@ export const SubMoverPage: React.FC = () => {
             ? `Billing transfer batch complete (${rows.length} row${rows.length === 1 ? "" : "s"}).`
             : `Change-tenant batch complete (${rows.length} row${rows.length === 1 ? "" : "s"}). Destination tenant may still need to accept the offer.`,
       });
+      // ENHANCEMENT — promote the destination tenant to the MRU list
+      // when a change-tenant batch at least reaches "accepted" without
+      // aborting. We don't gate on the LRO outcome because change-tenant
+      // commonly stays Pending on Azure's side until the destination
+      // tenant admin accepts the offer — we still want it remembered.
+      if (
+        !controller.signal.aborted &&
+        opKind === "change-tenant" &&
+        destTenant
+      ) {
+        noteRecentDestTenant(destTenant);
+      }
       setReloadTick((n) => n + 1);
       // Only clear the selection on a full success run — preserve on
       // abort/failure so the operator can rerun without re-selecting.
@@ -1291,6 +1416,7 @@ export const SubMoverPage: React.FC = () => {
       pollLros,
       runOneRow,
       store,
+      noteRecentDestTenant,
     ],
   );
 
@@ -1298,11 +1424,24 @@ export const SubMoverPage: React.FC = () => {
     void runRows();
   }, [runRows]);
 
-  /** Cancel the in-flight batch. The current ARM accept-call is left to
-   *  settle (its underlying fetch isn't AbortController-aware), but any
-   *  in-flight LRO polling AND any rows not yet started are aborted. */
-  const abortBatch = React.useCallback(() => {
+  /**
+   * Request cancel — opens a confirmation modal instead of aborting
+   * immediately. Cross-tenant moves are destructive (and rows already
+   * accepted by Azure cannot be un-accepted page-side) so the operator
+   * confirms once. Esc-during-batch still routes through here so a
+   * mis-press doesn't kill a batch the operator forgot they kicked off.
+   */
+  const requestAbortBatch = React.useCallback(() => {
+    if (!running) return;
+    setAbortConfirmOpen(true);
+  }, [running]);
+
+  /** Actually fire the abort once confirmed. The accept-call fetch isn't
+   *  AbortController-aware today, but any in-flight LRO polling AND any
+   *  rows not yet started ARE cancelled. */
+  const confirmAbortBatch = React.useCallback(() => {
     abortRef.current?.abort();
+    setAbortConfirmOpen(false);
   }, []);
 
   /** Rerun only the failed rows from the previous batch. */
@@ -1423,12 +1562,12 @@ export const SubMoverPage: React.FC = () => {
       }
       if (e.key === "Escape" && running) {
         e.preventDefault();
-        abortBatch();
+        requestAbortBatch();
       }
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [running, abortBatch]);
+  }, [running, requestAbortBatch]);
 
   // Global tenant-switch listener — when the operator flips tenants from
   // anywhere in the app (header switcher, etc.), pivot the SOURCE account
@@ -1455,7 +1594,7 @@ export const SubMoverPage: React.FC = () => {
         <SignInRequired
           whatYouCantDo="Move subscriptions"
           why="an EA-billing-capable account with owner access on the source enrollment account"
-          onNavigate={(k: PageKey) => navigate(`/${k}`)}
+          onNavigate={(k: PageKey) => navigateToPage(`/${k}`)}
         />
       </div>
     );
@@ -2016,6 +2155,65 @@ export const SubMoverPage: React.FC = () => {
                         accept the offer before the sub appears there.
                       </p>
                     </div>
+                    {recentDestTenants.length > 0 && (
+                      <div className="flex flex-col gap-1">
+                        <Label className="flex items-center gap-1 text-2xs uppercase tracking-wider text-muted-foreground">
+                          Recently used
+                          <InfoTooltip
+                            side="top"
+                            ariaLabel="About recently used destination tenants"
+                            content="Tenants you've successfully moved subscriptions to before — click to refill the destination box. Stored locally; the X removes one entry."
+                          />
+                        </Label>
+                        <div
+                          className="flex flex-wrap items-center gap-1"
+                          role="list"
+                          aria-label="Recently used destination tenants"
+                        >
+                          {recentDestTenants.map((entry) => {
+                            const active =
+                              destTenantId.trim().toLowerCase() ===
+                              entry.tenantId.toLowerCase();
+                            return (
+                              <span
+                                key={entry.tenantId}
+                                role="listitem"
+                                className={
+                                  "inline-flex items-center gap-1 rounded-full border px-2 py-0.5 text-2xs font-mono " +
+                                  (active
+                                    ? "border-primary/40 bg-primary/10"
+                                    : "border-border bg-muted/30")
+                                }
+                              >
+                                <button
+                                  type="button"
+                                  className="text-left hover:text-primary focus:outline-none focus:underline"
+                                  onClick={() =>
+                                    setDestTenantId(entry.tenantId)
+                                  }
+                                  aria-label={`Use recent destination tenant ${entry.label ?? entry.tenantId}`}
+                                  aria-pressed={active}
+                                  disabled={running}
+                                >
+                                  {entry.label ?? entry.tenantId}
+                                </button>
+                                <button
+                                  type="button"
+                                  className="rounded p-0.5 text-muted-foreground hover:bg-accent/40 hover:text-foreground focus:outline-none focus:ring-1"
+                                  onClick={() =>
+                                    forgetRecentDestTenant(entry.tenantId)
+                                  }
+                                  aria-label={`Remove ${entry.label ?? entry.tenantId} from recent tenants`}
+                                  disabled={running}
+                                >
+                                  <X className="h-3 w-3" aria-hidden />
+                                </button>
+                              </span>
+                            );
+                          })}
+                        </div>
+                      </div>
+                    )}
                   </div>
                 )}
 
@@ -2088,6 +2286,99 @@ export const SubMoverPage: React.FC = () => {
                   </label>
                 </div>
 
+                {/* ENHANCEMENT — pre-flight readiness banner. Surfaces a
+                    compact green/amber/red checklist before the operator
+                    presses Confirm: target tenant well-formedness,
+                    billing-scope present, source-sub state, token
+                    freshness. Pure derived data; no extra state. */}
+                {(() => {
+                  const ok: string[] = [];
+                  const warn: string[] = [];
+
+                  // Plan feasibility — these are the bare minimum.
+                  if (opKind === "transfer-billing") {
+                    if (destEnrollmentArmId.trim()) {
+                      ok.push("Destination enrollment account selected.");
+                    } else {
+                      warn.push(
+                        "Pick a destination enrollment account before confirming.",
+                      );
+                    }
+                  } else {
+                    const dest = destTenantId.trim();
+                    if (UUID_RE.test(dest)) {
+                      ok.push("Destination tenant ID is a valid GUID.");
+                    } else if (dest) {
+                      warn.push(
+                        "Destination tenant ID is not a well-formed GUID — Azure will 400 the request.",
+                      );
+                    } else {
+                      warn.push("Enter the destination tenant ID.");
+                    }
+                  }
+
+                  if (billingAccountName) {
+                    ok.push("EA billing account in scope.");
+                  } else {
+                    warn.push("Billing-account scope is unset.");
+                  }
+
+                  if (
+                    previewClassification.safeRows.length === selectedSubs.length &&
+                    selectedSubs.length > 0
+                  ) {
+                    ok.push(
+                      `All ${selectedSubs.length} selected subscription${selectedSubs.length === 1 ? " looks" : "s look"} eligible.`,
+                    );
+                  }
+
+                  const exp = armTokenTracker.secondsUntilExpiry;
+                  if (exp == null) {
+                    // No data yet — neutral.
+                  } else if (exp >= 600) {
+                    ok.push(
+                      `ARM token fresh (${Math.round(exp / 60)} min left).`,
+                    );
+                  } else if (exp >= 300) {
+                    ok.push(
+                      `ARM token has ${Math.round(exp / 60)} min before expiry — fine for short batches.`,
+                    );
+                  }
+
+                  if (ok.length + warn.length === 0) return null;
+                  return (
+                    <div
+                      className="flex flex-col gap-1 rounded-md border border-border bg-muted/15 p-2 text-2xs"
+                      role="status"
+                      aria-live="polite"
+                    >
+                      <p className="font-medium uppercase tracking-wider text-muted-foreground">
+                        Pre-flight
+                      </p>
+                      <ul className="flex flex-col gap-0.5">
+                        {ok.map((line, i) => (
+                          <li key={`ok-${i}`} className="flex items-start gap-1.5">
+                            <CheckCircle2
+                              className="mt-0.5 h-3 w-3 shrink-0 text-success"
+                              aria-hidden
+                            />
+                            <span>{line}</span>
+                          </li>
+                        ))}
+                        {warn.map((line, i) => (
+                          <li key={`warn-${i}`} className="flex items-start gap-1.5">
+                            <AlertTriangle
+                              className="mt-0.5 h-3 w-3 shrink-0 text-warning"
+                              aria-hidden
+                            />
+                            <span>{line}</span>
+                          </li>
+                        ))}
+                      </ul>
+                    </div>
+                  );
+                })()}
+
                 {planWarnings.length > 0 && (
                   <Alert variant="destructive" className="border-warning/40 bg-warning/10">
                     <AlertTriangle className="h-4 w-4" aria-hidden />
@@ -2137,8 +2428,9 @@ export const SubMoverPage: React.FC = () => {
                     <Button
                       type="button"
                       variant="outline"
-                      onClick={abortBatch}
-                      aria-label="Abort remaining rows in this batch (Esc)"
+                      onClick={requestAbortBatch}
+                      aria-label="Abort remaining rows in this batch (opens a confirmation, Esc)"
+                      aria-haspopup="dialog"
                     >
                       <Octagon className="h-3.5 w-3.5" aria-hidden />
                       Abort (Esc)
@@ -2151,6 +2443,55 @@ export const SubMoverPage: React.FC = () => {
                     </span>
                   )}
                 </div>
+                {/* ENHANCEMENT — live progress bar during a batch. Rendered
+                    only while running and only when there's a non-zero
+                    queue so the row stays unobtrusive otherwise. */}
+                {running && results.length > 0 && (
+                  <div
+                    className="flex flex-col gap-1"
+                    role="status"
+                    aria-live="polite"
+                    aria-atomic="false"
+                  >
+                    {(() => {
+                      const total = results.length;
+                      const finished =
+                        resultStats.success +
+                        resultStats.failed +
+                        resultStats.cancelled;
+                      const pct =
+                        total > 0 ? Math.round((finished / total) * 100) : 0;
+                      return (
+                        <>
+                          <div className="flex flex-wrap items-center justify-between gap-2 text-2xs text-muted-foreground">
+                            <span>
+                              Progress: {finished}/{total} ({pct}%)
+                              {resultStats.runningCount > 0
+                                ? ` — ${resultStats.runningCount} running`
+                                : ""}
+                              {resultStats.pollingCount > 0
+                                ? ` — ${resultStats.pollingCount} polling`
+                                : ""}
+                            </span>
+                          </div>
+                          <div
+                            className="h-1.5 w-full overflow-hidden rounded-full bg-muted"
+                            role="progressbar"
+                            aria-valuenow={pct}
+                            aria-valuemin={0}
+                            aria-valuemax={100}
+                            aria-label="Batch progress"
+                          >
+                            <div
+                              className="h-full bg-primary transition-[width] motion-reduce:transition-none"
+                              style={{ width: `${pct}%` }}
+                            />
+                          </div>
+                        </>
+                      );
+                    })()}
+                  </div>
+                )}
               </CardContent>
             </Card>
           )}
@@ -2423,6 +2764,37 @@ export const SubMoverPage: React.FC = () => {
                                 <Copy className="h-3 w-3" aria-hidden />
                                 Copy as cURL
                               </Button>
+                              {/* ENHANCEMENT — click-to-copy resulting sub
+                                  id post-move. On change-tenant, the id is
+                                  preserved across tenants but the operator
+                                  almost always needs it to paste into the
+                                  destination-tenant portal next. On
+                                  transfer-billing the AAD id is unchanged
+                                  but the EA scope shifts; either way the
+                                  sub id is the single most copied value. */}
+                              {(r.state === "success" ||
+                                r.pollOutcome === "Succeeded") && (
+                                <Button
+                                  type="button"
+                                  variant="ghost"
+                                  size="xs"
+                                  onClick={async () => {
+                                    const ok = await copyToClipboard(
+                                      r.subscriptionId,
+                                    );
+                                    if (ok) {
+                                      store.addNotification({
+                                        type: "info",
+                                        message: `Copied subscription id ${r.subscriptionId} to clipboard.`,
+                                      });
+                                    }
+                                  }}
+                                  aria-label={`Copy resulting subscription id ${r.subscriptionId}`}
+                                >
+                                  <Copy className="h-3 w-3" aria-hidden />
+                                  Copy result id
+                                </Button>
+                              )}
                             </div>
                           </div>
                         )}
@@ -2483,6 +2855,34 @@ export const SubMoverPage: React.FC = () => {
         loading={running}
         onConfirm={() => runBatch()}
         onCancel={() => setConfirmOpen(false)}
+      />
+      {/* Abort-with-confirm — gates an in-flight cancellation behind a
+          deliberate click so an accidental Esc / button mash doesn't
+          orphan rows that Azure has already accepted. */}
+      <ConfirmationDialog
+        hidden={!abortConfirmOpen}
+        title="Abort running batch?"
+        message={
+          <div className="flex flex-col gap-2 text-xs">
+            <p>
+              Stop the in-flight batch now? Rows that Azure has already
+              accepted will continue to run server-side and may complete
+              regardless. Rows still pending in the queue will be marked
+              cancelled.
+            </p>
+            <p className="text-2xs text-muted-foreground">
+              Polling (where enabled) is aborted immediately, so the page
+              stops watching the async-operation URL. Re-check the
+              destination tenant / enrollment account after a few minutes
+              to see what actually landed.
+            </p>
+          </div>
+        }
+        confirmText="Abort batch"
+        cancelText="Keep running"
+        danger
+        onConfirm={confirmAbortBatch}
+        onCancel={() => setAbortConfirmOpen(false)}
       />
     </div>
   );

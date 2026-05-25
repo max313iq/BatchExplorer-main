@@ -16,7 +16,6 @@
  *  - Quick OS-preset chips for the most common Linux/Windows images.
  */
 import * as React from "react";
-import { useNavigate } from "react-router-dom";
 import {
   AlertTriangle,
   Check,
@@ -75,6 +74,7 @@ import {
   useMultiRegionState,
   useMultiRegionStore,
 } from "../../store/store-context";
+import type { MultiRegionStore } from "../../store/multi-region-store";
 import type {
   PoolDefaults,
   TaskSchedulingPolicy,
@@ -88,11 +88,12 @@ import {
   INITIAL_POOL_DEFAULTS,
   buildPoolConfigFromDefaults,
 } from "../../store/pool-defaults";
+import { auditLog } from "../../services/audit-log";
 import { useBeforeUnload } from "../../hooks/use-before-unload";
 import { usePersistedState } from "../../hooks/use-persisted-state";
+import { useDashboardOutletContext } from "../page-router";
 import { ConfirmationDialog } from "../shared/confirmation-dialog";
 import { CopyButton } from "../shared/copy-button";
-import { EmptyState } from "../shared/empty-state";
 import { ErrorBoundary } from "../shared/error-boundary";
 import { InfoTooltip } from "../shared/info-tooltip";
 import { SkeletonLoader } from "../shared/skeleton-loader";
@@ -675,6 +676,34 @@ interface NamedPreset {
 
 const PRESETS_STORAGE_KEY = "pool-defaults:named-presets";
 
+/**
+ * Stable actor string used by every audit entry recorded from this page.
+ * Matches the `ui:<page-key>` convention used elsewhere in the dashboard.
+ */
+const AUDIT_ACTOR = "ui:pool-defaults";
+
+/**
+ * Compute a compact { added, removed, changed } sketch of which top-level
+ * fields differ between two PoolDefaults snapshots. Used as the `details`
+ * payload on save/import/preset-load audit entries so the audit-log page
+ * can render a meaningful diff without storing the whole object twice.
+ */
+function summarizeDefaultsDiff(
+  before: PoolDefaults | null,
+  after: PoolDefaults,
+): Record<string, unknown> {
+  if (!before) {
+    return { firstSnapshot: true, keys: Object.keys(after).length };
+  }
+  const changed: string[] = [];
+  (Object.keys(after) as (keyof PoolDefaults)[]).forEach((k) => {
+    if (!deepEqual(before[k], after[k])) {
+      changed.push(String(k));
+    }
+  });
+  return { changed, changedCount: changed.length };
+}
+
 /* ------------------------------------------------------------------ */
 /*  Field wrapper — label + control                                    */
 /* ------------------------------------------------------------------ */
@@ -905,7 +934,9 @@ const SectionCard: React.FC<{
 const PoolDefaultsPageInner: React.FC = () => {
   const state = useMultiRegionState();
   const store = useMultiRegionStore();
-  const navigate = useNavigate();
+  // Path-based nav from the dashboard outlet — keeps deep-link parity with
+  // every other page in the multi-region tree.
+  const { navigateToPage } = useDashboardOutletContext();
   const defaults: PoolDefaults | undefined = state.poolDefaults;
 
   // No-account empty state — if the user has no AAD account context the page
@@ -937,7 +968,7 @@ const PoolDefaultsPageInner: React.FC = () => {
         <SignInRequired
           whatYouCantDo="Manage pool defaults"
           why="an Azure account so defaults can be persisted alongside your subscriptions"
-          onNavigate={(k: PageKey) => navigate(`/${k}`)}
+          onNavigate={(k: PageKey) => navigateToPage(`/${k}`)}
         />
       </div>
     );
@@ -948,7 +979,7 @@ const PoolDefaultsPageInner: React.FC = () => {
 
 interface PoolDefaultsFormProps {
   defaults: PoolDefaults;
-  store: ReturnType<typeof useMultiRegionStore>;
+  store: MultiRegionStore;
 }
 
 const PoolDefaultsForm: React.FC<PoolDefaultsFormProps> = ({
@@ -1097,23 +1128,17 @@ const PoolDefaultsForm: React.FC<PoolDefaultsFormProps> = ({
     });
   }, []);
 
-  // Update helpers
+  // Update helpers — the store is fully typed, no `unknown` casts needed.
   const update = React.useCallback(
     (patch: Partial<PoolDefaults>) => {
-      (
-        store as unknown as {
-          updatePoolDefaults: (p: Partial<PoolDefaults>) => void;
-        }
-      ).updatePoolDefaults(patch);
+      store.updatePoolDefaults(patch);
     },
     [store],
   );
 
   const setEverything = React.useCallback(
     (next: PoolDefaults) => {
-      (
-        store as unknown as { setPoolDefaults: (d: PoolDefaults) => void }
-      ).setPoolDefaults(next);
+      store.setPoolDefaults(next);
     },
     [store],
   );
@@ -1123,6 +1148,49 @@ const PoolDefaultsForm: React.FC<PoolDefaultsFormProps> = ({
       update({ startTask: { ...defaults.startTask, ...patch } });
     },
     [update, defaults.startTask],
+  );
+
+  // Collapse the four-deep spread that publisher/offer/sku/version each
+  // need into one helper. Keeps the JSX terse and stops the temptation to
+  // copy-paste the nested spread for every new image-reference field.
+  //
+  // COORDINATOR: every page that edits a VM imageReference repeats this
+  // same nested-spread pattern. If a shared "image-reference editor"
+  // component is ever added under components/shared/, this helper is the
+  // call site to migrate.
+  const updateImageRef = React.useCallback(
+    (patch: Partial<PoolDefaults["virtualMachineConfiguration"]["imageReference"]>) => {
+      update({
+        virtualMachineConfiguration: {
+          ...defaults.virtualMachineConfiguration,
+          imageReference: {
+            ...defaults.virtualMachineConfiguration.imageReference,
+            ...patch,
+          },
+        },
+      });
+    },
+    [update, defaults.virtualMachineConfiguration],
+  );
+
+  // Same pattern for the startTask.userIdentity.autoUser triple-nested edit.
+  // COORDINATOR: factor into shared user-identity editor if added later.
+  const updateAutoUser = React.useCallback(
+    (
+      patch: Partial<
+        PoolDefaults["startTask"]["userIdentity"]["autoUser"]
+      >,
+    ) => {
+      updateStartTask({
+        userIdentity: {
+          autoUser: {
+            ...defaults.startTask.userIdentity.autoUser,
+            ...patch,
+          },
+        },
+      });
+    },
+    [updateStartTask, defaults.startTask.userIdentity.autoUser],
   );
 
   // Toast helper — short-lived inline confirmation that doesn't require a save.
@@ -1144,12 +1212,21 @@ const PoolDefaultsForm: React.FC<PoolDefaultsFormProps> = ({
     setEverything(defaults);
     setSavedSnapshot(defaults);
     setConfirmSaveOpen(false);
+    // These defaults flow into every future pool created via this UI —
+    // record the snapshot diff so the audit log has a footprint.
+    auditLog.record({
+      actor: AUDIT_ACTOR,
+      action: "save_pool_defaults",
+      target: "pool-defaults",
+      status: "success",
+      details: summarizeDefaultsDiff(savedSnapshot, defaults),
+    });
     flashToast("Saved to localStorage");
     // Move focus to the success banner for screen-reader users.
     window.setTimeout(() => {
       saveBannerRef.current?.focus();
     }, 0);
-  }, [setEverything, defaults, setSavedSnapshot, flashToast]);
+  }, [setEverything, defaults, setSavedSnapshot, savedSnapshot, flashToast]);
 
   // Revert handler — restores the saved snapshot.
   const handleRevert = React.useCallback(() => {
@@ -1161,6 +1238,13 @@ const PoolDefaultsForm: React.FC<PoolDefaultsFormProps> = ({
       setEverything(savedSnapshot);
     }
     setConfirmRevertOpen(false);
+    auditLog.record({
+      actor: AUDIT_ACTOR,
+      action: "revert_pool_defaults",
+      target: "pool-defaults",
+      status: "success",
+      details: { hadSnapshot: savedSnapshot !== null },
+    });
     flashToast("Reverted to last saved");
   }, [setEverything, savedSnapshot, flashToast]);
 
@@ -1191,6 +1275,13 @@ const PoolDefaultsForm: React.FC<PoolDefaultsFormProps> = ({
       patch = { subnetId: savedSnapshot.subnetId };
     }
     update(patch);
+    auditLog.record({
+      actor: AUDIT_ACTOR,
+      action: "discard_section_changes",
+      target: `pool-defaults:${key}`,
+      status: "success",
+      details: { section: key },
+    });
     flashToast(`Discarded changes in ${SECTION_LABELS[key]}`);
     setConfirmDiscardSection(null);
   }, [savedSnapshot, confirmDiscardSection, update, flashToast]);
@@ -1201,11 +1292,18 @@ const PoolDefaultsForm: React.FC<PoolDefaultsFormProps> = ({
   }, []);
 
   const handleConfirmReset = React.useCallback(() => {
-    (store as unknown as { resetPoolDefaults: () => void }).resetPoolDefaults();
+    store.resetPoolDefaults();
     setSavedSnapshot(INITIAL_POOL_DEFAULTS);
     setConfirmResetOpen(false);
+    auditLog.record({
+      actor: AUDIT_ACTOR,
+      action: "reset_pool_defaults_to_factory",
+      target: "pool-defaults",
+      status: "success",
+      details: summarizeDefaultsDiff(defaults, INITIAL_POOL_DEFAULTS),
+    });
     flashToast("Reset to factory defaults");
-  }, [store, setSavedSnapshot, flashToast]);
+  }, [store, setSavedSnapshot, defaults, flashToast]);
 
   // OS category change handler
   const handleOsCategoryChange = React.useCallback(
@@ -1268,6 +1366,13 @@ const PoolDefaultsForm: React.FC<PoolDefaultsFormProps> = ({
     ].sort((a, b) => a.name.localeCompare(b.name));
     setNamedPresets(next);
     setSavePresetDialogOpen(false);
+    auditLog.record({
+      actor: AUDIT_ACTOR,
+      action: "save_named_preset",
+      target: `preset:${name}`,
+      status: "success",
+      details: { totalPresets: next.length },
+    });
     flashToast(`Saved preset "${name}"`);
   }, [presetNameInput, namedPresets, defaults, setNamedPresets, flashToast]);
 
@@ -1278,15 +1383,31 @@ const PoolDefaultsForm: React.FC<PoolDefaultsFormProps> = ({
       const merged = { ...INITIAL_POOL_DEFAULTS, ...preset.defaults };
       setEverything(merged);
       setPresetsDialogOpen(false);
+      auditLog.record({
+        actor: AUDIT_ACTOR,
+        action: "load_named_preset",
+        target: `preset:${preset.name}`,
+        status: "success",
+        details: {
+          presetCreatedAt: preset.createdAt,
+          ...summarizeDefaultsDiff(defaults, merged),
+        },
+      });
       flashToast(`Loaded preset "${preset.name}"`);
     },
-    [setEverything, flashToast],
+    [setEverything, defaults, flashToast],
   );
 
   const handleDeletePreset = React.useCallback(
     (name: string) => {
       setNamedPresets(namedPresets.filter((p) => p.name !== name));
       setConfirmDeletePreset(null);
+      auditLog.record({
+        actor: AUDIT_ACTOR,
+        action: "delete_named_preset",
+        target: `preset:${name}`,
+        status: "success",
+      });
       flashToast(`Deleted preset "${name}"`);
     },
     [namedPresets, setNamedPresets, flashToast],
@@ -1368,17 +1489,34 @@ const PoolDefaultsForm: React.FC<PoolDefaultsFormProps> = ({
           },
         };
         setEverything(merged);
+        auditLog.record({
+          actor: AUDIT_ACTOR,
+          action: "import_pool_defaults",
+          target: `file:${file.name}`,
+          status: "success",
+          details: {
+            fileBytes: file.size,
+            ...summarizeDefaultsDiff(defaults, merged),
+          },
+        });
         flashToast(`Imported ${file.name}`);
       } catch (err) {
         const msg =
           err instanceof Error ? err.message : "Unknown parse error";
         setImportError(`Failed to import: ${msg}`);
+        auditLog.record({
+          actor: AUDIT_ACTOR,
+          action: "import_pool_defaults",
+          target: `file:${file.name}`,
+          status: "failure",
+          error: msg,
+        });
       } finally {
         // Clear so re-selecting the same file fires a fresh change event.
         if (importInputRef.current) importInputRef.current.value = "";
       }
     },
-    [setEverything, flashToast],
+    [setEverything, defaults, flashToast],
   );
 
   // Dynamic list helpers
@@ -2118,18 +2256,11 @@ const PoolDefaultsForm: React.FC<PoolDefaultsFormProps> = ({
                       .publisher
                   }
                   onChange={(e) =>
-                    update({
-                      virtualMachineConfiguration: {
-                        ...defaults.virtualMachineConfiguration,
-                        imageReference: {
-                          ...defaults.virtualMachineConfiguration
-                            .imageReference,
-                          publisher: e.target.value,
-                        },
-                      },
-                    })
+                    updateImageRef({ publisher: e.target.value })
                   }
                   aria-label="Image publisher"
+                  autoComplete="off"
+                  spellCheck={false}
                 />
                 <CopyButton
                   value={
@@ -2158,18 +2289,11 @@ const PoolDefaultsForm: React.FC<PoolDefaultsFormProps> = ({
                     defaults.virtualMachineConfiguration.imageReference.offer
                   }
                   onChange={(e) =>
-                    update({
-                      virtualMachineConfiguration: {
-                        ...defaults.virtualMachineConfiguration,
-                        imageReference: {
-                          ...defaults.virtualMachineConfiguration
-                            .imageReference,
-                          offer: e.target.value,
-                        },
-                      },
-                    })
+                    updateImageRef({ offer: e.target.value })
                   }
                   aria-label="Image offer"
+                  autoComplete="off"
+                  spellCheck={false}
                 />
                 <CopyButton
                   value={
@@ -2196,19 +2320,10 @@ const PoolDefaultsForm: React.FC<PoolDefaultsFormProps> = ({
                   value={
                     defaults.virtualMachineConfiguration.imageReference.sku
                   }
-                  onChange={(e) =>
-                    update({
-                      virtualMachineConfiguration: {
-                        ...defaults.virtualMachineConfiguration,
-                        imageReference: {
-                          ...defaults.virtualMachineConfiguration
-                            .imageReference,
-                          sku: e.target.value,
-                        },
-                      },
-                    })
-                  }
+                  onChange={(e) => updateImageRef({ sku: e.target.value })}
                   aria-label="Image SKU"
+                  autoComplete="off"
+                  spellCheck={false}
                 />
                 <CopyButton
                   value={
@@ -2234,18 +2349,10 @@ const PoolDefaultsForm: React.FC<PoolDefaultsFormProps> = ({
                 value={
                   defaults.virtualMachineConfiguration.imageReference.version
                 }
-                onChange={(e) =>
-                  update({
-                    virtualMachineConfiguration: {
-                      ...defaults.virtualMachineConfiguration,
-                      imageReference: {
-                        ...defaults.virtualMachineConfiguration.imageReference,
-                        version: e.target.value,
-                      },
-                    },
-                  })
-                }
+                onChange={(e) => updateImageRef({ version: e.target.value })}
                 aria-label="Image version"
+                autoComplete="off"
+                spellCheck={false}
               />
             </Field>
             <Field
@@ -2763,14 +2870,7 @@ const PoolDefaultsForm: React.FC<PoolDefaultsFormProps> = ({
                 <Select
                   value={defaults.startTask.userIdentity.autoUser.scope}
                   onValueChange={(v) =>
-                    updateStartTask({
-                      userIdentity: {
-                        autoUser: {
-                          ...defaults.startTask.userIdentity.autoUser,
-                          scope: v as "pool" | "task",
-                        },
-                      },
-                    })
+                    updateAutoUser({ scope: v as "pool" | "task" })
                   }
                 >
                   <SelectTrigger
@@ -2799,13 +2899,8 @@ const PoolDefaultsForm: React.FC<PoolDefaultsFormProps> = ({
                     defaults.startTask.userIdentity.autoUser.elevationLevel
                   }
                   onValueChange={(v) =>
-                    updateStartTask({
-                      userIdentity: {
-                        autoUser: {
-                          ...defaults.startTask.userIdentity.autoUser,
-                          elevationLevel: v as "admin" | "nonadmin",
-                        },
-                      },
+                    updateAutoUser({
+                      elevationLevel: v as "admin" | "nonadmin",
                     })
                   }
                 >

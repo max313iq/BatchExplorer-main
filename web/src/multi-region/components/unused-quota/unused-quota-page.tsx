@@ -37,6 +37,7 @@ import * as React from "react";
 import {
   AlertTriangle,
   CheckCircle2,
+  ExternalLink,
   Filter,
   Minus,
   PiggyBank,
@@ -90,7 +91,11 @@ import { cn, formatNumber, pluralize } from "@/lib/utils";
 
 import { OrchestratorAgent } from "../../agents/orchestrator-agent";
 import { useArmToken } from "../../auth/use-arm-token";
+import { useAbortableEffect } from "../../hooks/use-abortable-effect";
+import { usePersistedState } from "../../hooks/use-persisted-state";
 import { useUrlState } from "../../hooks/use-url-state";
+import { useDashboardOutletContext } from "../page-router";
+import { auditLog } from "../../services/audit-log";
 import { buildPoolConfigFromDefaults } from "../../store/pool-defaults";
 import type { PoolDefaults } from "../../store/pool-defaults";
 import {
@@ -109,10 +114,15 @@ import {
 import { EmptyState } from "../shared/empty-state";
 import { ErrorBoundary } from "../shared/error-boundary";
 import { ExportMenu } from "../shared/export-menu";
+import {
+  FilterChipRow,
+  type FilterChipOption,
+} from "../shared/filter-chip-row";
 import { InfoTooltip } from "../shared/info-tooltip";
 import { PageHeader } from "../shared/page-header";
 import { RegionBadge } from "../shared/region-badge";
 import { SkeletonLoader } from "../shared/skeleton-loader";
+import { SummaryStatItem } from "../shared/summary-stat-item";
 import { TokenExpiryBadge } from "../shared/token-expiry-badge";
 import {
   BorderBeam,
@@ -141,7 +151,54 @@ const VM_PRIORITY_LIST = [
 
 export interface UnusedQuotaPageProps {
   orchestrator: OrchestratorAgent;
-  onNavigate?: (key: string) => void;
+  /**
+   * @deprecated Path-based navigation now comes from
+   * `useDashboardOutletContext().navigateToPage`. Kept for backward
+   * compatibility with the existing page-router adapter, which still
+   * threads it through. New callers should rely on the context wiring
+   * and ignore this prop.
+   *
+   * COORDINATOR: when the migration is complete and no caller still
+   * passes `onNavigate`, drop this prop from the interface and from the
+   * page-router adapter at `UnusedQuotaRoute` (page-router.tsx ~ line 370).
+   */
+  onNavigate?: (path: string) => void;
+}
+
+/**
+ * Capacity-shape filter for the LP-only / Dedicated-only / both chip
+ * row. Persisted to localStorage so the operator's preferred capacity
+ * lens survives reloads (unlike most other filters, this one rarely
+ * changes within a session — keeping it in the URL would clutter the
+ * sharable deep-link).
+ */
+type CapacityShape = "lp" | "dedicated" | "either" | "both";
+
+const CAPACITY_SHAPE_OPTIONS: ReadonlyArray<FilterChipOption> = [
+  { key: "either", label: "Any capacity", tone: "default" },
+  { key: "lp", label: "LP-only", tone: "info" },
+  { key: "dedicated", label: "Dedicated-only", tone: "warning" },
+  { key: "both", label: "Both LP & Dedicated", tone: "success" },
+];
+
+const CAPACITY_SHAPES: ReadonlySet<CapacityShape> = new Set([
+  "either",
+  "lp",
+  "dedicated",
+  "both",
+]);
+
+function isCapacityShape(value: unknown): value is CapacityShape {
+  return typeof value === "string" && CAPACITY_SHAPES.has(value as CapacityShape);
+}
+
+/**
+ * Build the Azure portal deep-link for a subscription. Used by the
+ * per-row "Open in portal" action. Format matches the convention used
+ * across the rest of the app (see ea-subscription-page.tsx etc.).
+ */
+function portalSubscriptionUrl(subscriptionId: string): string {
+  return `https://portal.azure.com/#@/resource/subscriptions/${encodeURIComponent(subscriptionId)}/overview`;
 }
 
 interface EnvVar {
@@ -243,6 +300,26 @@ const UnusedQuotaPageInner: React.FC<UnusedQuotaPageProps> = ({
   const store = useMultiRegionStore();
   const poolDefaults: PoolDefaults | undefined = state.poolDefaults;
 
+  // Path-based navigation comes from the dashboard outlet context.
+  // Fall back to the legacy `onNavigate` prop so adapters that haven't
+  // been migrated yet continue to work — see the deprecation note on
+  // `UnusedQuotaPageProps.onNavigate`.
+  //
+  // COORDINATOR: once every adapter pulls from
+  // `useDashboardOutletContext`, the `onNavigate` prop + this fallback
+  // chain can be removed.
+  const outletNavigate = useDashboardOutletContext().navigateToPage;
+  const navigateToPath = React.useCallback(
+    (path: string) => {
+      if (outletNavigate) {
+        outletNavigate(path);
+      } else if (onNavigate) {
+        onNavigate(path);
+      }
+    },
+    [outletNavigate, onNavigate],
+  );
+
   // Pattern A: ARM-token expiry awareness using the first signed-in
   // account. Unused Quota is a multi-account view (no single picker), so
   // the badge is a heads-up that the primary signed-in account's token
@@ -270,6 +347,56 @@ const UnusedQuotaPageInner: React.FC<UnusedQuotaPageProps> = ({
   const [searchText, setSearchText] = React.useState("");
   // Compact density toggle on the table.
   const [compactDensity, setCompactDensity] = React.useState(false);
+
+  // Capacity-shape filter (LP-only / Dedicated-only / both). Persisted to
+  // localStorage because it represents an operator preference rather than
+  // a per-link filter (so it's not in the URL). See `usePersistedState`
+  // versioning contract — bump `version` if `CapacityShape` ever grows
+  // values not present in `CAPACITY_SHAPES`.
+  const [capacityShape, setCapacityShape] = usePersistedState<CapacityShape>(
+    "unused-quota.capacity-shape",
+    "either",
+    {
+      version: 1,
+      deserialize: (raw) => {
+        try {
+          const parsed = JSON.parse(raw) as unknown;
+          return isCapacityShape(parsed) ? parsed : undefined;
+        } catch {
+          return undefined;
+        }
+      },
+    },
+  );
+  const capacityShapeSet = React.useMemo(
+    () => new Set([capacityShape]),
+    [capacityShape],
+  );
+  const onCapacityShapeChange = React.useCallback(
+    (next: Set<string>) => {
+      // FilterChipRow is multi-select by default — every click toggles
+      // membership in the Set. We coerce it to single-select semantics
+      // here by:
+      //   - picking the newly-added key (set difference vs current) if any,
+      //   - else falling back to "either" when the user clicked the
+      //     currently-active chip (set went empty after the toggle).
+      let chosen: CapacityShape | null = null;
+      for (const k of next) {
+        if (!capacityShapeSet.has(k) && isCapacityShape(k)) {
+          chosen = k;
+          break;
+        }
+      }
+      if (chosen) {
+        setCapacityShape(chosen);
+      } else {
+        // User clicked the active chip — un-toggle to "either" (the
+        // baseline no-filter state).
+        setCapacityShape("either");
+      }
+    },
+    [capacityShapeSet, setCapacityShape],
+  );
 
   // Master live-catalog wire toggle — hydrated from / persisted to user
   // preferences. Shared with Pool Creation; the toggle here is a
@@ -439,6 +566,21 @@ const UnusedQuotaPageInner: React.FC<UnusedQuotaPageProps> = ({
       const allowed = new Set(selectedRegions);
       result = result.filter((r) => allowed.has(r.region));
     }
+    // Capacity-shape lens — collapse a row down to its capacity profile.
+    //   - lp        : has free LP cores, no free dedicated.
+    //   - dedicated : has free dedicated cores, no free LP.
+    //   - both      : has both LP and dedicated.
+    //   - either    : no filter (default).
+    if (capacityShape !== "either") {
+      result = result.filter((r) => {
+        const hasLp = r.lpFree > 0;
+        const hasDed = r.dedicatedFree > 0;
+        if (capacityShape === "lp") return hasLp && !hasDed;
+        if (capacityShape === "dedicated") return hasDed && !hasLp;
+        if (capacityShape === "both") return hasLp && hasDed;
+        return true;
+      });
+    }
     const q = searchText.trim().toLowerCase();
     if (q) {
       result = result.filter(
@@ -457,6 +599,7 @@ const UnusedQuotaPageInner: React.FC<UnusedQuotaPageProps> = ({
     minFreeCores,
     selectedRegions,
     searchText,
+    capacityShape,
   ]);
 
   // Selected rows derived from selectedIds
@@ -465,17 +608,58 @@ const UnusedQuotaPageInner: React.FC<UnusedQuotaPageProps> = ({
     [allRows, selectedIds],
   );
 
-  // Summary stats (whole dataset, not filtered)
-  const totalAccounts = allRows.length;
-  const totalFreeLpCores = allRows.reduce((s, r) => s + r.lpFree, 0);
-  const totalFreeDedicatedCores = allRows.reduce(
-    (s, r) => s + r.dedicatedFree,
-    0,
-  );
-  const totalLpQuota = allRows.reduce((s, r) => s + r.lpQuota, 0);
-  const accountsWithFreeQuota = allRows.filter((r) => r.lpFree > 0).length;
-  const spawnableNodes = allRows.reduce((s, r) => s + r.maxNodes, 0);
-  const distinctRegionsCount = allRegions.length;
+  // Summary stats (whole dataset, not filtered). Derived sums are
+  // wrapped in `useMemo` so they don't recompute on unrelated state
+  // changes (drawer open/close, search keystrokes, etc.). `allRows` is
+  // itself memoised, so this is effectively a one-shot compute per
+  // accountInfos/poolInfos change.
+  const summary = React.useMemo(() => {
+    let totalFreeLpCores = 0;
+    let totalFreeDedicatedCores = 0;
+    let totalLpQuota = 0;
+    let accountsWithFreeQuota = 0;
+    let accountsWithFreeDedicated = 0;
+    let spawnableNodes = 0;
+    const distinctSubs = new Set<string>();
+    const subsWithCapacity = new Set<string>();
+    for (const r of allRows) {
+      totalFreeLpCores += r.lpFree;
+      totalFreeDedicatedCores += r.dedicatedFree;
+      totalLpQuota += r.lpQuota;
+      if (r.lpFree > 0) accountsWithFreeQuota += 1;
+      if (r.dedicatedFree > 0) accountsWithFreeDedicated += 1;
+      spawnableNodes += r.maxNodes;
+      if (r.subscriptionId) {
+        distinctSubs.add(r.subscriptionId);
+        if (r.lpFree > 0 || r.dedicatedFree > 0) {
+          subsWithCapacity.add(r.subscriptionId);
+        }
+      }
+    }
+    return {
+      totalAccounts: allRows.length,
+      totalFreeLpCores,
+      totalFreeDedicatedCores,
+      totalLpQuota,
+      accountsWithFreeQuota,
+      accountsWithFreeDedicated,
+      spawnableNodes,
+      distinctRegionsCount: allRegions.length,
+      distinctSubsCount: distinctSubs.size,
+      subsWithCapacityCount: subsWithCapacity.size,
+    } as const;
+  }, [allRows, allRegions.length]);
+  const {
+    totalAccounts,
+    totalFreeLpCores,
+    totalFreeDedicatedCores,
+    totalLpQuota,
+    accountsWithFreeQuota,
+    spawnableNodes,
+    distinctRegionsCount,
+    distinctSubsCount,
+    subsWithCapacityCount,
+  } = summary;
   // Active filter count drives the "X filters active" badge in the toolbar.
   const activeFilterCount = React.useMemo(() => {
     let n = 0;
@@ -485,6 +669,7 @@ const UnusedQuotaPageInner: React.FC<UnusedQuotaPageProps> = ({
     if (minFreeCores > 0) n += 1;
     if (selectedRegions.length > 0) n += 1;
     if (searchText.trim()) n += 1;
+    if (capacityShape !== "either") n += 1;
     return n;
   }, [
     showOnlyFree,
@@ -493,6 +678,7 @@ const UnusedQuotaPageInner: React.FC<UnusedQuotaPageProps> = ({
     minFreeCores,
     selectedRegions,
     searchText,
+    capacityShape,
   ]);
 
   // Free-vs-quota ratio drives the tone of the summary cards. The thresholds
@@ -502,71 +688,111 @@ const UnusedQuotaPageInner: React.FC<UnusedQuotaPageProps> = ({
   //   - >= 20% free              -> info    (some headroom)
   //   - >  0% free               -> success (most quota in use, healthy)
   //   - == 0% free               -> muted   (fully consumed / nothing to use)
-  const freeLpRatio =
-    totalLpQuota > 0 ? totalFreeLpCores / totalLpQuota : 0;
-  const freeAccountsRatio =
-    totalAccounts > 0 ? accountsWithFreeQuota / totalAccounts : 0;
+  const { freeLpRatio, freeAccountsRatio, freeLpTone, freeAccountsTone } =
+    React.useMemo(() => {
+      const lpRatio = totalLpQuota > 0 ? totalFreeLpCores / totalLpQuota : 0;
+      const acctRatio =
+        totalAccounts > 0 ? accountsWithFreeQuota / totalAccounts : 0;
+      type CardTone = "info" | "success" | "warning" | "muted";
+      const pickTone = (ratio: number, hasAny: boolean): CardTone => {
+        if (!hasAny) return "muted";
+        if (ratio >= 0.5) return "warning";
+        if (ratio >= 0.2) return "info";
+        return "success";
+      };
+      return {
+        freeLpRatio: lpRatio,
+        freeAccountsRatio: acctRatio,
+        freeLpTone: pickTone(lpRatio, totalFreeLpCores > 0),
+        freeAccountsTone: pickTone(acctRatio, accountsWithFreeQuota > 0),
+      } as const;
+    }, [totalLpQuota, totalFreeLpCores, totalAccounts, accountsWithFreeQuota]);
 
-  type CardTone = "info" | "success" | "warning" | "muted";
-  const pickTone = (ratio: number, hasAny: boolean): CardTone => {
-    if (!hasAny) return "muted";
-    if (ratio >= 0.5) return "warning";
-    if (ratio >= 0.2) return "info";
-    return "success";
-  };
+  // Live refs into the latest values used by event-driven callbacks so
+  // we don't have to chase stale closures across rebinds. The keyboard
+  // shortcut handler installs `keydown` once and reads `selectedIds`
+  // through the ref instead of re-registering on every change.
+  const accountInfosLenRef = React.useRef(state.accountInfos.length);
+  accountInfosLenRef.current = state.accountInfos.length;
+  const accountsLenRef = React.useRef(state.accounts.length);
+  accountsLenRef.current = state.accounts.length;
 
-  const freeLpTone = pickTone(freeLpRatio, totalFreeLpCores > 0);
-  const freeAccountsTone = pickTone(
-    freeAccountsRatio,
-    accountsWithFreeQuota > 0,
-  );
-
-  // Refresh data on mount when needed
-  React.useEffect(() => {
-    let cancelled = false;
-    const doRefresh = async () => {
+  // Auto-refresh on mount when the store is empty but we have accounts
+  // configured. `useAbortableEffect` aborts the in-flight quota probes
+  // on unmount, so a fast page-flip doesn't leak a `setLoading(false)`
+  // into an unmounted tree (which would log a React warning in dev).
+  useAbortableEffect(
+    async (signal) => {
+      if (
+        accountInfosLenRef.current !== 0 ||
+        accountsLenRef.current === 0
+      ) {
+        return;
+      }
       setLoading(true);
       try {
         await orchestrator.execute({
           action: "refresh_account_info",
           payload: {},
+          signal,
         });
+        if (signal.aborted) return;
         await orchestrator.execute({
           action: "refresh_pool_info",
           payload: {},
+          signal,
         });
       } catch {
-        /* handled by orchestrator */
+        /* handled by orchestrator + activity log */
       } finally {
-        if (!cancelled) setLoading(false);
+        if (!signal.aborted) setLoading(false);
       }
-    };
-    if (state.accountInfos.length === 0 && state.accounts.length > 0) {
-      doRefresh();
-    }
+    },
+    // Intentionally narrow: this fires once per page mount. The refs
+    // pick up any post-mount changes to accountInfos / accounts.
+    [orchestrator],
+  );
+
+  // Mutable controller for the imperative `handleRefresh` callback —
+  // distinct from the mount-effect controller because the operator may
+  // hit "Refresh" repeatedly and we want the previous probe to abort.
+  const refreshAbortRef = React.useRef<AbortController | null>(null);
+  React.useEffect(() => {
     return () => {
-      cancelled = true;
+      refreshAbortRef.current?.abort();
+      refreshAbortRef.current = null;
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   const handleRefresh = React.useCallback(async () => {
+    // Abort any in-flight probe from a previous click before starting
+    // a new one — otherwise back-to-back refreshes race on setLoading.
+    refreshAbortRef.current?.abort();
+    const controller = new AbortController();
+    refreshAbortRef.current = controller;
     setLoading(true);
     setError(null);
     try {
       await orchestrator.execute({
         action: "refresh_account_info",
         payload: {},
+        signal: controller.signal,
       });
+      if (controller.signal.aborted) return;
       await orchestrator.execute({
         action: "refresh_pool_info",
         payload: {},
+        signal: controller.signal,
       });
     } catch (e: unknown) {
+      if (controller.signal.aborted) return;
       const msg = e instanceof Error ? e.message : String(e);
       setError(msg);
     } finally {
-      setLoading(false);
+      if (refreshAbortRef.current === controller) {
+        refreshAbortRef.current = null;
+        if (!controller.signal.aborted) setLoading(false);
+      }
     }
   }, [orchestrator]);
 
@@ -594,8 +820,9 @@ const UnusedQuotaPageInner: React.FC<UnusedQuotaPageProps> = ({
     setResizingFilter("all");
     setMinFreeCores(0);
     setSearchText("");
+    setCapacityShape("either");
     setUrlFilters({ regions: [] });
-  }, [setUrlFilters]);
+  }, [setUrlFilters, setCapacityShape]);
 
   /** Add every row in the given region to the current selection. */
   const selectAllInRegion = React.useCallback(
@@ -653,12 +880,18 @@ const UnusedQuotaPageInner: React.FC<UnusedQuotaPageProps> = ({
   // Use in Smart Mode — passes the selected accountIds + the suggested
   // VM sizes via URL params so Pool Creation can pre-fill the Target
   // step and Smart Mode picker on mount.
+  //
+  // Routes through `navigateToPath` so we transparently prefer the
+  // context-driven path nav and fall back to the legacy `onNavigate`
+  // prop when present. The destination path contract
+  // (`/pools?accountIds=...&vmSizes=...&smartMode=on&step=target`) is
+  // unchanged — the receiving Pool Creation page parses these params
+  // on mount.
   const handleUseInSmartMode = React.useCallback(
     (rowsOverride?: QuotaRow[]) => {
-      if (!onNavigate) return;
       const targetRows = rowsOverride ?? selectedRows;
       if (targetRows.length === 0) {
-        onNavigate("pools");
+        navigateToPath("/pools");
         return;
       }
       const accountIds = targetRows
@@ -677,9 +910,9 @@ const UnusedQuotaPageInner: React.FC<UnusedQuotaPageProps> = ({
       params.set("smartMode", "on");
       if (accountIds) params.set("accountIds", accountIds);
       if (vmSizes) params.set("vmSizes", vmSizes);
-      onNavigate(`/pools?${params.toString()}`);
+      navigateToPath(`/pools?${params.toString()}`);
     },
-    [onNavigate, selectedRows],
+    [navigateToPath, selectedRows],
   );
 
   // ------------------------------------------------------------------
@@ -777,8 +1010,37 @@ const UnusedQuotaPageInner: React.FC<UnusedQuotaPageProps> = ({
     setShowAutoCreateConfirm(true);
   };
 
+  // The submit path runs through this controller so the operator can
+  // close the drawer (which calls closeDrawer guarded by submitting)
+  // or unmount the page mid-flight without leaking promise resolution
+  // into a dead tree. Aborted on unmount via the cleanup effect below.
+  //
+  // COORDINATOR: this overlaps with the "auto-create from quota"
+  // workflow in `overview-page.tsx` (search for
+  // `auto_create_pools_from_quota`). Both paths currently audit under
+  // the same action name with distinct `actor` values so the audit-log
+  // page can attribute origins. Keep the two in sync if you ever
+  // factor the bulk-create plumbing into a shared service.
+  const submitAbortRef = React.useRef<AbortController | null>(null);
+  React.useEffect(() => {
+    return () => {
+      submitAbortRef.current?.abort();
+      submitAbortRef.current = null;
+    };
+  }, []);
+
   const submitAutoCreate = async () => {
     setShowAutoCreateConfirm(false);
+    // Snapshot the plan up front — `bulkPlan` is recomputed on every
+    // selection / override change and the async submit must operate
+    // on the plan the operator confirmed, not whatever the table
+    // looks like by the time the orchestrator returns.
+    const planSnapshot = bulkPlan.map((p) => ({ ...p }));
+    const eligibleSnapshot = planSnapshot.filter((p) => p.eligible);
+    const startedAt = new Date().toISOString();
+    const submitController = new AbortController();
+    submitAbortRef.current?.abort();
+    submitAbortRef.current = submitController;
     setAutoCreateSubmitting(true);
     const results: SubmitResult[] = [];
     try {
@@ -786,7 +1048,7 @@ const UnusedQuotaPageInner: React.FC<UnusedQuotaPageProps> = ({
 
       // Add a "skipped" entry for ineligible rows up front so the result
       // panel surfaces them.
-      for (const p of bulkPlan) {
+      for (const p of planSnapshot) {
         if (!p.eligible) {
           results.push({
             id: p.row.id,
@@ -806,8 +1068,9 @@ const UnusedQuotaPageInner: React.FC<UnusedQuotaPageProps> = ({
 
       // Group eligible plan entries by their (vmSize, nodes) signature
       // and dispatch one create_pools per group.
-      const groups = groupForDispatch(eligibleBulkPlan);
+      const groups = groupForDispatch(eligibleSnapshot);
       for (const [, group] of groups) {
+        if (submitController.signal.aborted) break;
         const first = group[0];
         const vmSize = first.vmSize;
         const nodes = first.nodes;
@@ -843,11 +1106,13 @@ const UnusedQuotaPageInner: React.FC<UnusedQuotaPageProps> = ({
           const res = await orchestrator.execute({
             action: "create_pools",
             payload: { accountIds, poolConfig },
+            signal: submitController.signal,
           });
-          const summary =
+          if (submitController.signal.aborted) break;
+          const groupSummary =
             (res.summary as Record<string, unknown> | undefined) ?? {};
           const failures =
-            (summary.failures as Array<{
+            (groupSummary.failures as Array<{
               accountName: string;
               region: string;
               error: string;
@@ -882,6 +1147,7 @@ const UnusedQuotaPageInner: React.FC<UnusedQuotaPageProps> = ({
             }
           }
         } catch (groupErr: unknown) {
+          if (submitController.signal.aborted) break;
           const msg =
             groupErr instanceof Error ? groupErr.message : String(groupErr);
           for (const p of group) {
@@ -903,25 +1169,77 @@ const UnusedQuotaPageInner: React.FC<UnusedQuotaPageProps> = ({
       const created = results.filter((r) => r.status === "created").length;
       const failedN = results.filter((r) => r.status === "failed").length;
       const skipped = results.filter((r) => r.status === "skipped").length;
-      store.addNotification({
-        type:
-          failedN === 0 && created > 0
-            ? "success"
-            : created > 0
-              ? "warning"
-              : "error",
-        message:
-          created > 0
-            ? `Auto-create complete: ${created} created, ${failedN} failed, ${skipped} skipped.`
-            : `Auto-create finished: 0 created, ${failedN} failed, ${skipped} skipped.`,
-      });
+      const distinctRegions = Array.from(
+        new Set(eligibleSnapshot.map((p) => p.row.region)),
+      );
+      if (!submitController.signal.aborted) {
+        store.addNotification({
+          type:
+            failedN === 0 && created > 0
+              ? "success"
+              : created > 0
+                ? "warning"
+                : "error",
+          message:
+            created > 0
+              ? `Auto-create complete: ${created} created, ${failedN} failed, ${skipped} skipped.`
+              : `Auto-create finished: 0 created, ${failedN} failed, ${skipped} skipped.`,
+        });
+      }
+
+      // Record the bulk auto-create in the canonical audit log. The
+      // overview page's "auto-create from quota" workflow writes
+      // entries under the same `action` name; we tag `actor` so the
+      // audit-log page can attribute origins. Best-effort — wrap in a
+      // try/catch so a logging failure doesn't break the result panel.
+      try {
+        auditLog.record({
+          actor: "unused-quota-page",
+          action: "auto_create_pools_from_quota",
+          target:
+            created > 0
+              ? `${created}/${eligibleSnapshot.length} pools across ${distinctRegions.length} regions`
+              : `0 pools (${failedN} failed, ${skipped} skipped)`,
+          status:
+            failedN === 0 && created > 0
+              ? "success"
+              : created > 0
+                ? "success"
+                : "failure",
+          details: {
+            created,
+            failed: failedN,
+            skipped,
+            total: eligibleSnapshot.length,
+            distinctConfigs: new Set(
+              eligibleSnapshot.map((p) => `${p.vmSize}|${p.nodes}`),
+            ).size,
+            distinctRegions,
+            startedAt,
+            withStartTask: startTask !== null,
+          },
+        });
+      } catch {
+        /* swallow — audit-log shouldn't ever break the operator path */
+      }
+
       // Fire-and-forget refresh — the result panel does not block on it.
-      void orchestrator.execute({
-        action: "refresh_account_info",
-        payload: {},
-      });
+      // Honour the submit controller so unmount also aborts the trailing
+      // refresh probe.
+      if (!submitController.signal.aborted) {
+        void orchestrator.execute({
+          action: "refresh_account_info",
+          payload: {},
+          signal: submitController.signal,
+        });
+      }
     } finally {
-      setSubmitResults(results);
+      if (!submitController.signal.aborted) {
+        setSubmitResults(results);
+      }
+      if (submitAbortRef.current === submitController) {
+        submitAbortRef.current = null;
+      }
       setAutoCreateSubmitting(false);
     }
   };
@@ -993,7 +1311,22 @@ const UnusedQuotaPageInner: React.FC<UnusedQuotaPageProps> = ({
   // ------------------------------------------------------------------
   // Keyboard shortcuts: `/` focus search, `Esc` clear/close, `r` refresh.
   // ------------------------------------------------------------------
+  //
+  // The listener is installed once on mount and reads live state via
+  // refs. Re-binding the global keydown handler on every selection
+  // change (the previous pattern) was wasteful and also created a
+  // brief window where the handler was missing between the
+  // `removeEventListener` and the next `addEventListener`. Using refs
+  // sidesteps both.
   const searchInputRef = React.useRef<HTMLInputElement | null>(null);
+  const drawerOpenRef = React.useRef(drawerOpen);
+  drawerOpenRef.current = drawerOpen;
+  const selectedIdsRef = React.useRef(selectedIds);
+  selectedIdsRef.current = selectedIds;
+  const setSelectedIdsRef = React.useRef(setSelectedIds);
+  setSelectedIdsRef.current = setSelectedIds;
+  const handleRefreshRef = React.useRef(handleRefresh);
+  handleRefreshRef.current = handleRefresh;
   React.useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       // Ignore when typing in form inputs (textarea / input / select / contenteditable).
@@ -1016,19 +1349,19 @@ const UnusedQuotaPageInner: React.FC<UnusedQuotaPageProps> = ({
         !e.metaKey
       ) {
         e.preventDefault();
-        void handleRefresh();
+        void handleRefreshRef.current();
         return;
       }
       if (e.key === "Escape" && !isEditable) {
         // Drawer escape is handled by Radix; only act when drawer closed.
-        if (!drawerOpen && selectedIds.size > 0) {
-          setSelectedIds(new Set());
+        if (!drawerOpenRef.current && selectedIdsRef.current.size > 0) {
+          setSelectedIdsRef.current(new Set());
         }
       }
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [drawerOpen, selectedIds, setSelectedIds, handleRefresh]);
+  }, []);
 
   // ------------------------------------------------------------------
   // DataTable columns
@@ -1404,6 +1737,43 @@ const UnusedQuotaPageInner: React.FC<UnusedQuotaPageProps> = ({
               </TooltipTrigger>
               <TooltipContent>Copy account JSON</TooltipContent>
             </Tooltip>
+            {/*
+              Per-row deep-link to the subscription blade in the Azure
+              portal. Opens in a new tab (noopener for security — we
+              don't want portal.azure.com to be able to back-reference
+              our window). Disabled when subscriptionId is missing.
+            */}
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <Button
+                  asChild
+                  type="button"
+                  variant="ghost"
+                  size="icon-sm"
+                  disabled={!r.subscriptionId}
+                  aria-label={
+                    r.subscriptionId
+                      ? `Open subscription ${r.subscriptionId} in Azure portal (new tab)`
+                      : "Subscription unavailable"
+                  }
+                  className="text-muted-foreground hover:text-info"
+                >
+                  <a
+                    href={
+                      r.subscriptionId
+                        ? portalSubscriptionUrl(r.subscriptionId)
+                        : "#"
+                    }
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    onClick={(e) => e.stopPropagation()}
+                  >
+                    <ExternalLink className="h-3.5 w-3.5" aria-hidden />
+                  </a>
+                </Button>
+              </TooltipTrigger>
+              <TooltipContent>Open subscription in Azure portal</TooltipContent>
+            </Tooltip>
           </div>
         ),
         className: "text-right",
@@ -1646,6 +2016,51 @@ const UnusedQuotaPageInner: React.FC<UnusedQuotaPageProps> = ({
         />
       </div>
 
+      {/*
+        Subscription-level KPI strip using the shared `SummaryStatItem`.
+        The five tiles above are account-level; these roll up by
+        subscriptionId so the operator can see "X of Y subs are sitting
+        on idle capacity". Compact so it doesn't overpower the per-account
+        summary row.
+      */}
+      {totalAccounts > 0 && distinctSubsCount > 0 && (
+        <div
+          className="grid grid-cols-2 gap-2 sm:grid-cols-3 lg:grid-cols-3"
+          role="group"
+          aria-label="Subscription-level capacity summary"
+        >
+          <SummaryStatItem
+            label="Subs with capacity"
+            value={subsWithCapacityCount}
+            tone={subsWithCapacityCount > 0 ? "warning" : "muted"}
+            hint={
+              distinctSubsCount > 0
+                ? `of ${formatNumber(distinctSubsCount)} ${distinctSubsCount === 1 ? "sub" : "subs"}`
+                : undefined
+            }
+            compact
+          />
+          <SummaryStatItem
+            label="Total LP free"
+            value={totalFreeLpCores}
+            tone={totalFreeLpCores > 0 ? "info" : "muted"}
+            hint={
+              totalLpQuota > 0
+                ? `${Math.round((totalFreeLpCores / totalLpQuota) * 100)}% of LP quota`
+                : undefined
+            }
+            compact
+          />
+          <SummaryStatItem
+            label="Total Dedicated free"
+            value={totalFreeDedicatedCores}
+            tone={totalFreeDedicatedCores > 0 ? "info" : "muted"}
+            hint="cores"
+            compact
+          />
+        </div>
+      )}
+
       {/* Per-region rollups */}
       {regionRollups.length > 0 && (
         <section
@@ -1846,6 +2261,28 @@ const UnusedQuotaPageInner: React.FC<UnusedQuotaPageProps> = ({
             </Button>
           )}
         </div>
+      </div>
+
+      {/*
+        Capacity-shape chip row — lets the operator narrow the view to
+        rows that have only LP free, only Dedicated free, or both. The
+        chosen shape persists across reloads (see `usePersistedState`
+        wiring above).
+      */}
+      <div
+        className="flex flex-wrap items-center gap-2"
+        role="region"
+        aria-label="Capacity shape filter"
+      >
+        <Filter className="h-3.5 w-3.5 text-muted-foreground" aria-hidden />
+        <span className="text-xs text-muted-foreground">Capacity:</span>
+        <FilterChipRow
+          label="Capacity shape"
+          value={capacityShapeSet}
+          options={CAPACITY_SHAPE_OPTIONS}
+          onChange={onCapacityShapeChange}
+          showAll={false}
+        />
       </div>
 
       {/* Region filter chips */}

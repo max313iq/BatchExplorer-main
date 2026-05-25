@@ -27,7 +27,6 @@
  * Keyboard: `/` focuses the search box, `Esc` clears selection.
  */
 import * as React from "react";
-import { useNavigate } from "react-router-dom";
 import {
   AlertTriangle,
   ArrowDownToLine,
@@ -63,6 +62,8 @@ import {
 } from "lucide-react";
 import { useUrlParam } from "../../hooks/use-url-state";
 import { useTenantChange } from "../../hooks/use-tenant-change";
+import { useAbortableEffect } from "../../hooks/use-abortable-effect";
+import { usePersistedState } from "../../hooks/use-persisted-state";
 
 import { Alert, AlertDescription } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
@@ -124,6 +125,11 @@ import {
   useMultiRegionState,
   useMultiRegionStore,
 } from "../../store/store-context";
+// COORDINATOR: page-router contract exposes `navigateToPage` (path-based) and
+// `store` via `useDashboardOutletContext`. We use that here instead of the
+// raw `useNavigate` hook so deep-page navigation goes through the
+// canonical router wrapper (preserves PageBoundary + path translation).
+import { useDashboardOutletContext } from "../page-router";
 
 import { ConfirmationDialog } from "../shared/confirmation-dialog";
 import { CopyableText } from "../shared/copy-button";
@@ -560,8 +566,18 @@ const DeletePreview: React.FC<{ rows: JoinedRow[] }> = ({ rows }) => {
 
 export const SubManagerPage: React.FC = () => {
   const state = useMultiRegionState();
-  const store = useMultiRegionStore();
-  const navigate = useNavigate();
+  // Prefer outlet-context store so all pages share the same canonical
+  // instance the page-router wired up. Fallback to the hook for direct-
+  // mounted unit tests that don't have the outlet. `useOutletContext`
+  // returns the context object only when this component is rendered as
+  // a child of a `<Outlet />`; tests sometimes mount the page directly,
+  // so we treat the return value as nullable at runtime.
+  const outlet = useDashboardOutletContext() as
+    | ReturnType<typeof useDashboardOutletContext>
+    | undefined;
+  const storeFromHook = useMultiRegionStore();
+  const store = outlet?.store ?? storeFromHook;
+  const navigateToPage = outlet?.navigateToPage;
   const azureAccounts = state.azureAccounts ?? [];
 
   /* ----- Tab selection ------------------------------------------- */
@@ -702,28 +718,30 @@ export const SubManagerPage: React.FC = () => {
     [setSubParam],
   );
 
-  React.useEffect(() => {
-    if (!account) {
-      setSubscriptions([]);
-      return;
-    }
-    let cancelled = false;
-    setSubsLoading(true);
-    setSubsError(null);
-    (async () => {
+  // useAbortableEffect: signal is aborted on unmount / dep-change. Service
+  // layer doesn't (yet) accept AbortSignal so we still gate state writes on
+  // `signal.aborted` to avoid stomping a fresher load. subscriptionId is
+  // intentionally excluded so the picker doesn't refetch on its own change.
+  useAbortableEffect(
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    async (signal) => {
+      if (!account) {
+        setSubscriptions([]);
+        return;
+      }
+      setSubsLoading(true);
+      setSubsError(null);
       try {
         // Tenant arg omitted so we pick up the operator's current active
         // tenant (was pinning to account.tenantId / the account's HOME
         // tenant — pre-switch).
         const token = await getArmTokenForAccount(account.homeAccountId);
+        if (signal.aborted) return;
         const subs = await listSubscriptions(token);
-        if (cancelled) return;
+        if (signal.aborted) return;
         setSubscriptions(subs);
         // Auto-pick when only one or when the stored selection is gone.
-        if (
-          subs.length === 1 &&
-          subscriptionId !== subs[0]!.subscriptionId
-        ) {
+        if (subs.length === 1 && subscriptionId !== subs[0]!.subscriptionId) {
           setSubscriptionId(subs[0]!.subscriptionId);
         } else if (
           subscriptionId &&
@@ -732,25 +750,70 @@ export const SubManagerPage: React.FC = () => {
           setSubscriptionId("");
         }
       } catch (err) {
-        if (cancelled) return;
+        if (signal.aborted) return;
         setSubsError(err instanceof Error ? err.message : String(err));
         setSubscriptions([]);
       } finally {
-        if (!cancelled) setSubsLoading(false);
+        if (!signal.aborted) setSubsLoading(false);
       }
-    })();
-    return () => {
-      cancelled = true;
-    };
-    // subscriptionId intentionally excluded so the picker doesn't refetch
-    // on its own change.
+    },
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [account?.homeAccountId, account?.tenantId, setSubscriptionId]);
+    [account?.homeAccountId, account?.tenantId, setSubscriptionId],
+  );
 
   const selectedSub = React.useMemo(
     () => subscriptions.find((s) => s.subscriptionId === subscriptionId) ?? null,
     [subscriptions, subscriptionId],
   );
+
+  /* ----- Subscription-state KPIs + "show only warned/disabled" chip ---
+   * Sub Manager is the unified subscription-management hub, so the
+   * picker doubles as a fleet view: counts of Enabled / Disabled /
+   * Warned / Deleted across every subscription this account can see.
+   * Operators can toggle a persisted "show only Disabled/Warned" chip
+   * to focus on subs in transient/bad states. Persisted in localStorage
+   * so the preference survives reloads. */
+  const [onlyTroubled, setOnlyTroubled] = usePersistedState<boolean>(
+    "sub-manager:only-troubled",
+    false,
+  );
+  const subStateStats = React.useMemo(() => {
+    let enabled = 0;
+    let disabled = 0;
+    let warned = 0;
+    let deleted = 0;
+    let other = 0;
+    for (const s of subscriptions) {
+      const st = (s.state ?? "").toLowerCase();
+      if (st === "enabled") enabled += 1;
+      else if (st === "disabled") disabled += 1;
+      else if (st === "warned") warned += 1;
+      else if (st === "deleted") deleted += 1;
+      else other += 1;
+    }
+    return {
+      total: subscriptions.length,
+      enabled,
+      disabled,
+      warned,
+      deleted,
+      other,
+      troubled: disabled + warned,
+    };
+  }, [subscriptions]);
+  /**
+   * Subscriptions the picker actually offers — filtered to troubled
+   * (Disabled / Warned) when the chip is active. The currently-selected
+   * sub is always retained so the picker doesn't go blank when the user
+   * flips the chip on while sitting on an Enabled sub.
+   */
+  const visibleSubscriptions = React.useMemo(() => {
+    if (!onlyTroubled) return subscriptions;
+    return subscriptions.filter((s) => {
+      const st = (s.state ?? "").toLowerCase();
+      return st === "disabled" || st === "warned" || s.subscriptionId === subscriptionId;
+    });
+  }, [subscriptions, onlyTroubled, subscriptionId]);
 
   /* ----- Role assignments + principal resolution ------------------- */
   const [assignments, setAssignments] = React.useState<RoleAssignmentRow[]>([]);
@@ -769,32 +832,33 @@ export const SubManagerPage: React.FC = () => {
 
   const reload = React.useCallback(() => setReloadTick((n) => n + 1), []);
 
-  React.useEffect(() => {
-    if (!account || !subscriptionId) {
-      setAssignments([]);
-      setPrincipals({});
-      setRoleDefs([]);
+  // useAbortableEffect: cancel-on-rerun so a tab-switch / sub-switch
+  // mid-fetch doesn't race a slower previous load into the UI. The
+  // service layer doesn't (yet) accept AbortSignal so we still gate
+  // state writes on `signal.aborted`.
+  useAbortableEffect(
+    async (signal) => {
+      if (!account || !subscriptionId) {
+        setAssignments([]);
+        setPrincipals({});
+        setRoleDefs([]);
+        setPrincipalResolveWarning(null);
+        return;
+      }
+      setListLoading(true);
+      setListError(null);
       setPrincipalResolveWarning(null);
-      return;
-    }
-    // Cancel-on-rerun so a tab-switch / sub-switch mid-fetch doesn't race
-    // a slower previous load into the UI. Service layer doesn't (yet)
-    // accept signals so we also keep the `cancelled` flag guard.
-    let cancelled = false;
-    setListLoading(true);
-    setListError(null);
-    setPrincipalResolveWarning(null);
-    (async () => {
       try {
         // Tenant arg omitted so we pick up the operator's current active
         // tenant (was pinning to account.tenantId / the account's HOME
         // tenant — pre-switch).
         const armToken = await getArmTokenForAccount(account.homeAccountId);
+        if (signal.aborted) return;
         const [rows, defs] = await Promise.all([
           listSubscriptionRoleAssignments(subscriptionId, armToken),
           listSubscriptionRoleDefinitions(subscriptionId, armToken),
         ]);
-        if (cancelled) return;
+        if (signal.aborted) return;
         setAssignments(rows);
         setRoleDefs(defs);
 
@@ -809,20 +873,21 @@ export const SubManagerPage: React.FC = () => {
             account.homeAccountId,
             subTenantId,
           );
+          if (signal.aborted) return;
           const ids = Array.from(new Set(rows.map((r) => r.principalId)));
           const resolved = await getPrincipalsByIds(
             subTenantId,
             ids,
             graphToken,
           );
-          if (cancelled) return;
+          if (signal.aborted) return;
           const map: Record<string, ResolvedPrincipal> = {};
           for (const p of resolved) map[p.id] = p;
           setPrincipals(map);
         } catch (graphErr) {
           // Non-fatal — the table still renders with raw GUIDs, but we tell
           // the user so they know why display names aren't appearing.
-          if (cancelled) return;
+          if (signal.aborted) return;
           const msg =
             graphErr instanceof Error ? graphErr.message : String(graphErr);
           console.warn("[sub-manager] principal resolve failed:", graphErr);
@@ -832,24 +897,22 @@ export const SubManagerPage: React.FC = () => {
           );
         }
       } catch (err) {
-        if (cancelled) return;
+        if (signal.aborted) return;
         setListError(err instanceof Error ? err.message : String(err));
         setAssignments([]);
         setRoleDefs([]);
       } finally {
-        if (!cancelled) setListLoading(false);
+        if (!signal.aborted) setListLoading(false);
       }
-    })();
-    return () => {
-      cancelled = true;
-    };
-  }, [
-    account?.homeAccountId,
-    account?.tenantId,
-    subscriptionId,
-    selectedSub?.tenantId,
-    reloadTick,
-  ]);
+    },
+    [
+      account?.homeAccountId,
+      account?.tenantId,
+      subscriptionId,
+      selectedSub?.tenantId,
+      reloadTick,
+    ],
+  );
 
   /* ----- Filter / search ------------------------------------------- */
   const [search, setSearch] = React.useState("");
@@ -1163,9 +1226,15 @@ export const SubManagerPage: React.FC = () => {
   }, [tab, selected.size, clearSelection]);
 
   /* ----- Self-protection diagnostics ------------------------------- */
-  const selfPrincipalId =
-    candidateAccounts.find((a) => a.homeAccountId === accountId) &&
-    azureAccounts.find((a) => a.homeAccountId === accountId)?.localAccountId;
+  // Narrow to `string | null` (previous shape leaked `SourceAccount | string |
+  // false | undefined` into downstream comparisons via JS short-circuit).
+  const selfPrincipalId = React.useMemo<string | null>(() => {
+    if (!candidateAccounts.some((a) => a.homeAccountId === accountId)) {
+      return null;
+    }
+    const match = azureAccounts.find((a) => a.homeAccountId === accountId);
+    return match?.localAccountId ?? null;
+  }, [candidateAccounts, azureAccounts, accountId]);
 
   const ownerCount = React.useMemo(
     () =>
@@ -1585,6 +1654,7 @@ export const SubManagerPage: React.FC = () => {
         <GrantSubCreatorTab
           azureAccounts={candidateAccounts}
           store={store}
+          navigateToPage={navigateToPage}
         />
       )}
 
@@ -1657,7 +1727,7 @@ export const SubManagerPage: React.FC = () => {
                   <SelectValue placeholder="Pick a subscription" />
                 </SelectTrigger>
                 <SelectContent>
-                  {subscriptions.map((s) => (
+                  {visibleSubscriptions.map((s) => (
                     <SelectItem
                       key={s.subscriptionId}
                       value={s.subscriptionId}
@@ -1675,6 +1745,90 @@ export const SubManagerPage: React.FC = () => {
             )}
           </div>
         </CardContent>
+        {/* Subscription-fleet KPIs + "only Disabled / Warned" toggle ----
+          * Renders only when at least one subscription is visible. Tiles
+          * use SummaryStatItem so tones (warning / destructive) match
+          * the rest of the dashboard. */}
+        {subscriptions.length > 0 && (
+          <CardContent className="border-t border-border pt-3">
+            <div className="grid grid-cols-2 gap-2 sm:grid-cols-5">
+              <SummaryStatItem
+                label="Total"
+                value={subStateStats.total}
+                compact
+                ariaLabel={`${subStateStats.total} subscriptions visible`}
+              />
+              <SummaryStatItem
+                label="Enabled"
+                value={subStateStats.enabled}
+                tone={subStateStats.enabled > 0 ? "success" : "muted"}
+                compact
+                ariaLabel={`${subStateStats.enabled} subscriptions enabled`}
+              />
+              <SummaryStatItem
+                label="Disabled"
+                value={subStateStats.disabled}
+                tone={subStateStats.disabled > 0 ? "warning" : "muted"}
+                compact
+                ariaLabel={`${subStateStats.disabled} subscriptions disabled`}
+              />
+              <SummaryStatItem
+                label="Warned"
+                value={subStateStats.warned}
+                tone={subStateStats.warned > 0 ? "warning" : "muted"}
+                compact
+                ariaLabel={`${subStateStats.warned} subscriptions warned`}
+              />
+              <SummaryStatItem
+                label="Deleted"
+                value={subStateStats.deleted}
+                tone={subStateStats.deleted > 0 ? "destructive" : "muted"}
+                compact
+                ariaLabel={`${subStateStats.deleted} subscriptions deleted`}
+              />
+            </div>
+            <div className="mt-2 flex flex-wrap items-center gap-2">
+              <Button
+                type="button"
+                variant={onlyTroubled ? "default" : "outline"}
+                size="sm"
+                className="h-7 text-xs"
+                onClick={() => setOnlyTroubled(!onlyTroubled)}
+                aria-pressed={onlyTroubled}
+                title="Filter the picker to subscriptions in Disabled or Warned state"
+                disabled={subStateStats.troubled === 0 && !onlyTroubled}
+              >
+                <AlertTriangle className="h-3 w-3" />
+                {onlyTroubled
+                  ? `Showing only troubled (${subStateStats.troubled})`
+                  : `Show only troubled (${subStateStats.troubled})`}
+              </Button>
+              {onlyTroubled && subStateStats.troubled === 0 && (
+                <span className="text-2xs text-muted-foreground">
+                  No troubled subs — toggle off to see all.
+                </span>
+              )}
+              {selectedSub && (
+                <span className="ml-auto flex items-center gap-1 text-2xs text-muted-foreground">
+                  Current:
+                  <Badge
+                    variant={
+                      (selectedSub.state ?? "").toLowerCase() === "enabled"
+                        ? "outline"
+                        : (selectedSub.state ?? "").toLowerCase() === "warned" ||
+                            (selectedSub.state ?? "").toLowerCase() === "disabled"
+                          ? "warning"
+                          : "destructive"
+                    }
+                    className="text-2xs"
+                  >
+                    {selectedSub.state ?? "unknown"}
+                  </Badge>
+                </span>
+              )}
+            </div>
+          </CardContent>
+        )}
       </Card>
 
       {!subscriptionId && !subsLoading && (
@@ -2338,7 +2492,7 @@ export const SubManagerPage: React.FC = () => {
               ) : viewMode === "grouped" ? (
                 <GroupedAssignmentsList
                   rows={filteredRows}
-                  selfPrincipalId={selfPrincipalId ?? null}
+                  selfPrincipalId={selfPrincipalId}
                   selected={selected}
                   onToggleSelect={toggleSelect}
                   collapsedGroups={collapsedGroups}
@@ -2510,25 +2664,25 @@ function useBillingAccountPicker(
     [setBaParam],
   );
 
-  React.useEffect(() => {
-    if (!account) {
-      setArmToken(null);
-      setBillingAccounts([]);
-      return;
-    }
-    let cancelled = false;
-    setBaLoading(true);
-    setBaError(null);
-    (async () => {
+  useAbortableEffect(
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    async (signal) => {
+      if (!account) {
+        setArmToken(null);
+        setBillingAccounts([]);
+        return;
+      }
+      setBaLoading(true);
+      setBaError(null);
       try {
         // Tenant arg omitted so we pick up the operator's current active
         // tenant (was pinning to account.tenantId / the account's HOME
         // tenant — pre-switch).
         const tok = await getArmTokenForAccount(account.homeAccountId);
-        if (cancelled) return;
+        if (signal.aborted) return;
         setArmToken(tok);
         const list = await listEaBillingAccounts(tok);
-        if (cancelled) return;
+        if (signal.aborted) return;
         setBillingAccounts(list);
         if (list.length === 1 && billingAccountName !== list[0]!.name) {
           setBillingAccountName(list[0]!.name);
@@ -2539,19 +2693,16 @@ function useBillingAccountPicker(
           setBillingAccountName("");
         }
       } catch (err) {
-        if (!cancelled) {
-          setArmToken(null);
-          setBaError(err instanceof Error ? err.message : String(err));
-        }
+        if (signal.aborted) return;
+        setArmToken(null);
+        setBaError(err instanceof Error ? err.message : String(err));
       } finally {
-        if (!cancelled) setBaLoading(false);
+        if (!signal.aborted) setBaLoading(false);
       }
-    })();
-    return () => {
-      cancelled = true;
-    };
+    },
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [account?.homeAccountId, account?.tenantId]);
+    [account?.homeAccountId, account?.tenantId],
+  );
 
   return {
     account,
@@ -2671,29 +2822,27 @@ const DepartmentsTab: React.FC<{
   // hundreds of departments under a tenant is common, so a quick
   // substring filter on display name + cost center cuts noise fast.
   const [deptSearch, setDeptSearch] = React.useState("");
-  React.useEffect(() => {
-    if (!armToken || !billingAccountName) {
-      setDepts([]);
-      return;
-    }
-    let cancelled = false;
-    setLoading(true);
-    setError(null);
-    listEaDepartments(billingAccountName, armToken)
-      .then((d) => {
-        if (!cancelled) setDepts(d);
-      })
-      .catch((err: unknown) => {
-        if (!cancelled)
-          setError(err instanceof Error ? err.message : String(err));
-      })
-      .finally(() => {
-        if (!cancelled) setLoading(false);
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [armToken, billingAccountName, reloadTick]);
+  useAbortableEffect(
+    async (signal) => {
+      if (!armToken || !billingAccountName) {
+        setDepts([]);
+        return;
+      }
+      setLoading(true);
+      setError(null);
+      try {
+        const d = await listEaDepartments(billingAccountName, armToken);
+        if (signal.aborted) return;
+        setDepts(d);
+      } catch (err: unknown) {
+        if (signal.aborted) return;
+        setError(err instanceof Error ? err.message : String(err));
+      } finally {
+        if (!signal.aborted) setLoading(false);
+      }
+    },
+    [armToken, billingAccountName, reloadTick],
+  );
 
   // Filtered + alphabetically-sorted view for the list. Sorting is
   // applied after filtering so the order is deterministic regardless of
@@ -3187,7 +3336,12 @@ const DepartmentsTab: React.FC<{
 const GrantSubCreatorTab: React.FC<{
   azureAccounts: SourceAccount[];
   store: ReturnType<typeof useMultiRegionStore>;
-}> = ({ azureAccounts, store }) => {
+  // Path-based navigator from page-router outlet context. Required for
+  // the "Retry creating EA Sub now" pivot card; the previous version
+  // referenced an out-of-scope `navigate` symbol from `SubManagerPage`'s
+  // closure, which would have ReferenceError'd at runtime on click.
+  navigateToPage?: (path: string) => void;
+}> = ({ azureAccounts, store, navigateToPage }) => {
   const ctx = useBillingAccountPicker(azureAccounts, store);
   const { account, armToken, billingAccountName } = ctx;
 
@@ -3195,29 +3349,27 @@ const GrantSubCreatorTab: React.FC<{
   const [eas, setEas] = React.useState<EaEnrollmentAccount[]>([]);
   const [eaLoading, setEaLoading] = React.useState(false);
   const [eaError, setEaError] = React.useState<string | null>(null);
-  React.useEffect(() => {
-    if (!armToken || !billingAccountName) {
-      setEas([]);
-      return;
-    }
-    let cancelled = false;
-    setEaLoading(true);
-    setEaError(null);
-    listEnrollmentAccounts(billingAccountName, armToken)
-      .then((list) => {
-        if (!cancelled) setEas(list);
-      })
-      .catch((err: unknown) => {
-        if (!cancelled)
-          setEaError(err instanceof Error ? err.message : String(err));
-      })
-      .finally(() => {
-        if (!cancelled) setEaLoading(false);
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [armToken, billingAccountName]);
+  useAbortableEffect(
+    async (signal) => {
+      if (!armToken || !billingAccountName) {
+        setEas([]);
+        return;
+      }
+      setEaLoading(true);
+      setEaError(null);
+      try {
+        const list = await listEnrollmentAccounts(billingAccountName, armToken);
+        if (signal.aborted) return;
+        setEas(list);
+      } catch (err: unknown) {
+        if (signal.aborted) return;
+        setEaError(err instanceof Error ? err.message : String(err));
+      } finally {
+        if (!signal.aborted) setEaLoading(false);
+      }
+    },
+    [armToken, billingAccountName],
+  );
 
   const [eaName, setEaName] = React.useState("");
   React.useEffect(() => {
@@ -3642,7 +3794,11 @@ const GrantSubCreatorTab: React.FC<{
                 } catch {
                   /* ignore */
                 }
-                navigate("/ea-sub-quick");
+                // Path-based navigation (page-router contract). Falls back
+                // to a no-op if the outlet didn't provide a navigator —
+                // sessionStorage was still seeded so a manual sidebar nav
+                // works too.
+                navigateToPage?.("/ea-sub-quick");
               }}
               aria-label="Retry creating EA subscription on EA Sub Quick"
             >

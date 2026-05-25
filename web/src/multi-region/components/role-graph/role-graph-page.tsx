@@ -31,6 +31,7 @@
 import * as React from "react";
 import {
   AlertTriangle,
+  Bookmark,
   CheckCircle2,
   ChevronDown,
   ChevronRight,
@@ -40,10 +41,13 @@ import {
   Loader2,
   Network,
   RefreshCw,
+  Save,
   Search,
   Shield,
   ShieldAlert,
   ShieldCheck,
+  Target,
+  Trash2,
   User,
   Users,
   UserX,
@@ -75,7 +79,10 @@ import { cn, formatNumber, pluralize } from "@/lib/utils";
 import { getActiveTenant, getGraphTokenForAccount } from "../../auth/msal-auth";
 import { resolveActiveTenantId } from "../../auth/perform-tenant-switch";
 import { useArmToken } from "../../auth/use-arm-token";
+import { useAbortableEffect } from "../../hooks/use-abortable-effect";
+import { usePersistedState } from "../../hooks/use-persisted-state";
 import { useTenantChange } from "../../hooks/use-tenant-change";
+import { useUrlState } from "../../hooks/use-url-state";
 import { auditLog } from "../../services/audit-log";
 import {
   getPrincipalsByIds,
@@ -85,6 +92,7 @@ import {
 } from "../../services";
 import { useMultiRegionState } from "../../store/store-context";
 
+import { CopyButton } from "../shared/copy-button";
 import { EmptyState } from "../shared/empty-state";
 import { ExportMenu, type ExportColumn } from "../shared/export-menu";
 import { PageHeader } from "../shared/page-header";
@@ -100,7 +108,6 @@ import {
   classifyScopeLevel,
   computeStats,
   describeScope,
-  EMPTY_FILTERS,
   groupByPrincipal,
   PRIVILEGE_TIER_META,
   type EscalationCategory,
@@ -383,11 +390,14 @@ const PrincipalNode: React.FC<{
   summary: PrincipalSummary;
   expanded: boolean;
   onToggle: () => void;
-}> = ({ summary, expanded, onToggle }) => {
+  /** True when this principal matches the path-finder focus (hide-other when filter active). */
+  isPathHighlight?: boolean;
+}> = ({ summary, expanded, onToggle, isPathHighlight }) => {
   const Icon = principalIcon(summary.principalType);
   const meta = PRIVILEGE_TIER_META[summary.highestTier];
-  const accentTint =
-    summary.highestTier === "critical"
+  const accentTint = isPathHighlight
+    ? "border-primary/60 bg-primary/5 ring-2 ring-primary/40"
+    : summary.highestTier === "critical"
       ? "border-destructive/40 bg-destructive/5"
       : summary.highestTier === "privileged"
         ? "border-warning/40 bg-warning/5"
@@ -397,57 +407,74 @@ const PrincipalNode: React.FC<{
 
   return (
     <div className={cn("overflow-hidden rounded-md border", accentTint)}>
-      <button
-        type="button"
-        onClick={onToggle}
-        className="flex w-full flex-wrap items-center gap-2 px-3 py-2 text-left text-xs transition-colors hover:bg-accent/30 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-        aria-expanded={expanded}
-        aria-controls={`principal-body-${summary.principalId}`}
-      >
-        {expanded ? (
-          <ChevronDown className="h-3.5 w-3.5 shrink-0" aria-hidden />
-        ) : (
-          <ChevronRight className="h-3.5 w-3.5 shrink-0" aria-hidden />
-        )}
-        <Icon className="h-3.5 w-3.5 shrink-0 text-muted-foreground" aria-hidden />
-        <span className="flex min-w-0 flex-1 flex-col">
-          <span className="flex flex-wrap items-center gap-1 truncate font-medium">
-            <span className="truncate">{summary.displayName}</span>
-            {summary.isGuest && (
-              <Badge variant="warning" className="ml-1 text-2xs">
-                <UserX className="mr-1 h-3 w-3" aria-hidden />
-                Guest
-              </Badge>
-            )}
-            {summary.hasEscalation && (
-              <Badge variant="destructive" className="ml-1 text-2xs">
-                <AlertTriangle className="mr-1 h-3 w-3" aria-hidden />
-                Escalation
-              </Badge>
-            )}
-          </span>
-          <span className="flex flex-wrap items-center gap-1 text-2xs text-muted-foreground">
-            {summary.signInName && (
-              <span className="truncate font-mono">{summary.signInName}</span>
-            )}
-            {summary.signInName && <span className="opacity-60">·</span>}
-            <span className="font-mono opacity-70">
-              {summary.principalId.substring(0, 8)}…
+      <div className="group/copy relative flex items-center">
+        <button
+          type="button"
+          onClick={onToggle}
+          className="flex w-full flex-wrap items-center gap-2 px-3 py-2 text-left text-xs transition-colors hover:bg-accent/30 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+          aria-expanded={expanded}
+          aria-controls={`principal-body-${summary.principalId}`}
+        >
+          {expanded ? (
+            <ChevronDown className="h-3.5 w-3.5 shrink-0" aria-hidden />
+          ) : (
+            <ChevronRight className="h-3.5 w-3.5 shrink-0" aria-hidden />
+          )}
+          <Icon
+            className="h-3.5 w-3.5 shrink-0 text-muted-foreground"
+            aria-hidden
+          />
+          <span className="flex min-w-0 flex-1 flex-col">
+            <span className="flex flex-wrap items-center gap-1 truncate font-medium">
+              <span className="truncate">{summary.displayName}</span>
+              {summary.isGuest && (
+                <Badge variant="warning" className="ml-1 text-2xs">
+                  <UserX className="mr-1 h-3 w-3" aria-hidden />
+                  Guest
+                </Badge>
+              )}
+              {summary.hasEscalation && (
+                <Badge variant="destructive" className="ml-1 text-2xs">
+                  <AlertTriangle className="mr-1 h-3 w-3" aria-hidden />
+                  Escalation
+                </Badge>
+              )}
+            </span>
+            <span className="flex flex-wrap items-center gap-1 text-2xs text-muted-foreground">
+              {summary.signInName && (
+                <span className="truncate font-mono">
+                  {summary.signInName}
+                </span>
+              )}
+              {summary.signInName && <span className="opacity-60">·</span>}
+              <span
+                className="font-mono opacity-70"
+                title={summary.principalId}
+              >
+                {summary.principalId.substring(0, 8)}…
+              </span>
             </span>
           </span>
+          <Badge variant="secondary" className="text-2xs">
+            {summary.principalType}
+          </Badge>
+          <Badge variant="outline" className="text-2xs">
+            {summary.assignmentCount}{" "}
+            {summary.assignmentCount === 1 ? "role" : "roles"}
+          </Badge>
+          <TierBadge tier={summary.highestTier} />
+          <span className="sr-only">
+            highest tier: {meta.label} ({meta.description})
+          </span>
+        </button>
+        {/* Sibling copy button so we don't nest a <button> inside a <button>. */}
+        <span className="absolute right-2 top-1/2 -translate-y-1/2">
+          <CopyButton
+            value={summary.principalId}
+            ariaLabel={`Copy principal id ${summary.principalId}`}
+          />
         </span>
-        <Badge variant="secondary" className="text-2xs">
-          {summary.principalType}
-        </Badge>
-        <Badge variant="outline" className="text-2xs">
-          {summary.assignmentCount}{" "}
-          {summary.assignmentCount === 1 ? "role" : "roles"}
-        </Badge>
-        <TierBadge tier={summary.highestTier} />
-        <span className="sr-only">
-          highest tier: {meta.label} ({meta.description})
-        </span>
-      </button>
+      </div>
       {expanded && (
         <div
           id={`principal-body-${summary.principalId}`}
@@ -507,13 +534,30 @@ const AssignmentRow: React.FC<{ assignment: PrincipalAssignment }> = ({
   assignment,
 }) => {
   return (
-    <li className="flex flex-wrap items-center gap-1.5 rounded border border-border/40 bg-card/40 px-2 py-1 text-2xs">
+    <li className="group/copy flex flex-wrap items-center gap-1.5 rounded border border-border/40 bg-card/40 px-2 py-1 text-2xs">
       <TierBadge tier={assignment.tier} />
-      <span className="truncate font-medium">{assignment.roleName}</span>
+      <span
+        className="truncate font-medium"
+        title={`Role definition id ${assignment.roleDefinitionId}`}
+      >
+        {assignment.roleName}
+      </span>
+      <CopyButton
+        value={assignment.roleDefinitionId}
+        ariaLabel={`Copy role definition id ${assignment.roleDefinitionId}`}
+      />
       <span className="opacity-60">@</span>
-      <Badge variant="outline" className="text-2xs">
+      <Badge
+        variant="outline"
+        className="text-2xs"
+        title={assignment.scope}
+      >
         {describeScope(assignment.scope)}
       </Badge>
+      <CopyButton
+        value={assignment.scope}
+        ariaLabel={`Copy scope ${assignment.scope}`}
+      />
       {assignment.subscriptionDisplayName && (
         <span className="truncate text-muted-foreground">
           in {assignment.subscriptionDisplayName}
@@ -871,61 +915,16 @@ export const RoleGraphPage: React.FC<RoleGraphPageProps> = ({ onNavigate }) => {
       setProbedAt(new Date().toISOString());
       setProbing(false);
 
-      // ---- Audit (success path) ----
-      // We compute lightweight counts here so the audit row contains the
-      // headline numbers without us needing to redo the helper math.
-      const totalAssignments = results.reduce(
-        (acc, r) => acc + r.assignments.length,
-        0,
-      );
-      const uniquePrincipals = new Set(
-        results.flatMap((r) => r.assignments.map((a) => a.principalId)),
-      ).size;
-      const escalationCount = results.reduce((acc, r) => {
-        const roleById = new Map(r.roleDefs.map((d) => [d.id, d]));
-        let local = 0;
-        for (const a of r.assignments) {
-          const tier = classifyRoleTier(
-            roleById.get(a.roleDefinitionId),
-            a.roleDefinitionId,
-            a.scope,
-          );
-          if (
-            tier === "critical" &&
-            (classifyScopeLevel(a.scope) === "subscription" ||
-              classifyScopeLevel(a.scope) === "managementGroup")
-          ) {
-            local++;
-          }
-        }
-        return acc + local;
-      }, 0);
-      auditLog.record({
-        actor: account.username,
-        action: "role_graph_probe",
-        target: targets.map((t) => t.displayName).join(", "),
-        status: warnings.length > 0 ? "success" : "success",
-        details: {
-          subscriptionIds: targets.map((t) => t.subscriptionId),
-          assignmentCount: totalAssignments,
-          principalCount: uniquePrincipals,
-          escalationCount,
-          warnings: warnings.length,
-        },
-      });
+      // NOTE: Per the page brief the probe itself is read-only enumeration
+      // and not a state-changing action for OUR app, so we deliberately do
+      // NOT call auditLog.record() for probes. Audit firing is reserved for
+      // filter mutations (see recordFilterMutation() below).
     } catch (err) {
       if (ctrl.signal.aborted) return;
       const msg = err instanceof Error ? err.message : String(err);
       setProbeError(msg);
       setProbing(false);
-      auditLog.record({
-        actor: account.username,
-        action: "role_graph_probe",
-        target: targets.map((t) => t.displayName).join(", "),
-        status: "failure",
-        error: msg,
-        details: { subscriptionIds: targets.map((t) => t.subscriptionId) },
-      });
+      // Probes are not audited (read-only enumeration); see note above.
     }
   }, [account, selectedSubs, subscriptionOptions, armTokenTracker]);
 
@@ -991,40 +990,274 @@ export const RoleGraphPage: React.FC<RoleGraphPageProps> = ({ onNavigate }) => {
     });
   }, [subResults, groupMembers]);
 
-  // -------- Filters --------
-  const [filters, setFilters] = React.useState<RoleGraphFilters>(EMPTY_FILTERS);
-  const updateFilter = React.useCallback(
-    (patch: Partial<RoleGraphFilters>) => {
-      setFilters((prev) => ({ ...prev, ...patch }));
-    },
+  // -------- Filters (URL-persisted via useUrlState) --------
+  //
+  // Filter state is kept in the URL search-params so an operator can
+  // bookmark / share a focused view ("here are all critical-tier guests on
+  // sub X"). Each filter mutation also records a single `role_graph_filter`
+  // audit-log row — per the page brief, raw probes are read-only and not
+  // audited, but filter changes ARE worth recording because a stripped-
+  // down view can change what an operator overlooks during a review.
+  const URL_KEYS = React.useMemo<string[]>(
+    () => [
+      "q",
+      "tier",
+      "ptype",
+      "esc",
+      "scope",
+      "focusPrincipal",
+      "focusScope",
+    ],
     [],
   );
-  const toggleTierFilter = React.useCallback((t: PrivilegeTier) => {
-    setFilters((prev) => {
-      const has = prev.tiers.includes(t);
-      return {
-        ...prev,
-        tiers: has ? prev.tiers.filter((x) => x !== t) : [...prev.tiers, t],
-      };
-    });
+  type UrlFilterState = {
+    q: string;
+    tier: string[];
+    ptype: string[];
+    esc: string;
+    scope: string;
+    /** Path-finder: principal id (or display-name substring) to highlight. */
+    focusPrincipal: string;
+    /** Path-finder: scope substring to highlight assignments under. */
+    focusScope: string;
+  };
+  const URL_INITIAL: UrlFilterState = React.useMemo(
+    () => ({
+      q: "",
+      tier: [],
+      ptype: [],
+      esc: "all",
+      scope: "all",
+      focusPrincipal: "",
+      focusScope: "",
+    }),
+    [],
+  );
+  const [urlState, setUrlState] = useUrlState<UrlFilterState>(URL_INITIAL, {
+    keys: URL_KEYS,
+    replace: true,
+  });
+
+  // Project the URL state into the typed `RoleGraphFilters` shape consumed by
+  // the helpers — the helpers don't know about path-finder; that's overlay-only.
+  const filters = React.useMemo<RoleGraphFilters>(() => {
+    const tierVals = (urlState.tier ?? []).filter(
+      (t): t is PrivilegeTier =>
+        t === "critical" || t === "privileged" || t === "write" || t === "readonly",
+    );
+    const escVal = (urlState.esc ?? "all") as RoleGraphFilters["escalation"];
+    const scopeVal = (urlState.scope ?? "all") as RoleGraphFilters["scope"];
+    return {
+      search: urlState.q ?? "",
+      tiers: tierVals,
+      principalTypes: urlState.ptype ?? [],
+      escalation: [
+        "all",
+        "any",
+        "direct",
+        "groupMediated",
+        "crossTenantGuest",
+      ].includes(escVal)
+        ? escVal
+        : "all",
+      scope: ["all", "subscription", "resourceGroup", "resource"].includes(
+        scopeVal,
+      )
+        ? scopeVal
+        : "all",
+    };
+  }, [urlState]);
+
+  // ---- Filter-mutation audit (only fires on user-initiated changes) ----
+  // Each kind/value pair is reduced to one audit row. We deliberately do
+  // NOT audit `useUrlState` rehydration on mount (that's not a mutation),
+  // so we route every change through `recordFilterMutation` from inside
+  // the toggle callbacks.
+  const recordFilterMutation = React.useCallback(
+    (kind: string, value: unknown) => {
+      if (!account) return;
+      auditLog.record({
+        actor: account.username,
+        action: `role_graph_filter_${kind}`,
+        target: getActiveTenant(account.homeAccountId) ?? "no-tenant",
+        status: "success",
+        details: { value },
+      });
+    },
+    [account],
+  );
+
+  // Debounce search-typing audit so we record ONE row per filter
+  // intent instead of one row per keystroke. Other filter mutations
+  // (tier toggle, scope select) audit synchronously because they're
+  // already one click = one mutation.
+  const searchAuditTimerRef = React.useRef<ReturnType<typeof setTimeout> | null>(
+    null,
+  );
+  React.useEffect(() => {
+    return () => {
+      if (searchAuditTimerRef.current) {
+        clearTimeout(searchAuditTimerRef.current);
+      }
+    };
   }, []);
-  const togglePrincipalType = React.useCallback((pt: string) => {
-    setFilters((prev) => {
-      const has = prev.principalTypes.includes(pt);
-      return {
-        ...prev,
-        principalTypes: has
-          ? prev.principalTypes.filter((x) => x !== pt)
-          : [...prev.principalTypes, pt],
-      };
-    });
-  }, []);
+  const updateFilter = React.useCallback(
+    (patch: Partial<RoleGraphFilters>) => {
+      setUrlState((prev) => {
+        const next: Partial<UrlFilterState> = {};
+        if (patch.search !== undefined) next.q = patch.search;
+        if (patch.tiers !== undefined) next.tier = patch.tiers as string[];
+        if (patch.principalTypes !== undefined) next.ptype = patch.principalTypes;
+        if (patch.escalation !== undefined) next.esc = patch.escalation;
+        if (patch.scope !== undefined) next.scope = patch.scope;
+        void prev;
+        return next as Partial<UrlFilterState>;
+      });
+      const keys = Object.keys(patch);
+      const headKey = keys[0] ?? "unknown";
+      // Debounce on search to avoid spamming audit-log on every keystroke.
+      if (headKey === "search" && keys.length === 1) {
+        if (searchAuditTimerRef.current) {
+          clearTimeout(searchAuditTimerRef.current);
+        }
+        const value = patch.search;
+        searchAuditTimerRef.current = setTimeout(() => {
+          recordFilterMutation("search", value);
+        }, 500);
+        return;
+      }
+      recordFilterMutation(headKey, patch);
+    },
+    [setUrlState, recordFilterMutation],
+  );
+  const toggleTierFilter = React.useCallback(
+    (t: PrivilegeTier) => {
+      setUrlState((prev) => {
+        const arr = prev.tier ?? [];
+        const next = arr.includes(t)
+          ? arr.filter((x) => x !== t)
+          : [...arr, t];
+        return { tier: next };
+      });
+      recordFilterMutation("tier", t);
+    },
+    [setUrlState, recordFilterMutation],
+  );
+  const togglePrincipalType = React.useCallback(
+    (pt: string) => {
+      setUrlState((prev) => {
+        const arr = prev.ptype ?? [];
+        const next = arr.includes(pt)
+          ? arr.filter((x) => x !== pt)
+          : [...arr, pt];
+        return { ptype: next };
+      });
+      recordFilterMutation("ptype", pt);
+    },
+    [setUrlState, recordFilterMutation],
+  );
   const clearFilters = React.useCallback(() => {
-    setFilters(EMPTY_FILTERS);
-  }, []);
+    setUrlState({
+      q: "",
+      tier: [],
+      ptype: [],
+      esc: "all",
+      scope: "all",
+      focusPrincipal: "",
+      focusScope: "",
+    });
+    recordFilterMutation("clear", true);
+  }, [setUrlState, recordFilterMutation]);
+
   const filteredSummaries = React.useMemo(
     () => applyFilters(summaries, filters),
     [summaries, filters],
+  );
+
+  // -------- Path-finder overlay --------
+  //
+  // The operator picks a principal hint + a scope hint, and we highlight
+  // every principal that holds an assignment under the matching scope.
+  // This is overlay-only — it doesn't change which rows render (that's the
+  // filter's job), it just visually emphasizes the matched principals so
+  // the "path" between them and a target scope is unambiguous at a glance.
+  const focusPrincipal = (urlState.focusPrincipal ?? "").toLowerCase();
+  const focusScope = (urlState.focusScope ?? "").toLowerCase();
+  const pathHighlightIds = React.useMemo<Set<string>>(() => {
+    if (!focusPrincipal && !focusScope) return new Set();
+    const out = new Set<string>();
+    for (const s of filteredSummaries) {
+      const principalMatch = focusPrincipal
+        ? s.principalId.toLowerCase().includes(focusPrincipal) ||
+          s.displayName.toLowerCase().includes(focusPrincipal) ||
+          (s.signInName ?? "").toLowerCase().includes(focusPrincipal)
+        : true;
+      if (!principalMatch) continue;
+      const scopeMatch = focusScope
+        ? s.assignments.some((a) =>
+            a.scope.toLowerCase().includes(focusScope),
+          )
+        : true;
+      if (scopeMatch) out.add(s.principalId);
+    }
+    return out;
+  }, [filteredSummaries, focusPrincipal, focusScope]);
+
+  // -------- Saved "graph view" presets (persisted in localStorage) --------
+  //
+  // The shape is `{ name, filters }`. We store the URL filter shape, not
+  // the projected helper-shape, so reloading a preset is just `setUrlState`.
+  type SavedPreset = {
+    name: string;
+    state: UrlFilterState;
+    savedAt: string;
+  };
+  const [presets, setPresets] = usePersistedState<SavedPreset[]>(
+    "role-graph:presets",
+    [],
+    { version: 1 },
+  );
+  const [presetName, setPresetName] = React.useState("");
+  const saveCurrentPreset = React.useCallback(() => {
+    const name = presetName.trim();
+    if (!name) return;
+    setPresets((prev) => {
+      const filtered = prev.filter((p) => p.name !== name);
+      return [
+        ...filtered,
+        {
+          name,
+          state: {
+            q: urlState.q ?? "",
+            tier: urlState.tier ?? [],
+            ptype: urlState.ptype ?? [],
+            esc: urlState.esc ?? "all",
+            scope: urlState.scope ?? "all",
+            focusPrincipal: urlState.focusPrincipal ?? "",
+            focusScope: urlState.focusScope ?? "",
+          },
+          savedAt: new Date().toISOString(),
+        },
+      ];
+    });
+    setPresetName("");
+    recordFilterMutation("preset_save", name);
+  }, [presetName, urlState, setPresets, recordFilterMutation]);
+  const loadPreset = React.useCallback(
+    (name: string) => {
+      const preset = presets.find((p) => p.name === name);
+      if (!preset) return;
+      setUrlState(preset.state);
+      recordFilterMutation("preset_load", name);
+    },
+    [presets, setUrlState, recordFilterMutation],
+  );
+  const deletePreset = React.useCallback(
+    (name: string) => {
+      setPresets((prev) => prev.filter((p) => p.name !== name));
+      recordFilterMutation("preset_delete", name);
+    },
+    [setPresets, recordFilterMutation],
   );
 
   // -------- Expansion state --------
@@ -1039,14 +1272,20 @@ export const RoleGraphPage: React.FC<RoleGraphPageProps> = ({ onNavigate }) => {
   }, []);
   // Auto-expand all escalation-flagged principals on initial render so the
   // operator sees risk without clicking. Subsequent toggles are user-driven.
-  React.useEffect(() => {
-    if (summaries.length === 0) return;
-    const next = new Set<string>();
-    for (const s of summaries) {
-      if (s.hasEscalation) next.add(s.principalId);
-    }
-    setExpanded(next);
-  }, [summaries]);
+  // Use `useAbortableEffect` so the synchronous body short-circuits cleanly
+  // if `summaries` changes between renders mid-tear-down.
+  useAbortableEffect(
+    (signal) => {
+      if (summaries.length === 0) return;
+      if (signal.aborted) return;
+      const next = new Set<string>();
+      for (const s of summaries) {
+        if (s.hasEscalation) next.add(s.principalId);
+      }
+      setExpanded(next);
+    },
+    [summaries],
+  );
 
   // -------- Summary stats --------
   const stats = React.useMemo(() => computeStats(summaries), [summaries]);
@@ -1527,6 +1766,135 @@ export const RoleGraphPage: React.FC<RoleGraphPageProps> = ({ onNavigate }) => {
                 );
               })}
             </div>
+
+            {/* Path-finder + presets */}
+            <div
+              className="flex flex-col gap-2 border-t border-border/40 pt-3"
+              role="group"
+              aria-label="Path finder and saved presets"
+            >
+              <div className="flex flex-wrap items-center gap-2">
+                <span className="flex items-center gap-1 text-2xs font-medium uppercase tracking-wider text-muted-foreground">
+                  <Target className="h-3 w-3" aria-hidden />
+                  Path finder
+                </span>
+                <Input
+                  value={urlState.focusPrincipal ?? ""}
+                  onChange={(e) => {
+                    setUrlState({ focusPrincipal: e.target.value });
+                  }}
+                  onBlur={(e) =>
+                    e.target.value &&
+                    recordFilterMutation("focusPrincipal", e.target.value)
+                  }
+                  placeholder="Principal id / name / UPN…"
+                  className="h-8 max-w-[260px] text-xs"
+                  aria-label="Path-finder principal hint"
+                />
+                <Input
+                  value={urlState.focusScope ?? ""}
+                  onChange={(e) => {
+                    setUrlState({ focusScope: e.target.value });
+                  }}
+                  onBlur={(e) =>
+                    e.target.value &&
+                    recordFilterMutation("focusScope", e.target.value)
+                  }
+                  placeholder="Target scope substring (e.g. /resourceGroups/prod-rg)"
+                  className="h-8 max-w-[320px] text-xs font-mono"
+                  aria-label="Path-finder scope hint"
+                />
+                {(urlState.focusPrincipal || urlState.focusScope) && (
+                  <>
+                    <Badge variant="secondary" className="text-2xs">
+                      {pathHighlightIds.size}{" "}
+                      {pathHighlightIds.size === 1 ? "match" : "matches"}
+                    </Badge>
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      size="sm"
+                      onClick={() => {
+                        setUrlState({
+                          focusPrincipal: "",
+                          focusScope: "",
+                        });
+                        recordFilterMutation("focusClear", true);
+                      }}
+                      className="h-8 px-2 text-2xs"
+                      aria-label="Clear path-finder"
+                    >
+                      <X className="h-3 w-3" />
+                      Clear
+                    </Button>
+                  </>
+                )}
+              </div>
+              <div className="flex flex-wrap items-center gap-2">
+                <span className="flex items-center gap-1 text-2xs font-medium uppercase tracking-wider text-muted-foreground">
+                  <Bookmark className="h-3 w-3" aria-hidden />
+                  Saved views
+                </span>
+                <Input
+                  value={presetName}
+                  onChange={(e) => setPresetName(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter") {
+                      e.preventDefault();
+                      saveCurrentPreset();
+                    }
+                  }}
+                  placeholder="Preset name…"
+                  className="h-8 max-w-[180px] text-xs"
+                  aria-label="Preset name"
+                />
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  onClick={saveCurrentPreset}
+                  disabled={!presetName.trim()}
+                  className="h-8 px-2 text-2xs"
+                  aria-label="Save current filters as preset"
+                >
+                  <Save className="h-3 w-3" aria-hidden />
+                  Save
+                </Button>
+                {presets.length > 0 && (
+                  <div
+                    className="flex flex-wrap items-center gap-1"
+                    role="list"
+                    aria-label="Saved presets"
+                  >
+                    {presets.map((p) => (
+                      <span
+                        key={p.name}
+                        role="listitem"
+                        className="inline-flex items-center gap-1 rounded border border-border/60 bg-muted/30 px-1.5 py-0.5 text-2xs"
+                        title={`Saved ${p.savedAt}`}
+                      >
+                        <button
+                          type="button"
+                          className="font-medium hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                          onClick={() => loadPreset(p.name)}
+                          aria-label={`Load preset ${p.name}`}
+                        >
+                          {p.name}
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => deletePreset(p.name)}
+                          className="text-muted-foreground hover:text-destructive focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                          aria-label={`Delete preset ${p.name}`}
+                        >
+                          <Trash2 className="h-3 w-3" aria-hidden />
+                        </button>
+                      </span>
+                    ))}
+                  </div>
+                )}
+              </div>
+            </div>
           </CardContent>
         </Card>
       )}
@@ -1636,6 +2004,7 @@ export const RoleGraphPage: React.FC<RoleGraphPageProps> = ({ onNavigate }) => {
                 summary={s}
                 expanded={expanded.has(s.principalId)}
                 onToggle={() => toggleExpanded(s.principalId)}
+                isPathHighlight={pathHighlightIds.has(s.principalId)}
               />
             ))}
           </div>

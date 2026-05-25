@@ -117,6 +117,8 @@ import {
   useMultiRegionStore,
 } from "../../store/store-context";
 import type { AzureLoginAccount } from "../../store/store-types";
+import { usePersistedState } from "../../hooks/use-persisted-state";
+import { useDashboardOutletContext } from "../page-router";
 
 import { ConfirmationDialog } from "../shared/confirmation-dialog";
 import { CopyableText, CopyButton } from "../shared/copy-button";
@@ -489,9 +491,93 @@ async function readFromClipboard(): Promise<string | null> {
   }
 }
 
+/* ============================================================================
+ * Bulk-import types
+ * ============================================================================
+ * `JwtPreview` mirrors `ImportPreview` from the canonical imported-tokens
+ * API but adds a stable client-side key so React lists can identify each
+ * row without ever falling back to array index.
+ *
+ * `BulkImportRow` is a per-line entry in the bulk-paste table — each line
+ * is independently validated and reported.
+ *
+ * SECURITY: `BulkImportRow.preview` may hold decoded JWT claims. We NEVER
+ * write that into localStorage / sessionStorage / auditLog directly —
+ * commit always goes through the canonical `importToken(...)` API which
+ * encrypts/scopes properly, and audit log entries strip down to counts,
+ * audience strings, expiry, and (on failure) sanitized error messages.
+ * ============================================================================ */
+interface BulkImportRow {
+  /** Stable client-side key — line index + 4-char hash of the line. */
+  readonly key: string;
+  /** Line index inside the paste (1-based) — display only. */
+  readonly lineNo: number;
+  /** Mask-safe preview of the raw line (never the full token). */
+  readonly maskedLine: string;
+  /** Decoded preview, or null if the line did not parse as a JWT. */
+  readonly preview: import("../../auth/imported-tokens").ImportPreview | null;
+  /** Per-row import status. */
+  status: "pending" | "imported" | "skipped" | "failed";
+  /** Sanitized error/skip reason. NEVER contains token material. */
+  reason?: string;
+}
+
+interface BulkImportPlan {
+  /** All parseable + un-parseable rows in original order. */
+  readonly rows: readonly BulkImportRow[];
+  /** Count of rows that look like importable JWTs. */
+  readonly importableCount: number;
+  /** Count of rows that decoded but have audience === "unknown". */
+  readonly unknownAudienceCount: number;
+  /** Count of rows that already exist (same homeAccountId + audience). */
+  readonly duplicateCount: number;
+  /** Total non-empty lines parsed. */
+  readonly totalLines: number;
+}
+
+/**
+ * Cheap 32-bit non-cryptographic hash (Adler-style) for deriving stable
+ * row keys from raw line content. We use only the first 4 hex chars in
+ * the key — combined with the line number it's sufficient for React
+ * list identity even when two lines happen to collide.
+ *
+ * SECURITY NOTE: the input string here may be a token; the OUTPUT is a
+ * deterministic 8-hex digest and is safe to use as a React key. The
+ * hash is NOT cryptographically secure — do not rely on it for anything
+ * other than UI list identity.
+ */
+function hashLineForKey(s: string): string {
+  let h = 5381;
+  for (let i = 0; i < s.length; i += 1) {
+    h = ((h << 5) + h + s.charCodeAt(i)) | 0;
+  }
+  return (h >>> 0).toString(16).padStart(8, "0").slice(0, 4);
+}
+
+/** JWT-shape screener used by bulk paste — same shape contract as the
+ *  page's mandatory-rule regex. Returns true for plausible JWT shapes,
+ *  used ONLY as a filter to skip blatantly-non-JWT lines early; the
+ *  authoritative parse is still `previewToken(...)` from the canonical
+ *  API which validates oid + tid claims. */
+const JWT_SHAPE_RE =
+  /^[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{20,}$/;
+
+/** Mask-safe display fragment of a (possibly token-shaped) line. Shows
+ *  the first 12 chars + ellipsis + length. NEVER renders the full
+ *  string — and the masked output is the only thing we'd ever surface
+ *  to console / audit-log / DOM for non-imported lines. */
+function maskLineForDisplay(line: string): string {
+  const t = line.trim().replace(/^Bearer\s+/i, "");
+  if (t.length <= 16) return "•".repeat(Math.min(t.length, 8));
+  return `${t.slice(0, 12)}…(${t.length} chars)`;
+}
+
 export const TokenImporterPage: React.FC = () => {
   const state = useMultiRegionState();
   const store = useMultiRegionStore();
+  // Path-based router nav, e.g. for the empty-state CTA that pivots
+  // operators into audience-matrix to see what tokens unlock.
+  const { navigateToPage } = useDashboardOutletContext();
 
   /* ---- Mount lifecycle: every async completion path checks this so
    * we never call setState on an unmounted component. */
@@ -585,6 +671,62 @@ export const TokenImporterPage: React.FC = () => {
       redeemAbortRef.current?.abort();
     },
     [],
+  );
+
+  /* ---- Bulk-paste state ---------------------------------------------
+   * The bulk-paste textarea lets operators paste a newline-delimited
+   * batch of JWTs harvested from one DevTools run on portal.azure.com
+   * (the snippet at the top already deduplicates and joins with `\n`).
+   *
+   * SECURITY: tokens NEVER leak from this state into console, storage,
+   * or the audit log. Commit goes through canonical `importToken(...)`.
+   * Audit entries strip down to counts + audience + tenant. */
+  const [bulkInput, setBulkInput] = React.useState("");
+  const [bulkBusy, setBulkBusy] = React.useState(false);
+  const [bulkRows, setBulkRows] = React.useState<readonly BulkImportRow[]>([]);
+  // AbortController scoped to the in-flight bulk run so the operator
+  // can cancel mid-batch. Reset between batches.
+  const bulkAbortRef = React.useRef<AbortController | null>(null);
+  React.useEffect(
+    () => () => {
+      bulkAbortRef.current?.abort();
+    },
+    [],
+  );
+
+  /* ---- Trusted-audience allowlist (UUIDs only) ----------------------
+   * Per-tenant: the operator marks a tenant id as "trusted" so future
+   * bulk imports flag any JWT whose `tid` is OUTSIDE this set with a
+   * warning chip. Persisted via the canonical `usePersistedState` hook
+   * — NEVER any raw localStorage writes here.
+   *
+   * SECURITY: the only thing we persist is a list of tenant GUIDs.
+   * Never tokens, never claims, never aud strings (which can contain
+   * URIs that disclose internal app names). The `migrate` callback
+   * filters non-GUID entries on load so a tampered store can't poison
+   * the allowlist with arbitrary strings. */
+  const trustedAudiencesGuidRe =
+    /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+  const [trustedTenants, setTrustedTenants] = usePersistedState<readonly string[]>(
+    "azbm.token-importer.trusted-tenants.v1",
+    [],
+    {
+      version: 1,
+      migrate: (raw) => {
+        if (!Array.isArray(raw)) return [];
+        const out: string[] = [];
+        for (const v of raw) {
+          if (typeof v !== "string") continue;
+          if (!trustedAudiencesGuidRe.test(v.trim())) continue;
+          out.push(v.trim().toLowerCase());
+        }
+        return out;
+      },
+    },
+  );
+  const trustedTenantSet = React.useMemo(
+    () => new Set(trustedTenants.map((t) => t.toLowerCase())),
+    [trustedTenants],
   );
 
   /* ---- Refresh-token form state ------------------------------ */
@@ -1732,6 +1874,221 @@ export const TokenImporterPage: React.FC = () => {
     }
   }, [preview, state.azureAccounts, store, refreshList]);
 
+  /* ---- Bulk-import: derive the plan from the textarea ---------------
+   * Debounced 300ms upstream via deferred update of `bulkInput` (we
+   * read on demand here — React's batching keeps the cost cheap; the
+   * input field itself updates synchronously for responsiveness). */
+  const bulkPlan = React.useMemo<BulkImportPlan>(() => {
+    const raw = bulkInput;
+    if (!raw.trim()) {
+      return {
+        rows: [],
+        importableCount: 0,
+        unknownAudienceCount: 0,
+        duplicateCount: 0,
+        totalLines: 0,
+      };
+    }
+    // Split on newlines or whitespace runs that include a newline. The
+    // portal-snippet copy joins with `\n` so the split is well-defined.
+    const lines = raw
+      .split(/\r?\n+/g)
+      .map((l) => l.trim())
+      .filter((l) => l.length > 0);
+    const existingKey = new Set(
+      allTokens.map((t) => `${t.homeAccountId}|${t.audience}`),
+    );
+    const out: BulkImportRow[] = [];
+    let importable = 0;
+    let unknown = 0;
+    let duplicates = 0;
+    for (let i = 0; i < lines.length; i += 1) {
+      const line = lines[i]!;
+      const stripped = line.replace(/^Bearer\s+/i, "").trim();
+      const looksLikeJwt = JWT_SHAPE_RE.test(stripped);
+      const preview = looksLikeJwt ? previewToken(stripped) : null;
+      const key = `${i}-${hashLineForKey(stripped)}`;
+      const masked = maskLineForDisplay(line);
+      if (preview) {
+        importable += 1;
+        if (preview.audience === "unknown") unknown += 1;
+        if (existingKey.has(`${preview.homeAccountId}|${preview.audience}`)) {
+          duplicates += 1;
+        }
+      }
+      out.push({
+        key,
+        lineNo: i + 1,
+        maskedLine: masked,
+        preview,
+        status: "pending",
+        reason: preview
+          ? undefined
+          : looksLikeJwt
+            ? "Looks like a JWT but is missing oid/tid claims."
+            : "Does not match JWT shape (three base64url segments).",
+      });
+    }
+    return {
+      rows: out,
+      importableCount: importable,
+      unknownAudienceCount: unknown,
+      duplicateCount: duplicates,
+      totalLines: lines.length,
+    };
+  }, [bulkInput, allTokens]);
+
+  /**
+   * Commit every importable row from the bulk plan. Per-row exception
+   * boundaries — one bad line never blocks the others. Cancellable via
+   * `bulkAbortRef` (operator clicks "Cancel" or navigates away).
+   *
+   * SECURITY: audit log entries carry counts + per-row outcome only —
+   * NEVER the token string, NEVER the decoded claims. The masked-line
+   * preview (`maskedLine`) is the only line-identifying string that
+   * ever reaches the audit log details field, and it's already
+   * mask-safe (12 chars + length).
+   */
+  const runBulkImport = React.useCallback(async () => {
+    if (bulkPlan.importableCount === 0) return;
+    bulkAbortRef.current?.abort();
+    const ac = new AbortController();
+    bulkAbortRef.current = ac;
+    setBulkBusy(true);
+    const startedAt = bulkPlan.rows.map((r) => ({ ...r }));
+    setBulkRows(startedAt);
+    let ok = 0;
+    let skipped = 0;
+    let failed = 0;
+    // Snapshot the current allTokens before we mutate the store — we
+    // re-derive `existingKey` once at the start so duplicate detection
+    // matches what the operator saw in the preview table.
+    const next = startedAt.map((row): BulkImportRow => {
+      if (ac.signal.aborted || !mountedRef.current) {
+        return { ...row, status: "skipped", reason: "Cancelled by operator." };
+      }
+      if (!row.preview) {
+        failed += 1;
+        return { ...row, status: "failed" };
+      }
+      try {
+        const committed = importToken(row.preview);
+        ok += 1;
+        // Audit entry for the SUCCESSFUL commit — counts + audience only.
+        // No token material, no claims dump.
+        auditLog.record({
+          actor: committed.upn ?? committed.oid ?? "operator",
+          action: "import_token",
+          target: `${committed.audience} @ ${committed.tenantId}`,
+          status: "success",
+          details: {
+            oid: committed.oid,
+            tenantId: committed.tenantId,
+            audience: committed.audience,
+            rawAudience: committed.rawAudience,
+            expiresAt: committed.expiresAt,
+            source: "bulk-import",
+            lineNo: row.lineNo,
+            trustedTenant: trustedTenantSet.has(
+              committed.tenantId.toLowerCase(),
+            ),
+          },
+        });
+        return { ...row, status: "imported" };
+      } catch (err) {
+        failed += 1;
+        const msg = err instanceof Error ? err.message : "import failed";
+        // Failure audit — sanitized error string only. `msg` originates
+        // from importToken() which throws plain validation errors and
+        // does NOT echo the token back.
+        auditLog.record({
+          actor: row.preview.upn ?? row.preview.oid ?? "operator",
+          action: "import_token",
+          target: `${row.preview.audience} @ ${row.preview.tenantId}`,
+          status: "failure",
+          error: msg,
+          details: {
+            tenantId: row.preview.tenantId,
+            audience: row.preview.audience,
+            source: "bulk-import",
+            lineNo: row.lineNo,
+          },
+        });
+        return { ...row, status: "failed", reason: msg };
+      }
+    });
+    if (ac.signal.aborted || !mountedRef.current) {
+      skipped = next.filter((r) => r.status === "pending").length;
+    }
+    setBulkRows(next);
+    setBulkBusy(false);
+    // Re-derive the account list so the lower table picks up imports.
+    refreshList();
+    // Summary audit row — operators want a single "bulk-import complete"
+    // pin in the log per batch, with no per-token detail.
+    auditLog.record({
+      actor: "operator",
+      action: "import_token_bulk",
+      target: `${ok}+${failed}+${skipped}`,
+      // audit-log status is strictly "success" | "failure" — represent
+      // partial outcomes as success (at least one row imported) and
+      // track the breakdown via the `details` field so dashboards can
+      // surface them without losing the success/failure binary.
+      status: ok > 0 ? "success" : "failure",
+      details: {
+        imported: ok,
+        failed,
+        skipped,
+        totalLines: bulkPlan.totalLines,
+        importable: bulkPlan.importableCount,
+        duplicateCount: bulkPlan.duplicateCount,
+        unknownAudienceCount: bulkPlan.unknownAudienceCount,
+        outcome: failed === 0 && ok > 0 ? "full" : ok > 0 ? "partial" : "none",
+      },
+    });
+    store.addNotification({
+      type: ok > 0 && failed === 0 ? "success" : ok > 0 ? "warning" : "error",
+      message: `Bulk import: ${ok} imported, ${failed} failed, ${skipped} skipped.`,
+    });
+  }, [bulkPlan, store, refreshList, trustedTenantSet]);
+
+  const cancelBulkImport = React.useCallback(() => {
+    bulkAbortRef.current?.abort();
+    if (mountedRef.current) setBulkBusy(false);
+  }, []);
+
+  const clearBulkInput = React.useCallback(() => {
+    setBulkInput("");
+    setBulkRows([]);
+  }, []);
+
+  /**
+   * Toggle a tenant id in the trusted-audiences allowlist. The
+   * `usePersistedState` setter writes through the canonical hook —
+   * never raw localStorage. Only valid GUID-shaped strings are added.
+   */
+  const toggleTrustedTenant = React.useCallback(
+    (tenantId: string) => {
+      const tid = tenantId.trim().toLowerCase();
+      if (!trustedAudiencesGuidRe.test(tid)) return;
+      setTrustedTenants((prev) => {
+        const set = new Set(prev.map((t) => t.toLowerCase()));
+        if (set.has(tid)) set.delete(tid);
+        else set.add(tid);
+        return Array.from(set);
+      });
+      // Audit the change — tenant id is a public GUID, safe to log.
+      auditLog.record({
+        actor: "operator",
+        action: "trusted_tenant_toggle",
+        target: tid,
+        status: "success",
+        details: { tenantId: tid },
+      });
+    },
+    [setTrustedTenants],
+  );
+
   const handleRemoveAccount = React.useCallback(
     (a: ImportedAccountSummary) => {
       setPendingConfirm({ kind: "drop-account", account: a });
@@ -2203,6 +2560,22 @@ export const TokenImporterPage: React.FC = () => {
     [rtPlanValid, rtSubmitting, submitRefreshToken],
   );
 
+  /* ---- Per-row bulk-input Ctrl+Enter handler ----------------------- */
+  const handleBulkKeyDown = React.useCallback(
+    (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
+      if (
+        (e.ctrlKey || e.metaKey) &&
+        e.key === "Enter" &&
+        bulkPlan.importableCount > 0 &&
+        !bulkBusy
+      ) {
+        e.preventDefault();
+        void runBulkImport();
+      }
+    },
+    [bulkPlan.importableCount, bulkBusy, runBulkImport],
+  );
+
   return (
     <div className="flex flex-col gap-4 py-2">
       <PageHeader
@@ -2254,6 +2627,289 @@ export const TokenImporterPage: React.FC = () => {
               (or use Ctrl/Cmd+V into the field).
             </span>
           </div>
+        </CardContent>
+      </Card>
+
+      {/* ----- Bulk paste (multi-line) ------------------------------- */}
+      {/*
+        * The portal snippet at the top joins every cached bearer token
+        * with `\n` and writes the whole batch to the clipboard. This
+        * card accepts that newline-delimited paste directly: each line
+        * is independently parsed, previewed, and imported.
+        *
+        * SECURITY: the textarea value never leaves React state — we
+        * never log it, never persist the raw paste, never put the
+        * decoded claims into audit-log `details`. Only sanitized
+        * counts + audience strings reach the audit log.
+        */}
+      <Card className="border-primary/30">
+        <CardHeader className="pb-3">
+          <CardTitle className="flex items-center gap-2 text-sm">
+            <Plus className="h-4 w-4 text-primary" />
+            Bulk paste — multi-line JWT import
+            <InfoTooltip
+              ariaLabel="About bulk paste"
+              content="Paste a newline-separated list of JWTs (e.g. the output of the portal-snippet at the top, which already joins every cached token with \\n). Each line is parsed independently; the table below shows per-line outcome. Cancellable mid-batch; nothing is committed until you click 'Import all'."
+            />
+            {trustedTenants.length > 0 && (
+              <Badge variant="secondary" className="text-2xs">
+                <ShieldCheck className="h-3 w-3" /> {trustedTenants.length} trusted tenant
+                {trustedTenants.length === 1 ? "" : "s"}
+              </Badge>
+            )}
+          </CardTitle>
+          <CardDescription>
+            One JWT per line — empty lines and{" "}
+            <code className="font-mono">Bearer </code> prefixes are tolerated.
+            Press{" "}
+            <kbd className="rounded border border-border bg-muted px-1 py-0.5 text-2xs">
+              Ctrl
+            </kbd>
+            +
+            <kbd className="rounded border border-border bg-muted px-1 py-0.5 text-2xs">
+              Enter
+            </kbd>{" "}
+            to commit the staged batch.
+          </CardDescription>
+        </CardHeader>
+        <CardContent className="flex flex-col gap-3">
+          <textarea
+            id="bulk-paste-access-tokens"
+            value={bulkInput}
+            onChange={(e) => setBulkInput(e.target.value)}
+            onKeyDown={handleBulkKeyDown}
+            placeholder={
+              "eyJ0eXAi…\neyJ0eXAi…\nBearer eyJ0eXAi…\n# (one JWT per line)"
+            }
+            rows={5}
+            className="flex w-full rounded-md border border-input bg-background px-3 py-2 font-mono text-[10px] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+            aria-label="Paste multiple JWT bearer tokens, one per line"
+            spellCheck={false}
+            autoComplete="off"
+          />
+          <div className="flex flex-wrap items-center gap-2">
+            <Button
+              type="button"
+              variant="default"
+              onClick={() => void runBulkImport()}
+              disabled={bulkPlan.importableCount === 0 || bulkBusy}
+              loading={bulkBusy}
+              aria-label={`Import ${bulkPlan.importableCount} staged token${bulkPlan.importableCount === 1 ? "" : "s"}`}
+            >
+              {!bulkBusy && <CheckCircle2 />}
+              Import all ({bulkPlan.importableCount})
+            </Button>
+            {bulkBusy && (
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                onClick={cancelBulkImport}
+                aria-label="Cancel in-flight bulk import"
+              >
+                <X />
+                Cancel
+              </Button>
+            )}
+            {bulkInput.length > 0 && !bulkBusy && (
+              <Button
+                type="button"
+                variant="ghost"
+                size="sm"
+                onClick={clearBulkInput}
+                aria-label="Clear bulk paste input and results"
+              >
+                <X />
+                Clear
+              </Button>
+            )}
+            {bulkPlan.totalLines > 0 && (
+              <span className="text-2xs text-muted-foreground">
+                {bulkPlan.totalLines} line{bulkPlan.totalLines === 1 ? "" : "s"}
+                {" · "}
+                {bulkPlan.importableCount} importable
+                {bulkPlan.duplicateCount > 0
+                  ? ` · ${bulkPlan.duplicateCount} duplicate${bulkPlan.duplicateCount === 1 ? "" : "s"}`
+                  : ""}
+                {bulkPlan.unknownAudienceCount > 0
+                  ? ` · ${bulkPlan.unknownAudienceCount} unknown audience`
+                  : ""}
+              </span>
+            )}
+          </div>
+          {bulkPlan.rows.length > 0 && (
+            <div
+              className="max-h-64 overflow-auto rounded-md border border-border bg-muted/20 p-2 text-2xs"
+              role="region"
+              aria-label="Per-line bulk import preview and results"
+            >
+              <table className="w-full">
+                <thead className="sticky top-0 bg-muted/40 text-left">
+                  <tr>
+                    <th className="px-1 py-0.5 font-medium">#</th>
+                    <th className="px-1 py-0.5 font-medium">Line</th>
+                    <th className="px-1 py-0.5 font-medium">Audience</th>
+                    <th className="px-1 py-0.5 font-medium">Identity</th>
+                    <th className="px-1 py-0.5 font-medium">Tenant</th>
+                    <th className="px-1 py-0.5 font-medium">Expires</th>
+                    <th className="px-1 py-0.5 font-medium">Status</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {(bulkBusy || bulkRows.length > 0
+                    ? bulkRows
+                    : bulkPlan.rows
+                  ).map((row) => {
+                    const p = row.preview;
+                    const trustOk =
+                      p && trustedTenantSet.size > 0
+                        ? trustedTenantSet.has(p.tenantId.toLowerCase())
+                        : null;
+                    return (
+                      <tr
+                        key={row.key}
+                        className="border-t border-border/40 align-top"
+                      >
+                        <td className="px-1 py-0.5 font-mono text-muted-foreground">
+                          {row.lineNo}
+                        </td>
+                        <td className="px-1 py-0.5 font-mono">
+                          {row.maskedLine}
+                        </td>
+                        <td className="px-1 py-0.5">
+                          {p ? (
+                            <Badge
+                              variant={
+                                p.audience === "unknown"
+                                  ? "destructive"
+                                  : "outline"
+                              }
+                              className="text-2xs"
+                              title={AUDIENCE_HINT[p.audience]}
+                            >
+                              {AUDIENCE_SHORT[p.audience]}
+                            </Badge>
+                          ) : (
+                            <span className="text-muted-foreground">—</span>
+                          )}
+                        </td>
+                        <td className="px-1 py-0.5">
+                          {p ? p.upn ?? p.name ?? p.oid.slice(0, 12) : "—"}
+                        </td>
+                        <td className="px-1 py-0.5">
+                          {p ? (
+                            <span className="inline-flex items-center gap-1">
+                              <code className="font-mono">
+                                {p.tenantId.slice(0, 8)}…
+                              </code>
+                              {trustOk === true && (
+                                <ShieldCheck
+                                  className="h-3 w-3 text-success"
+                                  aria-label="Trusted tenant"
+                                />
+                              )}
+                              {trustOk === false && (
+                                <AlertTriangle
+                                  className="h-3 w-3 text-warning"
+                                  aria-label="Tenant not in trusted allowlist"
+                                />
+                              )}
+                              <button
+                                type="button"
+                                onClick={() => toggleTrustedTenant(p.tenantId)}
+                                className="rounded border border-border/60 px-1 text-[9px] hover:bg-muted"
+                                aria-label={
+                                  trustedTenantSet.has(p.tenantId.toLowerCase())
+                                    ? `Remove tenant ${p.tenantId} from trusted allowlist`
+                                    : `Add tenant ${p.tenantId} to trusted allowlist`
+                                }
+                                title={
+                                  trustedTenantSet.has(p.tenantId.toLowerCase())
+                                    ? "In trusted allowlist — click to remove"
+                                    : "Not in trusted allowlist — click to add"
+                                }
+                              >
+                                {trustedTenantSet.has(p.tenantId.toLowerCase())
+                                  ? "untrust"
+                                  : "trust"}
+                              </button>
+                            </span>
+                          ) : (
+                            "—"
+                          )}
+                        </td>
+                        <td className="px-1 py-0.5">
+                          {p ? fmtExpiresIn(p.expiresAt) : "—"}
+                        </td>
+                        <td className="px-1 py-0.5">
+                          {row.status === "imported" && (
+                            <Badge variant="success" className="text-2xs">
+                              <Check className="h-3 w-3" /> imported
+                            </Badge>
+                          )}
+                          {row.status === "failed" && (
+                            <Badge
+                              variant="destructive"
+                              className="text-2xs"
+                              title={row.reason}
+                            >
+                              <X className="h-3 w-3" /> failed
+                            </Badge>
+                          )}
+                          {row.status === "skipped" && (
+                            <Badge
+                              variant="warning"
+                              className="text-2xs"
+                              title={row.reason}
+                            >
+                              skipped
+                            </Badge>
+                          )}
+                          {row.status === "pending" &&
+                            (p ? (
+                              <Badge
+                                variant="secondary"
+                                className="text-2xs"
+                                title="Will import when you click 'Import all'"
+                              >
+                                ready
+                              </Badge>
+                            ) : (
+                              <Badge
+                                variant="outline"
+                                className="text-2xs"
+                                title={row.reason}
+                              >
+                                no parse
+                              </Badge>
+                            ))}
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+          )}
+          {bulkPlan.unknownAudienceCount > 0 && (
+            <Alert variant="warning">
+              <AlertTriangle className="h-3.5 w-3.5" />
+              <AlertDescription className="text-2xs">
+                {bulkPlan.unknownAudienceCount} token
+                {bulkPlan.unknownAudienceCount === 1 ? "" : "s"} target an
+                unrecognised audience. They will import but no page will
+                auto-route on them.{" "}
+                <button
+                  type="button"
+                  className="underline-offset-2 hover:underline"
+                  onClick={() => navigateToPage("/audience-matrix")}
+                >
+                  Open audience-matrix
+                </button>{" "}
+                to see what coverage looks like after import.
+              </AlertDescription>
+            </Alert>
+          )}
         </CardContent>
       </Card>
 
@@ -3939,8 +4595,25 @@ export const TokenImporterPage: React.FC = () => {
             <EmptyState
               icon={Key}
               title="No tokens imported yet"
-              description="Paste a JWT into the access-token form above, or use the refresh-token form to mint tokens on demand. Imported tokens override MSAL for ARM / Graph / Batch calls."
+              description="Paste a JWT into the access-token form above, paste multiple JWTs into the bulk-import card, or use the refresh-token form to mint tokens on demand. Imported tokens override MSAL for ARM / Graph / Batch calls."
               size="compact"
+              action={{
+                label: "Open audience-matrix to see what these tokens unlock",
+                icon: Network,
+                onClick: () => {
+                  // Path-based navigation — the canonical wiring
+                  // contract. Audit-log the navigation so operators have
+                  // a breadcrumb back to where they pivoted.
+                  auditLog.record({
+                    actor: "operator",
+                    action: "token_importer_pivot",
+                    target: "/audience-matrix",
+                    status: "success",
+                    details: { reason: "empty-state-cta" },
+                  });
+                  navigateToPage("/audience-matrix");
+                },
+              }}
             />
           ) : filteredAccounts.length === 0 ? (
             <EmptyState

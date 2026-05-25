@@ -35,7 +35,6 @@ import {
   AlertTriangle,
   ArrowRight,
   Building2,
-  Check,
   CheckCircle2,
   Clock,
   Copy,
@@ -43,12 +42,12 @@ import {
   Database,
   ExternalLink,
   FolderTree,
+  Ghost,
   Layers,
   ListChecks,
   Loader2,
   PackageMinus,
   PackagePlus,
-  Pencil,
   RefreshCw,
   Search,
   Server,
@@ -87,6 +86,7 @@ import {
 } from "../../auth/msal-auth";
 import { resolveActiveTenantId } from "../../auth/perform-tenant-switch";
 import { useArmToken } from "../../auth/use-arm-token";
+import { usePersistedState } from "../../hooks/use-persisted-state";
 import { useTenantChange } from "../../hooks/use-tenant-change";
 import { auditLog } from "../../services/audit-log";
 import {
@@ -254,9 +254,30 @@ interface RgPlanRow {
 /**
  * Quick-filter chip values for the Batch-accounts picker. Maps to the
  * provisioningState of the ARM resource (case-insensitive). "all" is the
- * default no-op filter.
+ * default no-op filter. "stale" surfaces accounts that look problematic
+ * (failed/canceled provisioning OR zero dedicated core quota) — useful
+ * targets for a "cleanup move" pass.
  */
-type QuickFilter = "all" | "provisioned" | "failed" | "in-progress";
+type QuickFilter = "all" | "provisioned" | "failed" | "in-progress" | "stale";
+
+/**
+ * Heuristic: does this Batch account look stale / abandoned?
+ * Signals (any one triggers "stale"):
+ *   - provisioningState in {Failed, Canceled, Cancelled}
+ *   - dedicatedCoreQuota === 0 AND lowPriorityCoreQuota === 0
+ *     (account exists but can't actually allocate any compute)
+ * ARM doesn't surface a creation timestamp on Batch accounts, so this is
+ * the best we can do without an extra Activity-Log call per account.
+ */
+function isStaleBatchAccount(b: ArmBatchAccount): boolean {
+  const state = (b.properties?.provisioningState ?? "").toLowerCase();
+  if (state === "failed" || state === "canceled" || state === "cancelled") {
+    return true;
+  }
+  const dedicated = b.properties?.dedicatedCoreQuota ?? -1;
+  const lowPri = b.properties?.lowPriorityCoreQuota ?? -1;
+  return dedicated === 0 && lowPri === 0;
+}
 
 /**
  * Sort options for the Batch-accounts picker. "name-asc" is the default
@@ -564,13 +585,26 @@ export const ResourceManagerPage: React.FC = () => {
       provisioned: 0,
       failed: 0,
       "in-progress": 0,
+      stale: 0,
     };
     for (const b of batchAccounts) {
       const bucket = bucketState(b.properties?.provisioningState ?? "");
-      if (bucket !== "all") counts[bucket] += 1;
+      if (bucket !== "all" && bucket !== "stale") counts[bucket] += 1;
+      if (isStaleBatchAccount(b)) counts.stale += 1;
     }
     return counts;
   }, [batchAccounts, bucketState]);
+
+  /**
+   * List of "stale" Batch accounts — surfaced in the summary tile and
+   * by the persisted "Stale only" filter chip. Heuristic in
+   * `isStaleBatchAccount`. Memoised separately so the SummaryStatItem
+   * doesn't re-render every keystroke in the search box.
+   */
+  const staleAccounts = React.useMemo(
+    () => batchAccounts.filter(isStaleBatchAccount),
+    [batchAccounts],
+  );
 
   /**
    * Multi-token search: every whitespace-separated token must match SOME
@@ -587,9 +621,16 @@ export const ResourceManagerPage: React.FC = () => {
     const out = batchAccounts.filter((b) => {
       // Quick-filter chip first (cheap path).
       if (quickFilter !== "all") {
-        const bucket = bucketState(b.properties?.provisioningState ?? "");
-        if (bucket !== quickFilter) return false;
+        if (quickFilter === "stale") {
+          if (!isStaleBatchAccount(b)) return false;
+        } else {
+          const bucket = bucketState(b.properties?.provisioningState ?? "");
+          if (bucket !== quickFilter) return false;
+        }
       }
+      // Persisted "stale only" toggle composes with AND on top of the
+      // chip — lets the operator scope to e.g. "in-progress AND stale".
+      if (staleOnly && !isStaleBatchAccount(b)) return false;
       if (tokens.length === 0) return true;
       const haystack = [
         b.name,
@@ -629,12 +670,17 @@ export const ResourceManagerPage: React.FC = () => {
         break;
     }
     return sorted;
-  }, [batchAccounts, search, quickFilter, bucketState, sort]);
+  }, [batchAccounts, search, quickFilter, staleOnly, bucketState, sort]);
 
-  // Clear selection on source change.
+  // Clear selection ONLY when the source subscription changes — not on
+  // every `reloadTick`. The runMove pipeline calls `setReloadTick` to
+  // refresh the post-move list AND `setSelected` with the moved rows
+  // surgically removed (so failed rows stay ticked for retry). If we
+  // cleared selection on `reloadTick` too, that surgical update would
+  // be stomped on the next render.
   React.useEffect(() => {
     setSelected(new Set());
-  }, [srcSubId, reloadTick]);
+  }, [srcSubId]);
 
   const toggle = React.useCallback((id: string) => {
     setSelected((prev) => {
@@ -721,26 +767,42 @@ export const ResourceManagerPage: React.FC = () => {
   >({});
 
   /**
+   * Bulk-action toolbar state — input for the suffix/prefix the
+   * operator wants to slap onto every row's destination RG name in a
+   * single click. Kept in a transient local state (not persisted) so a
+   * stale "-prod" from yesterday doesn't accidentally re-apply on next
+   * session. Confirmation dialog state for bulk delete-from-selection
+   * lives separately so the operator can't accidentally fire it.
+   */
+  const [bulkSuffix, setBulkSuffix] = React.useState("");
+  const [confirmBulkRemoveOpen, setConfirmBulkRemoveOpen] =
+    React.useState(false);
+
+  /**
    * Bulk-rename template applied to every row that doesn't have an
    * explicit `destRgName` override. Persisted across reloads so an
    * operator who prefers `mig-{name}` doesn't have to re-set it every
-   * session.
+   * session. Uses `usePersistedState` for cross-tab sync + schema
+   * versioning (replaces ad-hoc sessionStorage handling).
    */
-  const [rgTemplate, setRgTemplateState] = React.useState<string>(() => {
-    try {
-      return sessionStorage.getItem(STORAGE_RG_TEMPLATE) ?? DEFAULT_RG_TEMPLATE;
-    } catch {
-      return DEFAULT_RG_TEMPLATE;
-    }
-  });
-  const setRgTemplate = React.useCallback((t: string) => {
-    setRgTemplateState(t);
-    try {
-      sessionStorage.setItem(STORAGE_RG_TEMPLATE, t);
-    } catch {
-      /* ignore */
-    }
-  }, []);
+  const [rgTemplate, setRgTemplate] = usePersistedState<string>(
+    STORAGE_RG_TEMPLATE,
+    DEFAULT_RG_TEMPLATE,
+    { syncAcrossTabs: true },
+  );
+
+  /**
+   * Stale-only filter — persisted via `usePersistedState` so the chip
+   * remembers its on/off state across reloads. When true, the visible
+   * list is restricted to accounts flagged by `isStaleBatchAccount`
+   * (Failed/Canceled provisioning OR zero core quota). Independent of
+   * the provisioningState quick-filter — both compose with AND.
+   */
+  const [staleOnly, setStaleOnly] = usePersistedState<boolean>(
+    "resource-manager:stale-only",
+    false,
+    { syncAcrossTabs: true },
+  );
 
   const planRows: RgPlanRow[] = React.useMemo(() => {
     const selectedAccounts = batchAccounts.filter((b) => selected.has(b.id));
@@ -777,6 +839,111 @@ export const ResourceManagerPage: React.FC = () => {
       };
     });
   }, [batchAccounts, selected, planOverrides, rgTemplate]);
+
+  /**
+   * Bulk-action: append a suffix to every planned row's destination RG
+   * name. Writes per-row overrides so the result survives a subsequent
+   * template change. No-op for rows with errors so we don't silently
+   * compound an invalid name into "still invalid + suffix". Sanitises
+   * the suffix through the same RG-name rules to keep the result valid.
+   *
+   * Bulk-removed selection items are surfaced via auditLog so the
+   * operator has a paper trail of what was un-planned just before
+   * kicking off a multi-minute move.
+   */
+  const applyBulkSuffix = React.useCallback(() => {
+    const raw = bulkSuffix.trim();
+    if (!raw) return;
+    // Sanitise the suffix the same way we sanitise generated names —
+    // operators sometimes paste in "  -prod  " or "foo bar" and would
+    // otherwise produce invalid RG names.
+    const safeSuffix = sanitiseForRg(raw).replace(/^[-.]+/, "");
+    if (!safeSuffix) {
+      store.addNotification({
+        type: "error",
+        message: "Suffix produced an empty string after sanitisation.",
+      });
+      return;
+    }
+    setPlanOverrides((prev) => {
+      const next = { ...prev };
+      for (const row of planRows) {
+        // Use the rendered (possibly-templated, possibly-overridden)
+        // name as the base. Idempotent: re-clicking with the same
+        // suffix won't double-append.
+        const current = row.destRgName;
+        if (current.toLowerCase().endsWith(safeSuffix.toLowerCase())) continue;
+        next[row.resourceId] = {
+          ...(next[row.resourceId] ?? {}),
+          destRgName: `${current}-${safeSuffix}`.replace(/-{2,}/g, "-"),
+        };
+      }
+      return next;
+    });
+    store.addNotification({
+      type: "info",
+      message: `Appended "-${safeSuffix}" to ${planRows.length} planned RG name${planRows.length === 1 ? "" : "s"}.`,
+    });
+  }, [bulkSuffix, planRows, store]);
+
+  /**
+   * Bulk-action: set the destination location on every row to a single
+   * value. Operators with mixed-region source selections sometimes want
+   * to land everything in one disaster-recovery region.
+   */
+  const applyBulkLocation = React.useCallback(
+    (loc: string) => {
+      const safe = loc.trim();
+      if (!safe) return;
+      setPlanOverrides((prev) => {
+        const next = { ...prev };
+        for (const row of planRows) {
+          if (row.destLocation === safe) continue;
+          next[row.resourceId] = {
+            ...(next[row.resourceId] ?? {}),
+            destLocation: safe,
+          };
+        }
+        return next;
+      });
+      store.addNotification({
+        type: "info",
+        message: `Set destination location to ${safe} on ${planRows.length} row${planRows.length === 1 ? "" : "s"}.`,
+      });
+    },
+    [planRows, store],
+  );
+
+  /**
+   * Bulk-action: remove EVERY selected account from the plan. Gated by
+   * a confirmation dialog because losing a 30-row plan to a stray
+   * click is a multi-minute setback for the operator.
+   */
+  const bulkRemoveFromSelection = React.useCallback(() => {
+    if (planRows.length === 0) return;
+    const removedIds = planRows.map((r) => r.resourceId);
+    setSelected(new Set());
+    // Drop overrides for removed rows so a re-selection starts clean.
+    setPlanOverrides((prev) => {
+      const next = { ...prev };
+      for (const id of removedIds) delete next[id];
+      return next;
+    });
+    auditLog.record({
+      actor: account?.username ?? accountId,
+      action: "bulk_remove_plan_rows",
+      target: srcSub?.subscriptionId ?? "",
+      status: "success",
+      details: {
+        sourceSubscriptionId: srcSub?.subscriptionId,
+        rowCount: removedIds.length,
+        rowIds: removedIds,
+      },
+    });
+    setConfirmBulkRemoveOpen(false);
+    // setSelected / setPlanOverrides / setConfirmBulkRemoveOpen are
+    // React state dispatchers — guaranteed stable, so omitted here.
+  }, [planRows, account?.username, accountId, srcSub?.subscriptionId]);
 
   const planErrors: { resourceId: string; message: string }[] = React.useMemo(() => {
     const errs: { resourceId: string; message: string }[] = [];
@@ -1332,7 +1499,50 @@ export const ResourceManagerPage: React.FC = () => {
     return { elapsedMs, etaMs: Math.round(avgPerRow * remaining) };
   }, [running, runStart, elapsedTick, results]);
 
-  /* ----- Export columns (planned moves + results) ---------------- */
+  /* ----- Export columns (source matrix + planned moves + results)
+   * The "source matrix" export covers the full unfiltered batchAccounts
+   * list — quotas, provisioning state, RG, region, stale-flag. Operators
+   * use it as a stocktake before deciding what to move. Filename
+   * includes the source subscription so multi-sub exports don't clobber
+   * each other on disk. */
+  const matrixExportColumns: ExportColumn<ArmBatchAccount>[] = React.useMemo(
+    () => [
+      { header: "Batch account", accessor: (b) => b.name },
+      { header: "Resource ID", accessor: (b) => b.id },
+      { header: "Resource group", accessor: (b) => rgFromArmId(b.id) },
+      { header: "Location", accessor: (b) => b.location },
+      {
+        header: "Provisioning state",
+        accessor: (b) => b.properties?.provisioningState ?? "",
+      },
+      {
+        header: "Dedicated core quota",
+        accessor: (b) => b.properties?.dedicatedCoreQuota ?? "",
+      },
+      {
+        header: "Low-priority core quota",
+        accessor: (b) => b.properties?.lowPriorityCoreQuota ?? "",
+      },
+      {
+        header: "Pool quota",
+        accessor: (b) => b.properties?.poolQuota ?? "",
+      },
+      {
+        header: "Pool allocation mode",
+        accessor: (b) => b.properties?.poolAllocationMode ?? "",
+      },
+      {
+        header: "Public network access",
+        accessor: (b) => b.properties?.publicNetworkAccess ?? "",
+      },
+      {
+        header: "Stale (heuristic)",
+        accessor: (b) => (isStaleBatchAccount(b) ? "yes" : "no"),
+      },
+    ],
+    [],
+  );
+
   const planExportColumns: ExportColumn<RgPlanRow>[] = React.useMemo(
     () => [
       { header: "Batch account", accessor: (r) => r.name },
@@ -1576,6 +1786,36 @@ export const ResourceManagerPage: React.FC = () => {
           compact
           hint="see results"
         />
+        {/* Stale-resource detector tile — surfaces problematic accounts
+            (Failed/Canceled OR zero core quota). Clickable: toggles the
+            persisted "Stale only" filter so the operator can drill in
+            without scrolling to the chip row. */}
+        {staleAccounts.length > 0 && (
+          <button
+            type="button"
+            onClick={() => setStaleOnly((v) => !v)}
+            aria-pressed={staleOnly}
+            aria-label={
+              staleOnly
+                ? `Stale-only filter on — ${staleAccounts.length} accounts flagged. Click to clear.`
+                : `${staleAccounts.length} stale-looking accounts. Click to filter to only these.`
+            }
+            className="rounded focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+            title={
+              staleOnly
+                ? "Click to clear the stale-only filter"
+                : "Click to filter the list to only stale-looking accounts"
+            }
+          >
+            <SummaryStatItem
+              label="Stale"
+              value={staleAccounts.length}
+              tone={staleOnly ? "warning" : "muted"}
+              compact
+              hint={staleOnly ? "filter active" : "click to filter"}
+            />
+          </button>
+        )}
         {stats.cancelled > 0 && (
           <SummaryStatItem
             label="Cancelled"
@@ -1883,6 +2123,31 @@ export const ResourceManagerPage: React.FC = () => {
                   />
                   Refresh
                 </Button>
+                {/* Full source-matrix CSV/JSON export — covers the
+                    unfiltered batchAccounts list (NOT just the plan).
+                    Operators use it as a stocktake before deciding
+                    what to move. */}
+                {batchAccounts.length > 0 && (
+                  <ExportMenu
+                    rows={batchAccounts}
+                    columns={matrixExportColumns}
+                    filename={
+                      srcSub
+                        ? `resource-manager-matrix-${srcSub.subscriptionId.slice(0, 8)}`
+                        : "resource-manager-matrix"
+                    }
+                    label="Export matrix"
+                    jsonMetadata={{
+                      sourceSubscriptionId: srcSub?.subscriptionId,
+                      sourceTenantId: srcSub?.tenantId,
+                      totalAccounts: batchAccounts.length,
+                      staleAccounts: staleAccounts.length,
+                      stateBuckets,
+                      exportedAt: new Date().toISOString(),
+                      exportedBy: account?.username ?? accountId,
+                    }}
+                  />
+                )}
               </div>
 
               {/* Quick-filter chips — by provisioningState bucket. */}
@@ -1909,6 +2174,11 @@ export const ResourceManagerPage: React.FC = () => {
                       label: "In progress",
                       count: stateBuckets["in-progress"],
                     },
+                    {
+                      value: "stale",
+                      label: "Stale",
+                      count: stateBuckets.stale,
+                    },
                   ] as const
                 ).map((chip) => {
                   const active = quickFilter === chip.value;
@@ -1933,6 +2203,32 @@ export const ResourceManagerPage: React.FC = () => {
                     </Button>
                   );
                 })}
+                {/* Persisted "Stale only" toggle — composes with AND on
+                    top of the chip above. Lives separately so the
+                    operator can keep e.g. "Failed" selected while
+                    additionally narrowing to "AND has zero core
+                    quota". usePersistedState persists across reloads
+                    and (with syncAcrossTabs) across browser tabs. */}
+                <Button
+                  type="button"
+                  variant={staleOnly ? "default" : "outline"}
+                  size="sm"
+                  className="h-6 gap-1 px-2 text-2xs focus-visible:ring-2 focus-visible:ring-ring"
+                  onClick={() => setStaleOnly((v) => !v)}
+                  aria-pressed={staleOnly}
+                  aria-label={`${staleOnly ? "Disable" : "Enable"} stale-only filter (persisted across reloads)`}
+                  title="Toggle a persistent filter that restricts the list to stale-looking accounts."
+                  disabled={staleAccounts.length === 0}
+                >
+                  <Ghost className="h-3 w-3" aria-hidden />
+                  Stale only
+                  <Badge
+                    variant={staleOnly ? "secondary" : "outline"}
+                    className="text-2xs"
+                  >
+                    {staleAccounts.length}
+                  </Badge>
+                </Button>
               </div>
 
               {batchLoading ? (
@@ -2176,6 +2472,88 @@ export const ResourceManagerPage: React.FC = () => {
                         {preset.label}
                       </Button>
                     ))}
+                  </div>
+                </div>
+
+                {/* ---- Bulk-action toolbar ----------------------------
+                    Operates on every planned row in a single click —
+                    bulk-suffix, bulk-location, bulk-remove. Distinct
+                    from the template above because the template
+                    rebuilds names from scratch while suffix/location
+                    overlay edits on top of the current rendered name.
+                    Confirmation dialog gates the destructive remove. */}
+                <div
+                  className="flex flex-wrap items-end gap-2 rounded-md border border-dashed border-border bg-muted/10 p-2"
+                  role="toolbar"
+                  aria-label="Bulk actions for the RG plan"
+                >
+                  <div className="flex flex-col gap-1">
+                    <Label
+                      htmlFor="rm-bulk-suffix"
+                      className="text-2xs text-muted-foreground"
+                    >
+                      Bulk suffix
+                    </Label>
+                    <div className="flex items-center gap-1">
+                      <Input
+                        id="rm-bulk-suffix"
+                        value={bulkSuffix}
+                        onChange={(e) => setBulkSuffix(e.target.value)}
+                        placeholder="-prod, -dr, …"
+                        className="h-7 w-32 font-mono text-2xs"
+                        disabled={running !== null}
+                        aria-label="Suffix to append to every destination RG name"
+                      />
+                      <Button
+                        type="button"
+                        size="xs"
+                        variant="outline"
+                        onClick={applyBulkSuffix}
+                        disabled={running !== null || !bulkSuffix.trim()}
+                        aria-label={`Append "${bulkSuffix.trim() || "(empty)"}" to ${planRows.length} destination RG name${planRows.length === 1 ? "" : "s"}`}
+                      >
+                        Apply to all
+                      </Button>
+                    </div>
+                  </div>
+                  <div className="flex flex-col gap-1">
+                    <Label className="text-2xs text-muted-foreground">
+                      Bulk location
+                    </Label>
+                    <div className="flex flex-wrap items-center gap-1">
+                      {(
+                        ["eastus", "westeurope", "westus2", "southeastasia"] as const
+                      ).map((loc) => (
+                        <Button
+                          key={loc}
+                          type="button"
+                          size="xs"
+                          variant="outline"
+                          onClick={() => applyBulkLocation(loc)}
+                          disabled={running !== null}
+                          aria-label={`Set destination location to ${loc} on all rows`}
+                        >
+                          {loc}
+                        </Button>
+                      ))}
+                    </div>
+                  </div>
+                  <div className="ml-auto flex flex-col gap-1">
+                    <Label className="text-2xs text-muted-foreground">
+                      Bulk remove
+                    </Label>
+                    <Button
+                      type="button"
+                      size="xs"
+                      variant="destructive"
+                      onClick={() => setConfirmBulkRemoveOpen(true)}
+                      disabled={running !== null || planRows.length === 0}
+                      aria-label={`Remove all ${planRows.length} rows from the plan`}
+                      title="Drop every planned row from the selection (no Azure side-effects). Confirmation required."
+                    >
+                      <Trash2 className="h-3 w-3" aria-hidden />
+                      Drop {planRows.length} row{planRows.length === 1 ? "" : "s"}
+                    </Button>
                   </div>
                 </div>
 
@@ -2723,9 +3101,32 @@ export const ResourceManagerPage: React.FC = () => {
         onConfirm={() => void runMove()}
         onCancel={() => setConfirmMoveOpen(false)}
       />
+
+      {/* Bulk-remove confirmation — destructive but local-only (no Azure
+          side-effects). Surfaces row count so a hasty click on a
+          30-row plan can't accidentally wipe the operator's work. */}
+      <ConfirmationDialog
+        hidden={!confirmBulkRemoveOpen}
+        title={`Drop ${planRows.length} row${planRows.length === 1 ? "" : "s"} from plan?`}
+        message={
+          <div className="flex flex-col gap-2 text-sm">
+            <p className="m-0">
+              This clears the entire selection and any per-row RG-name
+              / location overrides you've made. Nothing in Azure is
+              changed.
+            </p>
+            <p className="m-0 text-xs text-muted-foreground">
+              You'll be able to rebuild the plan by re-ticking
+              accounts in the list above.
+            </p>
+          </div>
+        }
+        confirmText={`Drop ${planRows.length}`}
+        danger
+        onConfirm={bulkRemoveFromSelection}
+        onCancel={() => setConfirmBulkRemoveOpen(false)}
+      />
     </div>
   );
 };
 
-// Silence unused-import lint if the design later surfaces these.
-export const _ResourceMgrIcons = { Check, Pencil };

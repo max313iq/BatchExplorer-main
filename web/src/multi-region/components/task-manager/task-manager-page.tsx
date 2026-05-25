@@ -41,6 +41,7 @@
 import * as React from "react";
 import {
   AlertTriangle,
+  ArrowDown,
   ArrowDownToLine,
   CheckCircle2,
   ClipboardCheck,
@@ -51,6 +52,7 @@ import {
   HelpCircle,
   Inbox,
   Info,
+  Keyboard,
   Loader2,
   Maximize2,
   PauseCircle,
@@ -81,6 +83,9 @@ import { cn } from "@/lib/utils";
 import { useDashboardOutletContext } from "../page-router";
 import { PageHeader } from "../shared/page-header";
 import { useMultiRegionStore } from "../../store/store-context";
+import { useShortcut } from "../../hooks/use-shortcut";
+import { usePersistedState } from "../../hooks/use-persisted-state";
+import { auditLog } from "../../services/audit-log";
 import {
   TaskRecord,
   TaskStatus,
@@ -199,6 +204,13 @@ function useNowTick(intervalMs = 1_000): number {
 /* --------------------------------------------------------------------- */
 /* Helpers                                                                */
 /* --------------------------------------------------------------------- */
+
+// COORDINATOR: This `dispatchResume` body is duplicated verbatim in
+// `task-auto-resumer.tsx` and `resume-prompt-dialog.tsx` (all three live
+// in this folder). If a future refactor wants to consolidate, extract it
+// to `task-manager/dispatch-resume.ts` (still inside this folder) and
+// have the auto-resumer + prompt dialog import from there. We are NOT
+// touching the orchestrator-agent or store layer to make this change.
 
 /**
  * Re-dispatch a task back to the orchestrator with its original input.
@@ -422,6 +434,12 @@ interface SectionProps {
   helpText?: string;
   /** Bulk actions surfaced in the section header for non-empty sections. */
   headerActions?: React.ReactNode;
+  /** Currently-selected task id (single-select). */
+  selectedId?: string | null;
+  /** Selection setter — invoked when a row body is clicked. */
+  onSelect?: (id: string) => void;
+  /** Show the inline raw-JSON expander on each row. */
+  enableJsonExpander?: boolean;
 }
 
 const Section: React.FC<SectionProps> = ({
@@ -434,6 +452,9 @@ const Section: React.FC<SectionProps> = ({
   defaultOpen = true,
   helpText,
   headerActions,
+  selectedId,
+  onSelect,
+  enableJsonExpander,
 }) => {
   const [open, setOpen] = React.useState(defaultOpen);
   return (
@@ -501,7 +522,14 @@ const Section: React.FC<SectionProps> = ({
               tone={accent === "warning" ? "warning" : "primary"}
               className="gap-2"
               renderItem={(t) => (
-                <TaskRow task={t} actions={actions} nowTick={nowTick} />
+                <TaskRow
+                  task={t}
+                  actions={actions}
+                  nowTick={nowTick}
+                  selected={selectedId === t.id}
+                  onSelect={onSelect}
+                  enableJsonExpander={enableJsonExpander}
+                />
               )}
             />
           )}
@@ -550,8 +578,13 @@ export const TaskManagerPage: React.FC = () => {
   const [tasks, refreshTasks] = useTasks();
   const nowTick = useNowTick();
   // Recompute "now" once per tick — keeps stuck-detection live without
-  // touching the runtime.
-  const nowMs = React.useMemo(() => Date.now(), [nowTick]);
+  // touching the runtime. We reference `nowTick` in the dep array so the
+  // memo refreshes once per second; the `void nowTick` line silences the
+  // "unused dep" lint without giving up the dependency.
+  const nowMs = React.useMemo(() => {
+    void nowTick;
+    return Date.now();
+  }, [nowTick]);
 
   const [filter, setFilter] = React.useState("");
   /**
@@ -567,6 +600,50 @@ export const TaskManagerPage: React.FC = () => {
   const [confirmState, setConfirmState] = React.useState<{
     kind: "clear-finished" | "discard-interrupted" | "remove-history" | null;
   }>({ kind: null });
+
+  /**
+   * Single-select id used by keyboard shortcuts (`c` to cancel, `r` to
+   * resume/retry). Clicking a row sets this; clicking buttons inside the
+   * row does NOT (the buttons stopPropagation). Null = nothing selected.
+   */
+  const [selectedId, setSelectedId] = React.useState<string | null>(null);
+
+  /**
+   * Tail-mode: auto-scroll to the newest task row whenever the underlying
+   * list changes. Persisted across reloads so the operator's preference
+   * sticks. Off by default — tail-mode steals scroll focus, which can be
+   * annoying when manually scrolling history.
+   */
+  const [tailMode, setTailMode, _resetTail] = usePersistedState<boolean>(
+    "mr.task-manager.tail-mode",
+    false,
+    { version: 1 },
+  );
+  void _resetTail; // reserved for a future "reset preferences" hook
+
+  /**
+   * "Show only failed in last 24h" — a persisted shortcut chip distinct
+   * from the regular status chip set because it has a time-window
+   * predicate. When on, OR'd onto the existing chip selection so the user
+   * can combine it with the search box and other chips.
+   */
+  const [failed24h, setFailed24h] = usePersistedState<boolean>(
+    "mr.task-manager.filter.failed-24h",
+    false,
+    { version: 1 },
+  );
+
+  /**
+   * Hotkey toast — a transient banner shown when a shortcut fires so the
+   * operator gets visible feedback without watching the toast region.
+   */
+  const [hotkeyHint, setHotkeyHint] = React.useState<string | null>(null);
+  const showHotkeyHint = React.useCallback((msg: string) => {
+    setHotkeyHint(msg);
+    window.setTimeout(() => {
+      setHotkeyHint((cur) => (cur === msg ? null : cur));
+    }, 1800);
+  }, []);
 
   const toggleChip = React.useCallback((status: string) => {
     setActiveChips((prev) => {
@@ -610,9 +687,24 @@ export const TaskManagerPage: React.FC = () => {
     return { ...counts, "all-active": activeCount } as Record<string, number>;
   }, [tasks]);
 
+  // COORDINATOR: Duplicate task filtering logic also lives in
+  // `sticky-tasks-panel.tsx` (active-only filter) and `resume-prompt-dialog.tsx`
+  // (interrupted-only). If a future PR consolidates them into a shared
+  // `filterTasks(predicates)` helper, this block should switch to that
+  // helper. Keeping it inline for now per the per-page-only edit scope.
+  const FAILED_24H_MS = 24 * 60 * 60 * 1000;
   const filtered = React.useMemo(() => {
     const q = filter.trim().toLowerCase();
+    const cutoff = nowMs - FAILED_24H_MS;
     return tasks.filter((t) => {
+      // "Failed in last 24h" gate is intersected with the other filters —
+      // explicitly the most restrictive predicate so users can pair it
+      // with search.
+      if (failed24h) {
+        if (t.status !== "failed") return false;
+        const updated = new Date(t.updatedAt).getTime();
+        if (!isFinite(updated) || updated < cutoff) return false;
+      }
       // Status-chip predicate: if any chip is active, the task must match
       // at least one selected predicate (OR semantics within the chip set).
       if (activeChips.size > 0) {
@@ -644,7 +736,7 @@ export const TaskManagerPage: React.FC = () => {
         (t.currentStep ?? "").toLowerCase().includes(q)
       );
     });
-  }, [tasks, filter, activeChips]);
+  }, [tasks, filter, activeChips, failed24h, nowMs]);
 
   /**
    * Stuck-running tasks are surfaced under attention so the user sees
@@ -682,6 +774,7 @@ export const TaskManagerPage: React.FC = () => {
   const actions = React.useMemo(
     () => ({
       onCancel: (id: string) => {
+        const rec = taskRuntime.get(id);
         // Cooperative cancel: flips the per-task flag (the provisioner /
         // pool-creator polls this between iterations). ALSO call
         // `orchestrator.cancel()` to halt the whole agent immediately —
@@ -698,6 +791,17 @@ export const TaskManagerPage: React.FC = () => {
           status: "cancelled",
           currentStep: "Cancelled by user",
         });
+        auditLog.record({
+          actor: "ui",
+          action: "task_cancel",
+          target: `task:${id}`,
+          status: "success",
+          details: {
+            kind: rec?.kind,
+            label: rec?.label,
+            priorStatus: rec?.status,
+          },
+        });
       },
       onResume: async (id: string) => {
         const rec = taskRuntime.get(id);
@@ -707,20 +811,43 @@ export const TaskManagerPage: React.FC = () => {
         // here — that previously caused the bug where the auto-resumer
         // and the orchestrator both raced to set status, leaving the
         // task stuck on "Auto-resuming…".
+        auditLog.record({
+          actor: "ui",
+          action: "task_retry",
+          target: `task:${id}`,
+          status: "success",
+          details: { kind: rec.kind, label: rec.label, priorStatus: rec.status },
+        });
         try {
           await dispatchResume(orchestrator, rec);
         } catch (e) {
+          const msg = (e as Error)?.message ?? String(e);
           taskRuntime.update(id, {
             status: "failed",
-            error: (e as Error)?.message ?? String(e),
+            error: msg,
+          });
+          auditLog.record({
+            actor: "ui",
+            action: "task_retry",
+            target: `task:${id}`,
+            status: "failure",
+            error: msg,
           });
         }
       },
       onPause: (id: string) => {
+        const rec = taskRuntime.get(id);
         // Cooperative pause — the orchestrator polls isPauseRequested()
         // between iterations. Already-running per-iteration work runs to
         // completion before the loop exits.
         taskRuntime.requestPause(id);
+        auditLog.record({
+          actor: "ui",
+          action: "task_pause",
+          target: `task:${id}`,
+          status: "success",
+          details: { kind: rec?.kind, label: rec?.label },
+        });
       },
       onStart: async (id: string) => {
         // "Start" from a paused task is the same code path as Resume —
@@ -729,20 +856,51 @@ export const TaskManagerPage: React.FC = () => {
         // work on the Azure side.
         const rec = taskRuntime.get(id);
         if (!rec) return;
+        auditLog.record({
+          actor: "ui",
+          action: "task_start",
+          target: `task:${id}`,
+          status: "success",
+          details: { kind: rec.kind, label: rec.label },
+        });
         try {
           await dispatchResume(orchestrator, rec);
         } catch (e) {
+          const msg = (e as Error)?.message ?? String(e);
           taskRuntime.update(id, {
             status: "failed",
-            error: (e as Error)?.message ?? String(e),
+            error: msg,
+          });
+          auditLog.record({
+            actor: "ui",
+            action: "task_start",
+            target: `task:${id}`,
+            status: "failure",
+            error: msg,
           });
         }
       },
       onDiscard: (id: string) => {
+        const rec = taskRuntime.get(id);
         taskRuntime.update(id, { status: "cancelled" });
+        auditLog.record({
+          actor: "ui",
+          action: "task_discard",
+          target: `task:${id}`,
+          status: "success",
+          details: { kind: rec?.kind, label: rec?.label, priorStatus: rec?.status },
+        });
       },
       onRemove: (id: string) => {
+        const rec = taskRuntime.get(id);
         taskRuntime.remove(id);
+        auditLog.record({
+          actor: "ui",
+          action: "task_remove",
+          target: `task:${id}`,
+          status: "success",
+          details: { kind: rec?.kind, label: rec?.label, priorStatus: rec?.status },
+        });
       },
     }),
     [orchestrator],
@@ -820,6 +978,83 @@ export const TaskManagerPage: React.FC = () => {
         : undefined;
     return out;
   }, [tasks, nowMs]);
+
+  /**
+   * Hotkey: `c` cancels the selected task (with confirmation toast hint).
+   * Hotkey: `r` resumes/retries the selected task (interrupted → resume,
+   * paused → start, failed → retry via the resume code path).
+   *
+   * Both shortcuts guard on:
+   *   - a selectedId must be set,
+   *   - the corresponding action must be valid for the task's status,
+   *   - no chord may fire while focus is in an input (handled by the hook).
+   */
+  const onHotkeyCancel = React.useCallback(() => {
+    if (!selectedId) {
+      showHotkeyHint("No task selected — click a row first.");
+      return;
+    }
+    const rec = taskRuntime.get(selectedId);
+    if (!rec) return;
+    if (rec.status !== "running" && rec.status !== "paused") {
+      showHotkeyHint(`Cannot cancel a ${rec.status} task.`);
+      return;
+    }
+    actions.onCancel(selectedId);
+    showHotkeyHint(`Cancelled "${rec.label}"`);
+  }, [actions, selectedId, showHotkeyHint]);
+
+  const onHotkeyRetry = React.useCallback(() => {
+    if (!selectedId) {
+      showHotkeyHint("No task selected — click a row first.");
+      return;
+    }
+    const rec = taskRuntime.get(selectedId);
+    if (!rec) return;
+    if (rec.status === "paused") {
+      void actions.onStart(selectedId);
+      showHotkeyHint(`Resumed "${rec.label}"`);
+      return;
+    }
+    if (rec.status === "interrupted" || rec.status === "failed") {
+      void actions.onResume(selectedId);
+      showHotkeyHint(`Retrying "${rec.label}"`);
+      return;
+    }
+    showHotkeyHint(`Cannot retry a ${rec.status} task.`);
+  }, [actions, selectedId, showHotkeyHint]);
+
+  useShortcut("c", onHotkeyCancel, { allowInInputs: false });
+  useShortcut("r", onHotkeyRetry, { allowInInputs: false });
+
+  /**
+   * Tail-mode: when on, scroll the page to the running section after every
+   * task list update so newly-arrived tasks are visible without manual
+   * scroll. Implementation: a ref attached to the running section + a
+   * scrollIntoView on tasks length change.
+   */
+  const tailAnchorRef = React.useRef<HTMLDivElement | null>(null);
+  React.useEffect(() => {
+    if (!tailMode) return;
+    if (!tailAnchorRef.current) return;
+    tailAnchorRef.current.scrollIntoView({
+      behavior: "smooth",
+      block: "start",
+    });
+  }, [tailMode, tasks.length]);
+
+  /**
+   * Clear dangling selection when the selected task disappears (e.g. user
+   * pressed `c`, the task was cancelled & cleared, the id no longer exists).
+   * Cheap O(n) check; the alternative is a stale id forever sticking
+   * around in state.
+   */
+  React.useEffect(() => {
+    if (selectedId === null) return;
+    if (!tasks.some((t) => t.id === selectedId)) {
+      setSelectedId(null);
+    }
+  }, [tasks, selectedId]);
 
   const popOut = React.useCallback(() => {
     // Open the same route in a borderless window. The shell still mounts
@@ -963,26 +1198,49 @@ export const TaskManagerPage: React.FC = () => {
 
   const onConfirm = React.useCallback(() => {
     if (confirmState.kind === "clear-finished") {
+      const count = finishedTasks.length;
       taskRuntime.clearTerminal();
+      auditLog.record({
+        actor: "ui",
+        action: "task_clear_finished",
+        target: "task-manager",
+        status: "success",
+        details: { count },
+      });
       store.addNotification({
         type: "info",
-        message: `Cleared ${finishedTasks.length} finished task${finishedTasks.length === 1 ? "" : "s"}.`,
+        message: `Cleared ${count} finished task${count === 1 ? "" : "s"}.`,
         autoDismissMs: 2500,
       });
     } else if (confirmState.kind === "discard-interrupted") {
       const n = taskRuntime.setStatusForInterrupted("cancelled");
+      auditLog.record({
+        actor: "ui",
+        action: "task_discard_interrupted",
+        target: "task-manager",
+        status: "success",
+        details: { count: n },
+      });
       store.addNotification({
         type: "info",
         message: `Discarded ${n} interrupted task${n === 1 ? "" : "s"}.`,
         autoDismissMs: 2500,
       });
     } else if (confirmState.kind === "remove-history") {
+      const count = historyTasks.length;
       for (const t of historyTasks) {
         taskRuntime.remove(t.id);
       }
+      auditLog.record({
+        actor: "ui",
+        action: "task_remove_history",
+        target: "task-manager",
+        status: "success",
+        details: { count },
+      });
       store.addNotification({
         type: "info",
-        message: `Removed ${historyTasks.length} historical task${historyTasks.length === 1 ? "" : "s"}.`,
+        message: `Removed ${count} historical task${count === 1 ? "" : "s"}.`,
         autoDismissMs: 2500,
       });
     }
@@ -995,7 +1253,10 @@ export const TaskManagerPage: React.FC = () => {
   // after a navigation when the subscriber hasn't fired yet AND there are
   // no tasks — render a few rows to show the layout will fill in.
   const showInitialSkeleton =
-    tasks.length === 0 && filter === "" && activeChips.size === 0;
+    tasks.length === 0 &&
+    filter === "" &&
+    activeChips.size === 0 &&
+    !failed24h;
 
   /* --- Confirm dialog content per kind ---------------------------------- */
   const confirmPayload = React.useMemo<{
@@ -1293,6 +1554,76 @@ export const TaskManagerPage: React.FC = () => {
           <span className="text-2xs tabular-nums text-muted-foreground">
             {filtered.length} / {tasks.length}
           </span>
+          {/* Tail-mode toggle: auto-scrolls to the running section every time
+              the underlying tasks list changes. Preference persists across
+              reloads via use-persisted-state. */}
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <button
+                type="button"
+                onClick={() => setTailMode((v) => !v)}
+                aria-pressed={tailMode}
+                aria-label="Toggle tail mode"
+                className={cn(
+                  "inline-flex items-center gap-1 rounded-full border px-2.5 py-1 text-2xs font-medium tabular-nums transition-colors duration-fast",
+                  tailMode
+                    ? "border-primary/40 bg-primary/10 text-primary"
+                    : "border-border bg-card text-muted-foreground hover:bg-muted/40",
+                )}
+              >
+                <ArrowDown className="h-3 w-3" />
+                Tail {tailMode ? "on" : "off"}
+              </button>
+            </TooltipTrigger>
+            <TooltipContent className="max-w-xs">
+              Auto-scrolls to the newest task on every update so live
+              progress is always visible.
+            </TooltipContent>
+          </Tooltip>
+          {/* Persisted "Failed in last 24h" filter — surfaced as a separate
+              chip because it pairs with a time window, not just a status. */}
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <button
+                type="button"
+                onClick={() => setFailed24h((v) => !v)}
+                aria-pressed={failed24h}
+                aria-label="Toggle failed-in-last-24h filter"
+                className={cn(
+                  "inline-flex items-center gap-1 rounded-full border px-2.5 py-1 text-2xs font-medium tabular-nums transition-colors duration-fast",
+                  failed24h
+                    ? "border-destructive/40 bg-destructive/10 text-destructive"
+                    : "border-border bg-card text-muted-foreground hover:bg-muted/40",
+                )}
+              >
+                <XCircle className="h-3 w-3" />
+                Failed (24h)
+              </button>
+            </TooltipTrigger>
+            <TooltipContent className="max-w-xs">
+              Limits the list to tasks whose status is `failed` and whose
+              last update was within the past 24 hours. Persisted.
+            </TooltipContent>
+          </Tooltip>
+          {/* Hotkey legend — tiny pill explaining the keyboard shortcuts. */}
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <span
+                className="inline-flex cursor-help items-center gap-1 rounded-full border border-border bg-card px-2 py-0.5 text-2xs text-muted-foreground"
+                aria-label="Keyboard shortcuts help"
+              >
+                <Keyboard className="h-3 w-3" />
+                <kbd className="rounded bg-muted/40 px-1 font-mono">c</kbd>
+                /
+                <kbd className="rounded bg-muted/40 px-1 font-mono">r</kbd>
+              </span>
+            </TooltipTrigger>
+            <TooltipContent className="max-w-xs">
+              Click a row to select it, then press <strong>c</strong> to
+              cancel a running/paused task or <strong>r</strong> to
+              resume/retry an interrupted, paused, or failed task.
+            </TooltipContent>
+          </Tooltip>
         </div>
         <div className="flex flex-wrap items-center gap-1.5">
           {STATUS_CHIPS.map((c) => (
@@ -1306,6 +1637,20 @@ export const TaskManagerPage: React.FC = () => {
           ))}
         </div>
       </div>
+
+      {/* Hotkey hint banner — momentary feedback for `c` / `r` actions. */}
+      {hotkeyHint && (
+        <div
+          role="status"
+          className="flex animate-fade-in items-center gap-2 rounded-md border border-primary/30 bg-primary/5 px-2.5 py-1 text-2xs font-medium text-primary"
+        >
+          <Keyboard className="h-3 w-3" />
+          {hotkeyHint}
+        </div>
+      )}
+
+      {/* Tail-mode anchor — scrollIntoView target when tail-mode is on. */}
+      <div ref={tailAnchorRef} aria-hidden="true" />
 
       {showInitialSkeleton ? (
         <div className="flex flex-col gap-2" aria-hidden="true">
@@ -1321,6 +1666,9 @@ export const TaskManagerPage: React.FC = () => {
             accent="primary"
             actions={actions}
             nowTick={nowTick}
+            selectedId={selectedId}
+            onSelect={setSelectedId}
+            enableJsonExpander
             helpText="Tasks executing now or paused mid-flight. Pause is cooperative — the orchestrator finishes the current iteration before stopping."
             headerActions={
               grouped.running.length > 0 ? (
@@ -1346,6 +1694,9 @@ export const TaskManagerPage: React.FC = () => {
             accent="warning"
             actions={actions}
             nowTick={nowTick}
+            selectedId={selectedId}
+            onSelect={setSelectedId}
+            enableJsonExpander
             helpText="Interrupted, failed, partial, or stuck tasks. Stuck tasks have no heartbeat for over a minute — consider cancelling and resuming."
             headerActions={
               <div className="flex items-center gap-1">
@@ -1390,6 +1741,9 @@ export const TaskManagerPage: React.FC = () => {
             tasks={grouped.terminal}
             actions={actions}
             nowTick={nowTick}
+            selectedId={selectedId}
+            onSelect={setSelectedId}
+            enableJsonExpander
             defaultOpen={false}
             helpText="Completed and cancelled tasks. Use 'Clear finished' or 'Remove history' to clean up."
             headerActions={

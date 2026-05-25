@@ -48,8 +48,8 @@
  */
 import * as React from "react";
 import {
-  AlertTriangle,
   Check,
+  Clock,
   Copy,
   KeyRound,
   Layers,
@@ -111,16 +111,23 @@ import {
 import { resolveActiveTenantId } from "../../auth/perform-tenant-switch";
 import { useArmToken } from "../../auth/use-arm-token";
 import { useTenantChange } from "../../hooks/use-tenant-change";
+import { useUrlState } from "../../hooks/use-url-state";
 import { auditLog } from "../../services/audit-log";
 import {
   useMultiRegionState,
   useMultiRegionStore,
 } from "../../store/store-context";
 
+// COORDINATOR: This page consumes `useDashboardOutletContext().navigateToPage`
+// for the empty-state CTA only. We do NOT edit page-router.tsx — the
+// `audience-matrix` route is already wired there (see line ~643).
+import { useDashboardOutletContext } from "../page-router";
+
 import { ConfirmationDialog } from "../shared/confirmation-dialog";
 import { CopyButton } from "../shared/copy-button";
 import { EmptyState } from "../shared/empty-state";
 import { ExportMenu, type ExportColumn } from "../shared/export-menu";
+import { FilterChipRow } from "../shared/filter-chip-row";
 import { InfoTooltip } from "../shared/info-tooltip";
 import { PageHeader } from "../shared/page-header";
 import { SummaryStatItem } from "../shared/summary-stat-item";
@@ -160,6 +167,44 @@ interface AuditDetail {
   aadError?: string;
 }
 
+// URL-state schema — flat strings so `useUrlState` can round-trip cleanly.
+// Render-stable per the hook's contract (snapshotted once on first render).
+interface MatrixUrlState {
+  /** "rt" | "account" | "both" — defaults to "both". */
+  src: string;
+  /** Free-text filter on display name / UPN / tenant / client / oid. */
+  q: string;
+  /** Operator-typed scope for the Custom column. */
+  custom: string;
+  /** "1" when "only minted in last 24h" chip is active; "" otherwise. */
+  recent: string;
+}
+
+const INITIAL_URL_STATE: MatrixUrlState = Object.freeze({
+  src: "both",
+  q: "",
+  custom: "",
+  recent: "",
+}) as MatrixUrlState;
+
+/** Recency window for the "issued in last 24h" chip (seconds). */
+const RECENT_WINDOW_SEC = 24 * 60 * 60;
+
+/** True when a row has at least one successful cell inside the recency window. */
+function rowMatchesRecent(
+  rowId: string,
+  cells: Record<string, CellState>,
+  nowSec: number,
+): boolean {
+  for (const k in cells) {
+    if (!k.startsWith(`${rowId}|`)) continue;
+    const s = cells[k];
+    if (!s || s.kind !== "success") continue;
+    if (nowSec - s.mintedAt <= RECENT_WINDOW_SEC) return true;
+  }
+  return false;
+}
+
 // ---------------------------------------------------------------------------
 //  Page
 // ---------------------------------------------------------------------------
@@ -167,17 +212,19 @@ interface AuditDetail {
 export const AudienceMatrixPage: React.FC = () => {
   const state = useMultiRegionState();
   const store = useMultiRegionStore();
+  const { navigateToPage } = useDashboardOutletContext();
 
   // Mount lifecycle — every async path checks this before calling setState
   // so we never trigger a setState-after-unmount warning when the operator
-  // navigates away mid-batch.
+  // navigates away mid-batch. Initialised to `true` at construction; the
+  // unmount-side handler flips it to `false` exactly once.
   const mountedRef = React.useRef(true);
-  React.useEffect(() => {
-    mountedRef.current = true;
-    return () => {
+  React.useEffect(
+    () => () => {
       mountedRef.current = false;
-    };
-  }, []);
+    },
+    [],
+  );
 
   // ----- Source data -----
   const [importedAccounts, setImportedAccounts] = React.useState<
@@ -201,11 +248,37 @@ export const AudienceMatrixPage: React.FC = () => {
     primaryAccount ? resolveActiveTenantId(primaryAccount) : undefined,
   );
 
-  // ----- Filter + search -----
-  const [sourceFilter, setSourceFilter] =
-    React.useState<RowSourceFilter>("both");
-  const [search, setSearch] = React.useState("");
-  const [customScope, setCustomScope] = React.useState("");
+  // ----- Filter + search (URL-persisted so deep links / refreshes preserve
+  //       operator's filter context). Keys are short to keep URLs tidy when
+  //       the operator shares a link via screenshare. -----
+  const [urlState, setUrlState] = useUrlState<MatrixUrlState>(
+    INITIAL_URL_STATE,
+    { replace: true },
+  );
+  const sourceFilter: RowSourceFilter =
+    urlState.src === "rt" || urlState.src === "account" || urlState.src === "both"
+      ? (urlState.src as RowSourceFilter)
+      : "both";
+  const search = urlState.q;
+  const customScope = urlState.custom;
+  const recentOnly = urlState.recent === "1";
+
+  const setSourceFilter = React.useCallback(
+    (next: RowSourceFilter) => setUrlState({ src: next }),
+    [setUrlState],
+  );
+  const setSearch = React.useCallback(
+    (next: string) => setUrlState({ q: next }),
+    [setUrlState],
+  );
+  const setCustomScope = React.useCallback(
+    (next: string) => setUrlState({ custom: next }),
+    [setUrlState],
+  );
+  const setRecentOnly = React.useCallback(
+    (next: boolean) => setUrlState({ recent: next ? "1" : "" }),
+    [setUrlState],
+  );
 
   // ----- Cell state map -----
   // One entry per (rowId, audienceKey). Absent === idle. Single Record
@@ -217,6 +290,12 @@ export const AudienceMatrixPage: React.FC = () => {
   // state — bumped every time the row source changes (deleting an RT
   // mid-batch must invalidate that RT's in-flight mints).
   const generationRef = React.useRef(0);
+
+  // In-flight controllers tracked OUTSIDE the cells map so the unmount
+  // cleanup can abort everything without closing over a stale React state
+  // snapshot. Adding to / removing from the set runs synchronously with
+  // setCells so the two views stay in sync.
+  const controllersRef = React.useRef<Set<AbortController>>(new Set());
 
   // ----- Bulk-mint confirmation -----
   const [pendingBulk, setPendingBulk] = React.useState<
@@ -242,17 +321,28 @@ export const AudienceMatrixPage: React.FC = () => {
   const [includeTokens, setIncludeTokens] = React.useState(false);
 
   // ----- Cleanup all in-flight controllers on unmount -----
+  // Using `controllersRef` (not the `cells` map) so the cleanup sees every
+  // in-flight controller — closing over `cells` here would capture the
+  // empty initial map and abort nothing.
   React.useEffect(
     () => () => {
       // Bump generation so any unfinished mints' completion handlers
       // discover they're stale and skip setState.
       generationRef.current++;
-      // Abort every still-pending cell so its fetch promise rejects fast.
-      for (const v of Object.values(cells)) {
-        if (v.kind === "pending") v.controller.abort();
+      // Abort every still-pending controller so its fetch promise rejects
+      // fast. The set is mutated in place during component lifetime; here
+      // we just drain it.
+      for (const c of controllersRef.current) {
+        try {
+          c.abort();
+        } catch {
+          // AbortController.abort() doesn't throw in any spec we care about,
+          // but a polyfill or old runtime could. Swallow — unmount must
+          // never throw.
+        }
       }
+      controllersRef.current.clear();
     },
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- intentional: cleanup-only effect
     [],
   );
 
@@ -313,12 +403,15 @@ export const AudienceMatrixPage: React.FC = () => {
     return set.size;
   }, [importedAccounts]);
 
-  // Filtered rows = source filter + free-text search.
+  // Filtered rows = source filter + free-text search + optional recency
+  // chip ("only audiences with a token issued in the last 24h").
   const visibleRows = React.useMemo(() => {
     const needle = search.trim().toLowerCase();
+    const nowSec = Math.floor(Date.now() / 1000);
     return allRows.filter((r) => {
       if (sourceFilter === "rt" && r.kind !== "rt") return false;
       if (sourceFilter === "account" && r.kind !== "account") return false;
+      if (recentOnly && !rowMatchesRecent(r.id, cells, nowSec)) return false;
       if (!needle) return true;
       return (
         r.displayName.toLowerCase().includes(needle) ||
@@ -328,7 +421,17 @@ export const AudienceMatrixPage: React.FC = () => {
         r.oid.toLowerCase().includes(needle)
       );
     });
-  }, [allRows, sourceFilter, search]);
+  }, [allRows, sourceFilter, search, recentOnly, cells]);
+
+  // Count rows that have at least one recent successful mint — drives the
+  // count badge on the recent-only chip so the operator knows how many rows
+  // the filter would surface BEFORE flipping it on.
+  const recentRowCount = React.useMemo(() => {
+    const nowSec = Math.floor(Date.now() / 1000);
+    let n = 0;
+    for (const r of allRows) if (rowMatchesRecent(r.id, cells, nowSec)) n++;
+    return n;
+  }, [allRows, cells]);
 
   // -----------------------------------------------------------------------
   //  Mint pipeline
@@ -521,6 +624,13 @@ export const AudienceMatrixPage: React.FC = () => {
       const key = cellKey(row.id, audience.key);
       const controller = new AbortController();
       const myGen = generationRef.current;
+      // Local high-resolution timer captured BEFORE the React state update —
+      // closing over `cells` for the failure-duration fallback was a stale-
+      // snapshot bug that often yielded 0ms or wildly wrong values. Using a
+      // locally captured `performance.now()` gives an honest wall-clock for
+      // both success AND failure audit entries.
+      const startedAt = performance.now();
+      controllersRef.current.add(controller);
       setCells((prev) => ({
         ...prev,
         [key]: {
@@ -529,12 +639,17 @@ export const AudienceMatrixPage: React.FC = () => {
           controller,
         },
       }));
-      const result = await performMint(
-        row,
-        audience,
-        scopeOverride,
-        controller.signal,
-      );
+      let result: CellState;
+      try {
+        result = await performMint(
+          row,
+          audience,
+          scopeOverride,
+          controller.signal,
+        );
+      } finally {
+        controllersRef.current.delete(controller);
+      }
       // Stale-mint guard — if the row source changed (RT removed, page
       // unmounted) between request and response, discard the result.
       if (!mountedRef.current || myGen !== generationRef.current) {
@@ -552,9 +667,7 @@ export const AudienceMatrixPage: React.FC = () => {
         durationMs:
           result.kind === "success"
             ? result.result.durationMs
-            : Date.now() - (cells[key]?.kind === "pending"
-                ? cells[key].startedAt
-                : Date.now()),
+            : Math.max(0, performance.now() - startedAt),
         tokenAudience:
           result.kind === "success" ? result.result.audience : undefined,
         aadError: result.kind === "error" ? result.aadError : undefined,
@@ -569,10 +682,6 @@ export const AudienceMatrixPage: React.FC = () => {
       });
       return result;
     },
-    // `cells` is captured intentionally only for the duration computation
-    // fallback; if it's stale that just means the fallback uses the new
-    // start time, which is fine for a UX metric.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
     [performMint],
   );
 
@@ -868,11 +977,37 @@ export const AudienceMatrixPage: React.FC = () => {
                 size="sm"
                 variant={sourceFilter === key ? "default" : "outline"}
                 onClick={() => setSourceFilter(key)}
+                aria-pressed={sourceFilter === key}
               >
                 <Icon className="h-3.5 w-3.5" aria-hidden />
                 {label}
               </Button>
             ))}
+
+            {/* Recency filter chip — URL-persisted via `recent=1`. Uses the
+                shared FilterChipRow so it matches the visual language of
+                overview / sub-manager / role-graph / security-audit /
+                audit-log filters. The chip set is single-entry; clicking
+                "All" or the chip itself toggles `recentOnly`. */}
+            <FilterChipRow
+              label="Mint recency filter"
+              value={
+                recentOnly ? new Set(["recent"]) : new Set<string>()
+              }
+              onChange={(next) => setRecentOnly(next.has("recent"))}
+              options={[
+                {
+                  key: "recent",
+                  label: "Minted last 24h",
+                  tone: "success",
+                  icon: Clock,
+                },
+              ]}
+              counts={{ recent: recentRowCount }}
+              showAll={false}
+              className="ml-1"
+            />
+
             <div className="ml-auto flex flex-wrap items-center gap-2">
               <div className="relative">
                 <Search
@@ -896,6 +1031,7 @@ export const AudienceMatrixPage: React.FC = () => {
                   source: "audience-matrix-page",
                   rowFilter: sourceFilter,
                   searchApplied: search.trim() || undefined,
+                  recentOnly,
                   includeTokens,
                 }}
                 disabled={exportRows.length === 0}
@@ -1008,6 +1144,15 @@ export const AudienceMatrixPage: React.FC = () => {
               rtCount + accountCount === 0
                 ? "Import a refresh token via Token Importer or sign in via Azure Accounts to populate the matrix."
                 : "Try widening the source-toggle chips or clearing the search input."
+            }
+            action={
+              rtCount + accountCount === 0
+                ? {
+                    label: "Open Token Importer",
+                    onClick: () => navigateToPage("/token-importer"),
+                    icon: KeyRound,
+                  }
+                : undefined
             }
           />
         ) : (
@@ -1124,7 +1269,18 @@ export const AudienceMatrixPage: React.FC = () => {
                                 }}
                                 onImportToVault={() => {
                                   if (cell?.kind !== "success") return;
-                                  importSuccessIntoVault(row, aud, cell.result, store);
+                                  importSuccessIntoVault(
+                                    row,
+                                    aud,
+                                    cell.result,
+                                    store,
+                                  );
+                                  // The vault write affects `listImportedAccounts()`
+                                  // (new audience bucket on this principal) — re-read
+                                  // sources so the header subtitle's audience-count
+                                  // and the row list stay accurate without forcing
+                                  // the operator to hit "Refresh rows".
+                                  refreshRowSources();
                                 }}
                               />
                             </td>
@@ -1477,6 +1633,48 @@ const MatrixCell: React.FC<MatrixCellProps> = ({
 //  SuccessPopoverBody — decoded claims + actions for a successful cell.
 // ---------------------------------------------------------------------------
 
+/**
+ * Single claim row inside the success popover. Renders the value in a
+ * `group/copy` wrapper so the `<CopyButton>` reveals on hover/focus — same
+ * affordance as `<CopyableText>` elsewhere in the app. When the value is
+ * `(none)` we omit the copy button so it doesn't look click-bait.
+ */
+const ClaimRow: React.FC<{
+  /** Term label (e.g. "aud", "tid"). */
+  term: React.ReactNode;
+  /** The claim value to render + copy. */
+  value: string | undefined;
+  /** Optional `aria-label` override for the copy button. */
+  copyLabel?: string;
+  /** Render the value in mono (default true for GUID-like claims). */
+  mono?: boolean;
+  /** Optional override to render a custom display node (e.g. the ISO exp). */
+  display?: React.ReactNode;
+}> = ({ term, value, copyLabel, mono = true, display }) => {
+  const present = value !== undefined && value !== "" && value !== "(none)";
+  return (
+    <>
+      <dt className="font-semibold text-muted-foreground">{term}</dt>
+      <dd
+        className={`group/copy inline-flex min-w-0 items-center gap-1 ${
+          mono ? "font-mono" : ""
+        } break-all`}
+      >
+        <span className="min-w-0 break-all">
+          {display ?? (present ? value : "(none)")}
+        </span>
+        {present && value !== undefined && (
+          <CopyButton
+            value={value}
+            ariaLabel={copyLabel ?? `Copy ${value} to clipboard`}
+            iconSize={11}
+          />
+        )}
+      </dd>
+    </>
+  );
+};
+
 const SuccessPopoverBody: React.FC<{
   row: MintRow;
   audience: AudienceColumn;
@@ -1484,7 +1682,16 @@ const SuccessPopoverBody: React.FC<{
   onReMint: () => void;
   onImportToVault: () => void;
 }> = ({ row, audience, result, onReMint, onImportToVault }) => {
-  const claims = summariseFromJwt(result.accessToken);
+  // Memoise the claim summary — `summariseFromJwt` walks the JWT payload
+  // and the popover re-renders on every 1s tick from the parent cell.
+  const claims = React.useMemo(
+    () => summariseFromJwt(result.accessToken),
+    [result.accessToken],
+  );
+  const appId = claims.azp ?? claims.appid;
+  const expIso = claims.exp
+    ? new Date(claims.exp * 1000).toISOString()
+    : undefined;
   return (
     <div className="flex flex-col gap-2 text-xs">
       <div className="flex items-center justify-between gap-2">
@@ -1498,37 +1705,71 @@ const SuccessPopoverBody: React.FC<{
       </div>
 
       <dl className="grid grid-cols-[80px_1fr] gap-x-2 gap-y-1 text-2xs">
-        <dt className="font-semibold text-muted-foreground">aud</dt>
-        <dd className="font-mono break-all">{claims.aud ?? "(none)"}</dd>
-        <dt className="font-semibold text-muted-foreground">
-          tid
-          <InfoTooltip
-            content="Tenant id of the token (the directory whose RBAC applies)."
-            withProvider={false}
-          />
-        </dt>
-        <dd className="font-mono break-all">{claims.tid ?? "(none)"}</dd>
-        <dt className="font-semibold text-muted-foreground">
-          azp / appid
-          <InfoTooltip
-            content="The AAD app id that minted the token. For FOCI mints, this is the TARGET client id."
-            withProvider={false}
-          />
-        </dt>
-        <dd className="font-mono break-all">
-          {claims.azp ?? claims.appid ?? "(none)"}
-        </dd>
-        <dt className="font-semibold text-muted-foreground">scp</dt>
-        <dd className="break-words text-3xs">
-          {claims.scp ?? "(none)"}
-        </dd>
-        <dt className="font-semibold text-muted-foreground">oid</dt>
-        <dd className="font-mono break-all">{claims.oid ?? "(none)"}</dd>
-        <dt className="font-semibold text-muted-foreground">exp</dt>
-        <dd className="font-mono">
-          {claims.exp ? new Date(claims.exp * 1000).toISOString() : "(none)"}
-        </dd>
+        <ClaimRow
+          term="aud"
+          value={claims.aud}
+          copyLabel="Copy audience claim"
+        />
+        <ClaimRow
+          term={
+            <>
+              tid
+              <InfoTooltip
+                content="Tenant id of the token (the directory whose RBAC applies)."
+                withProvider={false}
+              />
+            </>
+          }
+          value={claims.tid}
+          copyLabel="Copy tenant id"
+        />
+        <ClaimRow
+          term={
+            <>
+              azp / appid
+              <InfoTooltip
+                content="The AAD app id that minted the token. For FOCI mints, this is the TARGET client id."
+                withProvider={false}
+              />
+            </>
+          }
+          value={appId}
+          copyLabel="Copy app id"
+        />
+        <ClaimRow
+          term="scp"
+          value={claims.scp}
+          mono={false}
+          copyLabel="Copy scope claim"
+        />
+        <ClaimRow term="oid" value={claims.oid} copyLabel="Copy object id" />
+        <ClaimRow
+          term="exp"
+          value={expIso}
+          display={expIso ?? "(none)"}
+          copyLabel="Copy expiry ISO timestamp"
+        />
       </dl>
+
+      {/* Row-context row so the operator can re-copy the source row's
+          identifiers without leaving the popover. Useful when correlating
+          a successful mint back to the imported RT it came from. */}
+      {(row.clientId || row.tenantId) && (
+        <dl className="grid grid-cols-[80px_1fr] gap-x-2 gap-y-1 border-t pt-2 text-2xs">
+          {row.clientId && (
+            <ClaimRow
+              term="src appid"
+              value={row.clientId}
+              copyLabel="Copy source client id"
+            />
+          )}
+          <ClaimRow
+            term="row tid"
+            value={row.tenantId}
+            copyLabel="Copy row tenant id"
+          />
+        </dl>
+      )}
 
       <div className="flex flex-wrap items-center gap-1.5 border-t pt-2">
         <Button

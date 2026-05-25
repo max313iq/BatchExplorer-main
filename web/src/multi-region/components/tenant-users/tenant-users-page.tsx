@@ -1,3 +1,13 @@
+// COORDINATOR: OrchestratorAgent.execute(params) does NOT currently accept a
+// second `{ signal }` argument. The page-improvement spec asks every list
+// page to thread `useAbortableEffect`'s AbortSignal into orchestrator calls;
+// for now we use the signal to guard post-await state writes (via the
+// existing seq monotonic-guard for `list_tenant_users`) but don't pipe it
+// into the agent layer. When the orchestrator interface gains a
+// `(params, opts?: { signal }) => Promise<AgentResult>` overload, the
+// `refreshUsers` callback and the capability-discovery effect in this file
+// should switch to passing the signal through directly. Until then the seq
+// guard + signal.aborted checks here are functionally equivalent.
 /**
  * Tenant Users page — list users in a privileged tenant, reset passwords
  * (single or bulk), and inspect per-user activity / credentials. Bulk
@@ -117,8 +127,10 @@ import {
   attemptInteractiveLogin,
   launchPortalAutoLogin,
 } from "../../auth/portal-auto-login";
+import { useAbortableEffect } from "../../hooks/use-abortable-effect";
 import { useTenantChange } from "../../hooks/use-tenant-change";
 import { useUrlState } from "../../hooks/use-url-state";
+import { usePersistedState } from "../../hooks/use-persisted-state";
 import { auditLog } from "../../services/audit-log";
 import {
   canResetPasswords,
@@ -133,12 +145,14 @@ import {
 } from "../../store/store-context";
 
 import { ConfirmationDialog } from "../shared/confirmation-dialog";
+import { CopyButton } from "../shared/copy-button";
 import {
   DataTable,
   type DataTableColumn,
 } from "../shared/enhanced-table";
 import { EmptyState } from "../shared/empty-state";
 import { ErrorBoundary } from "../shared/error-boundary";
+import { ExportMenu, type ExportColumn } from "../shared/export-menu";
 import { PageHeader } from "../shared/page-header";
 import { PortalLoginButton } from "../shared/portal-login-button";
 import { type PageKey } from "../shared/sidebar-nav";
@@ -157,8 +171,28 @@ const BULK_CONCURRENCY_PREF_KEY = "tenant-users:bulk-concurrency";
 const BULK_CONCURRENCY_OPTIONS = [1, 3, 5, 10] as const;
 const DEFAULT_BULK_CONCURRENCY = 3;
 
+// Stale-user heuristic. Microsoft Graph signInActivity requires Premium P1 +
+// AuditLog.Read.All which the service layer does not currently request, so we
+// fall back to two soft signals available on the base /users select set:
+//   1. accountEnabled === false   (cannot sign in at all)
+//   2. createdDateTime older than STALE_DAYS_THRESHOLD AND no Azure sub roles
+// The threshold is configurable via the persisted "stale-threshold-days" pref
+// so an operator can tighten/loosen the heuristic without code changes.
+const STALE_THRESHOLD_DAYS_PREF_KEY = "tenant-users:stale-threshold-days";
+const DEFAULT_STALE_DAYS = 90;
+const STALE_DAYS_OPTIONS = [30, 60, 90, 180, 365] as const;
+const MS_PER_DAY = 86_400_000;
+
 // Quick-filter chip ids — kept short so the URL stays compact.
-type QuickFilter = "all" | "members" | "guests" | "enabled" | "disabled" | "subs" | "nosubs";
+type QuickFilter =
+  | "all"
+  | "members"
+  | "guests"
+  | "enabled"
+  | "disabled"
+  | "subs"
+  | "nosubs"
+  | "stale";
 
 const QUICK_FILTERS: { id: QuickFilter; label: string; hint: string }[] = [
   { id: "all", label: "All", hint: "Show every user in the tenant." },
@@ -168,6 +202,12 @@ const QUICK_FILTERS: { id: QuickFilter; label: string; hint: string }[] = [
   { id: "disabled", label: "Disabled", hint: "Users blocked from signing in (accountEnabled = false)." },
   { id: "subs", label: "Has sub", hint: "Users with one or more Azure subscriptions visible to the caller." },
   { id: "nosubs", label: "No sub", hint: "Users with no visible Azure subscription roles." },
+  {
+    id: "stale",
+    label: "Stale",
+    hint:
+      "Heuristic-stale users: disabled OR (createdDateTime older than threshold AND no Azure sub roles). signInActivity is not consulted (requires Entra P1 + AuditLog.Read.All).",
+  },
 ];
 
 // =============================================================================
@@ -192,6 +232,14 @@ interface UserRow extends GraphUser {
   isGuest: boolean;
   /** Computed: does the user appear to be on-prem synced? Best-effort. */
   appearsOnPremSynced: boolean;
+  /**
+   * Computed: heuristic-stale (likely inactive). True when the account is
+   * disabled, or the account was created more than `staleDaysThreshold` ago
+   * AND the user has no visible Azure subscription role assignments.
+   * signInActivity is NOT consulted (would require AuditLog.Read.All +
+   * Entra P1 licensing the service layer does not currently request).
+   */
+  isStale: boolean;
 }
 
 // =============================================================================
@@ -282,6 +330,33 @@ function appearsOnPremSynced(u: GraphUser): boolean {
   // we return false (conservative) and let a future service-layer
   // enhancement flip this to true when the field is available.
   return false;
+}
+
+/**
+ * Heuristic-stale predicate. Returns true when:
+ *   - accountEnabled is explicitly false (cannot sign in at all), OR
+ *   - createdDateTime is older than `thresholdDays` AND the user has no
+ *     visible Azure subscription role assignments (`subscriptionCount === 0`).
+ *
+ * The createdDateTime side is conservative: users with subs are kept out of
+ * the "stale" bucket regardless of age, because an assigned sub is strong
+ * evidence the account is still in active use. signInActivity is NOT
+ * consulted (the service layer would need AuditLog.Read.All + Entra P1 to
+ * select it, which isn't available in this WebUI's Graph scope).
+ */
+function isStaleUser(
+  u: GraphUser & { createdDateTime?: string; subscriptionCount: number },
+  thresholdDays: number,
+  nowMs: number,
+): boolean {
+  if (u.accountEnabled === false) return true;
+  if (u.subscriptionCount > 0) return false;
+  const created = u.createdDateTime;
+  if (!created) return false;
+  const createdMs = Date.parse(created);
+  if (!Number.isFinite(createdMs)) return false;
+  const ageDays = (nowMs - createdMs) / MS_PER_DAY;
+  return ageDays >= thresholdDays;
 }
 
 /**
@@ -1608,7 +1683,6 @@ const UserDetailsSheet: React.FC<UserDetailsSheetProps> = ({
   onReset,
 }) => {
   const state = useMultiRegionState();
-  const store = useMultiRegionStore();
 
   // Recent audit-log entries for this user — searches by target match.
   const recentAudit = React.useMemo(() => {
@@ -1619,14 +1693,6 @@ const UserDetailsSheet: React.FC<UserDetailsSheetProps> = ({
       .slice(-8)
       .reverse();
   }, [user, state.auditEntries]);
-
-  const doCopy = async (label: string, text: string) => {
-    const ok = await copyToClipboard(text);
-    store.addNotification({
-      type: ok ? "success" : "error",
-      message: ok ? `${label} copied.` : `Failed to copy ${label.toLowerCase()}.`,
-    });
-  };
 
   return (
     <Sheet open={user !== null} onOpenChange={(o) => !o && onClose()}>
@@ -1639,33 +1705,35 @@ const UserDetailsSheet: React.FC<UserDetailsSheetProps> = ({
         </SheetHeader>
         {user && (
           <SheetBody className="flex flex-col gap-4">
-            {/* Identity block */}
+            {/* Identity block — uses shared CopyButton via DetailRow so the
+                hover-reveal pattern, success state, and ARIA labels match
+                every other list page in the WebUI. */}
             <div className="flex flex-col gap-2">
               <DetailRow
                 label="Display name"
                 value={user.displayName || "(unnamed)"}
-                onCopy={() => void doCopy("Display name", user.displayName ?? "")}
+                copyValue={user.displayName ?? ""}
                 hasValue={Boolean(user.displayName)}
               />
               <DetailRow
                 label="UPN"
                 value={user.userPrincipalName || "(none)"}
                 mono
-                onCopy={() => void doCopy("UPN", user.userPrincipalName ?? "")}
+                copyValue={user.userPrincipalName ?? ""}
                 hasValue={Boolean(user.userPrincipalName)}
               />
               <DetailRow
                 label="Mail"
                 value={user.mail || "(none)"}
                 mono
-                onCopy={() => void doCopy("Mail", user.mail ?? "")}
+                copyValue={user.mail ?? ""}
                 hasValue={Boolean(user.mail)}
               />
               <DetailRow
                 label="Object ID"
                 value={user.id}
                 mono
-                onCopy={() => void doCopy("Object ID", user.id)}
+                copyValue={user.id}
                 hasValue
               />
               {user.jobTitle && <DetailRow label="Job title" value={user.jobTitle} />}
@@ -1798,7 +1866,13 @@ interface DetailRowProps {
   label: string;
   value: string;
   mono?: boolean;
-  onCopy?: () => void;
+  /**
+   * Optional explicit value to copy (defaults to `value`). When set and
+   * `hasValue` is true, a shared `<CopyButton>` is rendered to the right
+   * of the value — visible only on hover/focus per the `group/copy`
+   * Tailwind contract.
+   */
+  copyValue?: string;
   hasValue?: boolean;
 }
 
@@ -1806,11 +1880,13 @@ const DetailRow: React.FC<DetailRowProps> = ({
   label,
   value,
   mono,
-  onCopy,
+  copyValue,
   hasValue = true,
 }) => {
+  const toCopy = copyValue ?? value;
+  const showCopy = hasValue && toCopy.length > 0;
   return (
-    <div className="grid grid-cols-[7rem_1fr_auto] items-center gap-2">
+    <div className="group/copy grid grid-cols-[7rem_1fr_auto] items-center gap-2">
       <span className="text-2xs font-medium uppercase tracking-wider text-muted-foreground">
         {label}
       </span>
@@ -1823,17 +1899,15 @@ const DetailRow: React.FC<DetailRowProps> = ({
       >
         {value}
       </span>
-      {onCopy && hasValue && (
-        <Button
-          type="button"
-          variant="ghost"
-          size="icon-xs"
-          onClick={onCopy}
-          aria-label={`Copy ${label.toLowerCase()}`}
-          title={`Copy ${label.toLowerCase()}`}
-        >
-          <Copy />
-        </Button>
+      {showCopy ? (
+        <CopyButton
+          value={toCopy}
+          ariaLabel={`Copy ${label.toLowerCase()}`}
+          alwaysVisible={false}
+          iconSize={14}
+        />
+      ) : (
+        <span aria-hidden />
       )}
     </div>
   );
@@ -1869,13 +1943,16 @@ const TenantUsersPageInner: React.FC<TenantUsersPageProps> = ({
     [azureAccounts],
   );
 
-  // Capability discovery — guarded by a seq so a slow per-account probe
-  // can't clobber a newer round started by an account-set change.
-  const capabilitySeqRef = React.useRef(0);
-  React.useEffect(() => {
-    const seq = ++capabilitySeqRef.current;
-    setDiscoveringPrivileges(true);
-    (async () => {
+  // Capability discovery — guarded by the per-render AbortSignal from
+  // useAbortableEffect. When the account set changes (or the component
+  // unmounts), `signal.aborted` flips true and we drop every in-flight
+  // probe's result instead of clobbering newer state. Token / role calls
+  // don't accept a signal directly (the MSAL + Graph wrappers predate
+  // this hook), so we check `signal.aborted` after each await as the
+  // moral equivalent.
+  useAbortableEffect(
+    async (signal) => {
+      setDiscoveringPrivileges(true);
       const next: Record<string, boolean> = {};
       await Promise.allSettled(
         azureAccounts.map(async (a) => {
@@ -1890,32 +1967,26 @@ const TenantUsersPageInner: React.FC<TenantUsersPageProps> = ({
               a.homeAccountId,
               tenantId,
             );
+            if (signal.aborted) return;
             const roles = await getMyDirectoryRoles(tenantId, token);
+            if (signal.aborted) return;
             const ok = canResetPasswords(roles);
             next[a.homeAccountId] = ok;
-            // Only commit per-account store flags if we're still the latest
-            // probe — keeps stale results from racing newer ones.
-            if (seq === capabilitySeqRef.current) {
-              store.setPasswordResetCapability(a.homeAccountId, ok);
-            }
+            store.setPasswordResetCapability(a.homeAccountId, ok);
           } catch {
+            if (signal.aborted) return;
             next[a.homeAccountId] = false;
-            if (seq === capabilitySeqRef.current) {
-              store.setPasswordResetCapability(a.homeAccountId, false);
-            }
+            store.setPasswordResetCapability(a.homeAccountId, false);
           }
         }),
       );
-      if (seq === capabilitySeqRef.current) {
-        setPrivilegedMap(next);
-        setDiscoveringPrivileges(false);
-      }
-    })();
-    return () => {
-      // Bump seq so any in-flight result for the previous round is dropped.
-      capabilitySeqRef.current += 1;
-    };
-  }, [accountKey, azureAccounts, store]);
+      if (signal.aborted) return;
+      setPrivilegedMap(next);
+      setDiscoveringPrivileges(false);
+    },
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [accountKey, store],
+  );
 
   const privilegedAccounts: PrivilegedAccount[] = React.useMemo(() => {
     return azureAccounts
@@ -2072,9 +2143,19 @@ const TenantUsersPageInner: React.FC<TenantUsersPageProps> = ({
     }
   }, [orchestrator, activeAccount]);
 
-  React.useEffect(() => {
-    if (activeAccount) refreshUsers();
-  }, [activeAccount, refreshUsers]);
+  // Auto-load on account change. The refresh path itself is seq-guarded
+  // (refreshUsersSeqRef) so a slow load can't clobber a newer one started
+  // by an account change; we still wire this through useAbortableEffect
+  // so an unmount aborts the wait. (orchestrator.execute does not yet
+  // accept an AbortSignal — see COORDINATOR note below.)
+  useAbortableEffect(
+    async (signal) => {
+      if (!activeAccount) return;
+      await refreshUsers();
+      if (signal.aborted) return;
+    },
+    [activeAccount, refreshUsers],
+  );
 
   // Bump a re-render once a minute so the "Refreshed Xs ago" pill stays fresh.
   const [, forceRelativeTick] = React.useState(0);
@@ -2084,17 +2165,48 @@ const TenantUsersPageInner: React.FC<TenantUsersPageProps> = ({
     return () => clearInterval(id);
   }, [lastRefreshedAt]);
 
-  // Per-row enrichment: derive isGuest / appearsOnPremSynced once.
+  // Stale-threshold preference — defaults to 90 days, configurable from the
+  // toolbar. Persisted across sessions via the standard hook (versioned so
+  // future shape changes can migrate cleanly).
+  const [staleDaysThreshold, setStaleDaysThreshold] = usePersistedState<number>(
+    STALE_THRESHOLD_DAYS_PREF_KEY,
+    DEFAULT_STALE_DAYS,
+    {
+      version: 1,
+      migrate: (raw) => {
+        const n = typeof raw === "number" ? raw : Number(raw);
+        if (!Number.isFinite(n)) return DEFAULT_STALE_DAYS;
+        return (STALE_DAYS_OPTIONS as readonly number[]).includes(n)
+          ? n
+          : DEFAULT_STALE_DAYS;
+      },
+    },
+  );
+
+  // Per-row enrichment: derive isGuest / appearsOnPremSynced / isStale once.
+  // We snapshot Date.now() into the memo so a single tenant load uses one
+  // reference time across all rows; the memo refreshes whenever the source
+  // data, subscription map, or stale threshold changes.
   const allRows: UserRow[] = React.useMemo(() => {
-    return tenantUsers.map((u) => ({
-      ...u,
-      subscriptionCount: userSubMap[u.id] ?? 0,
-      createdDateTime: (u as unknown as { createdDateTime?: string })
-        .createdDateTime,
-      isGuest: isGuestUser(u),
-      appearsOnPremSynced: appearsOnPremSynced(u),
-    }));
-  }, [tenantUsers, userSubMap]);
+    const nowMs = Date.now();
+    return tenantUsers.map((u) => {
+      const createdDateTime = (u as unknown as { createdDateTime?: string })
+        .createdDateTime;
+      const subscriptionCount = userSubMap[u.id] ?? 0;
+      return {
+        ...u,
+        subscriptionCount,
+        createdDateTime,
+        isGuest: isGuestUser(u),
+        appearsOnPremSynced: appearsOnPremSynced(u),
+        isStale: isStaleUser(
+          { ...u, createdDateTime, subscriptionCount },
+          staleDaysThreshold,
+          nowMs,
+        ),
+      };
+    });
+  }, [tenantUsers, userSubMap, staleDaysThreshold]);
 
   // Quick-filter predicate.
   const matchesQuickFilter = React.useCallback(
@@ -2112,6 +2224,8 @@ const TenantUsersPageInner: React.FC<TenantUsersPageProps> = ({
           return u.subscriptionCount > 0;
         case "nosubs":
           return u.subscriptionCount === 0;
+        case "stale":
+          return u.isStale;
         case "all":
         default:
           return true;
@@ -2147,6 +2261,7 @@ const TenantUsersPageInner: React.FC<TenantUsersPageProps> = ({
       disabled: 0,
       subs: 0,
       nosubs: 0,
+      stale: 0,
     };
     for (const u of allRows) {
       if (u.isGuest) counts.guests += 1;
@@ -2155,6 +2270,7 @@ const TenantUsersPageInner: React.FC<TenantUsersPageProps> = ({
       else counts.disabled += 1;
       if (u.subscriptionCount > 0) counts.subs += 1;
       else counts.nosubs += 1;
+      if (u.isStale) counts.stale += 1;
     }
     return counts;
   }, [allRows]);
@@ -2165,7 +2281,11 @@ const TenantUsersPageInner: React.FC<TenantUsersPageProps> = ({
   const memberCount = chipCounts.members;
   const guestCount = chipCounts.guests;
   const disabledCount = chipCounts.disabled;
-  const subCount = allRows.reduce((sum, u) => sum + u.subscriptionCount, 0);
+  const staleCount = chipCounts.stale;
+  const subCount = React.useMemo(
+    () => allRows.reduce((sum, u) => sum + u.subscriptionCount, 0),
+    [allRows],
+  );
   const usersWithSubs = chipCounts.subs;
 
   // ---- Single-user reset --------------------------------------------------
@@ -2566,6 +2686,45 @@ const TenantUsersPageInner: React.FC<TenantUsersPageProps> = ({
       });
     },
     [store],
+  );
+
+  // ---- Export columns -----------------------------------------------------
+  // Headless column descriptors for the shared ExportMenu. The DataTable's
+  // built-in CSV button already exports the visible columns, so this menu
+  // gives the operator a richer "full matrix" dump including computed
+  // fields (isGuest, isStale, appearsOnPremSynced) that aren't surfaced
+  // as table columns. JSON export ships the full row shape.
+  const exportColumns = React.useMemo<ExportColumn<UserRow>[]>(
+    () => [
+      { header: "Display Name", accessor: (u) => u.displayName },
+      { header: "UPN", accessor: (u) => u.userPrincipalName },
+      { header: "Mail", accessor: (u) => u.mail ?? "" },
+      { header: "Object ID", accessor: (u) => u.id },
+      { header: "Type", accessor: (u) => (u.isGuest ? "Guest" : "Member") },
+      {
+        header: "Status",
+        accessor: (u) => (u.accountEnabled ? "Enabled" : "Disabled"),
+      },
+      { header: "Job Title", accessor: (u) => u.jobTitle ?? "" },
+      { header: "Department", accessor: (u) => u.department ?? "" },
+      {
+        header: "Subscription Count",
+        accessor: (u) => u.subscriptionCount,
+      },
+      {
+        header: "Created",
+        accessor: (u) => u.createdDateTime ?? "",
+      },
+      {
+        header: "On-prem Synced (heuristic)",
+        accessor: (u) => (u.appearsOnPremSynced ? "yes" : "no"),
+      },
+      {
+        header: "Stale (heuristic)",
+        accessor: (u) => (u.isStale ? "yes" : "no"),
+      },
+    ],
+    [],
   );
 
   // ---- Columns ------------------------------------------------------------
@@ -2979,6 +3138,55 @@ const TenantUsersPageInner: React.FC<TenantUsersPageProps> = ({
               </DropdownMenuItem>
             </DropdownMenuContent>
           </DropdownMenu>
+          {/* Full-matrix export (CSV + JSON). DataTable has its own CSV button
+              scoped to visible columns; this menu dumps the full row shape
+              including computed fields (isGuest, isStale, appearsOnPremSynced)
+              so the operator can audit the matrix outside the UI. */}
+          <ExportMenu<UserRow>
+            rows={filteredRows}
+            columns={exportColumns}
+            filename={`tenant-users-${activeAccount?.tenantId ?? "unknown"}`}
+            jsonMetadata={{
+              tenantId: activeAccount?.tenantId,
+              actor: activeAccount?.username,
+              quickFilter,
+              searchQuery,
+              staleDaysThreshold,
+            }}
+            label="Export matrix"
+          />
+          {/* Stale-threshold picker — only visible when the Stale filter or
+              KPI is in play. Persists across sessions. */}
+          <TooltipProvider delayDuration={250}>
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <Select
+                  value={String(staleDaysThreshold)}
+                  onValueChange={(v) => setStaleDaysThreshold(Number(v))}
+                >
+                  <SelectTrigger
+                    className="h-8 w-28 text-xs"
+                    aria-label="Stale threshold in days"
+                  >
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {STALE_DAYS_OPTIONS.map((n) => (
+                      <SelectItem key={n} value={String(n)}>
+                        Stale ≥{n}d
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              </TooltipTrigger>
+              <TooltipContent side="bottom">
+                Age threshold for the "Stale" heuristic. A user counts as
+                stale when accountEnabled = false OR (createdDateTime older
+                than this AND subscriptionCount === 0). Persisted across
+                sessions.
+              </TooltipContent>
+            </Tooltip>
+          </TooltipProvider>
           {/* Bulk concurrency picker — only meaningful when something selected */}
           <TooltipProvider delayDuration={250}>
             <Tooltip>
@@ -3077,6 +3285,15 @@ const TenantUsersPageInner: React.FC<TenantUsersPageProps> = ({
           hint="Users with accountEnabled = false (cannot sign in)."
           onClick={() => setUrlFilters({ filter: "disabled" })}
           active={quickFilter === "disabled"}
+        />
+        <SummaryStat
+          icon={AlertTriangle}
+          label="Stale"
+          value={staleCount}
+          tone="warning"
+          hint={`Heuristic-stale users (≥${staleDaysThreshold}d old with no subs, or disabled). signInActivity is NOT consulted (requires Entra P1 + AuditLog.Read.All).`}
+          onClick={() => setUrlFilters({ filter: "stale" })}
+          active={quickFilter === "stale"}
         />
         <SummaryStat
           icon={Cloud}

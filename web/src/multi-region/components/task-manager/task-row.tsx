@@ -83,6 +83,26 @@ export interface TaskRowProps {
   actions?: TaskRowActions;
   /** Re-render trigger: parent passes a tick from setInterval to keep ETA fresh. */
   nowTick?: number;
+  /**
+   * Optional single-select highlight. When `selected === true` the row gets a
+   * ring + faint primary tint so the operator can see which task the
+   * keyboard shortcuts (`c` / `r`) will act on. Additive — defaults to off
+   * so external consumers (sticky-tasks-panel, resume-prompt-dialog) keep
+   * their existing visuals.
+   */
+  selected?: boolean;
+  /**
+   * Click handler for selecting the row. Buttons inside the row stop the
+   * propagation so they keep acting as discrete actions; the row itself
+   * surfaces the selection via this callback. Additive and optional.
+   */
+  onSelect?: (id: string) => void;
+  /**
+   * Optional inline JSON expander. Renders a fold-out `<pre>` showing the
+   * raw `TaskRecord` for triage. No syntax highlight library — manual
+   * `<pre>` per task-manager constraints. Defaults to off.
+   */
+  enableJsonExpander?: boolean;
 }
 
 export const TaskRow: React.FC<TaskRowProps> = ({
@@ -91,6 +111,9 @@ export const TaskRow: React.FC<TaskRowProps> = ({
   actions = {},
   // eslint-disable-next-line @typescript-eslint/no-unused-vars
   nowTick,
+  selected = false,
+  onSelect,
+  enableJsonExpander = false,
 }) => {
   const tone = STATUS_TONE[task.status];
   const pct = progressPct(task);
@@ -106,9 +129,40 @@ export const TaskRow: React.FC<TaskRowProps> = ({
   const [expanded, setExpanded] = React.useState<boolean>(
     () => task.status === "running" || task.status === "paused",
   );
+  // Inline JSON expander — gated by `enableJsonExpander` so external
+  // consumers (sticky-tasks-panel) keep their compact layout.
+  const [jsonOpen, setJsonOpen] = React.useState(false);
+  const onRowClick = React.useCallback<
+    React.MouseEventHandler<HTMLDivElement>
+  >(
+    (e) => {
+      if (!onSelect) return;
+      // Skip clicks that originated inside an interactive control so the
+      // action buttons keep their semantics. Buttons inside the row don't
+      // stopPropagation; the guard runs on the captured target tag.
+      const target = e.target as HTMLElement;
+      if (target.closest("button, a, [role=menu], [role=menuitem]")) return;
+      onSelect(task.id);
+    },
+    [onSelect, task.id],
+  );
 
   return (
     <div
+      role={onSelect ? "button" : undefined}
+      tabIndex={onSelect ? 0 : undefined}
+      aria-selected={onSelect ? selected : undefined}
+      onClick={onRowClick}
+      onKeyDown={
+        onSelect
+          ? (e) => {
+              if (e.key === "Enter" || e.key === " ") {
+                e.preventDefault();
+                onSelect(task.id);
+              }
+            }
+          : undefined
+      }
       className={cn(
         "group rounded-lg border bg-card transition-all duration-base",
         "hover:shadow-elev-1",
@@ -126,6 +180,7 @@ export const TaskRow: React.FC<TaskRowProps> = ({
           task.status !== "failed" &&
           task.status !== "completed" &&
           "border-border",
+        selected && "ring-2 ring-primary/60 ring-offset-1 ring-offset-background",
       )}
     >
       <div className="flex items-start gap-3 p-3">
@@ -305,7 +360,10 @@ export const TaskRow: React.FC<TaskRowProps> = ({
                 <div className="mt-2">
                   <button
                     type="button"
-                    onClick={() => setExpanded((e) => !e)}
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      setExpanded((x) => !x);
+                    }}
                     aria-expanded={expanded}
                     className="inline-flex items-center gap-1 rounded text-2xs text-muted-foreground transition-colors duration-fast hover:text-foreground"
                   >
@@ -372,11 +430,48 @@ export const TaskRow: React.FC<TaskRowProps> = ({
                   {task.error}
                 </div>
               )}
+
+              {/* Inline JSON expander — manual <pre>, no syntax-highlight
+                  library, per task-manager folder constraints. Lets the
+                  operator inspect the raw TaskRecord (id, input, steps,
+                  timestamps) without flipping to devtools. Renders only
+                  when `enableJsonExpander` is true. */}
+              {enableJsonExpander && (
+                <div className="mt-2">
+                  <button
+                    type="button"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      setJsonOpen((o) => !o);
+                    }}
+                    aria-expanded={jsonOpen}
+                    className="inline-flex items-center gap-1 rounded text-2xs text-muted-foreground transition-colors duration-fast hover:text-foreground"
+                  >
+                    {jsonOpen ? (
+                      <ChevronDown className="h-3 w-3" />
+                    ) : (
+                      <ChevronRight className="h-3 w-3" />
+                    )}
+                    {jsonOpen ? "Hide raw JSON" : "Show raw JSON"}
+                  </button>
+                  {jsonOpen && (
+                    <pre
+                      className="mt-1 max-h-64 overflow-auto rounded-md border border-border bg-surface-base/40 p-2 text-2xs leading-snug text-muted-foreground"
+                      onClick={(e) => e.stopPropagation()}
+                    >
+                      {JSON.stringify(task, null, 2)}
+                    </pre>
+                  )}
+                </div>
+              )}
             </>
           )}
         </div>
 
-        <div className="flex shrink-0 items-center gap-1">
+        <div
+          className="flex shrink-0 items-center gap-1"
+          onClick={(e) => e.stopPropagation()}
+        >
           {task.status === "running" && actions.onPause && (
             <Tooltip>
               <TooltipTrigger asChild>

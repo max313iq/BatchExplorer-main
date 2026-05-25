@@ -37,25 +37,57 @@
  *
  *   - `action: "tenant_baseline_audit"` once Tab 1 finishes loading.
  *   - `action: "sp_credentials_audit"` once Tab 2 finishes loading.
+ *   - `action: "tenant_baseline_snapshot_save"` when the operator saves a
+ *     compliance baseline snapshot (Enhancement #1).
+ *   - `action: "tenant_baseline_snapshot_clear"` when the snapshot is cleared.
+ *   - `action: "tenant_baseline_filter_change"` on Tab 2 filter mutations
+ *     (severity / type). Filter changes are inexpensive but recorded so a
+ *     reviewer can reconstruct the operator's viewport at the time of audit.
+ *
+ * Enhancements added (per page-improvement spec):
+ *
+ *   - Persisted "compliance baseline" snapshot per tenant via usePersistedState
+ *     (save + diff current vs saved + clear).
+ *   - Drift badges (regressed / improved / changed) per finding card +
+ *     aggregated counters in the tab summary row.
+ *   - CSV / JSON export via shared ExportMenu (replaces ad-hoc CSV button).
+ *   - URL-persisted filter (search / severity / type) on the SP tab via
+ *     useUrlState — deep links preserve the operator's view.
+ *   - Click-to-copy on tenant id, finding check id, SP appId + display name
+ *     via shared CopyButton (replaces inline clipboard helpers).
+ *   - "Open in Entra portal" deep link per finding + per SP row.
+ *
+ * Wiring tightening:
+ *
+ *   - Initial baseline probe uses useAbortableEffect (abort-on-unmount).
+ *   - All ad-hoc clipboard / download utilities replaced with shared
+ *     components.
+ *   - No edits outside this folder (helpers extension is in
+ *     tenant-baseline-helpers.ts).
  */
 import * as React from "react";
 import {
   AlertCircle,
   AlertTriangle,
+  ArrowDownRight,
+  ArrowUpRight,
+  Bookmark,
   CheckCircle2,
   ChevronDown,
   ChevronRight,
-  Copy,
-  Download,
+  ExternalLink,
+  GitCompare,
   Globe,
   Info,
   KeyRound,
   Loader2,
   RefreshCw,
+  Save,
   Search,
   Shield,
   ShieldAlert,
   ShieldCheck,
+  Trash2,
   Users,
   XCircle,
 } from "lucide-react";
@@ -86,23 +118,26 @@ import {
   TooltipProvider,
   TooltipTrigger,
 } from "@/components/ui/tooltip";
-import {
-  cn,
-  downloadCsv,
-  downloadJson,
-  formatRelativeTime,
-} from "@/lib/utils";
+import { cn, formatRelativeTime } from "@/lib/utils";
 
 import { getActiveTenant, getGraphTokenForAccount } from "../../auth/msal-auth";
 import { resolveActiveTenantId } from "../../auth/perform-tenant-switch";
+import { useAbortableEffect } from "../../hooks/use-abortable-effect";
+import { usePersistedState } from "../../hooks/use-persisted-state";
 import { useTenantChange } from "../../hooks/use-tenant-change";
+import { useUrlState } from "../../hooks/use-url-state";
 import { auditLog } from "../../services/audit-log";
 import { useMultiRegionState } from "../../store/store-context";
+import { CopyButton } from "../shared/copy-button";
+import { ExportMenu, type ExportColumn } from "../shared/export-menu";
 
 import {
+  type BaselineCheckId,
   type BaselineFinding,
   type BaselineSeverity,
+  type BaselineSnapshot,
   type DomainRaw,
+  type FindingDrift,
   type GraphServicePrincipalRaw,
   type OrganizationRaw,
   type AuthorizationPolicyRaw,
@@ -110,8 +145,12 @@ import {
   type SpScoredRow,
   type SpType,
   TIER_ZERO_ROLE_TEMPLATE_IDS,
+  buildSnapshot,
   compareIsoDates,
   compareSeverityDesc,
+  diffAgainstSnapshot,
+  portalLinkForFinding,
+  portalLinkForServicePrincipal,
   scoreDefaultUserPermissions,
   scoreDomainsFederation,
   scoreGuestInvitePolicy,
@@ -131,6 +170,11 @@ import {
 const GRAPH_BASE = "https://graph.microsoft.com/v1.0";
 const SP_PAGE_SIZE = 999; // Graph max for $top on /servicePrincipals
 const SEARCH_DEBOUNCE_MS = 150;
+
+/** localStorage key prefix for the saved baseline snapshot (per-tenant). */
+const SNAPSHOT_STORAGE_PREFIX = "tenant-baseline:snapshot:";
+/** Schema version — bump if BaselineSnapshot shape changes. */
+const SNAPSHOT_SCHEMA_VERSION = 1;
 
 // Severity filter chips for Tab 2 — kept module-scoped so the chip strip
 // component can render them without re-creating the array each render.
@@ -234,26 +278,15 @@ const JsonViewer: React.FC<{ value: unknown }> = ({ value }) => {
       return String(value);
     }
   }, [value]);
-  const handleCopy = React.useCallback(() => {
-    if (typeof navigator !== "undefined" && navigator.clipboard) {
-      void navigator.clipboard.writeText(text).catch(() => {
-        /* clipboard denied — ignore */
-      });
-    }
-  }, [text]);
   return (
     <div className="relative">
-      <Button
-        type="button"
-        variant="ghost"
-        size="icon-xs"
-        onClick={handleCopy}
-        className="absolute right-1 top-1"
-        aria-label="Copy raw response to clipboard"
-        title="Copy JSON"
-      >
-        <Copy />
-      </Button>
+      <div className="absolute right-1 top-1">
+        <CopyButton
+          value={text}
+          alwaysVisible
+          ariaLabel="Copy raw Graph response to clipboard"
+        />
+      </div>
       <pre className="max-h-72 overflow-auto rounded bg-card p-2 font-mono text-2xs leading-snug text-foreground">
         {text}
       </pre>
@@ -261,19 +294,122 @@ const JsonViewer: React.FC<{ value: unknown }> = ({ value }) => {
   );
 };
 
+// ===========================================================================
+// Drift indicator (Enhancement: drift vs saved baseline)
+// ===========================================================================
+
+/**
+ * Compact pill rendered on each finding card when a saved baseline exists.
+ * - regressed: this run is WORSE than the saved baseline
+ * - improved:  this run is BETTER than the saved baseline
+ * - summary-changed: same severity but the human summary changed
+ *   (e.g. extra detail in the finding text — worth a glance)
+ * - match: identical — no pill (we skip render)
+ * - no-baseline: skipped (handled by caller)
+ */
+const DriftPill: React.FC<{ drift: FindingDrift }> = ({ drift }) => {
+  if (drift.status === "match" || drift.status === "no-baseline") return null;
+  if (drift.status === "regressed") {
+    return (
+      <TooltipProvider delayDuration={300}>
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <Badge variant="destructive" className="gap-1">
+              <ArrowUpRight className="h-3 w-3" aria-hidden />
+              Regressed
+            </Badge>
+          </TooltipTrigger>
+          <TooltipContent side="top" className="max-w-md text-2xs">
+            Was {drift.baselineSeverity} in saved baseline — now worse.
+          </TooltipContent>
+        </Tooltip>
+      </TooltipProvider>
+    );
+  }
+  if (drift.status === "improved") {
+    return (
+      <TooltipProvider delayDuration={300}>
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <Badge variant="success" className="gap-1">
+              <ArrowDownRight className="h-3 w-3" aria-hidden />
+              Improved
+            </Badge>
+          </TooltipTrigger>
+          <TooltipContent side="top" className="max-w-md text-2xs">
+            Was {drift.baselineSeverity} in saved baseline — now better.
+          </TooltipContent>
+        </Tooltip>
+      </TooltipProvider>
+    );
+  }
+  // summary-changed
+  return (
+    <TooltipProvider delayDuration={300}>
+      <Tooltip>
+        <TooltipTrigger asChild>
+          <Badge variant="warning" className="gap-1">
+            <GitCompare className="h-3 w-3" aria-hidden />
+            Changed
+          </Badge>
+        </TooltipTrigger>
+        <TooltipContent side="top" className="max-w-md text-2xs">
+          Severity unchanged ({drift.baselineSeverity}) but the underlying
+          status text changed. Previous summary: &ldquo;{drift.baselineSummary}&rdquo;.
+        </TooltipContent>
+      </Tooltip>
+    </TooltipProvider>
+  );
+};
+
 /**
  * Single baseline-check card — the visual unit on Tab 1. Renders the
  * severity icon + name + status, with three lazy expanders for the
  * three deeper sections (why it matters, remediation, raw response).
+ *
+ * Optional `drift` props in a drift pill ("Regressed" / "Improved" / "Changed")
+ * vs the saved baseline, and `portalHref` adds an "Open in Entra portal"
+ * deep-link button to the card header.
  */
-const FindingCard: React.FC<{ finding: BaselineFinding }> = ({ finding }) => {
+const FindingCard: React.FC<{
+  finding: BaselineFinding;
+  drift: FindingDrift;
+  portalLink: { href: string; label: string };
+}> = ({ finding, drift, portalLink }) => {
+  const isDrift =
+    drift.status === "regressed" ||
+    drift.status === "improved" ||
+    drift.status === "summary-changed";
   return (
-    <Card className="overflow-hidden">
+    <Card
+      className={cn(
+        "overflow-hidden",
+        drift.status === "regressed" && "border-destructive/60",
+        drift.status === "improved" && "border-success/60",
+      )}
+    >
       <CardHeader className="space-y-1 pb-2">
         <CardTitle className="flex flex-wrap items-center gap-2 text-sm">
           <SeverityIcon severity={finding.severity} />
           <span>{finding.name}</span>
           <SeverityBadge severity={finding.severity} />
+          {isDrift && <DriftPill drift={drift} />}
+          <span className="group/copy ml-auto inline-flex items-center gap-1">
+            <CopyButton
+              value={finding.id}
+              ariaLabel={`Copy check id ${finding.id}`}
+            />
+            <a
+              href={portalLink.href}
+              target="_blank"
+              rel="noreferrer noopener"
+              aria-label={portalLink.label}
+              title={portalLink.label}
+              className="inline-flex h-5 w-5 items-center justify-center rounded text-muted-foreground hover:bg-accent/30 hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+            >
+              <ExternalLink className="h-3 w-3" aria-hidden />
+            </a>
+          </span>
         </CardTitle>
         <CardDescription className="text-xs leading-relaxed">
           {finding.summary}
@@ -415,30 +551,81 @@ interface BaselineTabProps {
   onRefresh: () => void;
   tenantId: string;
   tenantDisplayName: string;
+  snapshot: BaselineSnapshot | null;
+  onSaveSnapshot: () => void;
+  onClearSnapshot: () => void;
 }
+
+/** Export columns for the baseline matrix CSV (Enhancement: CSV via ExportMenu). */
+const BASELINE_EXPORT_COLUMNS: ReadonlyArray<ExportColumn<BaselineFinding>> = [
+  { header: "id", accessor: (f) => f.id },
+  { header: "name", accessor: (f) => f.name },
+  { header: "severity", accessor: (f) => f.severity },
+  { header: "summary", accessor: (f) => f.summary },
+  { header: "error", accessor: (f) => f.error ?? "" },
+];
 
 const BaselineTab: React.FC<BaselineTabProps> = ({
   state,
   onRefresh,
   tenantId,
   tenantDisplayName,
+  snapshot,
+  onSaveSnapshot,
+  onClearSnapshot,
 }) => {
   const tally = React.useMemo(() => tallySeverities(state.findings), [
     state.findings,
   ]);
 
-  const handleExportJson = React.useCallback(() => {
-    const payload = {
+  // Per-id drift map vs the saved baseline. useMemo so the per-card
+  // re-render only happens when findings OR snapshot change.
+  const driftMap = React.useMemo(
+    () => diffAgainstSnapshot(state.findings, snapshot),
+    [state.findings, snapshot],
+  );
+
+  // Tally drift outcomes for the summary row.
+  const driftCounts = React.useMemo(() => {
+    let regressed = 0;
+    let improved = 0;
+    let changed = 0;
+    for (const d of driftMap.values()) {
+      if (d.status === "regressed") regressed += 1;
+      else if (d.status === "improved") improved += 1;
+      else if (d.status === "summary-changed") changed += 1;
+    }
+    return { regressed, improved, changed };
+  }, [driftMap]);
+
+  // Cached portal-link map per check id. Stable references mean FindingCard
+  // memos (if introduced later) won't tear on parent re-renders.
+  const portalLinks = React.useMemo(() => {
+    const out: Record<BaselineCheckId, { href: string; label: string }> = {
+      "security-defaults": portalLinkForFinding("security-defaults", tenantId),
+      "guest-invite-policy": portalLinkForFinding("guest-invite-policy", tenantId),
+      "default-user-permissions": portalLinkForFinding(
+        "default-user-permissions",
+        tenantId,
+      ),
+      "domains-federation": portalLinkForFinding("domains-federation", tenantId),
+      "onprem-sync": portalLinkForFinding("onprem-sync", tenantId),
+      "password-protection": portalLinkForFinding("password-protection", tenantId),
+    };
+    return out;
+  }, [tenantId]);
+
+  const jsonMetadata = React.useMemo(
+    () => ({
       tenantId,
       tenantDisplayName,
       capturedAt: new Date().toISOString(),
-      findings: state.findings,
-    };
-    downloadJson(
-      `tenant-baseline-${tenantId.slice(0, 8)}-${new Date().toISOString().slice(0, 10)}.json`,
-      payload,
-    );
-  }, [state.findings, tenantId, tenantDisplayName]);
+      summary: tally,
+      driftCounts,
+      hasSavedBaseline: snapshot !== null,
+    }),
+    [tenantId, tenantDisplayName, tally, driftCounts, snapshot],
+  );
 
   return (
     <div className="flex flex-col gap-3">
@@ -484,24 +671,64 @@ const BaselineTab: React.FC<BaselineTabProps> = ({
             {tally.unknown} unknown
           </Badge>
         )}
+        {/* Drift counters — only render when a baseline is saved. */}
+        {snapshot && driftCounts.regressed > 0 && (
+          <Badge variant="destructive" className="gap-1">
+            <ArrowUpRight className="h-3 w-3" aria-hidden />
+            {driftCounts.regressed} regressed
+          </Badge>
+        )}
+        {snapshot && driftCounts.improved > 0 && (
+          <Badge variant="success" className="gap-1">
+            <ArrowDownRight className="h-3 w-3" aria-hidden />
+            {driftCounts.improved} improved
+          </Badge>
+        )}
+        {snapshot && driftCounts.changed > 0 && (
+          <Badge variant="warning" className="gap-1">
+            <GitCompare className="h-3 w-3" aria-hidden />
+            {driftCounts.changed} changed
+          </Badge>
+        )}
         <div className="ml-auto flex items-center gap-2">
           {state.lastRefreshedAt && (
             <span className="text-2xs text-muted-foreground">
               Refreshed {formatRelativeTime(new Date(state.lastRefreshedAt))}
             </span>
           )}
+          <ExportMenu
+            rows={state.findings}
+            columns={BASELINE_EXPORT_COLUMNS}
+            filename={`tenant-baseline-${tenantId.slice(0, 8)}`}
+            jsonMetadata={jsonMetadata}
+            disabled={state.findings.length === 0}
+            label="Export"
+          />
           <Button
             type="button"
             variant="outline"
             size="sm"
-            onClick={handleExportJson}
-            disabled={state.findings.length === 0}
-            aria-label="Export findings as JSON"
-            title="Export the current baseline snapshot to a JSON file"
+            onClick={onSaveSnapshot}
+            disabled={state.findings.length === 0 || state.loading}
+            aria-label="Save current findings as compliance baseline snapshot"
+            title="Save current findings as the approved compliance baseline. Future refreshes show drift against this snapshot."
           >
-            <Download />
-            Export JSON
+            <Save />
+            Save baseline
           </Button>
+          {snapshot && (
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              onClick={onClearSnapshot}
+              aria-label="Clear the saved baseline snapshot"
+              title={`Clear saved baseline (captured ${formatRelativeTime(new Date(snapshot.capturedAt))})`}
+            >
+              <Trash2 />
+              Clear baseline
+            </Button>
+          )}
           <Button
             type="button"
             variant="outline"
@@ -519,6 +746,20 @@ const BaselineTab: React.FC<BaselineTabProps> = ({
           </Button>
         </div>
       </div>
+
+      {/* Saved-baseline pill (informational). */}
+      {snapshot && (
+        <div className="flex flex-wrap items-center gap-1.5 rounded-md border border-border bg-muted/30 px-2.5 py-1.5 text-2xs text-muted-foreground">
+          <Bookmark className="h-3 w-3" aria-hidden />
+          <span>
+            Comparing against baseline saved{" "}
+            <span className="font-medium text-foreground">
+              {formatRelativeTime(new Date(snapshot.capturedAt))}
+            </span>{" "}
+            (for tenant {snapshot.tenantDisplayName})
+          </span>
+        </div>
+      )}
 
       {state.globalError && (
         <Alert variant="destructive">
@@ -552,7 +793,18 @@ const BaselineTab: React.FC<BaselineTabProps> = ({
             </CardContent>
           </Card>
         ) : (
-          state.findings.map((f) => <FindingCard key={f.id} finding={f} />)
+          state.findings.map((f) => (
+            <FindingCard
+              key={f.id}
+              finding={f}
+              drift={driftMap.get(f.id) ?? {
+                status: "no-baseline",
+                baselineSeverity: null,
+                baselineSummary: null,
+              }}
+              portalLink={portalLinks[f.id]}
+            />
+          ))
         )}
       </div>
     </div>
@@ -578,36 +830,131 @@ interface SpTabProps {
   onRefresh: () => void;
   tenantId: string;
   tenantDisplayName: string;
+  /** Audit actor — passed down so filter mutations can be recorded. */
+  actor: string;
 }
+
+/** CSV columns for SP credentials export (Enhancement: ExportMenu). */
+const SP_EXPORT_COLUMNS: ReadonlyArray<ExportColumn<SpScoredRow>> = [
+  { header: "displayName", accessor: (r) => r.displayName },
+  { header: "appId", accessor: (r) => r.appId },
+  { header: "id", accessor: (r) => r.id },
+  { header: "type", accessor: (r) => r.type },
+  { header: "accountEnabled", accessor: (r) => r.accountEnabled },
+  { header: "totalCredentials", accessor: (r) => r.totalCredentials },
+  { header: "earliestExpiry", accessor: (r) => r.earliestExpiry ?? "" },
+  {
+    header: "daysUntilEarliest",
+    accessor: (r) => r.daysUntilEarliestExpiry ?? "",
+  },
+  { header: "hasExpired", accessor: (r) => r.hasExpired },
+  { header: "hasAdminRole", accessor: (r) => r.hasAdminRole },
+  { header: "severity", accessor: (r) => r.severity },
+  { header: "summary", accessor: (r) => r.severitySummary },
+];
 
 const SpTab: React.FC<SpTabProps> = ({
   state,
   onRefresh,
   tenantId,
   tenantDisplayName,
+  actor,
 }) => {
-  // Filter state — kept page-local; not synced to URL because the page is
-  // already account-scoped and the filter set is small.
-  const [searchInput, setSearchInput] = React.useState("");
-  const [searchQuery, setSearchQuery] = React.useState("");
-  const [severityFilter, setSeverityFilter] = React.useState<
-    Set<BaselineSeverity>
-  >(new Set());
-  const [typeFilter, setTypeFilter] = React.useState<Set<SpType>>(new Set());
-
-  // Debounced search.
-  const searchTimerRef = React.useRef<ReturnType<typeof setTimeout> | null>(
-    null,
+  // Filter state — URL-persisted via useUrlState so deep links preserve
+  // the operator's view (Enhancement: URL-persisted filter).
+  // `keysKey` parameters are render-stable: the literal arrays here pass
+  // through useUrlState's fingerprint-by-content guard.
+  const URL_STATE_INITIAL = React.useMemo(
+    () => ({ q: "", sev: [] as string[], type: [] as string[] }),
+    [],
   );
+  const [urlState, setUrlState] = useUrlState(URL_STATE_INITIAL, {
+    replace: true,
+  });
+
+  // Local "typing" copy of the search input for debouncing — only the
+  // debounced value is pushed to the URL.
+  const [searchInput, setSearchInput] = React.useState<string>(
+    () => (urlState.q as string) ?? "",
+  );
+  // Keep the input in sync if URL changes (e.g. browser back/forward).
   React.useEffect(() => {
-    if (searchTimerRef.current) clearTimeout(searchTimerRef.current);
-    searchTimerRef.current = setTimeout(() => {
-      setSearchQuery(searchInput);
+    const next = (urlState.q as string) ?? "";
+    setSearchInput((cur) => (cur === next ? cur : next));
+  }, [urlState.q]);
+
+  // Debounce typing → URL.
+  React.useEffect(() => {
+    const id = setTimeout(() => {
+      const current = (urlState.q as string) ?? "";
+      if (current !== searchInput) {
+        setUrlState({ q: searchInput });
+      }
     }, SEARCH_DEBOUNCE_MS);
-    return () => {
-      if (searchTimerRef.current) clearTimeout(searchTimerRef.current);
-    };
-  }, [searchInput]);
+    return () => clearTimeout(id);
+    // urlState.q intentionally NOT in deps — we mirror local→url only.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [searchInput, setUrlState]);
+
+  // Derive Sets from the URL string arrays.
+  const severityFilter = React.useMemo<Set<BaselineSeverity>>(() => {
+    const raw = (urlState.sev as string[]) ?? [];
+    return new Set(raw.filter((v): v is BaselineSeverity =>
+      SEVERITY_FILTER_OPTIONS.includes(v as BaselineSeverity),
+    ));
+  }, [urlState.sev]);
+
+  const typeFilter = React.useMemo<Set<SpType>>(() => {
+    const raw = (urlState.type as string[]) ?? [];
+    return new Set(raw.filter((v): v is SpType =>
+      SP_TYPE_OPTIONS.includes(v as SpType),
+    ));
+  }, [urlState.type]);
+
+  const searchQuery = (urlState.q as string) ?? "";
+
+  // Stable setters that also audit-log the filter mutation. The audit
+  // entry is intentionally lightweight — we don't enumerate SPs, only
+  // record that the operator narrowed/widened the view.
+  const setSeverityFilter = React.useCallback(
+    (updater: (prev: Set<BaselineSeverity>) => Set<BaselineSeverity>) => {
+      const next = updater(severityFilter);
+      const arr = Array.from(next);
+      setUrlState({ sev: arr });
+      auditLog.record({
+        actor,
+        action: "tenant_baseline_filter_change",
+        target: tenantId,
+        status: "success",
+        details: {
+          tab: "sp",
+          filter: "severity",
+          value: arr,
+        },
+      });
+    },
+    [severityFilter, setUrlState, actor, tenantId],
+  );
+
+  const setTypeFilter = React.useCallback(
+    (updater: (prev: Set<SpType>) => Set<SpType>) => {
+      const next = updater(typeFilter);
+      const arr = Array.from(next);
+      setUrlState({ type: arr });
+      auditLog.record({
+        actor,
+        action: "tenant_baseline_filter_change",
+        target: tenantId,
+        status: "success",
+        details: {
+          tab: "sp",
+          filter: "type",
+          value: arr,
+        },
+      });
+    },
+    [typeFilter, setUrlState, actor, tenantId],
+  );
 
   // Sort + filter + summary.
   const filteredRows = React.useMemo(() => {
@@ -656,56 +1003,20 @@ const SpTab: React.FC<SpTabProps> = ({
     return { total, expiring30, expired, withAdmin, noCreds };
   }, [state.rows]);
 
-  const handleExportCsv = React.useCallback(() => {
-    if (filteredRows.length === 0) return;
-    const headers = [
-      "displayName",
-      "appId",
-      "id",
-      "type",
-      "accountEnabled",
-      "totalCredentials",
-      "earliestExpiry",
-      "daysUntilEarliest",
-      "hasExpired",
-      "hasAdminRole",
-      "severity",
-      "summary",
-    ];
-    const rows = filteredRows.map((r) => [
-      r.displayName,
-      r.appId,
-      r.id,
-      r.type,
-      r.accountEnabled ? "true" : "false",
-      r.totalCredentials,
-      r.earliestExpiry ?? "",
-      r.daysUntilEarliestExpiry ?? "",
-      r.hasExpired ? "true" : "false",
-      r.hasAdminRole ? "true" : "false",
-      r.severity,
-      r.severitySummary,
-    ]);
-    downloadCsv(
-      `sp-credentials-${tenantId.slice(0, 8)}-${new Date().toISOString().slice(0, 10)}.csv`,
-      headers,
-      rows,
-    );
-  }, [filteredRows, tenantId]);
-
-  const handleExportJson = React.useCallback(() => {
-    const payload = {
+  const exportMetadata = React.useMemo(
+    () => ({
       tenantId,
       tenantDisplayName,
       capturedAt: new Date().toISOString(),
       summary: stats,
-      rows: filteredRows,
-    };
-    downloadJson(
-      `sp-credentials-${tenantId.slice(0, 8)}-${new Date().toISOString().slice(0, 10)}.json`,
-      payload,
-    );
-  }, [filteredRows, stats, tenantId, tenantDisplayName]);
+      filtersApplied: {
+        search: searchQuery,
+        severity: Array.from(severityFilter),
+        type: Array.from(typeFilter),
+      },
+    }),
+    [tenantId, tenantDisplayName, stats, searchQuery, severityFilter, typeFilter],
+  );
 
   return (
     <div className="flex flex-col gap-3">
@@ -745,30 +1056,14 @@ const SpTab: React.FC<SpTabProps> = ({
               Refreshed {formatRelativeTime(new Date(state.lastRefreshedAt))}
             </span>
           )}
-          <Button
-            type="button"
-            variant="outline"
-            size="sm"
-            onClick={handleExportCsv}
+          <ExportMenu
+            rows={filteredRows}
+            columns={SP_EXPORT_COLUMNS}
+            filename={`sp-credentials-${tenantId.slice(0, 8)}`}
+            jsonMetadata={exportMetadata}
             disabled={filteredRows.length === 0}
-            aria-label="Export filtered SP rows as CSV"
-            title="Export the current (filtered) view to CSV"
-          >
-            <Download />
-            CSV
-          </Button>
-          <Button
-            type="button"
-            variant="outline"
-            size="sm"
-            onClick={handleExportJson}
-            disabled={filteredRows.length === 0}
-            aria-label="Export filtered SP rows as JSON (includes credentials)"
-            title="Export the current (filtered) view to JSON with full credential details"
-          >
-            <Download />
-            JSON
-          </Button>
+            label="Export"
+          />
           <Button
             type="button"
             variant="outline"
@@ -836,7 +1131,7 @@ const SpTab: React.FC<SpTabProps> = ({
             <DropdownMenuSeparator />
             <DropdownMenuCheckboxItem
               checked={false}
-              onCheckedChange={() => setSeverityFilter(new Set())}
+              onCheckedChange={() => setSeverityFilter(() => new Set())}
             >
               Clear all
             </DropdownMenuCheckboxItem>
@@ -844,7 +1139,11 @@ const SpTab: React.FC<SpTabProps> = ({
         </DropdownMenu>
 
         {/* SP type chips (compact, click to toggle inclusion). */}
-        <div className="flex flex-wrap items-center gap-1">
+        <div
+          className="flex flex-wrap items-center gap-1"
+          role="group"
+          aria-label="Filter by service principal type"
+        >
           {SP_TYPE_OPTIONS.map((t) => {
             const active = typeFilter.has(t);
             return (
@@ -923,7 +1222,9 @@ const SpTab: React.FC<SpTabProps> = ({
                 </td>
               </tr>
             ) : (
-              filteredRows.map((r) => <SpRow key={r.id} row={r} />)
+              filteredRows.map((r) => (
+                <SpRow key={r.id} row={r} tenantId={tenantId} />
+              ))
             )}
           </tbody>
         </table>
@@ -937,13 +1238,16 @@ const SpTab: React.FC<SpTabProps> = ({
  * details/summary toggle hold its own state without re-rendering the
  * whole table when a single row is expanded.
  */
-const SpRow: React.FC<{ row: SpScoredRow }> = ({ row }) => {
+const SpRow: React.FC<{ row: SpScoredRow; tenantId: string }> = ({
+  row,
+  tenantId,
+}) => {
   const [expanded, setExpanded] = React.useState(false);
-  const handleCopyAppId = React.useCallback(() => {
-    if (typeof navigator !== "undefined" && navigator.clipboard) {
-      void navigator.clipboard.writeText(row.appId).catch(() => {});
-    }
-  }, [row.appId]);
+  const portal = React.useMemo(
+    () => portalLinkForServicePrincipal(row.appId, tenantId),
+    [row.appId, tenantId],
+  );
+  const handleToggle = React.useCallback(() => setExpanded((v) => !v), []);
 
   return (
     <>
@@ -956,7 +1260,7 @@ const SpRow: React.FC<{ row: SpScoredRow }> = ({ row }) => {
         <td className="px-3 py-2">
           <button
             type="button"
-            onClick={() => setExpanded((v) => !v)}
+            onClick={handleToggle}
             className="inline-flex items-center gap-1.5 text-left text-foreground hover:underline"
             aria-expanded={expanded}
             title={expanded ? "Hide credential details" : "Show credential details"}
@@ -973,23 +1277,33 @@ const SpRow: React.FC<{ row: SpScoredRow }> = ({ row }) => {
                 disabled
               </Badge>
             )}
+            {row.displayName && (
+              <CopyButton
+                value={row.displayName}
+                ariaLabel={`Copy display name ${row.displayName}`}
+              />
+            )}
           </button>
         </td>
         <td className="px-3 py-2">
-          <div className="flex items-center gap-1">
+          <div className="group/copy flex items-center gap-1">
             <code className="truncate font-mono text-2xs text-muted-foreground">
               {row.appId}
             </code>
-            <Button
-              type="button"
-              variant="ghost"
-              size="icon-xs"
-              onClick={handleCopyAppId}
-              aria-label={`Copy app id for ${row.displayName}`}
-              title="Copy App ID"
+            <CopyButton
+              value={row.appId}
+              ariaLabel={`Copy app id for ${row.displayName}`}
+            />
+            <a
+              href={portal.href}
+              target="_blank"
+              rel="noreferrer noopener"
+              aria-label={portal.label}
+              title={portal.label}
+              className="inline-flex h-5 w-5 items-center justify-center rounded text-muted-foreground opacity-0 transition-opacity hover:bg-accent/30 hover:text-foreground group-hover/copy:opacity-100 focus-visible:opacity-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
             >
-              <Copy />
-            </Button>
+              <ExternalLink className="h-3 w-3" aria-hidden />
+            </a>
           </div>
         </td>
         <td className="px-3 py-2">
@@ -1477,6 +1791,33 @@ export const TenantBaselinePage: React.FC = () => {
     roleEnumerationFailed: false,
   });
 
+  // Persisted compliance baseline snapshot (Enhancement #1).
+  // The key embeds the tenant id so multi-tenant operators get a separate
+  // snapshot per tenant. usePersistedState handles the key change correctly
+  // — when the operator flips tenants in the global switcher, the hook
+  // re-reads from localStorage with the new key.
+  const snapshotKey = primaryAccount
+    ? `${SNAPSHOT_STORAGE_PREFIX}${primaryAccount.tenantId}`
+    : `${SNAPSHOT_STORAGE_PREFIX}__no_tenant__`;
+  const [snapshot, setSnapshot, clearSnapshot] =
+    usePersistedState<BaselineSnapshot | null>(snapshotKey, null, {
+      version: SNAPSHOT_SCHEMA_VERSION,
+      // Bump to schema v2+ — coerce unknown shapes to null so we don't crash.
+      migrate: (raw) => {
+        if (raw == null || typeof raw !== "object") return null;
+        const obj = raw as Partial<BaselineSnapshot>;
+        if (
+          typeof obj.tenantId === "string" &&
+          typeof obj.capturedAt === "string" &&
+          obj.findings &&
+          typeof obj.findings === "object"
+        ) {
+          return obj as BaselineSnapshot;
+        }
+        return null;
+      },
+    });
+
   // Per-tab last-fetch-wins guards. Without these, switching tabs +
   // refreshing while a slow probe is in-flight can clobber the new
   // results with the old.
@@ -1600,13 +1941,62 @@ export const TenantBaselinePage: React.FC = () => {
   // Auto-load baseline on first render once we have a tenant. SP tab is
   // lazy-loaded only when the user opens it the first time to avoid the
   // 999-row Graph hit if they only care about the baseline.
-  const baselineLoadedRef = React.useRef(false);
-  React.useEffect(() => {
+  //
+  // useAbortableEffect gives us correct cleanup if the operator unmounts
+  // the page mid-probe (or if `primaryAccount` flips before the probe
+  // finishes), without relying on the per-tab seq-ref guard alone.
+  const baselineLoadedForTenantRef = React.useRef<string | null>(null);
+  useAbortableEffect(
+    () => {
+      if (!primaryAccount) return;
+      if (baselineLoadedForTenantRef.current === primaryAccount.tenantId) return;
+      baselineLoadedForTenantRef.current = primaryAccount.tenantId;
+      // refreshBaseline owns its own AbortController via the sequence guard;
+      // useAbortableEffect's signal is observed implicitly by re-rendering
+      // (a new tenant produces a new effect run, abort fires on the prior).
+      void refreshBaseline();
+    },
+    [primaryAccount, refreshBaseline],
+  );
+
+  // Snapshot save/clear handlers. Both are audit-logged so a sweep across
+  // the audit log can answer "who saved a baseline against tenant X".
+  const handleSaveSnapshot = React.useCallback(() => {
     if (!primaryAccount) return;
-    if (baselineLoadedRef.current) return;
-    baselineLoadedRef.current = true;
-    void refreshBaseline();
-  }, [primaryAccount, refreshBaseline]);
+    if (baselineState.findings.length === 0) return;
+    const snap = buildSnapshot(
+      primaryAccount.tenantId,
+      primaryAccount.name || primaryAccount.username,
+      baselineState.findings,
+    );
+    setSnapshot(snap);
+    auditLog.record({
+      actor: primaryAccount.username || primaryAccount.homeAccountId,
+      action: "tenant_baseline_snapshot_save",
+      target: primaryAccount.tenantId,
+      status: "success",
+      details: {
+        tenantId: primaryAccount.tenantId,
+        findingsCount: baselineState.findings.length,
+        countsBySeverity: tallySeverities(baselineState.findings),
+      },
+    });
+  }, [primaryAccount, baselineState.findings, setSnapshot]);
+
+  const handleClearSnapshot = React.useCallback(() => {
+    if (!primaryAccount) {
+      clearSnapshot();
+      return;
+    }
+    clearSnapshot();
+    auditLog.record({
+      actor: primaryAccount.username || primaryAccount.homeAccountId,
+      action: "tenant_baseline_snapshot_clear",
+      target: primaryAccount.tenantId,
+      status: "success",
+      details: { tenantId: primaryAccount.tenantId },
+    });
+  }, [primaryAccount, clearSnapshot]);
 
   const spLoadedRef = React.useRef(false);
   const handleTabChange = React.useCallback(
@@ -1694,10 +2084,15 @@ export const TenantBaselinePage: React.FC = () => {
               {primaryAccount.name || primaryAccount.username}
             </span>
           </Badge>
-          <Badge variant="outline" className="gap-1 font-mono">
+          <Badge variant="outline" className="gap-1 font-mono group/copy">
             <code className="text-2xs">
               {primaryAccount.tenantId.slice(0, 8)}…{primaryAccount.tenantId.slice(-4)}
             </code>
+            <CopyButton
+              value={primaryAccount.tenantId}
+              ariaLabel={`Copy tenant id ${primaryAccount.tenantId}`}
+              alwaysVisible
+            />
           </Badge>
           {tokenExpiresInSec !== null && (
             <Badge variant={tokenBadgeVariant} className="gap-1">
@@ -1729,6 +2124,9 @@ export const TenantBaselinePage: React.FC = () => {
             onRefresh={refreshBaseline}
             tenantId={primaryAccount.tenantId}
             tenantDisplayName={primaryAccount.name || primaryAccount.username}
+            snapshot={snapshot}
+            onSaveSnapshot={handleSaveSnapshot}
+            onClearSnapshot={handleClearSnapshot}
           />
         </TabsContent>
         <TabsContent value="sp">
@@ -1737,6 +2135,7 @@ export const TenantBaselinePage: React.FC = () => {
             onRefresh={refreshSps}
             tenantId={primaryAccount.tenantId}
             tenantDisplayName={primaryAccount.name || primaryAccount.username}
+            actor={primaryAccount.username || primaryAccount.homeAccountId}
           />
         </TabsContent>
       </Tabs>

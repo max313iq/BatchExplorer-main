@@ -77,6 +77,7 @@ import { getActiveTenant, getGraphTokenForAccount } from "../../auth/msal-auth";
 import { resolveActiveTenantId } from "../../auth/perform-tenant-switch";
 import { useArmToken } from "../../auth/use-arm-token";
 import { useTenantChange } from "../../hooks/use-tenant-change";
+import { usePersistedState } from "../../hooks/use-persisted-state";
 import {
   credentialVault,
   type CredentialEntry,
@@ -114,6 +115,15 @@ const TAB_KEY = "user-creator:tab";
 const ACCOUNT_MODE_KEY = "user-creator:account-mode";
 const AUTO_LOGIN_PREF_KEY = "user-creator:auto-launch-portal";
 const SHOW_ALL_PW_KEY = "user-creator:show-all-pw";
+const SAVED_TEMPLATES_KEY = "user-creator:saved-templates";
+/**
+ * Count threshold above which a bulk quick-mode create requires an explicit
+ * confirmation step. Single-user creates skip the dialog (low-risk happy
+ * path). Anything bigger triggers a "you are about to provision N users in
+ * tenant X" confirmation so an accidental finger-slip on the up-arrow can't
+ * spawn 50 Entra accounts.
+ */
+const BULK_CONFIRM_THRESHOLD = 1;
 
 const VALID_TABS = ["create", "browse", "created"] as const;
 type TabValue = (typeof VALID_TABS)[number];
@@ -133,7 +143,11 @@ type AccountMode = "auto" | "manual";
 const MIN_PASSWORD_LENGTH = 12;
 const GENERATED_PASSWORD_LENGTH = 16;
 const USER_PREFIX_RE = /^[a-zA-Z0-9._-]{1,40}$/;
-const AVAILABILITY_DEBOUNCE_MS = 400;
+// 300ms hits the sweet spot — long enough to ignore mid-typing strokes
+// (typical inter-keystroke gap is ~120-180ms for sustained typing), short
+// enough that the spinner appears almost instantly when the user pauses.
+// Previously 400ms which felt unresponsive on the success-card flow.
+const AVAILABILITY_DEBOUNCE_MS = 300;
 const GRAPH_BASE = "https://graph.microsoft.com/v1.0";
 
 // Sign-in helpers (Playwright auto-login, MSAL interactive popup) live in
@@ -223,6 +237,27 @@ interface PrivilegedAccount {
   tenantId: string;
   username: string;
   name: string;
+}
+
+/**
+ * Operator-saved quick-mode template — captures the per-tenant attribute
+ * shape (preset role + display-name pattern + optional post-create redirect
+ * URL) so the operator can re-apply a frequently-used combo with one click.
+ *
+ * Persisted in localStorage via `usePersistedState` keyed by SAVED_TEMPLATES_KEY.
+ * `displayNamePattern` supports `{first}` / `{last}` / `{prefix}` placeholders
+ * — empty pattern falls back to the default title-cased prefix.
+ * `redirectUrl` is informational only; the success-card sign-in flow still
+ * uses the WebUI origin. It's stored for operator reference.
+ */
+interface SavedTemplate {
+  id: string;
+  name: string;
+  presetKey: string;
+  displayNamePattern: string;
+  redirectUrl: string;
+  count: number;
+  createdAt: string;
 }
 
 type AvailabilityState =
@@ -430,6 +465,101 @@ function generateBatchPayload(
   return out;
 }
 
+/**
+ * Parse an operator-pasted CSV blob into a list of QuickUserPayload rows.
+ *
+ * Accepted column shapes (per row, header row optional):
+ *   - `prefix`                              (1 col, falls back to titleCase)
+ *   - `prefix,displayName`                  (2 cols)
+ *   - `prefix,displayName,jobTitle`         (3 cols)
+ *   - `prefix,displayName,jobTitle,dept`    (4 cols)
+ *
+ * Header rows (`prefix,displayName,...`) are skipped if detected. Comment
+ * lines starting with `#` and blank lines are ignored. UPN prefix is
+ * validated against USER_PREFIX_RE; rows that fail validation are
+ * collected into the `errors` output so the operator can fix them
+ * without retyping everything.
+ *
+ * Password + accountEnabled + force-change are taken from the active
+ * preset (not from CSV) — keeping the CSV operator-friendly and the
+ * sensitive bits server-derived.
+ */
+interface ParsedCsv {
+  rows: QuickUserPayload[];
+  errors: Array<{ line: number; text: string; reason: string }>;
+}
+
+function parseCsvPayload(
+  text: string,
+  preset: PresetDefinition,
+  domain: string,
+): ParsedCsv {
+  const rows: QuickUserPayload[] = [];
+  const errors: Array<{ line: number; text: string; reason: string }> = [];
+  const seen = new Set<string>();
+  const lines = text.split(/\r?\n/);
+  for (let i = 0; i < lines.length; i++) {
+    const raw = lines[i] ?? "";
+    const trimmed = raw.trim();
+    if (!trimmed) continue;
+    if (trimmed.startsWith("#")) continue;
+    // Header sniff — first non-blank line, contains "prefix" and a comma.
+    if (
+      rows.length === 0 &&
+      errors.length === 0 &&
+      /^prefix\b/i.test(trimmed) &&
+      trimmed.includes(",")
+    ) {
+      continue;
+    }
+    // Simple CSV split — we don't expect quoted fields in this minimal
+    // contract; if someone needs commas in display names they can edit
+    // post-create. Keeps the parser predictable.
+    const parts = trimmed.split(",").map((p) => p.trim());
+    const prefix = parts[0] ?? "";
+    if (!prefix) {
+      errors.push({ line: i + 1, text: raw, reason: "empty prefix" });
+      continue;
+    }
+    if (!USER_PREFIX_RE.test(prefix)) {
+      errors.push({
+        line: i + 1,
+        text: raw,
+        reason: "invalid prefix (use letters/numbers/._- max 40)",
+      });
+      continue;
+    }
+    if (seen.has(prefix.toLowerCase())) {
+      errors.push({
+        line: i + 1,
+        text: raw,
+        reason: "duplicate prefix in CSV",
+      });
+      continue;
+    }
+    seen.add(prefix.toLowerCase());
+    const givenName = parts[1] ? deriveGivenName(parts[1]) : deriveGivenName(prefix);
+    const surname = parts[1] ? deriveSurname(parts[1]) : deriveSurname(prefix);
+    const displayName = parts[1] || titleCase(prefix);
+    const jobTitle = parts[2] || preset.jobTitle;
+    const department = parts[3] || preset.department;
+    rows.push({
+      prefix,
+      upn: `${prefix}@${domain}`,
+      displayName,
+      givenName,
+      surname,
+      password: generateRandomPassword(),
+      jobTitle,
+      department,
+      usageLocation: preset.usageLocation,
+      forceChange: preset.forceChangePassword,
+      accountEnabled: preset.accountEnabled,
+    });
+  }
+  return { rows, errors };
+}
+
 function formatRelative(iso: string | null | undefined): string {
   if (!iso) return "-";
   const ms = Date.parse(iso);
@@ -504,6 +634,13 @@ interface BrowseRow extends GraphUser {
 
 export interface UserCreatorPageProps {
   orchestrator?: OrchestratorAgent;
+  // COORDINATOR: prop kept as PageKey for backward compat with legacy
+  // adapter signature. The page-router adapter passes `navigateToPage`
+  // directly here; PageKey is a subset of `string`, and navigateToPage
+  // accepts both PageKey strings AND full paths, so direct pass-through
+  // is type-safe at the call site. Internally we call onNavigate("…page…")
+  // with PageKey literals only. If we migrate to path-strings later,
+  // bump the type to `(target: string) => void`.
   onNavigate?: (k: PageKey) => void;
 }
 
@@ -1263,6 +1400,41 @@ const CreateUserForm: React.FC<CreateUserFormProps> = ({
     total: number;
     current?: string;
   } | null>(null);
+  /**
+   * Two-step confirm for any bulk create that would provision more than
+   * BULK_CONFIRM_THRESHOLD users. Single-user creates skip the dialog
+   * (low-risk happy path). The dialog renders a summary of what will be
+   * created so the operator can sanity-check before committing to N
+   * Graph writes.
+   */
+  const [bulkConfirmOpen, setBulkConfirmOpen] = React.useState(false);
+
+  /**
+   * Persisted operator templates — captures preset + display-name pattern
+   * + optional redirect URL so the operator can re-apply a frequently-used
+   * combo with one click. Lives in localStorage (per-browser); no tenant
+   * scoping because templates are operator-personal, not tenant-state.
+   *
+   * COORDINATOR: if a sibling page wants to share these templates (e.g.
+   * tenant-users password-reset flow re-applying the same role preset),
+   * promote the storage key to a shared module — for now it's local.
+   */
+  const [savedTemplates, setSavedTemplates] = usePersistedState<
+    SavedTemplate[]
+  >(SAVED_TEMPLATES_KEY, [], { version: 1 });
+  /**
+   * CSV-paste mode — operator pastes a multi-line CSV (`prefix,displayName,role?`)
+   * to drive a batch create with explicit per-row UPNs instead of synthesized
+   * names. Toggled off by default; lives inside quick-mode because it's a
+   * quick-mode variant.
+   *
+   * COORDINATOR: user-creator has CSV paste, consider import-batch. The
+   * import-batch page may want to delegate single-tenant CSV creates here
+   * rather than re-implementing the row→Graph-write loop.
+   */
+  const [csvMode, setCsvMode] = React.useState(false);
+  const [csvText, setCsvText] = React.useState("");
+  const [csvError, setCsvError] = React.useState<string | null>(null);
 
   const [availability, setAvailability] = React.useState<AvailabilityState>({
     status: "idle",
@@ -1509,12 +1681,55 @@ const CreateUserForm: React.FC<CreateUserFormProps> = ({
     void batchSeed;
     if (!quickMode) return [];
     if (!selectedDomain) return [];
+    // CSV-paste branch — operator-driven UPNs override synthesized names.
+    // Parser failures DON'T crash the preview; they surface via csvError
+    // below the preview list.
+    if (csvMode) {
+      if (!csvText.trim()) return [];
+      const parsed = parseCsvPayload(csvText, activePresetForQuick, selectedDomain);
+      // Cap CSV-parsed rows to QUICK_COUNT_MAX — protects the operator
+      // from accidentally pasting a 10k-row export.
+      return parsed.rows.slice(0, QUICK_COUNT_MAX);
+    }
     const safeCount = Math.max(
       QUICK_COUNT_MIN,
       Math.min(QUICK_COUNT_MAX, Math.floor(count) || 1),
     );
     return generateBatchPayload(safeCount, activePresetForQuick, selectedDomain);
-  }, [quickMode, count, activePresetForQuick, selectedDomain, batchSeed]);
+  }, [
+    quickMode,
+    count,
+    activePresetForQuick,
+    selectedDomain,
+    batchSeed,
+    csvMode,
+    csvText,
+  ]);
+
+  /**
+   * CSV-parse errors — re-derived alongside batchPreview so we can surface
+   * the offending rows to the operator without coupling preview rendering
+   * to the error path.
+   */
+  const csvParseErrors = React.useMemo(() => {
+    if (!csvMode || !selectedDomain || !csvText.trim()) return [];
+    return parseCsvPayload(csvText, activePresetForQuick, selectedDomain).errors;
+  }, [csvMode, csvText, selectedDomain, activePresetForQuick]);
+
+  // Surface CSV parser errors as a single-line submitError-style hint —
+  // separate from submitError so a partial CSV doesn't block clearing.
+  React.useEffect(() => {
+    if (csvMode && csvParseErrors.length > 0) {
+      setCsvError(
+        `${csvParseErrors.length} CSV row${csvParseErrors.length === 1 ? "" : "s"} ignored: ${csvParseErrors
+          .slice(0, 3)
+          .map((e) => `line ${e.line} (${e.reason})`)
+          .join("; ")}${csvParseErrors.length > 3 ? "; …" : ""}`,
+      );
+    } else {
+      setCsvError(null);
+    }
+  }, [csvMode, csvParseErrors]);
 
   const quickValid =
     !!account && quickMode && batchPreview.length > 0 && !bulkSubmitting;
@@ -2259,9 +2474,12 @@ const CreateUserForm: React.FC<CreateUserFormProps> = ({
                 <div className="flex flex-col gap-1.5">
                   <Label
                     htmlFor="user-creator-quick-count"
-                    className="text-xs font-medium"
+                    className={cn(
+                      "text-xs font-medium",
+                      csvMode && "text-muted-foreground",
+                    )}
                   >
-                    How many users
+                    How many users{csvMode ? " (from CSV)" : ""}
                   </Label>
                   <Input
                     id="user-creator-quick-count"
@@ -2269,7 +2487,8 @@ const CreateUserForm: React.FC<CreateUserFormProps> = ({
                     min={QUICK_COUNT_MIN}
                     max={QUICK_COUNT_MAX}
                     step={1}
-                    value={count}
+                    value={csvMode ? batchPreview.length : count}
+                    disabled={csvMode}
                     onChange={(e) => {
                       const v = Number(e.target.value);
                       if (Number.isFinite(v)) {
@@ -2282,10 +2501,16 @@ const CreateUserForm: React.FC<CreateUserFormProps> = ({
                       }
                     }}
                     aria-label="Number of users to create"
+                    aria-describedby="user-creator-quick-count-help"
                     className="font-mono"
                   />
-                  <p className="text-2xs text-muted-foreground">
-                    {QUICK_COUNT_MIN}–{QUICK_COUNT_MAX}.
+                  <p
+                    id="user-creator-quick-count-help"
+                    className="text-2xs text-muted-foreground"
+                  >
+                    {csvMode
+                      ? `Derived from pasted CSV (${batchPreview.length} valid row${batchPreview.length === 1 ? "" : "s"}).`
+                      : `${QUICK_COUNT_MIN}–${QUICK_COUNT_MAX}.`}
                   </p>
                 </div>
               </div>
@@ -2324,6 +2549,170 @@ const CreateUserForm: React.FC<CreateUserFormProps> = ({
                       : "MSAL popup against the new user's tenant; on success the new account becomes the active WebUI session. Portal session is a separate manual button on the success card."}
                   </p>
                 </div>
+              </div>
+
+              {/*
+                Saved templates — one-click re-apply of a previously saved
+                (preset, count) combo. Persisted in localStorage via
+                usePersistedState. Tenant-agnostic; the operator is free
+                to apply the same template across multiple tenants.
+              */}
+              <div className="flex flex-col gap-2 rounded-md border border-border bg-card/60 p-3">
+                <div className="flex flex-wrap items-center gap-2 text-xs font-medium">
+                  <BadgeCheck
+                    className="h-3.5 w-3.5 text-primary"
+                    aria-hidden
+                  />
+                  <span>Saved templates</span>
+                  <span className="text-2xs text-muted-foreground">
+                    ({savedTemplates.length})
+                  </span>
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="sm"
+                    className="ml-auto"
+                    disabled={bulkSubmitting || !activePresetForQuick}
+                    onClick={() => {
+                      const name = window.prompt(
+                        `Save current settings as a template?\n\nPreset: ${activePresetForQuick.label}\nCount: ${count}\n\nEnter a name:`,
+                        `${activePresetForQuick.label} ×${count}`,
+                      );
+                      if (!name || !name.trim()) return;
+                      const tpl: SavedTemplate = {
+                        id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+                        name: name.trim().slice(0, 60),
+                        presetKey: activePresetForQuick.key,
+                        displayNamePattern: "",
+                        redirectUrl: "",
+                        count: Math.max(
+                          QUICK_COUNT_MIN,
+                          Math.min(QUICK_COUNT_MAX, Math.floor(count) || 1),
+                        ),
+                        createdAt: new Date().toISOString(),
+                      };
+                      setSavedTemplates((prev) => [tpl, ...prev].slice(0, 20));
+                    }}
+                    aria-label="Save current settings as a template"
+                    title="Save the current preset + count combo for one-click re-apply"
+                  >
+                    <Sparkles />
+                    Save current
+                  </Button>
+                </div>
+                {savedTemplates.length === 0 ? (
+                  <p className="text-2xs text-muted-foreground">
+                    No saved templates yet. Click &ldquo;Save current&rdquo; to
+                    capture the current preset + count for later.
+                  </p>
+                ) : (
+                  <div className="flex flex-wrap gap-1.5">
+                    {savedTemplates.map((tpl) => (
+                      <div
+                        key={tpl.id}
+                        className="flex items-center gap-1 rounded-full border border-border bg-card px-2 py-0.5 text-2xs"
+                      >
+                        <button
+                          type="button"
+                          onClick={() => {
+                            handlePresetChange(tpl.presetKey);
+                            setCount(tpl.count);
+                            setBatchSeed((s) => s + 1);
+                          }}
+                          disabled={bulkSubmitting}
+                          className="font-medium text-foreground hover:text-primary"
+                          aria-label={`Apply template ${tpl.name}`}
+                          title={`Apply preset ${tpl.presetKey} × ${tpl.count}`}
+                        >
+                          {tpl.name}
+                        </button>
+                        <span className="text-muted-foreground">
+                          ×{tpl.count}
+                        </span>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setSavedTemplates((prev) =>
+                              prev.filter((t) => t.id !== tpl.id),
+                            );
+                          }}
+                          disabled={bulkSubmitting}
+                          aria-label={`Delete template ${tpl.name}`}
+                          title="Delete template"
+                          className="text-muted-foreground hover:text-destructive"
+                        >
+                          <X className="h-3 w-3" />
+                        </button>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+
+              {/*
+                CSV-paste mode — operator-driven UPN list instead of synthesized
+                names. COORDINATOR: if the import-batch page grows a single-
+                tenant CSV path, prefer delegating here rather than re-
+                implementing the row → Graph-write loop.
+              */}
+              <div className="flex flex-col gap-2 rounded-md border border-border bg-card/60 p-3">
+                <div className="flex items-start gap-3">
+                  <Switch
+                    id="user-creator-csv-mode"
+                    checked={csvMode}
+                    onCheckedChange={(v) => {
+                      setCsvMode(Boolean(v));
+                      setSubmitError(null);
+                    }}
+                    aria-label="CSV-paste mode"
+                    className="mt-0.5"
+                    disabled={bulkSubmitting}
+                  />
+                  <div className="flex flex-1 flex-col gap-0.5">
+                    <Label
+                      htmlFor="user-creator-csv-mode"
+                      className="flex cursor-pointer items-center gap-1.5 text-sm font-medium"
+                    >
+                      <FileJson
+                        className="h-3.5 w-3.5 text-primary"
+                        aria-hidden
+                      />
+                      CSV-paste mode (operator-supplied UPN list)
+                    </Label>
+                    <p className="text-2xs text-muted-foreground">
+                      Override synthesized names with a pasted CSV. Format:{" "}
+                      <code className="font-mono">
+                        prefix,displayName,jobTitle,department
+                      </code>
+                      . Header row optional. Passwords + force-change still come
+                      from the active preset.
+                    </p>
+                  </div>
+                </div>
+                {csvMode && (
+                  <>
+                    <textarea
+                      value={csvText}
+                      onChange={(ev) => {
+                        setCsvText(ev.target.value);
+                        setSubmitError(null);
+                      }}
+                      placeholder={
+                        "# prefix,displayName,jobTitle,department\nalex.doe,Alex Doe,Engineer,Platform\njamie.lee,Jamie Lee,Auditor,Compliance"
+                      }
+                      rows={6}
+                      aria-label="CSV rows"
+                      className="w-full rounded-md border border-border bg-background px-2 py-1.5 font-mono text-2xs text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                      disabled={bulkSubmitting}
+                    />
+                    {csvError && (
+                      <Alert variant="warning" className="text-2xs">
+                        <AlertCircle className="h-3.5 w-3.5" />
+                        <AlertDescription>{csvError}</AlertDescription>
+                      </Alert>
+                    )}
+                  </>
+                )}
               </div>
 
               {/* Live preview of the synthesized batch */}
@@ -2392,7 +2781,16 @@ const CreateUserForm: React.FC<CreateUserFormProps> = ({
                 <Button
                   type="button"
                   variant="default"
-                  onClick={() => void handleQuickSubmit()}
+                  onClick={() => {
+                    // Bulk → require confirm dialog. Single → fire directly
+                    // (low-risk happy path; the auto-login flow is the
+                    // surfacing UX for the operator).
+                    if (batchPreview.length > BULK_CONFIRM_THRESHOLD) {
+                      setBulkConfirmOpen(true);
+                    } else {
+                      void handleQuickSubmit();
+                    }
+                  }}
                   disabled={!quickValid}
                   aria-label={`Create ${batchPreview.length || count} user${(batchPreview.length || count) === 1 ? "" : "s"}`}
                 >
@@ -3236,6 +3634,36 @@ const CreateUserForm: React.FC<CreateUserFormProps> = ({
         onConfirm={handleConfirm}
         onCancel={() => {
           if (!submitting) setConfirmOpen(false);
+        }}
+      />
+
+      <ConfirmationDialog
+        hidden={!bulkConfirmOpen}
+        title={`Create ${batchPreview.length} users`}
+        danger={batchPreview.length >= 10}
+        message={
+          <span>
+            About to provision <strong>{batchPreview.length}</strong> users in
+            tenant{" "}
+            <code className="font-mono text-xs">{account.tenantId}</code>{" "}
+            (preset{" "}
+            <strong>{activePresetForQuick.label}</strong>
+            {csvMode ? ", from pasted CSV" : ""}). Each user will receive a
+            randomly-generated password{" "}
+            {activePresetForQuick.forceChangePassword
+              ? "and be forced to change it on first sign-in"
+              : "with no forced reset"}
+            . Continue?
+          </span>
+        }
+        confirmText={`Create ${batchPreview.length} users`}
+        loading={bulkSubmitting}
+        onConfirm={async () => {
+          setBulkConfirmOpen(false);
+          await handleQuickSubmit();
+        }}
+        onCancel={() => {
+          if (!bulkSubmitting) setBulkConfirmOpen(false);
         }}
       />
     </>

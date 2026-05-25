@@ -479,3 +479,120 @@ export function compareByTierThenName(
     sensitivity: "base",
   });
 }
+
+// ===========================================================================
+// Risk score (highest-privilege-first ordering)
+// ===========================================================================
+
+/**
+ * Stale-membership window. A principal whose newest known activity timestamp
+ * (we use `createdDateTime` for SPs as the best-available proxy) is older
+ * than this is flagged as "stale" by the operator filter chip. Matches the
+ * SkyArk / MicroBurst "90-day inactive admin" heuristic.
+ *
+ * Note: Graph's `signInActivity` endpoint would give us a true last-sign-in
+ * stamp, but it requires `AuditLog.Read.All` which we deliberately do NOT
+ * demand — the page degrades to "createdDateTime > 90d ago" for SPs and
+ * shows "unknown" for everyone else.
+ */
+export const STALE_THRESHOLD_MS = 90 * 24 * 60 * 60 * 1000;
+
+/**
+ * Numerical risk score for sorting. Higher = more privileged.
+ *
+ * Composition:
+ *   - 1000 per Tier-0 role (irreducible — one is enough to dominate).
+ *   - 100 per Tier-1 role.
+ *   - 10 per Tier-2 role.
+ *   - 1 per Tier-3 role.
+ *   - +500 if the principal is a guest holding any T0/T1 role.
+ *   - +200 if any assignment is non-direct (shadow-admin lift).
+ *   - +50 if the principal is a service principal.
+ *
+ * The score is deliberately bucketed (powers of ten between tiers) so it
+ * always ranks T0 above any number of T3 holders, no matter how many.
+ */
+export function riskScore(principal: PrivilegedPrincipal): number {
+  const weights: Record<RoleTier, number> = {
+    tier0: 1000,
+    tier1: 100,
+    tier2: 10,
+    tier3: 1,
+    other: 0,
+  };
+  // Unique roles by id — a principal holding the same role through three
+  // groups should not score 3x for it.
+  const uniqueRoleTiers = new Map<string, RoleTier>();
+  for (const a of principal.assignments) {
+    uniqueRoleTiers.set(a.roleId, a.tier);
+  }
+  let score = 0;
+  for (const tier of uniqueRoleTiers.values()) score += weights[tier];
+  if (
+    principal.isExternal &&
+    (principal.topTier === "tier0" || principal.topTier === "tier1")
+  ) {
+    score += 500;
+  }
+  if (principal.isShadowAdmin) score += 200;
+  if (principal.isServicePrincipal) score += 50;
+  return score;
+}
+
+/**
+ * Risk-then-name comparator. Sorts highest-risk principals first.
+ */
+export function compareByRiskScore(
+  a: PrivilegedPrincipal,
+  b: PrivilegedPrincipal,
+): number {
+  const ra = riskScore(a);
+  const rb = riskScore(b);
+  if (ra !== rb) return rb - ra; // desc — highest risk first
+  return a.displayName.localeCompare(b.displayName, undefined, {
+    sensitivity: "base",
+  });
+}
+
+/**
+ * Best-effort "stale" heuristic. Returns true when:
+ *   - For SPs: `createdDateTime` is older than `STALE_THRESHOLD_MS`.
+ *   - For Users: no signInName (orphaned / partially-resolved) AND not a
+ *     guest. Guests are intentionally excluded because we already flag
+ *     them via the `isExternal` channel.
+ *
+ * When we can't make a confident determination (no timestamp, no name
+ * shape), we conservatively return false to avoid hiding fresh principals.
+ */
+export function isStalePrincipal(
+  principal: PrivilegedPrincipal,
+  now: number = Date.now(),
+): boolean {
+  if (principal.type === "ServicePrincipal" && principal.createdDateTime) {
+    const ts = new Date(principal.createdDateTime).getTime();
+    if (!Number.isFinite(ts)) return false;
+    return now - ts > STALE_THRESHOLD_MS;
+  }
+  if (principal.type === "User" && !principal.signInName && !principal.isExternal) {
+    return true;
+  }
+  return false;
+}
+
+// ===========================================================================
+// Role-scoped portal deep-link
+// ===========================================================================
+
+/**
+ * Portal deep-link to the "Assignments" blade of a specific directory role.
+ * Useful for "open this role in the portal" affordances next to the role
+ * chip in the expanded assignment-detail list.
+ */
+export function roleDeepLink(tenantId: string, roleId: string): string {
+  const base = "https://portal.azure.com";
+  return (
+    `${base}/#@${encodeURIComponent(tenantId)}` +
+    `/blade/Microsoft_AAD_IAM/RoleMenuBlade/AdminRoles/roleId/` +
+    encodeURIComponent(roleId)
+  );
+}

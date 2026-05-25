@@ -37,6 +37,7 @@ import {
   AlertTriangle,
   ChevronDown,
   ChevronRight,
+  Clock,
   EyeOff,
   ExternalLink,
   Filter as FilterIcon,
@@ -71,11 +72,13 @@ import {
 import { resolveActiveTenantId } from "../../auth/perform-tenant-switch";
 import { auditLog } from "../../services/audit-log";
 import {
-  getMyDirectoryRoles,
   getPrincipalsByIds,
   type ResolvedPrincipal,
 } from "../../services/graph-service";
+import { useAbortableEffect } from "../../hooks/use-abortable-effect";
+import { usePersistedState } from "../../hooks/use-persisted-state";
 import { useTenantChange } from "../../hooks/use-tenant-change";
+import { useUrlState } from "../../hooks/use-url-state";
 import { useMultiRegionState } from "../../store/store-context";
 
 import { CopyButton } from "../shared/copy-button";
@@ -92,15 +95,20 @@ import { TokenExpiryBadge } from "../shared/token-expiry-badge";
 
 import {
   ASSIGNMENT_PATH_META,
+  STALE_THRESHOLD_MS,
   TIER_META,
   classifyRole,
+  compareByRiskScore,
   compareByTierThenName,
   hasShadowAdminPath,
   highestTier,
   isExternalUpn,
   isHighBlastRadiusGroup,
   isPrivilegedRoleAdmin,
+  isStalePrincipal,
   portalDeepLink,
+  riskScore,
+  roleDeepLink,
   type AssignmentDetail,
   type AssignmentPath,
   type PrincipalType,
@@ -680,6 +688,17 @@ export const PrivilegedAuditPage: React.FC = () => {
     (primaryAccount ? resolveActiveTenantId(primaryAccount) : "") ??
     "";
 
+  // Tracks mount state so async resolutions (token acquisition, probe fetch)
+  // never call setState after unmount. Flipped in a cleanup effect at the
+  // top of the page so it's defined before any callback closes over it.
+  const mountedRef = React.useRef(true);
+  React.useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+    };
+  }, []);
+
   // -------------------------------------------------------------------------
   // Graph token tracking — manual because there's no useGraphToken hook
   // analogous to useArmToken. The badge needs `secondsUntilExpiry`, so we
@@ -699,12 +718,16 @@ export const PrivilegedAuditPage: React.FC = () => {
 
   const acquireGraphToken = React.useCallback(async () => {
     if (!primaryAccount?.homeAccountId || !tenantId) {
-      setGraphToken(null);
-      setGraphTokenExpiresAt(null);
+      if (mountedRef.current) {
+        setGraphToken(null);
+        setGraphTokenExpiresAt(null);
+      }
       return null;
     }
-    setGraphTokenLoading(true);
-    setGraphTokenError(null);
+    if (mountedRef.current) {
+      setGraphTokenLoading(true);
+      setGraphTokenError(null);
+    }
     try {
       const t = await getGraphTokenForAccount(
         primaryAccount.homeAccountId,
@@ -713,18 +736,24 @@ export const PrivilegedAuditPage: React.FC = () => {
       const claims = decodeJwtClaimsUnsafe(t);
       const exp =
         typeof claims?.exp === "number" ? (claims.exp as number) : null;
-      setGraphToken(t);
-      setGraphTokenExpiresAt(exp);
+      if (mountedRef.current) {
+        setGraphToken(t);
+        setGraphTokenExpiresAt(exp);
+      }
       return t;
     } catch (err) {
-      setGraphTokenError(
-        err instanceof Error ? err.message : String(err),
-      );
-      setGraphToken(null);
-      setGraphTokenExpiresAt(null);
+      if (mountedRef.current) {
+        setGraphTokenError(
+          err instanceof Error ? err.message : String(err),
+        );
+        setGraphToken(null);
+        setGraphTokenExpiresAt(null);
+      }
       return null;
     } finally {
-      setGraphTokenLoading(false);
+      if (mountedRef.current) {
+        setGraphTokenLoading(false);
+      }
     }
   }, [primaryAccount?.homeAccountId, tenantId]);
 
@@ -732,6 +761,9 @@ export const PrivilegedAuditPage: React.FC = () => {
     void acquireGraphToken();
   }, [acquireGraphToken]);
 
+  // Tick the badge clock once per second only while a token's outstanding.
+  // The interval cleans up on unmount AND when either dep falls to null —
+  // no stray timer keeps the page mounted in the React profiler.
   React.useEffect(() => {
     if (!graphToken || !graphTokenExpiresAt) return;
     const id = window.setInterval(
@@ -753,102 +785,284 @@ export const PrivilegedAuditPage: React.FC = () => {
   const [status, setStatus] = React.useState<LoadStatus>("idle");
   const [error, setError] = React.useState<string | null>(null);
   const [lastProbedAt, setLastProbedAt] = React.useState<string | null>(null);
-  // Monotonic sequence so a slow stale probe can't overwrite a faster
-  // newer one (tenant switch while a probe is in flight).
+
+  // Sequence so a slow stale probe can't overwrite a fresher one (tenant
+  // switch while a probe is in flight). Paired with an `AbortController`
+  // stored in a ref so unmount AND newer probes cancel in-flight fetches —
+  // before this, the controller was a local in the callback, so neither
+  // unmount nor "Re-probe" cancelled the previous run's network work.
   const probeSeqRef = React.useRef(0);
+  const probeAbortRef = React.useRef<AbortController | null>(null);
+
+  // Abort any in-flight probe on unmount to prevent setState-after-unmount
+  // and stop leaking Graph requests when the user navigates away mid-probe.
+  React.useEffect(() => {
+    return () => {
+      probeAbortRef.current?.abort();
+      probeAbortRef.current = null;
+    };
+  }, []);
 
   const runProbe = React.useCallback(async () => {
     if (!tenantId) return;
     const token = graphToken ?? (await acquireGraphToken());
     if (!token) {
-      setError("Could not acquire a Microsoft Graph token for this tenant.");
-      setStatus("error");
+      if (mountedRef.current) {
+        setError("Could not acquire a Microsoft Graph token for this tenant.");
+        setStatus("error");
+      }
       return;
     }
-    const mySeq = ++probeSeqRef.current;
-    setStatus("loading");
-    setError(null);
+    // Cancel any previous in-flight probe before starting a new one.
+    probeAbortRef.current?.abort();
     const abort = new AbortController();
+    probeAbortRef.current = abort;
+    const mySeq = ++probeSeqRef.current;
+    if (mountedRef.current) {
+      setStatus("loading");
+      setError(null);
+    }
     try {
       const data = await probeTenant(tenantId, token, abort.signal);
-      if (mySeq !== probeSeqRef.current) return;
+      // Drop stale results when a newer probe has started OR the page
+      // unmounted while we were in flight.
+      if (!mountedRef.current || mySeq !== probeSeqRef.current) return;
       setDataset(data);
       setLastProbedAt(new Date().toISOString());
       setStatus("ok");
-      // Audit hook — exactly the action+target shape from the spec.
-      const tier0Count = data.principals.filter(
-        (p) => p.topTier === "tier0",
-      ).length;
-      auditLog.record({
-        actor: primaryAccount?.username ?? "unknown",
-        action: "privileged_audit_probe",
-        target: tenantId,
-        status: "success",
-        details: {
-          tier0Count,
-          shadowAdminCount: data.shadowPaths.length,
-          groupCount: data.groups.length,
-          spCount: data.servicePrincipals.length,
-          warnings: data.warnings.length,
-          activatedRoleCount: data.activatedRoleCount,
-        },
-      });
+      // NOTE: Per the page brief the probe itself is read-only enumeration
+      // and not a state-changing action for OUR app, so we deliberately do
+      // NOT call auditLog.record() here. Audit firing is reserved for
+      // filter mutations (see useAuditFilters() below).
     } catch (err) {
-      if (mySeq !== probeSeqRef.current) return;
+      if ((err as { name?: string }).name === "AbortError") return;
+      if (!mountedRef.current || mySeq !== probeSeqRef.current) return;
       const msg = err instanceof Error ? err.message : String(err);
       setError(msg);
       setStatus("error");
+    }
+  }, [tenantId, graphToken, acquireGraphToken]);
+
+  // Auto-run the probe the first time we have a token + tenant. Using
+  // `useAbortableEffect` here means the effect-owned `AbortSignal` cancels
+  // any in-flight enumeration if the page unmounts before the manual
+  // controller is even installed. The probeStartedRef guard prevents a
+  // tenant-change refresh (which manually drives runProbe) from racing
+  // with the initial auto-run.
+  const probeStartedRef = React.useRef(false);
+  useAbortableEffect(
+    async (signal) => {
+      if (probeStartedRef.current) return;
+      if (!tenantId || !graphToken) return;
+      probeStartedRef.current = true;
+      // runProbe installs its own AbortController in probeAbortRef so it
+      // can be cancelled by future re-probes. We also subscribe the
+      // effect-owned signal so unmount during the initial probe aborts
+      // the in-flight controller proactively.
+      const onAbort = () => probeAbortRef.current?.abort();
+      signal.addEventListener("abort", onAbort, { once: true });
+      try {
+        await runProbe();
+      } finally {
+        signal.removeEventListener("abort", onAbort);
+      }
+    },
+    [tenantId, graphToken, runProbe],
+  );
+
+  // -------------------------------------------------------------------------
+  // Filter UI state — synced to URL so deep links preserve filter chips,
+  // tier / path / sort. The "show only stale" toggle is persisted across
+  // sessions per the page brief because operators commonly leave it on.
+  // -------------------------------------------------------------------------
+  type SortMode = "risk" | "tier";
+  const URL_KEYS = React.useMemo<string[]>(
+    () => ["tier", "type", "path", "shadow", "sort", "q"],
+    [],
+  );
+  const [urlState, setUrlState] = useUrlState<{
+    tier: string[];
+    type: string[];
+    path: string[];
+    shadow: string;
+    sort: string;
+    q: string;
+  }>(
+    {
+      tier: [],
+      type: [],
+      path: [],
+      shadow: "",
+      sort: "risk",
+      q: "",
+    },
+    { keys: URL_KEYS, replace: true },
+  );
+
+  const tierFilters = React.useMemo<Set<RoleTier>>(
+    () => new Set(urlState.tier.filter((t) => t in TIER_META) as RoleTier[]),
+    [urlState.tier],
+  );
+  const typeFilters = React.useMemo<Set<PrincipalType>>(
+    () =>
+      new Set(
+        urlState.type.filter(
+          (t): t is PrincipalType =>
+            t === "User" ||
+            t === "Group" ||
+            t === "ServicePrincipal" ||
+            t === "Unknown",
+        ),
+      ),
+    [urlState.type],
+  );
+  const pathFilters = React.useMemo<Set<AssignmentPath>>(
+    () =>
+      new Set(
+        urlState.path.filter(
+          (p): p is AssignmentPath =>
+            p === "direct" || p === "group" || p === "sp" || p === "guest",
+        ),
+      ),
+    [urlState.path],
+  );
+  const shadowOnly = urlState.shadow === "1";
+  const sortMode: SortMode = urlState.sort === "tier" ? "tier" : "risk";
+  const searchTerm = urlState.q;
+
+  // ENHANCEMENT — persisted "show only stale members (no activity 90d)"
+  // filter. Operators leave this on during weekly hygiene sweeps.
+  const [staleOnly, setStaleOnly] = usePersistedState<boolean>(
+    "privileged-audit:stale-only",
+    false,
+  );
+
+  // Memoized + stable audit hook for filter-mutation events. Per the brief,
+  // the probe itself is read-only enumeration (no audit), but filter
+  // mutations ARE worth recording because a stripped-down view can change
+  // what an operator overlooks during a review.
+  const recordFilterMutation = React.useCallback(
+    (kind: string, value: unknown) => {
       auditLog.record({
         actor: primaryAccount?.username ?? "unknown",
-        action: "privileged_audit_probe",
-        target: tenantId,
-        status: "failure",
-        error: msg,
+        action: `privileged_audit_filter_${kind}`,
+        target: tenantId || "no-tenant",
+        status: "success",
+        details: { value },
       });
-    }
-  }, [tenantId, graphToken, acquireGraphToken, primaryAccount?.username]);
-
-  // Auto-run the probe the first time we have a token + tenant.
-  const probeStartedRef = React.useRef(false);
-  React.useEffect(() => {
-    if (probeStartedRef.current) return;
-    if (!tenantId || !graphToken) return;
-    probeStartedRef.current = true;
-    void runProbe();
-  }, [tenantId, graphToken, runProbe]);
-
-  // -------------------------------------------------------------------------
-  // Filter UI state
-  // -------------------------------------------------------------------------
-  const [tierFilters, setTierFilters] = React.useState<Set<RoleTier>>(
-    () => new Set<RoleTier>(),
+    },
+    [primaryAccount?.username, tenantId],
   );
-  const [typeFilters, setTypeFilters] = React.useState<Set<PrincipalType>>(
-    () => new Set<PrincipalType>(),
-  );
-  const [pathFilters, setPathFilters] = React.useState<Set<AssignmentPath>>(
-    () => new Set<AssignmentPath>(),
-  );
-  const [shadowOnly, setShadowOnly] = React.useState(false);
-  const [searchTerm, setSearchTerm] = React.useState("");
 
-  const toggleSet = <T extends string>(
-    set: Set<T>,
-    value: T,
-    setter: (s: Set<T>) => void,
-  ) => {
-    const next = new Set(set);
-    if (next.has(value)) next.delete(value);
-    else next.add(value);
-    setter(next);
-  };
+  const toggleTierFilter = React.useCallback(
+    (t: RoleTier) => {
+      setUrlState((prev) => {
+        const arr = prev.tier ?? [];
+        const next = arr.includes(t)
+          ? arr.filter((x) => x !== t)
+          : [...arr, t];
+        return { tier: next };
+      });
+      recordFilterMutation("tier", t);
+    },
+    [setUrlState, recordFilterMutation],
+  );
+
+  const toggleTypeFilter = React.useCallback(
+    (t: PrincipalType) => {
+      setUrlState((prev) => {
+        const arr = prev.type ?? [];
+        const next = arr.includes(t)
+          ? arr.filter((x) => x !== t)
+          : [...arr, t];
+        return { type: next };
+      });
+      recordFilterMutation("type", t);
+    },
+    [setUrlState, recordFilterMutation],
+  );
+
+  const togglePathFilter = React.useCallback(
+    (p: AssignmentPath) => {
+      setUrlState((prev) => {
+        const arr = prev.path ?? [];
+        const next = arr.includes(p)
+          ? arr.filter((x) => x !== p)
+          : [...arr, p];
+        return { path: next };
+      });
+      recordFilterMutation("path", p);
+    },
+    [setUrlState, recordFilterMutation],
+  );
+
+  const setShadowOnly = React.useCallback(
+    (v: boolean) => {
+      setUrlState({ shadow: v ? "1" : "" });
+      recordFilterMutation("shadow_only", v);
+    },
+    [setUrlState, recordFilterMutation],
+  );
+
+  const setStaleOnlyAudited = React.useCallback(
+    (v: boolean) => {
+      setStaleOnly(v);
+      recordFilterMutation("stale_only", v);
+    },
+    [setStaleOnly, recordFilterMutation],
+  );
+
+  const setSortMode = React.useCallback(
+    (mode: SortMode) => {
+      setUrlState({ sort: mode });
+      recordFilterMutation("sort", mode);
+    },
+    [setUrlState, recordFilterMutation],
+  );
+
+  const setSearchTerm = React.useCallback(
+    (s: string) => {
+      setUrlState({ q: s });
+    },
+    [setUrlState],
+  );
+
+  const onClearFilters = React.useCallback(() => {
+    setUrlState({
+      tier: [],
+      type: [],
+      path: [],
+      shadow: "",
+      q: "",
+      // intentionally NOT resetting `sort` — operators expect their sort
+      // preference to survive a "clear filters" click.
+    });
+    recordFilterMutation("clear", null);
+  }, [setUrlState, recordFilterMutation]);
 
   // -------------------------------------------------------------------------
   // Derived per-section views
   // -------------------------------------------------------------------------
+  // Pre-sort principals by the chosen sort mode. The sort is the heaviest
+  // operation (full array copy + comparator) so we hoist it out of
+  // `filteredPrincipals` and recompute only when the dataset or mode change.
+  const sortedPrincipals = React.useMemo(() => {
+    const copy = dataset.principals.slice();
+    if (sortMode === "risk") {
+      copy.sort(compareByRiskScore);
+    } else {
+      copy.sort(compareByTierThenName);
+    }
+    return copy;
+  }, [dataset.principals, sortMode]);
+
+  // Snapshot now() once per render so isStalePrincipal isn't re-evaluating
+  // Date.now() inside .filter() on every principal.
+  const probeNow = React.useMemo(() => Date.now(), [dataset.principals]);
+
   const filteredPrincipals = React.useMemo(() => {
     const q = searchTerm.trim().toLowerCase();
-    return dataset.principals.filter((p) => {
+    return sortedPrincipals.filter((p) => {
       if (tierFilters.size > 0 && !tierFilters.has(p.topTier)) return false;
       if (typeFilters.size > 0 && !typeFilters.has(p.type)) return false;
       if (pathFilters.size > 0) {
@@ -856,6 +1070,7 @@ export const PrivilegedAuditPage: React.FC = () => {
         if (!has) return false;
       }
       if (shadowOnly && !p.isShadowAdmin) return false;
+      if (staleOnly && !isStalePrincipal(p, probeNow)) return false;
       if (q) {
         const hay =
           `${p.displayName} ${p.signInName ?? ""} ${p.id}`.toLowerCase();
@@ -864,12 +1079,14 @@ export const PrivilegedAuditPage: React.FC = () => {
       return true;
     });
   }, [
-    dataset.principals,
+    sortedPrincipals,
     tierFilters,
     typeFilters,
     pathFilters,
     shadowOnly,
+    staleOnly,
     searchTerm,
+    probeNow,
   ]);
 
   const summary = React.useMemo(() => {
@@ -910,17 +1127,26 @@ export const PrivilegedAuditPage: React.FC = () => {
 
   // Live tenant-change propagation. This page auto-targets the primary
   // signed-in account's active tenant, so when that account's active tenant
-  // changes elsewhere in the app, drop the stale Graph token and re-probe.
-  useTenantChange(undefined, (detail) => {
-    const candidate = detail.homeAccountId;
-    if (!azureAccounts.some((a) => a.homeAccountId === candidate)) return;
-    if (primaryAccount?.homeAccountId !== candidate) return;
-    if (detail.tenantId === tenantId) return;
-    setGraphToken(null);
-    setGraphTokenExpiresAt(null);
-    probeStartedRef.current = false;
-    void acquireGraphToken();
-  });
+  // changes elsewhere in the app, drop the stale Graph token, abort any
+  // in-flight probe (otherwise we'd write tenant-A results into tenant-B's
+  // dataset), and re-acquire fresh credentials.
+  const onTenantChange = React.useCallback(
+    (detail: { homeAccountId: string; tenantId: string }) => {
+      const candidate = detail.homeAccountId;
+      if (!azureAccounts.some((a) => a.homeAccountId === candidate)) return;
+      if (primaryAccount?.homeAccountId !== candidate) return;
+      if (detail.tenantId === tenantId) return;
+      probeAbortRef.current?.abort();
+      probeAbortRef.current = null;
+      setGraphToken(null);
+      setGraphTokenExpiresAt(null);
+      setDataset(EMPTY_DATASET);
+      probeStartedRef.current = false;
+      void acquireGraphToken();
+    },
+    [azureAccounts, primaryAccount?.homeAccountId, tenantId, acquireGraphToken],
+  );
+  useTenantChange(undefined, onTenantChange);
 
   // -------------------------------------------------------------------------
   // Render guards (no account / no tenant)
@@ -1025,20 +1251,18 @@ export const PrivilegedAuditPage: React.FC = () => {
         typeFilters={typeFilters}
         pathFilters={pathFilters}
         shadowOnly={shadowOnly}
+        staleOnly={staleOnly}
+        sortMode={sortMode}
         searchTerm={searchTerm}
         principals={dataset.principals}
-        onToggleTier={(t) => toggleSet(tierFilters, t, setTierFilters)}
-        onToggleType={(t) => toggleSet(typeFilters, t, setTypeFilters)}
-        onTogglePath={(p) => toggleSet(pathFilters, p, setPathFilters)}
+        onToggleTier={toggleTierFilter}
+        onToggleType={toggleTypeFilter}
+        onTogglePath={togglePathFilter}
         onShadowOnlyChange={setShadowOnly}
+        onStaleOnlyChange={setStaleOnlyAudited}
+        onSortModeChange={setSortMode}
         onSearchTermChange={setSearchTerm}
-        onClear={() => {
-          setTierFilters(new Set());
-          setTypeFilters(new Set());
-          setPathFilters(new Set());
-          setShadowOnly(false);
-          setSearchTerm("");
-        }}
+        onClear={onClearFilters}
       />
 
       {/* ─────────────────────────────────────────────────────────── B */}
@@ -1175,12 +1399,16 @@ interface FiltersBarProps {
   typeFilters: Set<PrincipalType>;
   pathFilters: Set<AssignmentPath>;
   shadowOnly: boolean;
+  staleOnly: boolean;
+  sortMode: "risk" | "tier";
   searchTerm: string;
   principals: PrivilegedPrincipal[];
   onToggleTier: (t: RoleTier) => void;
   onToggleType: (t: PrincipalType) => void;
   onTogglePath: (p: AssignmentPath) => void;
   onShadowOnlyChange: (v: boolean) => void;
+  onStaleOnlyChange: (v: boolean) => void;
+  onSortModeChange: (mode: "risk" | "tier") => void;
   onSearchTermChange: (s: string) => void;
   onClear: () => void;
 }
@@ -1190,12 +1418,16 @@ const FiltersBar: React.FC<FiltersBarProps> = ({
   typeFilters,
   pathFilters,
   shadowOnly,
+  staleOnly,
+  sortMode,
   searchTerm,
   principals,
   onToggleTier,
   onToggleType,
   onTogglePath,
   onShadowOnlyChange,
+  onStaleOnlyChange,
+  onSortModeChange,
   onSearchTermChange,
   onClear,
 }) => {
@@ -1244,6 +1476,7 @@ const FiltersBar: React.FC<FiltersBarProps> = ({
     typeFilters.size +
     pathFilters.size +
     (shadowOnly ? 1 : 0) +
+    (staleOnly ? 1 : 0) +
     (searchTerm.trim() ? 1 : 0);
 
   return (
@@ -1258,6 +1491,44 @@ const FiltersBar: React.FC<FiltersBarProps> = ({
             Filters
           </span>
           <div className="ml-auto flex items-center gap-2">
+            {/* Sort segmented control — risk (default, highest privilege
+                first) vs strict tier order. */}
+            <div
+              role="radiogroup"
+              aria-label="Sort mode"
+              className="inline-flex rounded-md border border-border bg-card p-0.5 text-2xs"
+            >
+              <button
+                type="button"
+                role="radio"
+                aria-checked={sortMode === "risk"}
+                onClick={() => onSortModeChange("risk")}
+                className={cn(
+                  "rounded px-2 py-0.5 transition-colors",
+                  sortMode === "risk"
+                    ? "bg-primary text-primary-foreground"
+                    : "text-muted-foreground hover:text-foreground",
+                )}
+                title="Sort by composite risk score — highest privilege first"
+              >
+                Risk
+              </button>
+              <button
+                type="button"
+                role="radio"
+                aria-checked={sortMode === "tier"}
+                onClick={() => onSortModeChange("tier")}
+                className={cn(
+                  "rounded px-2 py-0.5 transition-colors",
+                  sortMode === "tier"
+                    ? "bg-primary text-primary-foreground"
+                    : "text-muted-foreground hover:text-foreground",
+                )}
+                title="Sort strictly by tier (T0 → T3), then by display name"
+              >
+                Tier
+              </button>
+            </div>
             <label className="flex items-center gap-1.5 text-2xs text-muted-foreground">
               <input
                 type="checkbox"
@@ -1272,6 +1543,22 @@ const FiltersBar: React.FC<FiltersBarProps> = ({
               />
               Shadow only
               <InfoTooltip content="Anything other than a Direct user assignment — group-mediated, service-principal, or guest paths." />
+            </label>
+            <label className="flex items-center gap-1.5 text-2xs text-muted-foreground">
+              <input
+                type="checkbox"
+                checked={staleOnly}
+                onChange={(e) => onStaleOnlyChange(e.target.checked)}
+                aria-label="Show only stale members (no activity in 90 days)"
+                className="h-3.5 w-3.5 rounded border-border"
+              />
+              <Clock className="h-3 w-3 text-info" aria-hidden />
+              Stale only
+              <InfoTooltip
+                content={`Best-effort: SPs whose createdDateTime is older than ${Math.round(
+                  STALE_THRESHOLD_MS / (24 * 60 * 60 * 1000),
+                )} days, and users with no resolvable UPN. signInActivity from Graph would give a precise number but requires AuditLog.Read.All which this page deliberately does not demand.`}
+              />
             </label>
             {activeFilterCount > 0 && (
               <Button
@@ -1399,10 +1686,16 @@ const PRINCIPAL_EXPORT_COLUMNS: ReadonlyArray<ExportColumn<PrivilegedPrincipal>>
   { header: "Sign-in name", accessor: (p) => p.signInName ?? "" },
   { header: "Object id", accessor: (p) => p.id },
   { header: "Top tier", accessor: (p) => TIER_META[p.topTier].label },
+  { header: "Risk score", accessor: (p) => riskScore(p) },
   {
     header: "Roles",
     accessor: (p) =>
       Array.from(new Set(p.assignments.map((a) => a.roleDisplayName))).join("; "),
+  },
+  {
+    header: "Role template ids",
+    accessor: (p) =>
+      Array.from(new Set(p.assignments.map((a) => a.roleTemplateId))).join("; "),
   },
   {
     header: "Assignment paths",
@@ -1411,6 +1704,7 @@ const PRINCIPAL_EXPORT_COLUMNS: ReadonlyArray<ExportColumn<PrivilegedPrincipal>>
   },
   { header: "Shadow admin", accessor: (p) => (p.isShadowAdmin ? "yes" : "no") },
   { header: "Guest", accessor: (p) => (p.isExternal ? "yes" : "no") },
+  { header: "Stale (heuristic)", accessor: (p) => (isStalePrincipal(p) ? "yes" : "no") },
 ];
 
 interface PrivilegedIdentityListProps {
@@ -1440,14 +1734,14 @@ const PrivilegedIdentityList: React.FC<PrivilegedIdentityListProps> = ({
   const [expanded, setExpanded] = React.useState<Set<string>>(
     () => new Set(),
   );
-  const toggleExpand = (id: string) => {
+  const toggleExpand = React.useCallback((id: string) => {
     setExpanded((prev) => {
       const next = new Set(prev);
       if (next.has(id)) next.delete(id);
       else next.add(id);
       return next;
     });
-  };
+  }, []);
 
   // For JSON export we want EVERYTHING (paths, summary stats, partial-data
   // warnings) so the file is self-contained per the spec.
@@ -1569,12 +1863,53 @@ const PrivilegedIdentityList: React.FC<PrivilegedIdentityListProps> = ({
         },
       },
       {
-        id: "lastSignIn",
-        header: "Last sign-in",
-        width: "w-28",
-        cell: () => (
-          <span className="text-2xs text-muted-foreground">Unknown</span>
+        id: "risk",
+        header: "Risk",
+        width: "w-16",
+        sort: (a, b) => riskScore(b) - riskScore(a),
+        cell: (p) => (
+          <span
+            className="tabular-nums text-2xs text-muted-foreground"
+            title={`Composite risk score — Tier-weighted (T0=1000, T1=100, T2=10, T3=1) plus shadow/guest/SP modifiers. See helpers.riskScore() for the full breakdown.`}
+          >
+            {riskScore(p).toLocaleString()}
+          </span>
         ),
+        csv: (p) => riskScore(p),
+      },
+      {
+        id: "activity",
+        header: "Activity",
+        width: "w-24",
+        cell: (p) => {
+          // Graph's signInActivity endpoint would give us a true last-sign-in
+          // stamp but requires AuditLog.Read.All which this page deliberately
+          // doesn't demand. We surface our best-effort "stale" heuristic
+          // instead (see isStalePrincipal()) so the value is at least
+          // honestly labelled.
+          const stale = isStalePrincipal(p);
+          if (stale) {
+            return (
+              <Badge
+                variant="warning"
+                title="Stale by heuristic — see filter tooltip"
+              >
+                Stale
+              </Badge>
+            );
+          }
+          if (p.type === "ServicePrincipal" && p.createdDateTime) {
+            return (
+              <span
+                className="text-2xs text-muted-foreground"
+                title={`Created ${p.createdDateTime}`}
+              >
+                {formatRelativeTime(p.createdDateTime)}
+              </span>
+            );
+          }
+          return <span className="text-2xs text-muted-foreground">—</span>;
+        },
       },
       {
         id: "actions",
@@ -1623,7 +1958,10 @@ const PrivilegedIdentityList: React.FC<PrivilegedIdentityListProps> = ({
           columns={columns}
           rowKey={(p) => p.id}
           loading={loading}
-          initialSort={{ column: "tier", direction: "asc" }}
+          // Rows arrive pre-sorted by the parent (risk score by default,
+          // strict tier order when sortMode === "tier"). Letting DataTable
+          // apply an initialSort would fight the parent ordering, so we
+          // omit it and only honour explicit per-column clicks by the user.
           empty={
             loading ? (
               <Skeleton className="h-12 w-full" />
@@ -1645,16 +1983,17 @@ const PrivilegedIdentityList: React.FC<PrivilegedIdentityListProps> = ({
             )
           }
         />
-        {/* Expanded detail rows — render below the table, keyed by id. */}
-        {principals.map((p) =>
-          expanded.has(p.id) ? (
+        {/* Expanded detail rows — only iterate the principals the user
+            actually expanded (was O(N) on every render before). */}
+        {principals
+          .filter((p) => expanded.has(p.id))
+          .map((p) => (
             <ExpandedAssignmentDetail
               key={`exp-${p.id}`}
               principal={p}
               tenantId={tenantId}
             />
-          ) : null,
-        )}
+          ))}
       </CardContent>
     </Card>
   );
@@ -1663,26 +2002,39 @@ const PrivilegedIdentityList: React.FC<PrivilegedIdentityListProps> = ({
 const ExpandedAssignmentDetail: React.FC<{
   principal: PrivilegedPrincipal;
   tenantId: string;
-}> = ({ principal, tenantId }) => (
-  <div className="mt-2 rounded-md border border-dashed border-border bg-muted/30 p-3">
-    <div className="mb-2 flex items-center justify-between text-2xs">
-      <span className="font-semibold uppercase tracking-wider text-muted-foreground">
-        Every role this principal holds
-      </span>
+}> = React.memo(({ principal, tenantId }) => (
+  <div
+    className="mt-2 rounded-md border border-dashed border-border bg-muted/30 p-3"
+    role="region"
+    aria-label={`Assignment detail for ${principal.displayName}`}
+  >
+    <div className="mb-2 flex flex-wrap items-center justify-between gap-2 text-2xs">
+      <div className="flex items-center gap-2">
+        <span className="font-semibold uppercase tracking-wider text-muted-foreground">
+          Every role this principal holds
+        </span>
+        <span
+          className="rounded bg-muted px-1.5 py-0.5 tabular-nums text-3xs text-muted-foreground"
+          title="Composite risk score (see Risk column tooltip)"
+        >
+          risk {riskScore(principal).toLocaleString()}
+        </span>
+      </div>
       <a
         href={portalDeepLink(tenantId, principal)}
         target="_blank"
         rel="noopener noreferrer"
         className="inline-flex items-center gap-1 text-info hover:underline"
+        aria-label={`Open ${principal.displayName} in the Entra portal`}
       >
-        Open in portal <ExternalLink className="h-3 w-3" />
+        Open in Entra <ExternalLink className="h-3 w-3" aria-hidden />
       </a>
     </div>
     <ul className="flex flex-col gap-1.5">
       {principal.assignments.map((a) => (
         <li
           key={`${a.roleId}::${a.path}::${a.viaGroupId ?? ""}`}
-          className="flex flex-wrap items-center gap-2 text-2xs"
+          className="group/copy flex flex-wrap items-center gap-2 text-2xs"
         >
           <TierBadge tier={a.tier} compact />
           <span className="font-medium text-foreground">
@@ -1695,11 +2047,27 @@ const ExpandedAssignmentDetail: React.FC<{
               <span className="font-mono">{a.viaGroupName}</span>
             </span>
           )}
+          {/* ENHANCEMENT — click-to-copy role-id + per-role portal link. */}
+          <span className="ml-auto inline-flex items-center gap-1 font-mono text-3xs text-muted-foreground/70">
+            {a.roleTemplateId.slice(0, 8)}…
+            <CopyButton value={a.roleTemplateId} />
+            <a
+              href={roleDeepLink(tenantId, a.roleId)}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="inline-flex h-4 w-4 items-center justify-center rounded text-muted-foreground hover:bg-muted hover:text-foreground"
+              title="Open role assignments in the Entra portal"
+              aria-label={`Open ${a.roleDisplayName} in the Entra portal`}
+            >
+              <ExternalLink className="h-2.5 w-2.5" aria-hidden />
+            </a>
+          </span>
         </li>
       ))}
     </ul>
   </div>
-);
+));
+ExpandedAssignmentDetail.displayName = "ExpandedAssignmentDetail";
 
 // ===========================================================================
 // Section C: shadow admin paths panel

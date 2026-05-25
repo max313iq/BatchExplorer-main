@@ -37,11 +37,13 @@ import {
   EyeOff,
   History,
   Info,
+  Keyboard,
   Loader2,
   Plus,
   RefreshCw,
   Save,
   Server,
+  ShieldCheck,
   Sparkles,
   Terminal,
   Trash2,
@@ -95,6 +97,15 @@ import {
   useMultiRegionStore,
 } from "../../store/store-context";
 import { useTenantChange } from "../../hooks/use-tenant-change";
+import { useAbortableEffect } from "../../hooks/use-abortable-effect";
+import { usePersistedState } from "../../hooks/use-persisted-state";
+import { useShortcut, modKeyLabel } from "../../hooks/use-shortcut";
+import { useUrlState } from "../../hooks/use-url-state";
+// COORDINATOR: prefer `useDashboardOutletContext().navigateToPage` over the
+// legacy `onNavigate` prop. The route adapter in page-router still passes the
+// legacy prop; we accept it for backward-compat but resolve to the context
+// value when mounted inside the router (the normal case).
+import { useDashboardOutletContext } from "../page-router";
 
 import { ConfirmationDialog } from "../shared/confirmation-dialog";
 import { CopyButton, CopyableText } from "../shared/copy-button";
@@ -109,6 +120,19 @@ const STORAGE_ACCOUNT = "ea-sub-quick:account";
 const STORAGE_BA = "ea-sub-quick:billing-account";
 const STORAGE_EA = "ea-sub-quick:enrollment-account";
 const STORAGE_PRESETS = "ea-sub-quick:display-name-presets";
+/**
+ * Persists the last few SUCCESSFUL submissions (alias name, scope, workload,
+ * displayName template) so a returning operator can one-click rehydrate the
+ * form to a configuration they've used before. Stored under localStorage so
+ * it survives a full browser reload — distinct from the in-memory session
+ * history (which is cleared on unmount and capped at HISTORY_MAX_ROWS).
+ *
+ * Capped at RECENT_PRESETS_MAX rows. We do NOT persist subscription IDs or
+ * cross-tenant owner/tenant ids here: those are operator-identifying and the
+ * audit log already keeps the canonical record. Only the recipe is stored.
+ */
+const STORAGE_RECENT_CONFIGS = "ea-sub-quick:recent-configs";
+const RECENT_PRESETS_MAX = 5;
 
 const UUID_RE =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -169,6 +193,27 @@ interface SubmittedAlias {
   crossTenant: boolean;
 }
 
+/**
+ * A "recent configuration" persisted across reloads. Holds only the
+ * non-PII recipe (displayName template, billing scope identifiers,
+ * workload). Recovered on mount and surfaced as one-click chips so a
+ * returning operator can rehydrate the form to a configuration they
+ * already used. Capped at RECENT_PRESETS_MAX entries.
+ */
+interface RecentConfig {
+  /** Identity. Constructed from scope + workload + displayName so the same
+   *  recipe doesn't accumulate duplicate rows.                            */
+  key: string;
+  displayNameTemplate: string;
+  workload: "Production" | "DevTest";
+  billingAccountName: string;
+  enrollmentAccountName: string;
+  /** True when the operator submitted via the custom-scope override.     */
+  customScopeMode: boolean;
+  /** ISO timestamp; used for sort + "used X ago" display.                */
+  lastUsedAt: string;
+}
+
 /** Random alias name matching the PowerShell `"ea-sub-" + Get-Random` pattern. */
 function generateAliasName(): string {
   // 9-digit suffix similar in cardinality to PowerShell's Get-Random.
@@ -202,25 +247,26 @@ function applyDisplayNameTokens(
     .replaceAll("{user}", user);
 }
 
-/** Load saved display-name presets from localStorage. */
-function loadPresets(): string[] {
-  try {
-    const raw = localStorage.getItem(STORAGE_PRESETS);
-    if (!raw) return [];
-    const parsed = JSON.parse(raw);
-    if (!Array.isArray(parsed)) return [];
-    return parsed.filter((p): p is string => typeof p === "string");
-  } catch {
-    return [];
-  }
+/**
+ * Migration helper for `usePersistedState`. Accepts the legacy bare-array
+ * value (pre-versioning) or the modern envelope; coerces to `string[]`.
+ * Anything malformed → empty array (caller falls back to initial value).
+ */
+function migratePresets(raw: unknown): string[] | undefined {
+  if (!Array.isArray(raw)) return [];
+  const arr = raw.filter((p): p is string => typeof p === "string");
+  return arr;
 }
 
-function savePresets(presets: string[]): void {
-  try {
-    localStorage.setItem(STORAGE_PRESETS, JSON.stringify(presets));
-  } catch {
-    /* ignore */
-  }
+/** Stable identity for a RecentConfig — same scope + workload + template = same row. */
+function recentConfigKey(c: Omit<RecentConfig, "key" | "lastUsedAt">): string {
+  return [
+    c.billingAccountName,
+    c.enrollmentAccountName,
+    c.workload,
+    c.customScopeMode ? "custom" : "picker",
+    c.displayNameTemplate,
+  ].join("|");
 }
 
 /**
@@ -283,6 +329,25 @@ export const EaSubQuickPage: React.FC<EaSubQuickPageProps> = ({
   const state = useMultiRegionState();
   const store = useMultiRegionStore();
   const navigate = useNavigate();
+  // Prefer the outlet context's path-based navigateToPage over the legacy
+  // `onNavigate(pageKey)` prop. The route adapter still passes onNavigate
+  // for backward compat — accept it but resolve to context.navigateToPage
+  // when mounted in the dashboard. `useOutletContext` returns undefined
+  // outside an Outlet, so we tolerate it for sandbox / storybook mounts.
+  const outletCtx = useDashboardOutletContext() as unknown as
+    | { navigateToPage?: (path: string) => void }
+    | undefined;
+  const goTo = React.useCallback(
+    (path: string) => {
+      const normalized = path.startsWith("/") ? path : `/${path}`;
+      if (outletCtx?.navigateToPage) {
+        outletCtx.navigateToPage(normalized);
+        return;
+      }
+      navigate(normalized);
+    },
+    [outletCtx, navigate],
+  );
   const azureAccounts = state.azureAccounts ?? [];
 
   /* ----- Account picker ------------------------------------------ */
@@ -442,26 +507,33 @@ export const EaSubQuickPage: React.FC<EaSubQuickPageProps> = ({
     setNoOidDetected(!oid);
   }, [armToken]);
 
-  React.useEffect(() => {
-    if (!account) {
-      setArmToken(null);
-      setBillingAccounts([]);
-      return;
-    }
-    let cancelled = false;
-    setBaLoading(true);
-    setBaError(null);
-    const actor = account.username;
-    (async () => {
+  // Billing-account fetch — migrated to useAbortableEffect so the per-render
+  // AbortSignal supersedes the manual `cancelled` boolean. The underlying
+  // arm-service helpers don't take a signal today, so we still gate state
+  // writes on `signal.aborted` after each await; switching to a signal-aware
+  // service surface would automatically thread cancellation downstream.
+  // COORDINATOR: arm-service.listAllBillingAccountsAnyAgreementType doesn't
+  // accept an AbortSignal — adding one would let this effect cancel the
+  // outbound fetch (not just discard the result) and is worth a follow-up.
+  useAbortableEffect(
+    async (signal) => {
+      if (!account) {
+        setArmToken(null);
+        setBillingAccounts([]);
+        return;
+      }
+      setBaLoading(true);
+      setBaError(null);
+      const actor = account.username;
       try {
         // Tenant arg omitted so we pick up the operator's current active
         // tenant (was pinning to account.tenantId / the account's HOME
         // tenant — pre-switch).
         const tok = await getArmTokenForAccount(account.homeAccountId);
-        if (cancelled) return;
+        if (signal.aborted) return;
         setArmToken(tok);
         const list = await listAllBillingAccountsAnyAgreementType(tok);
-        if (cancelled) return;
+        if (signal.aborted) return;
         setBillingAccounts(list);
         // Audit: surface the list-call to the audit log so operators can
         // trace which accounts the page actually queried (mirrors the
@@ -482,7 +554,7 @@ export const EaSubQuickPage: React.FC<EaSubQuickPageProps> = ({
           setBillingAccountName("");
         }
       } catch (err) {
-        if (cancelled) return;
+        if (signal.aborted) return;
         const msg = err instanceof Error ? err.message : String(err);
         setBaError(msg);
         setBillingAccounts([]);
@@ -495,14 +567,12 @@ export const EaSubQuickPage: React.FC<EaSubQuickPageProps> = ({
           details: { page: "ea-sub-quick" },
         });
       } finally {
-        if (!cancelled) setBaLoading(false);
+        if (!signal.aborted) setBaLoading(false);
       }
-    })();
-    return () => {
-      cancelled = true;
-    };
+    },
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [account?.homeAccountId, account?.tenantId]);
+    [account?.homeAccountId, account?.tenantId],
+  );
 
   /* ----- Enrollment accounts under chosen billing ---------------- */
   const [eas, setEas] = React.useState<EaEnrollmentAccount[]>([]);
@@ -549,39 +619,38 @@ export const EaSubQuickPage: React.FC<EaSubQuickPageProps> = ({
    */
   const eaCascadeRef = React.useRef(0);
 
-  React.useEffect(() => {
-    if (!armToken || !billingAccountName) {
-      setEas([]);
-      return;
-    }
-    // Non-EA accounts don't have an enrollmentAccounts collection —
-    // skip the listing call to avoid a 4xx and the noisy error banner.
-    if (selectedBa && !accountIsEnterpriseAgreement) {
-      setEas([]);
+  // Enrollment-account fetch. useAbortableEffect provides the abort signal;
+  // the eaCascadeRef sequence number still guards against rapid BA-flips
+  // landing parallel fetches whose results out-order each other (signal
+  // alone can't tell us "I'm the latest cascade", only "I'm not torn down").
+  // COORDINATOR: arm-service.listEnrollmentAccounts also doesn't accept an
+  // AbortSignal — pairs with the billing-account TODO above.
+  useAbortableEffect(
+    async (signal) => {
+      if (!armToken || !billingAccountName) {
+        setEas([]);
+        return;
+      }
+      // Non-EA accounts don't have an enrollmentAccounts collection —
+      // skip the listing call to avoid a 4xx and the noisy error banner.
+      if (selectedBa && !accountIsEnterpriseAgreement) {
+        setEas([]);
+        setEaError(null);
+        setEaLoading(false);
+        return;
+      }
+      const mySeq = ++eaCascadeRef.current;
+      setEaLoading(true);
       setEaError(null);
-      setEaLoading(false);
-      return;
-    }
-    const mySeq = ++eaCascadeRef.current;
-    let cancelled = false;
-    setEaLoading(true);
-    setEaError(null);
-    const baForThisCall = billingAccountName;
-    const actor = account?.username ?? "";
-    listEnrollmentAccounts(baForThisCall, armToken)
-      .then((list) => {
-        // Race guard (belt + braces): the captured sequence number
-        // must still be the latest, the BA must still be the one we
-        // started this fetch for, and the unmount flag must not have
-        // flipped. Any of these failing means we lost the race and
-        // a newer cascade owns the result set.
-        if (
-          cancelled ||
-          mySeq !== eaCascadeRef.current ||
-          baForThisCall !== billingAccountName
-        ) {
-          return;
-        }
+      const baForThisCall = billingAccountName;
+      const actor = account?.username ?? "";
+      const stillLatest = () =>
+        !signal.aborted &&
+        mySeq === eaCascadeRef.current &&
+        baForThisCall === billingAccountName;
+      try {
+        const list = await listEnrollmentAccounts(baForThisCall, armToken);
+        if (!stillLatest()) return;
         setEas(list);
         auditLog.record({
           actor,
@@ -598,15 +667,8 @@ export const EaSubQuickPage: React.FC<EaSubQuickPageProps> = ({
         ) {
           setEnrollmentAccountName("");
         }
-      })
-      .catch((err: unknown) => {
-        if (
-          cancelled ||
-          mySeq !== eaCascadeRef.current ||
-          baForThisCall !== billingAccountName
-        ) {
-          return;
-        }
+      } catch (err) {
+        if (!stillLatest()) return;
         const msg = err instanceof Error ? err.message : String(err);
         setEaError(msg);
         auditLog.record({
@@ -617,31 +679,22 @@ export const EaSubQuickPage: React.FC<EaSubQuickPageProps> = ({
           error: msg,
           details: { page: "ea-sub-quick" },
         });
-      })
-      .finally(() => {
-        if (
-          cancelled ||
-          mySeq !== eaCascadeRef.current ||
-          baForThisCall !== billingAccountName
-        ) {
-          return;
-        }
-        setEaLoading(false);
-      });
-    return () => {
-      cancelled = true;
-    };
+      } finally {
+        if (stillLatest()) setEaLoading(false);
+      }
+    },
     // We intentionally depend on `accountIsEnterpriseAgreement` (a
     // derived scalar) rather than `selectedBa` (a memo whose identity
     // changes whenever billingAccounts is replaced) so the effect
     // doesn't re-fire on stable cascade state.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [
-    armToken,
-    billingAccountName,
-    accountIsEnterpriseAgreement,
-    account?.username,
-  ]);
+    [
+      armToken,
+      billingAccountName,
+      accountIsEnterpriseAgreement,
+      account?.username,
+    ],
+  );
 
   const selectedEa = React.useMemo(
     () => eas.find((e) => e.name === enrollmentAccountName) ?? null,
@@ -706,13 +759,38 @@ export const EaSubQuickPage: React.FC<EaSubQuickPageProps> = ({
   ]);
 
   /* ----- Subscription form --------------------------------------- */
-  const [displayName, setDisplayName] = React.useState("My EA Subscription");
-  const [workload, setWorkload] = React.useState<"Production" | "DevTest">(
-    "Production",
+  // URL-persisted form state. Keys: name (displayName template), wl
+  // (workload), st (subscriptionTenantId), so (subscriptionOwnerId).
+  // Replace mode (default) keeps history clean while typing. Short keys
+  // chosen so a shared link doesn't bloat the URL bar.
+  const [formUrl, setFormUrl] = useUrlState<{
+    name: string;
+    wl: string;
+    st: string;
+    so: string;
+  }>({ name: "My EA Subscription", wl: "Production", st: "", so: "" });
+  const displayName = formUrl.name;
+  const setDisplayName = React.useCallback(
+    (v: string) => setFormUrl({ name: v }),
+    [setFormUrl],
+  );
+  const workload: "Production" | "DevTest" =
+    formUrl.wl === "DevTest" ? "DevTest" : "Production";
+  const setWorkload = React.useCallback(
+    (v: "Production" | "DevTest") => setFormUrl({ wl: v }),
+    [setFormUrl],
+  );
+  const subscriptionTenantId = formUrl.st;
+  const setSubscriptionTenantId = React.useCallback(
+    (v: string) => setFormUrl({ st: v }),
+    [setFormUrl],
+  );
+  const subscriptionOwnerId = formUrl.so;
+  const setSubscriptionOwnerId = React.useCallback(
+    (v: string) => setFormUrl({ so: v }),
+    [setFormUrl],
   );
   const [aliasName, setAliasName] = React.useState(() => generateAliasName());
-  const [subscriptionTenantId, setSubscriptionTenantId] = React.useState("");
-  const [subscriptionOwnerId, setSubscriptionOwnerId] = React.useState("");
   // Optional tag editor — each row is one key/value pair.
   const [tagPairs, setTagPairs] = React.useState<
     Array<{ key: string; value: string }>
@@ -916,23 +994,31 @@ export const EaSubQuickPage: React.FC<EaSubQuickPageProps> = ({
   const [counter, setCounter] = React.useState(1);
 
   /* ----- DisplayName presets ------------------------------------ */
-  const [presets, setPresets] = React.useState<string[]>(() => loadPresets());
-  const persistPresets = React.useCallback((next: string[]) => {
-    setPresets(next);
-    savePresets(next);
-  }, []);
+  // Migrated to usePersistedState so we share the single localStorage
+  // adapter the rest of the codebase already uses; the legacy callers
+  // (and pre-versioned blobs) are still accepted via `migrate`.
+  const [presets, setPresets] = usePersistedState<string[]>(
+    STORAGE_PRESETS,
+    [],
+    {
+      version: 1,
+      migrate: (raw) => migratePresets(raw),
+    },
+  );
   const handleSavePreset = React.useCallback(() => {
     const tpl = displayName.trim();
-    if (!tpl || presets.includes(tpl)) return;
-    // Cap at 8 to keep the dropdown tidy.
-    const next = [tpl, ...presets].slice(0, 8);
-    persistPresets(next);
-  }, [displayName, presets, persistPresets]);
+    if (!tpl) return;
+    setPresets((prev) => {
+      if (prev.includes(tpl)) return prev;
+      // Cap at 8 to keep the dropdown tidy.
+      return [tpl, ...prev].slice(0, 8);
+    });
+  }, [displayName, setPresets]);
   const handleDeletePreset = React.useCallback(
     (tpl: string) => {
-      persistPresets(presets.filter((p) => p !== tpl));
+      setPresets((prev) => prev.filter((p) => p !== tpl));
     },
-    [presets, persistPresets],
+    [setPresets],
   );
   const handleApplyPreset = React.useCallback(
     (tpl: string) => {
@@ -942,7 +1028,47 @@ export const EaSubQuickPage: React.FC<EaSubQuickPageProps> = ({
       });
       setDisplayName(resolved);
     },
-    [counter, account?.username],
+    [counter, account?.username, setDisplayName],
+  );
+
+  /* ----- Recently-used full configurations ----------------------- */
+  // Persisted across reloads (last 5 successful submissions). Distinct
+  // from `presets` (just displayName templates) and from `submittedAliases`
+  // (the in-memory session history). One click = whole-form rehydrate.
+  const [recentConfigs, setRecentConfigs] = usePersistedState<RecentConfig[]>(
+    STORAGE_RECENT_CONFIGS,
+    [],
+    {
+      version: 1,
+      migrate: (raw) => {
+        if (!Array.isArray(raw)) return [];
+        // Best-effort: keep only well-shaped rows.
+        return (raw as unknown[])
+          .filter(
+            (r): r is RecentConfig =>
+              !!r &&
+              typeof r === "object" &&
+              typeof (r as RecentConfig).key === "string" &&
+              typeof (r as RecentConfig).displayNameTemplate === "string",
+          )
+          .slice(0, RECENT_PRESETS_MAX);
+      },
+    },
+  );
+  const recordRecentConfig = React.useCallback(
+    (cfg: Omit<RecentConfig, "key" | "lastUsedAt">) => {
+      const key = recentConfigKey(cfg);
+      setRecentConfigs((prev) => {
+        const filtered = prev.filter((r) => r.key !== key);
+        const next: RecentConfig = {
+          ...cfg,
+          key,
+          lastUsedAt: new Date().toISOString(),
+        };
+        return [next, ...filtered].slice(0, RECENT_PRESETS_MAX);
+      });
+    },
+    [setRecentConfigs],
   );
 
   /**
@@ -961,6 +1087,104 @@ export const EaSubQuickPage: React.FC<EaSubQuickPageProps> = ({
     displayName.trim().length <= 64 &&
     !!aliasName &&
     crossTenantValid;
+
+  /**
+   * Preflight checklist — five fast-path checks the page can evaluate WITHOUT
+   * burning an API request. Surfaces the same gating conditions that the
+   * submit button consults so the operator sees WHY the button is disabled
+   * (or what will go wrong with the alias-create call even when it's not).
+   *
+   * `tone` drives the indicator color (success / warning / destructive).
+   * `blocking` rows must be green before submit is meaningful.
+   *
+   * This is not an Azure-side quota check — the EA enrollment account quota
+   * lives on the EA portal side, not behind ARM's listing surface — but it
+   * IS a precise reproduction of every gate the page itself enforces.
+   */
+  const preflight = React.useMemo(() => {
+    type Tone = "success" | "warning" | "destructive" | "muted";
+    type Row = {
+      label: string;
+      ok: boolean;
+      tone: Tone;
+      blocking: boolean;
+      hint?: string;
+    };
+    const rows: Row[] = [];
+    rows.push({
+      label: "Account",
+      ok: !!account,
+      tone: account ? "success" : "destructive",
+      blocking: true,
+      hint: account?.username,
+    });
+    rows.push({
+      label: "ARM token",
+      ok: !!armToken,
+      tone: armToken
+        ? noOidDetected
+          ? "warning"
+          : "success"
+        : "destructive",
+      blocking: true,
+      hint: armToken
+        ? noOidDetected
+          ? "no oid claim"
+          : armTokenClaims?.oid
+            ? `oid ${armTokenClaims.oid.slice(0, 8)}…`
+            : undefined
+        : undefined,
+    });
+    rows.push({
+      label: "Billing scope",
+      ok: !!billingScope,
+      tone: billingScope ? "success" : "destructive",
+      blocking: true,
+      hint: billingScope
+        ? customScopeMode
+          ? "custom"
+          : accountIsEnterpriseAgreement
+            ? "EA + EA"
+            : "BA only"
+        : undefined,
+    });
+    const dnLen = displayName.trim().length;
+    rows.push({
+      label: "Display name",
+      ok: dnLen >= 3 && dnLen <= 64,
+      tone: dnLen >= 3 && dnLen <= 64 ? "success" : "destructive",
+      blocking: true,
+      hint: `${dnLen}/64`,
+    });
+    rows.push({
+      label: "Cross-tenant",
+      ok: crossTenantValid,
+      tone: crossTenantRequested
+        ? crossTenantValid
+          ? "warning"
+          : "destructive"
+        : "muted",
+      blocking: true,
+      hint: crossTenantRequested
+        ? crossTenantValid
+          ? "ready"
+          : "needs both ids"
+        : "off",
+    });
+    return rows;
+  }, [
+    account,
+    armToken,
+    noOidDetected,
+    armTokenClaims,
+    billingScope,
+    customScopeMode,
+    accountIsEnterpriseAgreement,
+    displayName,
+    crossTenantValid,
+    crossTenantRequested,
+  ]);
+  const preflightBlocking = preflight.filter((r) => r.blocking && !r.ok).length;
 
   const submit = React.useCallback(async () => {
     if (!canSubmit || !armToken) return;
@@ -1131,6 +1355,19 @@ export const EaSubQuickPage: React.FC<EaSubQuickPageProps> = ({
         return next.slice(0, HISTORY_MAX_ROWS);
       });
       setCounter((c) => c + 1);
+      // Persist this configuration as a "recently used" preset so the
+      // operator can one-click rehydrate it on a future page load. The
+      // raw template is kept (not the resolved tokens) so {date}/{counter}
+      // still expand fresh next time. We skip cross-tenant/owner ids on
+      // purpose — those are operator-specific and would leak into shared
+      // browsers; the recipe is what's reusable.
+      recordRecentConfig({
+        displayNameTemplate: displayName.trim(),
+        workload,
+        billingAccountName,
+        enrollmentAccountName,
+        customScopeMode,
+      });
       // Re-roll alias on success so the next submit doesn't 409 on
       // the same name — operators almost always want a fresh one and
       // we already keep the previous in history.
@@ -1234,11 +1471,13 @@ export const EaSubQuickPage: React.FC<EaSubQuickPageProps> = ({
     tagsForBody,
     billingAccountName,
     enrollmentAccountName,
+    customScopeMode,
     account?.username,
     armTokenClaims,
     preGrantRole,
     store,
     counter,
+    recordRecentConfig,
   ]);
 
   const regenAlias = React.useCallback(() => {
@@ -1269,6 +1508,65 @@ export const EaSubQuickPage: React.FC<EaSubQuickPageProps> = ({
     submit,
   ]);
 
+  // Ctrl/Cmd+Enter from anywhere on the page submits — fast path for
+  // operators batching many subs. `allowInInputs: true` because the
+  // operator is virtually always typing in the displayName or alias
+  // inputs when they press it. We still bail if `canSubmit` is false
+  // (mirrors the click handler exactly).
+  useShortcut("Mod+Enter", () => handleCreateClick(), {
+    allowInInputs: true,
+    preventDefault: true,
+  });
+
+  // Recently-used preset → whole-form rehydrate. The displayName template
+  // is kept verbatim (tokens not yet expanded — they'll re-expand at
+  // submit time). Scope rehydrate works for both picker and custom modes.
+  const handleApplyRecentConfig = React.useCallback(
+    (cfg: RecentConfig) => {
+      setDisplayName(cfg.displayNameTemplate);
+      setWorkload(cfg.workload);
+      if (cfg.customScopeMode) {
+        setCustomScopeMode(true);
+        setCustomBillingAccountName(cfg.billingAccountName);
+        setCustomEnrollmentAccountName(cfg.enrollmentAccountName);
+      } else {
+        setCustomScopeMode(false);
+        if (cfg.billingAccountName) {
+          setBillingAccountName(cfg.billingAccountName);
+        }
+        if (cfg.enrollmentAccountName) {
+          setEnrollmentAccountName(cfg.enrollmentAccountName);
+        }
+      }
+      auditLog.record({
+        actor: account?.username ?? "",
+        action: "apply_recent_config",
+        target: cfg.key,
+        status: "success",
+        details: {
+          page: "ea-sub-quick",
+          billingAccountName: cfg.billingAccountName,
+          enrollmentAccountName: cfg.enrollmentAccountName,
+          workload: cfg.workload,
+          customScopeMode: cfg.customScopeMode,
+        },
+      });
+    },
+    [
+      account?.username,
+      setBillingAccountName,
+      setEnrollmentAccountName,
+      setDisplayName,
+      setWorkload,
+    ],
+  );
+  const handleDeleteRecentConfig = React.useCallback(
+    (key: string) => {
+      setRecentConfigs((prev) => prev.filter((r) => r.key !== key));
+    },
+    [setRecentConfigs],
+  );
+
   const handleNavigateSubManager = React.useCallback(() => {
     // Pre-seed Sub Manager → Grant Subscription Creator tab with this
     // scope. The picker there reads these sessionStorage keys on mount.
@@ -1281,12 +1579,17 @@ export const EaSubQuickPage: React.FC<EaSubQuickPageProps> = ({
     } catch {
       /* ignore */
     }
-    if (onNavigate) {
+    // Path-based navigation through the outlet context (preferred) — falls
+    // back to the legacy onNavigate(pageKey) prop for backward-compat, then
+    // to react-router's `navigate` for sandbox mounts.
+    if (outletCtx?.navigateToPage) {
+      outletCtx.navigateToPage("/sub-manager");
+    } else if (onNavigate) {
       onNavigate("sub-manager");
     } else {
       navigate("/sub-manager");
     }
-  }, [billingScope, onNavigate, navigate]);
+  }, [billingScope, outletCtx, onNavigate, navigate]);
 
   /* ----- Export columns for the submitted-aliases history --------- */
   const exportColumns = React.useMemo<ExportColumn<SubmittedAlias>[]>(
@@ -1422,6 +1725,70 @@ export const EaSubQuickPage: React.FC<EaSubQuickPageProps> = ({
           user/SPN in one go.
         </AlertDescription>
       </Alert>
+
+      {/* ----- Recently-used configurations (one-click rehydrate) ----- */}
+      {recentConfigs.length > 0 && (
+        <Card className="border-dashed border-primary/40 bg-primary/5">
+          <CardHeader className="pb-2">
+            <CardTitle className="flex items-center gap-2 text-sm">
+              <History className="h-4 w-4 text-primary" />
+              Recently used
+              <Badge variant="outline" className="text-[9px]">
+                {recentConfigs.length}/{RECENT_PRESETS_MAX}
+              </Badge>
+            </CardTitle>
+            <CardDescription className="text-2xs">
+              One-click rehydrate from your last few successful submissions.
+              Cleared on browser data wipe — recipes only, no tokens or owner
+              ids.
+            </CardDescription>
+          </CardHeader>
+          <CardContent>
+            <ul
+              className="flex flex-wrap gap-1.5"
+              aria-label="Recently used configurations"
+            >
+              {recentConfigs.map((cfg) => (
+                <li
+                  key={cfg.key}
+                  className="inline-flex items-center gap-0.5 rounded-full border border-border bg-background/60 pl-2 pr-0.5"
+                >
+                  <button
+                    type="button"
+                    onClick={() => handleApplyRecentConfig(cfg)}
+                    className="flex items-center gap-1 py-0.5 text-2xs hover:text-primary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                    aria-label={`Rehydrate form to ${cfg.displayNameTemplate} (${cfg.workload})`}
+                    title={`Last used ${new Date(cfg.lastUsedAt).toLocaleString()}`}
+                  >
+                    <span className="font-medium">
+                      {cfg.displayNameTemplate}
+                    </span>
+                    <Badge
+                      variant="outline"
+                      className="ml-1 text-[9px] font-mono"
+                    >
+                      {cfg.workload}
+                    </Badge>
+                    {cfg.customScopeMode && (
+                      <Badge variant="outline" className="text-[9px]">
+                        custom
+                      </Badge>
+                    )}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => handleDeleteRecentConfig(cfg.key)}
+                    className="ml-1 inline-flex h-4 w-4 items-center justify-center rounded-full text-muted-foreground hover:bg-destructive/20 hover:text-destructive focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                    aria-label={`Remove ${cfg.displayNameTemplate} from recent`}
+                  >
+                    <Trash2 className="h-2.5 w-2.5" />
+                  </button>
+                </li>
+              ))}
+            </ul>
+          </CardContent>
+        </Card>
+      )}
 
       {/* ----- Quick-stat header -------------------------------- */}
       <div
@@ -2251,30 +2618,26 @@ export const EaSubQuickPage: React.FC<EaSubQuickPageProps> = ({
                         )}
                         Re-acquire token
                       </Button>
-                      {onNavigate && (
-                        <Button
-                          type="button"
-                          size="sm"
-                          variant="outline"
-                          className="h-7 text-2xs"
-                          onClick={() => onNavigate("azure-accounts")}
-                          aria-label="Open Azure Accounts to switch tenant"
-                        >
-                          Open Azure Accounts
-                        </Button>
-                      )}
-                      {onNavigate && (
-                        <Button
-                          type="button"
-                          size="sm"
-                          variant="outline"
-                          className="h-7 text-2xs"
-                          onClick={() => onNavigate("token-importer")}
-                          aria-label="Open Token Importer to paste a fresh token"
-                        >
-                          Open Token Importer
-                        </Button>
-                      )}
+                      <Button
+                        type="button"
+                        size="sm"
+                        variant="outline"
+                        className="h-7 text-2xs"
+                        onClick={() => goTo("/azure-accounts")}
+                        aria-label="Open Azure Accounts to switch tenant"
+                      >
+                        Open Azure Accounts
+                      </Button>
+                      <Button
+                        type="button"
+                        size="sm"
+                        variant="outline"
+                        className="h-7 text-2xs"
+                        onClick={() => goTo("/token-importer")}
+                        aria-label="Open Token Importer to paste a fresh token"
+                      >
+                        Open Token Importer
+                      </Button>
                     </div>
                     <span className="break-all text-[10px] opacity-80">
                       Raw error: {submitError}
@@ -2461,6 +2824,65 @@ export const EaSubQuickPage: React.FC<EaSubQuickPageProps> = ({
                 )}
               </div>
 
+              {/* ----- Preflight checklist (live) --------------- */}
+              <div
+                className="flex flex-col gap-1.5 rounded-md border border-border bg-muted/20 p-2.5"
+                role="region"
+                aria-label="Preflight checklist"
+                aria-live="polite"
+              >
+                <div className="flex items-center gap-1.5 text-2xs font-medium uppercase tracking-wide text-muted-foreground">
+                  <ShieldCheck className="h-3 w-3" />
+                  Preflight
+                  {preflightBlocking === 0 ? (
+                    <Badge variant="success" className="text-[9px]">
+                      ready
+                    </Badge>
+                  ) : (
+                    <Badge variant="destructive" className="text-[9px]">
+                      {preflightBlocking} blocking
+                    </Badge>
+                  )}
+                </div>
+                <ul className="flex flex-wrap gap-1.5">
+                  {preflight.map((row) => (
+                    <li
+                      key={row.label}
+                      className="inline-flex items-center gap-1 rounded-full border border-border/60 bg-background/60 px-2 py-0.5 text-2xs"
+                      aria-label={`${row.label}: ${row.ok ? "ok" : "blocked"}${row.hint ? ` (${row.hint})` : ""}`}
+                    >
+                      {row.ok ? (
+                        <Check
+                          className={
+                            row.tone === "success"
+                              ? "h-3 w-3 text-success"
+                              : "h-3 w-3 text-warning"
+                          }
+                          aria-hidden
+                        />
+                      ) : row.tone === "muted" ? (
+                        <Info
+                          className="h-3 w-3 text-muted-foreground"
+                          aria-hidden
+                        />
+                      ) : (
+                        <XCircle className="h-3 w-3 text-destructive" aria-hidden />
+                      )}
+                      <span className="font-medium">{row.label}</span>
+                      {row.hint && (
+                        <span className="font-mono text-[10px] text-muted-foreground">
+                          {row.hint}
+                        </span>
+                      )}
+                    </li>
+                  ))}
+                </ul>
+                <p className="text-[10px] text-muted-foreground">
+                  Local checks only — Azure-side quota & role enforcement run
+                  on submit.
+                </p>
+              </div>
+
               <div className="flex flex-wrap items-center gap-3">
                 <Button
                   type="button"
@@ -2473,10 +2895,21 @@ export const EaSubQuickPage: React.FC<EaSubQuickPageProps> = ({
                       ? "Creating EA subscription, polling alias"
                       : "Create EA subscription"
                   }
+                  aria-keyshortcuts="Control+Enter Meta+Enter"
+                  title={`Create subscription (${modKeyLabel()}+Enter)`}
                 >
                   {!submitting && <CheckCircle2 />}
                   {submitting ? "Creating & polling…" : "Create subscription"}
                 </Button>
+                <span
+                  className="inline-flex items-center gap-1 text-2xs text-muted-foreground"
+                  aria-hidden
+                >
+                  <Keyboard className="h-3 w-3" />
+                  <kbd className="rounded border border-border/60 bg-muted/40 px-1 font-mono text-[10px]">
+                    {modKeyLabel()}+Enter
+                  </kbd>
+                </span>
                 {submitting && (
                   <div
                     className="flex items-center gap-2 text-2xs text-muted-foreground"
@@ -2726,10 +3159,7 @@ export const EaSubQuickPage: React.FC<EaSubQuickPageProps> = ({
             type="button"
             variant="outline"
             size="sm"
-            onClick={() => {
-              if (onNavigate) onNavigate("ea-subscription");
-              else navigate("/ea-subscription");
-            }}
+            onClick={() => goTo("/ea-subscription")}
             aria-label="Open Multi-recipient EA Sub creator"
           >
             <Server className="h-3.5 w-3.5" /> Multi-recipient EA Sub creator
@@ -2738,10 +3168,7 @@ export const EaSubQuickPage: React.FC<EaSubQuickPageProps> = ({
             type="button"
             variant="outline"
             size="sm"
-            onClick={() => {
-              if (onNavigate) onNavigate("department-admin");
-              else navigate("/department-admin");
-            }}
+            onClick={() => goTo("/department-admin")}
             aria-label="Open Department Admin workspace"
           >
             <Building2 className="h-3.5 w-3.5" /> Department Admin workspace

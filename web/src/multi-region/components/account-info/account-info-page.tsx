@@ -50,6 +50,7 @@ import { ErrorState } from "@/components/ui/error-state";
 import { Input } from "@/components/ui/input";
 import { Kbd } from "@/components/ui/kbd";
 import { Label } from "@/components/ui/label";
+import { Progress } from "@/components/ui/progress";
 import {
   Select,
   SelectContent,
@@ -94,6 +95,7 @@ import { usePersistedState } from "../../hooks/use-persisted-state";
 import { useSearch } from "../../hooks/use-search";
 import { useShortcut } from "../../hooks/use-shortcut";
 import { useUrlState } from "../../hooks/use-url-state";
+import { auditLog } from "../../services/audit-log";
 import { useMultiRegionState } from "../../store/store-context";
 import { AccountInfo } from "../../store/store-types";
 import { CopyButton, CopyableText } from "../shared/copy-button";
@@ -127,21 +129,37 @@ const ALL_REGIONS = "__all";
 const STALE_DATA_THRESHOLD_MS = 5 * 60 * 1000; // 5 min
 const CRITICAL_UTILIZATION_PCT = 80;
 const WARNING_UTILIZATION_PCT = 50;
-// "Utilization" pseudo-filter applied client-side, NOT URL-synced (it overlaps
-// with explicit filter rows in unhelpful ways if linked).
+// Utilization band — URL-synced so a "show me only the critical accounts" view
+// is deep-linkable + shareable. "all" is treated as the default (no URL entry).
 type UtilizationBand = "all" | "critical" | "warning" | "healthy";
+const UTILIZATION_BANDS: ReadonlySet<UtilizationBand> = new Set([
+  "all",
+  "critical",
+  "warning",
+  "healthy",
+]);
 
 interface AccountInfoFilters {
   region: string;
   lowFree: string;
   q: string;
+  /** URL-synced utilization band — empty / missing → "all". */
+  band: string;
 }
 
 const INITIAL_FILTERS: AccountInfoFilters = {
   region: "",
   lowFree: "",
   q: "",
+  band: "",
 };
+
+/** Narrow an arbitrary string from URL state to a known `UtilizationBand`. */
+function coerceBand(value: string): UtilizationBand {
+  return UTILIZATION_BANDS.has(value as UtilizationBand)
+    ? (value as UtilizationBand)
+    : "all";
+}
 
 export interface AccountInfoPageProps {
   orchestrator: OrchestratorAgent;
@@ -236,6 +254,12 @@ interface AccountDetailSheetProps {
    * state during the first refresh round-trip after mount.
    */
   loading?: boolean;
+  /**
+   * Absolute URL operators can copy + paste into chat to send a teammate
+   * straight to this sheet. Built once in the parent — we compute it there
+   * so the sheet stays a pure rendering component.
+   */
+  deepLinkUrl?: string;
 }
 
 const AccountDetailSheet: React.FC<AccountDetailSheetProps> = ({
@@ -244,6 +268,7 @@ const AccountDetailSheet: React.FC<AccountDetailSheetProps> = ({
   onOpenChange,
   onNavigate,
   loading = false,
+  deepLinkUrl,
 }) => {
   const families = account?.dedicatedCoreQuotaPerVMFamily ?? [];
   const familiesEnforced =
@@ -314,6 +339,18 @@ const AccountDetailSheet: React.FC<AccountDetailSheetProps> = ({
                     <span className="text-muted-foreground">
                       {account.resourceGroup || "—"}
                     </span>
+                    {deepLinkUrl && (
+                      <span
+                        className="inline-flex items-center gap-1 rounded-full bg-muted/60 px-2 py-0.5 text-2xs text-muted-foreground"
+                        title="Shareable URL — paste into chat to deep-link a teammate to this account view"
+                      >
+                        Deep-link
+                        <CopyButton
+                          value={deepLinkUrl}
+                          ariaLabel={`Copy shareable deep-link URL for ${account.accountName}`}
+                        />
+                      </span>
+                    )}
                   </>
                 ) : (
                   "No account selected."
@@ -640,22 +677,92 @@ interface RawQuotaCardProps {
   free: number;
 }
 
-const RawQuotaCard: React.FC<RawQuotaCardProps> = ({
-  label,
-  used,
-  quota,
-  free,
-}) => (
-  <div className="flex flex-col gap-1 rounded-md border border-border bg-card p-3 transition-shadow duration-200 ease-out hover:shadow-elev-1">
-    <span className="text-2xs uppercase tracking-wider text-muted-foreground">
-      {label}
-    </span>
-    <UsageBar used={used} quota={quota} />
-    <span className="text-2xs text-muted-foreground tabular-nums">
-      Free: {formatNumber(free)}
-    </span>
-  </div>
+type QuotaTone = "destructive" | "warning" | "success" | "muted";
+const QUOTA_TRACK_TONE: Record<QuotaTone, string> = {
+  muted: "bg-muted",
+  destructive: "bg-destructive/15",
+  warning: "bg-warning/15",
+  success: "bg-success/15",
+};
+const QUOTA_FILL_TONE: Record<QuotaTone, string> = {
+  muted: "[&>*]:bg-muted-foreground/60",
+  destructive: "[&>*]:bg-destructive",
+  warning: "[&>*]:bg-warning",
+  success: "[&>*]:bg-success",
+};
+const QUOTA_LABEL_TONE: Record<QuotaTone, string> = {
+  muted: "text-muted-foreground",
+  destructive: "text-destructive",
+  warning: "text-warning",
+  success: "text-success",
+};
+
+const RawQuotaCard: React.FC<RawQuotaCardProps> = React.memo(
+  ({ label, used, quota, free }) => {
+    const pct = usagePct(used, quota);
+    // Color-coded threshold band — matches the row-level UsageBar tone scale
+    // so the operator's color → severity mapping is consistent across the
+    // page. We tint the Progress *track* with a faded tone so the unfilled
+    // portion also carries a hint of the band, and pass a tone-specific
+    // class to color the indicator fill.
+    const tone: QuotaTone =
+      quota <= 0
+        ? "muted"
+        : pct > CRITICAL_UTILIZATION_PCT
+          ? "destructive"
+          : pct >= WARNING_UTILIZATION_PCT
+            ? "warning"
+            : "success";
+    return (
+      <div className="flex flex-col gap-1.5 rounded-md border border-border bg-card p-3 transition-shadow duration-200 ease-out hover:shadow-elev-1">
+        <span className="text-2xs uppercase tracking-wider text-muted-foreground">
+          {label}
+        </span>
+        <div className="flex items-baseline justify-between gap-2">
+          <span
+            className={cn(
+              "text-xs font-semibold tabular-nums",
+              QUOTA_LABEL_TONE[tone],
+            )}
+          >
+            {formatNumber(used)} / {formatNumber(quota)}
+          </span>
+          <span
+            className={cn(
+              "text-2xs tabular-nums",
+              QUOTA_LABEL_TONE[tone],
+            )}
+            aria-hidden
+          >
+            {quota > 0 ? `${pct}%` : "—"}
+          </span>
+        </div>
+        <Progress
+          value={pct}
+          className={cn(
+            "h-1.5",
+            QUOTA_TRACK_TONE[tone],
+            QUOTA_FILL_TONE[tone],
+          )}
+          aria-label={`${label}: ${used} of ${quota} (${pct} percent used)`}
+          aria-valuetext={`${pct}% — ${
+            tone === "destructive"
+              ? "critical"
+              : tone === "warning"
+                ? "warning"
+                : tone === "success"
+                  ? "healthy"
+                  : "no quota assigned"
+          }`}
+        />
+        <span className="text-2xs text-muted-foreground tabular-nums">
+          Free: {formatNumber(free)}
+        </span>
+      </div>
+    );
+  },
 );
+RawQuotaCard.displayName = "RawQuotaCard";
 
 /* ------------------------------------------------------------------ */
 /*  Quota Glance — fleet-wide gauges + top utilization accounts         */
@@ -825,6 +932,10 @@ const QuotaGlance: React.FC<QuotaGlanceProps> = ({
 /*  Auto-refresh countdown chip                                        */
 /* ------------------------------------------------------------------ */
 
+// COORDINATOR: extract <AutoRefreshChip> — duplicated with overview, pools,
+// nodes, pool-info pages. Same 30s interval + tooltip + countdown pattern.
+// Promote to `components/shared/auto-refresh-chip.tsx` once 2+ pages adopt
+// a uniform interval contract.
 interface AutoRefreshChipProps {
   enabled: boolean;
   loading: boolean;
@@ -919,16 +1030,22 @@ const AccountInfoPageInner: React.FC<AccountInfoPageProps> = ({
   // initial) so a screen-reader user knows what happened when the page
   // re-paints. Surfaced only to the polite live region.
   const [refreshReason, setRefreshReason] = React.useState<string | null>(null);
-  // Client-side utilization band filter (NOT URL-synced — chip toggles in
-  // a single page-life cycle, no need to deep-link).
-  const [utilizationBand, setUtilizationBand] =
-    React.useState<UtilizationBand>("all");
-
-  // URL-synced filters per Contract §4.3.
+  // URL-synced filters per Contract §4.3. The utilization band now rides on
+  // the URL too so a deep link captures the operator's full view (region +
+  // low-free threshold + free-text query + risk band).
   const [filters, setFilters] = useUrlState(INITIAL_FILTERS, { replace: true });
   const regionFilter = filters.region ?? "";
   const lowFreeFilter = filters.lowFree ?? "";
   const urlQuery = filters.q ?? "";
+  const utilizationBand: UtilizationBand = React.useMemo(
+    () => coerceBand(filters.band ?? ""),
+    [filters.band],
+  );
+  const setUtilizationBand = React.useCallback(
+    (band: UtilizationBand) =>
+      setFilters({ band: band === "all" ? "" : band }),
+    [setFilters],
+  );
 
   const accountInfos = state.accountInfos ?? [];
 
@@ -950,11 +1067,26 @@ const AccountInfoPageInner: React.FC<AccountInfoPageProps> = ({
   // `inFlightRef` short-circuits overlapping refreshes when the auto-refresh
   // tick fires while a manual refresh is still pending — important because
   // the orchestrator action issues one ARM round-trip per account.
+  // `manualAbortRef` lets the Stop button actually cancel the in-flight
+  // orchestrator round-trip (the action accepts `signal`).
+  // COORDINATOR: extract <RefreshWithAbort> hook — duplicated with overview,
+  // pools, nodes, pool-info pages (auto-refresh + inFlightRef + AbortController
+  // + lastRefreshedAt + stale-banner is the same recipe everywhere).
   const inFlightRef = React.useRef(false);
+  const manualAbortRef = React.useRef<AbortController | null>(null);
   const refresh = React.useCallback(
     async (reason: string = "manual", signal?: AbortSignal) => {
       if (inFlightRef.current) return;
       inFlightRef.current = true;
+      // For manual / mount / retry triggers we own the controller so Stop can
+      // cancel. For auto-refresh ticks the caller may pass its own signal.
+      let ownedController: AbortController | null = null;
+      let effectiveSignal: AbortSignal | undefined = signal;
+      if (!signal) {
+        ownedController = new AbortController();
+        manualAbortRef.current = ownedController;
+        effectiveSignal = ownedController.signal;
+      }
       setLoading(true);
       setError(null);
       setRefreshReason(reason);
@@ -962,30 +1094,52 @@ const AccountInfoPageInner: React.FC<AccountInfoPageProps> = ({
         await orchestrator.execute({
           action: "refresh_account_info",
           payload: {},
-          signal,
+          signal: effectiveSignal,
         });
-        if (!signal?.aborted) setLastRefreshedAt(Date.now());
+        if (!effectiveSignal?.aborted) setLastRefreshedAt(Date.now());
       } catch (e: unknown) {
-        if (signal?.aborted) return;
+        if (effectiveSignal?.aborted) return;
         const msg = e instanceof Error ? e.message : String(e);
         setError(msg);
+        // Record refresh failures so the audit-log page reflects what the
+        // operator saw. Successful refreshes are intentionally NOT audited:
+        // they are pure read-side ARM calls and would drown the log.
+        auditLog.record({
+          actor: "ui:account-info",
+          action: "refresh_account_info",
+          target: "fleet",
+          status: "failure",
+          error: msg,
+          details: { reason },
+        });
       } finally {
-        if (!signal?.aborted) setLoading(false);
+        if (!effectiveSignal?.aborted) setLoading(false);
         inFlightRef.current = false;
+        if (ownedController && manualAbortRef.current === ownedController) {
+          manualAbortRef.current = null;
+        }
       }
     },
     [orchestrator],
   );
 
-  // Stop button: drop the spinner and disable auto-refresh. We can't cancel
-  // an in-flight `orchestrator.execute` (the agent doesn't accept a signal),
-  // but flipping the local flags prevents the next tick + restores the UI.
+  // Stop button: cancel the in-flight ARM round-trip (if any), drop the
+  // spinner, and disable auto-refresh so the next tick doesn't fire. Records
+  // an audit entry — operator-initiated cancellation of fleet activity is
+  // worth keeping a trail of even though it isn't strictly "destructive".
   const stop = React.useCallback(() => {
+    if (manualAbortRef.current) {
+      manualAbortRef.current.abort();
+      manualAbortRef.current = null;
+    }
     setLoading(false);
     setAutoRefresh(false);
-    // Note: in-flight ARM round-trips will still resolve; we simply ignore
-    // their result for UI purposes (the state will reflect whatever the
-    // orchestrator wrote to the store before the user clicked Stop).
+    auditLog.record({
+      actor: "ui:account-info",
+      action: "refresh_account_info.stop",
+      target: "fleet",
+      status: "success",
+    });
   }, [setAutoRefresh]);
 
   // Auto-load on mount when accountInfos is empty. Uses a ref so React 18
@@ -1152,19 +1306,28 @@ const AccountInfoPageInner: React.FC<AccountInfoPageProps> = ({
     [setFilters],
   );
   const clearFilters = React.useCallback(() => {
-    setFilters({ region: "", lowFree: "", q: "" });
+    setFilters({ region: "", lowFree: "", q: "", band: "" });
     setSearchInput("");
-    setUtilizationBand("all");
   }, [setFilters]);
   const filtersActive = Boolean(
     regionFilter || lowFreeFilter || urlQuery || utilizationBand !== "all",
   );
 
   // ---- Deep-link sheet -----------------------------------------------------
+  // Build an id → account index once per account-set change so the deep-link
+  // lookup is O(1) instead of O(N) per render. With ~hundreds of accounts the
+  // difference is small but the index also feeds the deep-link clipboard
+  // affordance below without re-scanning the list.
+  const accountById = React.useMemo<ReadonlyMap<string, AccountInfo>>(() => {
+    const map = new Map<string, AccountInfo>();
+    for (const a of accountInfos) map.set(a.id, a);
+    return map;
+  }, [accountInfos]);
+
   const focusedAccount = React.useMemo<AccountInfo | null>(() => {
     if (!routeAccountId) return null;
-    return accountInfos.find((a) => a.id === routeAccountId) ?? null;
-  }, [routeAccountId, accountInfos]);
+    return accountById.get(routeAccountId) ?? null;
+  }, [routeAccountId, accountById]);
 
   const sheetOpen = Boolean(routeAccountId);
 
@@ -1194,19 +1357,56 @@ const AccountInfoPageInner: React.FC<AccountInfoPageProps> = ({
     [navigate],
   );
 
+  // Absolute deep-link URL for the currently focused account — null when no
+  // sheet is open, or when no DOM `location` is available (SSR/jest). The
+  // anchor is the canonical `/account-info/<id>` route so the recipient lands
+  // back on this exact sheet view. Guarded against ssr by `typeof window`.
+  const deepLinkUrl = React.useMemo<string | undefined>(() => {
+    if (!focusedAccount) return undefined;
+    if (typeof window === "undefined" || !window.location) return undefined;
+    const origin = window.location.origin;
+    const pathname = window.location.pathname.replace(
+      /\/account-info(?:\/[^/]*)?$/,
+      "",
+    );
+    return `${origin}${pathname}/account-info/${encodeURIComponent(focusedAccount.id)}`;
+  }, [focusedAccount]);
+
   // ---- Keyboard shortcuts --------------------------------------------------
   const searchInputRef = React.useRef<HTMLInputElement | null>(null);
-  useShortcut("/", (e) => {
+  // Debounce the `r` hotkey so key-repeat (holding the key) coalesces into a
+  // single refresh — `inFlightRef` would short-circuit duplicates but we'd
+  // still allocate AbortControllers + emit `setRefreshReason` churn on every
+  // re-trigger. 250 ms covers the OS autorepeat interval comfortably.
+  const refreshHotkeyDebounceRef = React.useRef<number | null>(null);
+  const debouncedManualRefresh = React.useCallback(() => {
+    if (refreshHotkeyDebounceRef.current != null) return;
+    refreshHotkeyDebounceRef.current = window.setTimeout(() => {
+      refreshHotkeyDebounceRef.current = null;
+    }, 250);
+    void refresh("manual-hotkey");
+  }, [refresh]);
+  // Clean up the debounce timer on unmount so we don't leak a setTimeout
+  // handle into a re-mounted page (StrictMode double-mount safe).
+  React.useEffect(() => {
+    return () => {
+      if (refreshHotkeyDebounceRef.current != null) {
+        window.clearTimeout(refreshHotkeyDebounceRef.current);
+        refreshHotkeyDebounceRef.current = null;
+      }
+    };
+  }, []);
+  const focusSearch = React.useCallback((e: KeyboardEvent) => {
     e.preventDefault();
     searchInputRef.current?.focus();
     searchInputRef.current?.select();
-  });
-  useShortcut("r", () => {
-    void refresh("manual");
-  });
-  useShortcut("a", () => {
+  }, []);
+  const toggleAutoRefresh = React.useCallback(() => {
     setAutoRefresh(!autoRefresh);
-  });
+  }, [autoRefresh, setAutoRefresh]);
+  useShortcut("/", focusSearch);
+  useShortcut("r", debouncedManualRefresh);
+  useShortcut("a", toggleAutoRefresh);
 
   // ---- DataTable columns ---------------------------------------------------
   const columns = React.useMemo<DataTableColumn<AccountInfo>[]>(
@@ -1708,6 +1908,13 @@ const AccountInfoPageInner: React.FC<AccountInfoPageProps> = ({
       )}
 
       {/* Quota at a glance — fleet-wide gauges + top utilization accounts */}
+      {/* COORDINATOR: extract <PoolCountSparkline> — needs a time-series
+          slice on MultiRegionStore (e.g. `state.accountInfoHistory: Map<id,
+          {ts, poolCount}[]>`) populated by the orchestrator on each
+          refresh_account_info round-trip. No store source exists today, so a
+          sparkline would either render flat (single sample) or fabricate
+          history — both misleading. Leaving the gauge view in place until
+          the store gains a history slice. */}
       {accountInfos.length > 0 && (
         <QuotaGlance
           accounts={accountInfos}
@@ -1929,6 +2136,7 @@ const AccountInfoPageInner: React.FC<AccountInfoPageProps> = ({
         onOpenChange={handleSheetOpenChange}
         onNavigate={handleSheetNavigate}
         loading={loading && accountInfos.length === 0}
+        deepLinkUrl={deepLinkUrl}
       />
     </div>
   );

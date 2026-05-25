@@ -94,7 +94,17 @@ import { CopyButton, CopyableText } from "../shared/copy-button";
 import { InfoTooltip } from "../shared/info-tooltip";
 import { SummaryStatItem } from "../shared/summary-stat-item";
 import { useUrlState } from "../../hooks/use-url-state";
+import { usePersistedState } from "../../hooks/use-persisted-state";
+import { useShortcut } from "../../hooks/use-shortcut";
 import { useArmToken } from "../../auth/use-arm-token";
+import { auditLog } from "../../services/audit-log";
+import {
+  cachePeek,
+  invalidateQuotaCache,
+  subscribeQuotaCache,
+  vmSkusCacheKey,
+  ComputeVmSku,
+} from "../../services/quota-service";
 
 // ---- Constants -----------------------------------------------------------
 
@@ -104,6 +114,13 @@ const POOL_ID_ERROR_ID = "pool-id-error";
 const POOL_JSON_ERROR_ID = "pool-json-error";
 const SUBNET_ID_PATTERN =
   /^\/subscriptions\/[^/]+\/resourceGroups\/[^/]+\/providers\/Microsoft\.Network\/virtualNetworks\/[^/]+\/subnets\/[^/]+$/;
+// POSIX env-var name: must start with letter/underscore, then alnum/underscore.
+// Used by BOTH the inline env-var Name input and the .env paste parser — keep
+// them in sync so a name that's invalid via paste is also invalid via type.
+const ENV_NAME_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*$/;
+// localStorage key for the saved-templates feature (last 5 successful configs).
+const POOL_TEMPLATES_KEY = "pool-creation:templates:v1";
+const POOL_TEMPLATES_MAX = 5;
 
 type StepKey =
   | "target"
@@ -222,6 +239,12 @@ const START_TASK_PRESETS: readonly StartTaskPreset[] = [
 // single/double quotes around the value. Returns the parsed pairs plus a
 // flat list of human-readable warnings for anything that couldn't be
 // understood — surfaced in the UI so the operator can see what was dropped.
+//
+// COORDINATOR: pool-creation has env-paste import behavior — if another page
+// adds clipboard→env-var import (e.g. pool-defaults, job creation), the
+// `parseEnvPaste` shape + `ENV_NAME_PATTERN` should be promoted to a
+// shared util rather than duplicated. Touch this from the per-page agent
+// owning that page; do NOT re-implement.
 
 interface EnvParseResult {
   parsed: { name: string; value: string }[];
@@ -243,8 +266,10 @@ function parseEnvPaste(raw: string): EnvParseResult {
       continue;
     }
     const name = line.slice(0, eq).trim();
-    if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(name)) {
-      warnings.push(`Line ${i + 1}: invalid env name "${name}", skipped`);
+    if (!ENV_NAME_PATTERN.test(name)) {
+      warnings.push(
+        `Line ${i + 1}: invalid POSIX env name "${name}", skipped (must start with letter/underscore, then alnum/underscore)`,
+      );
       continue;
     }
     let value = line.slice(eq + 1);
@@ -283,6 +308,31 @@ function validateSubnetId(id: string): string | null {
 interface EnvVar {
   name: string;
   value: string;
+}
+
+// ---- Saved pool templates -----------------------------------------------
+// Persisted in localStorage via usePersistedState so operators can re-use
+// a successful configuration without retyping every step. Keeps the last
+// POOL_TEMPLATES_MAX entries (newest first). A template is a denormalised
+// snapshot of the wizard form — NOT the orchestrator payload — so it
+// survives schema changes in the dispatch path.
+interface PoolTemplate {
+  id: string;
+  /** Human label — defaults to poolId at save-time, operator can rename. */
+  name: string;
+  /** ISO timestamp the template was saved. */
+  savedAt: string;
+  poolIdPrefix: string;
+  osCategory: "linux" | "windows";
+  resizeTimeoutMin: number;
+  subnetId: string;
+  interNodeComm: boolean;
+  startTaskCmd: string;
+  maxRetryCount: number;
+  waitForSuccess: boolean;
+  envVars: EnvVar[];
+  smartMode: boolean;
+  smartVmSizes: string[];
 }
 
 type EligibleAccount = {
@@ -546,6 +596,86 @@ const PoolCreationPageInner: React.FC<PoolCreationPageProps> = ({
   // to the hardcoded list without surprising the user.
   const liveCatalogEffective =
     liveCatalogEnabled && catalogAvailability.available;
+
+  // Catalog freshness — exposed in the UI as a "Last updated: X ago" chip
+  // so the operator can spot a stale cache before a dispatch picks the
+  // wrong SKU set. Pulls the underlying `fetchedAt` from the quota-service
+  // cache item and re-reads on cache pub/sub changes (covers TTL expiry,
+  // operator-driven invalidate, vm-catalog page refresh).
+  const [catalogFetchedAt, setCatalogFetchedAt] = React.useState<number | null>(
+    null,
+  );
+  React.useEffect(() => {
+    if (!subscriptionId) {
+      setCatalogFetchedAt(null);
+      return;
+    }
+    const read = () => {
+      const all = cachePeek<ComputeVmSku[]>(
+        vmSkusCacheKey(subscriptionId, false),
+      );
+      const gpu = cachePeek<ComputeVmSku[]>(
+        vmSkusCacheKey(subscriptionId, true),
+      );
+      // Prefer whichever is fresher — they're populated independently.
+      const fetched = Math.max(all?.fetchedAt ?? 0, gpu?.fetchedAt ?? 0);
+      setCatalogFetchedAt(fetched > 0 ? fetched : null);
+    };
+    read();
+    return subscribeQuotaCache((key) => {
+      if (
+        !subscriptionId ||
+        key === "*" ||
+        key === vmSkusCacheKey(subscriptionId, true) ||
+        key === vmSkusCacheKey(subscriptionId, false)
+      ) {
+        read();
+      }
+    });
+  }, [subscriptionId]);
+
+  // Tick once a minute so the relative "X min ago" label refreshes even
+  // when the cache itself isn't changing. Cheap — single setInterval.
+  const [, setNowTick] = React.useState(0);
+  React.useEffect(() => {
+    const id = window.setInterval(() => setNowTick((n) => n + 1), 60_000);
+    return () => window.clearInterval(id);
+  }, []);
+
+  const catalogAgeLabel = React.useMemo(() => {
+    if (catalogFetchedAt == null) return null;
+    const ageMs = Date.now() - catalogFetchedAt;
+    if (ageMs < 0) return "just now";
+    const min = Math.floor(ageMs / 60_000);
+    if (min < 1) return "just now";
+    if (min < 60) return `${min} min ago`;
+    const hr = Math.floor(min / 60);
+    if (hr < 24) return `${hr}h ago`;
+    const d = Math.floor(hr / 24);
+    return `${d}d ago`;
+  }, [catalogFetchedAt]);
+
+  // Manual refresh — invalidates the cached SKU set for the current sub
+  // and routes the operator to the VM Catalog page where the prefetch
+  // will re-populate. We don't have a direct "fetch VM SKUs" action on
+  // the orchestrator (boot prefetch in dashboard-shell owns that path),
+  // so the safe contract is invalidate-and-navigate.
+  const handleRefreshCatalog = React.useCallback(() => {
+    if (!subscriptionId) return;
+    invalidateQuotaCache(subscriptionId);
+    auditLog.record({
+      actor: primaryAccount?.username ?? "unknown",
+      action: "invalidate_vm_catalog",
+      target: `subscription:${subscriptionId}`,
+      status: "success",
+      details: { from: "pool-creation" },
+    });
+    store.addNotification({
+      type: "info",
+      message: "VM catalog cache cleared — open VM Catalog to repopulate.",
+      autoDismissMs: 4000,
+    });
+  }, [subscriptionId, primaryAccount?.username, store]);
   const [autoSelectedSubscription, setAutoSelectedSubscription] =
     React.useState(false);
 
@@ -580,6 +710,32 @@ const PoolCreationPageInner: React.FC<PoolCreationPageProps> = ({
   // Review step
   const [saveAsDefault, setSaveAsDefault] = React.useState(false);
   const [confirmHidden, setConfirmHidden] = React.useState(true);
+
+  // ---- Saved templates (last N successful configs) ----
+  const [templates, setTemplates] = usePersistedState<PoolTemplate[]>(
+    POOL_TEMPLATES_KEY,
+    [],
+  );
+
+  // ---- Per-submit AbortController ----
+  // Lets the operator cancel a long-running smart-fill dispatch via the
+  // "Stop" button and also auto-cancels on unmount. The orchestrator
+  // already accepts `params.signal` and forwards it to the per-agent
+  // cancellation tracker; we just supply the controller here.
+  const submitAbortRef = React.useRef<AbortController | null>(null);
+
+  // Separate controller for the "Discover accounts" action so the
+  // operator typing in the sub picker (changes selectedSubIds) can abort
+  // the previous discovery without nuking the in-flight pool create.
+  const discoverAbortRef = React.useRef<AbortController | null>(null);
+
+  // Mount-effect-only abort on unmount.
+  React.useEffect(() => {
+    return () => {
+      submitAbortRef.current?.abort();
+      discoverAbortRef.current?.abort();
+    };
+  }, []);
 
   // ---- Refs / IDs ----
   const poolIdFieldRef = React.useRef<HTMLInputElement | null>(null);
@@ -664,6 +820,10 @@ const PoolCreationPageInner: React.FC<PoolCreationPageProps> = ({
       return;
     }
     setDiscoverError(null);
+    // Spin a fresh controller; aborts any in-flight discovery from a
+    // previous click before starting the new walk.
+    discoverAbortRef.current?.abort();
+    discoverAbortRef.current = new AbortController();
     setDiscoverProgress({
       completed: 0,
       total: targetSubs.length,
@@ -684,6 +844,7 @@ const PoolCreationPageInner: React.FC<PoolCreationPageProps> = ({
           await orchestrator.execute({
             action: "discover_accounts",
             payload: { subscriptionId: subId },
+            signal: discoverAbortRef.current?.signal,
           });
         } catch (err: unknown) {
           const message = err instanceof Error ? err.message : String(err);
@@ -702,6 +863,7 @@ const PoolCreationPageInner: React.FC<PoolCreationPageProps> = ({
         await orchestrator.execute({
           action: "refresh_account_info",
           payload: {},
+          signal: discoverAbortRef.current?.signal,
         });
       } catch (err: unknown) {
         const message = err instanceof Error ? err.message : String(err);
@@ -1008,6 +1170,19 @@ const PoolCreationPageInner: React.FC<PoolCreationPageProps> = ({
     return dups;
   }, [envVars]);
 
+  // POSIX-invalid env-var names. An operator can type `123-bad` directly
+  // into the inline name input; we don't drop that on submit (it'd be a
+  // silent fail), we highlight inline and block submit on the Tasks step.
+  const envInvalidIndices = React.useMemo(() => {
+    const set = new Set<number>();
+    envVars.forEach((ev, idx) => {
+      const k = ev.name.trim();
+      if (k !== "" && !ENV_NAME_PATTERN.test(k)) set.add(idx);
+    });
+    return set;
+  }, [envVars]);
+  const envHasInvalidNames = envInvalidIndices.size > 0;
+
   // ---- start-task helpers ----
   const applyStartTaskPreset = React.useCallback((preset: StartTaskPreset) => {
     setStartTaskCmd(preset.commandLine);
@@ -1163,7 +1338,8 @@ const PoolCreationPageInner: React.FC<PoolCreationPageProps> = ({
 
   const networkingStepValid = validateSubnetId(subnetId) === null;
 
-  const tasksStepValid = startTaskCmd.trim().length > 0;
+  const tasksStepValid =
+    startTaskCmd.trim().length > 0 && !envHasInvalidNames;
 
   const stepValidity: Record<StepKey, boolean> = {
     target: targetStepValid,
@@ -1292,34 +1468,37 @@ const PoolCreationPageInner: React.FC<PoolCreationPageProps> = ({
   // Keyboard shortcut: Ctrl/Cmd + Enter advances the wizard. On the
   // review step it opens the confirmation dialog (matches the visible
   // "Create pools" CTA). On any earlier step it triggers Continue,
-  // which re-runs the per-step validators. Deliberately skipped when
-  // focus is in the Monaco editor / textarea since those eat the keys
-  // for their own purposes (newline / paste / smart-indent).
-  React.useEffect(() => {
-    const onKey = (event: KeyboardEvent) => {
-      if (!(event.ctrlKey || event.metaKey)) return;
-      if (event.key !== "Enter") return;
-      const target = event.target as HTMLElement | null;
-      if (target) {
-        const tag = target.tagName;
-        if (tag === "TEXTAREA") return;
-        // Monaco renders inside contenteditable=true descendants — skip.
-        const ce =
-          target.closest("[contenteditable='true']") ??
-          target.closest(".monaco-editor");
-        if (ce) return;
-      }
-      if (isRunning) return;
-      event.preventDefault();
-      if (currentStep === "review") {
-        handleSubmit();
-      } else {
-        handleContinue();
-      }
-    };
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, [currentStep, isRunning, handleSubmit, handleContinue]);
+  // which re-runs the per-step validators. Routed through the shared
+  // `useShortcut` hook so the chord parsing + cross-platform Cmd vs Ctrl
+  // handling lives in one place. `allowInInputs: true` because the
+  // operator routinely fires this while focus is in the Pool ID / subnet
+  // inputs; we keep the manual Monaco/textarea bailouts below.
+  useShortcut(
+    "Mod+Enter",
+    React.useCallback(
+      (event: KeyboardEvent) => {
+        const target = event.target as HTMLElement | null;
+        if (target) {
+          const tag = target.tagName;
+          if (tag === "TEXTAREA") return;
+          // Monaco renders inside contenteditable=true descendants — skip.
+          const ce =
+            target.closest("[contenteditable='true']") ??
+            target.closest(".monaco-editor");
+          if (ce) return;
+        }
+        if (isRunning) return;
+        event.preventDefault();
+        if (currentStep === "review") {
+          handleSubmit();
+        } else {
+          handleContinue();
+        }
+      },
+      [currentStep, isRunning, handleSubmit, handleContinue],
+    ),
+    { allowInInputs: true, preventDefault: false },
+  );
 
   const persistDefaultsFromForm = React.useCallback(() => {
     const updater = store as unknown as {
@@ -1362,6 +1541,45 @@ const PoolCreationPageInner: React.FC<PoolCreationPageProps> = ({
 
   const handleCreate = React.useCallback(async () => {
     setConfirmHidden(true);
+    // Spin a fresh controller for this submit. Abort any previous in-flight
+    // controller first (defensive — UI disables the button while running,
+    // but a stale controller could leak through if isRunning was already
+    // mid-toggle when handleCreate re-fired).
+    submitAbortRef.current?.abort();
+    const controller = new AbortController();
+    submitAbortRef.current = controller;
+    const actor = primaryAccount?.username ?? "unknown";
+    const submitTarget = `${selectedAccountIds.size} account(s)`;
+    // Inlined re-derivation of the planned-VM count and cross-sub flag so
+    // the useCallback dep array stays free of the post-callback `const`s
+    // (referencing those in deps would be a TDZ error at first render).
+    const plannedVmCount =
+      smartMode && liveCatalogEffective && smartVmSizes.length > 0
+        ? smartVmSizes.length
+        : smartMode
+          ? getAllVmSizes().length
+          : 1;
+    const distinctSubsInSelection = new Set<string>();
+    {
+      const acctById = new Map(state.accounts.map((a) => [a.id, a] as const));
+      for (const id of selectedAccountIds) {
+        const acc = acctById.get(id);
+        if (acc) distinctSubsInSelection.add(acc.subscriptionId);
+      }
+    }
+    auditLog.record({
+      actor,
+      action: smartMode ? "create_pools_smart:submit" : "create_pools:submit",
+      target: submitTarget,
+      status: "success",
+      details: {
+        accountIds: Array.from(selectedAccountIds),
+        smartMode,
+        poolIdPrefix: poolIdInput,
+        vmSizeCount: plannedVmCount,
+        crossSubDispatch: distinctSubsInSelection.size > 1,
+      },
+    });
     try {
       setConfigError(null);
       setIsRunning(true);
@@ -1447,6 +1665,7 @@ const PoolCreationPageInner: React.FC<PoolCreationPageProps> = ({
             poolConfig,
             quotaType: "lowPriority",
           },
+          signal: controller.signal,
         });
       } else {
         const poolConfig = JSON.parse(poolConfigJson);
@@ -1457,8 +1676,60 @@ const PoolCreationPageInner: React.FC<PoolCreationPageProps> = ({
             accountIds: Array.from(selectedAccountIds),
             poolConfig,
           },
+          signal: controller.signal,
         });
       }
+
+      // Audit-log on successful dispatch. The pool-agent emits its own
+      // per-account audit; this is the page-level "submit completed" line
+      // that lets us correlate a wizard run with the per-account events.
+      auditLog.record({
+        actor,
+        action: smartMode ? "create_pools_smart:result" : "create_pools:result",
+        target: submitTarget,
+        status: "success",
+        details: {
+          accountIds: Array.from(selectedAccountIds),
+          smartMode,
+          poolIdPrefix: poolIdInput,
+        },
+      });
+
+      // Save the just-dispatched config as a template (cap at the last N).
+      // Skipped if every field matches the most recent template — avoids
+      // the operator ending up with five identical entries from clicking
+      // Create on the same config repeatedly.
+      const snapshot: PoolTemplate = {
+        id: crypto.randomUUID(),
+        name: poolIdInput || "untitled",
+        savedAt: new Date().toISOString(),
+        poolIdPrefix: poolIdInput,
+        osCategory,
+        resizeTimeoutMin,
+        subnetId,
+        interNodeComm,
+        startTaskCmd,
+        maxRetryCount,
+        waitForSuccess,
+        envVars: envVars.filter((ev) => ev.name.trim() !== ""),
+        smartMode,
+        smartVmSizes: [...smartVmSizes],
+      };
+      setTemplates((prev) => {
+        const dupOfLatest =
+          prev[0] &&
+          prev[0].poolIdPrefix === snapshot.poolIdPrefix &&
+          prev[0].osCategory === snapshot.osCategory &&
+          prev[0].resizeTimeoutMin === snapshot.resizeTimeoutMin &&
+          prev[0].subnetId === snapshot.subnetId &&
+          prev[0].interNodeComm === snapshot.interNodeComm &&
+          prev[0].startTaskCmd === snapshot.startTaskCmd &&
+          prev[0].maxRetryCount === snapshot.maxRetryCount &&
+          prev[0].waitForSuccess === snapshot.waitForSuccess &&
+          prev[0].smartMode === snapshot.smartMode;
+        if (dupOfLatest) return prev;
+        return [snapshot, ...prev].slice(0, POOL_TEMPLATES_MAX);
+      });
 
       // Persist as new defaults if the operator opted in.
       if (saveAsDefault) {
@@ -1470,32 +1741,103 @@ const PoolCreationPageInner: React.FC<PoolCreationPageProps> = ({
         });
       }
     } catch (e) {
-      if (e instanceof SyntaxError) {
-        setConfigError(`Invalid JSON: ${e.message}`);
-      } else if (e instanceof Error) {
-        setConfigError(e.message);
+      // Distinguish operator-driven abort from real errors so we don't
+      // surface a scary banner for "I clicked Stop".
+      const aborted =
+        controller.signal.aborted ||
+        (e instanceof DOMException && e.name === "AbortError");
+      if (aborted) {
+        auditLog.record({
+          actor,
+          action: smartMode ? "create_pools_smart:cancel" : "create_pools:cancel",
+          target: submitTarget,
+          status: "success",
+          details: { accountIds: Array.from(selectedAccountIds) },
+        });
+        store.addNotification({
+          type: "info",
+          message: "Pool creation cancelled",
+          autoDismissMs: 3000,
+        });
+      } else {
+        const message =
+          e instanceof Error ? e.message : "Unknown pool-creation error";
+        if (e instanceof SyntaxError) {
+          setConfigError(`Invalid JSON: ${message}`);
+        } else if (e instanceof Error) {
+          setConfigError(message);
+        }
+        auditLog.record({
+          actor,
+          action: smartMode ? "create_pools_smart:result" : "create_pools:result",
+          target: submitTarget,
+          status: "failure",
+          error: message,
+          details: { accountIds: Array.from(selectedAccountIds), smartMode },
+        });
       }
     } finally {
       setIsRunning(false);
+      if (submitAbortRef.current === controller) {
+        submitAbortRef.current = null;
+      }
     }
   }, [
     orchestrator,
     selectedAccountIds,
     poolConfigJson,
     smartMode,
+    smartVmSizes,
     startTaskCmd,
     envVars,
     maxRetryCount,
     waitForSuccess,
     poolDefaults,
     poolIdInput,
+    osCategory,
     resizeTimeoutMin,
     interNodeComm,
     subnetId,
     saveAsDefault,
     persistDefaultsFromForm,
+    setTemplates,
+    primaryAccount?.username,
+    liveCatalogEffective,
+    state.accounts,
     store,
   ]);
+
+  // Load a saved template into the wizard. Replaces every field the
+  // template captured; leaves account picks alone (different runs target
+  // different accounts even when the config is identical).
+  const loadTemplate = React.useCallback(
+    (t: PoolTemplate) => {
+      setPoolIdInput(t.poolIdPrefix);
+      setOsCategory(t.osCategory);
+      setResizeTimeoutMin(t.resizeTimeoutMin);
+      setSubnetId(t.subnetId);
+      setInterNodeComm(t.interNodeComm);
+      setStartTaskCmd(t.startTaskCmd);
+      setMaxRetryCount(t.maxRetryCount);
+      setWaitForSuccess(t.waitForSuccess);
+      setEnvVars(t.envVars.map((ev) => ({ name: ev.name, value: ev.value })));
+      setSmartMode(t.smartMode);
+      setSmartVmSizes([...t.smartVmSizes]);
+      store.addNotification({
+        type: "info",
+        message: `Loaded template "${t.name}"`,
+        autoDismissMs: 2500,
+      });
+    },
+    [store],
+  );
+
+  const deleteTemplate = React.useCallback(
+    (id: string) => {
+      setTemplates((prev) => prev.filter((t) => t.id !== id));
+    },
+    [setTemplates],
+  );
 
   const handleRetryFailedPools = React.useCallback(() => {
     const ids = store.retryFailedPools();
@@ -1733,6 +2075,82 @@ const PoolCreationPageInner: React.FC<PoolCreationPageProps> = ({
 
         {/* -------- Target step -------- */}
         <TabsContent value="target" className="flex flex-col gap-3">
+          {templates.length > 0 && (
+            <div
+              className="flex flex-wrap items-center gap-1.5 rounded-md border border-dashed border-border bg-surface-sunken/40 p-2"
+              role="group"
+              aria-label="Saved pool templates"
+            >
+              <span className="text-2xs font-semibold uppercase tracking-wider text-muted-foreground">
+                Templates
+              </span>
+              <DropdownMenu>
+                <DropdownMenuTrigger asChild>
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="sm"
+                    aria-label={`Load a saved pool template (${templates.length} available)`}
+                    className="gap-1.5"
+                  >
+                    <Sparkles className="h-3.5 w-3.5" aria-hidden />
+                    Load template
+                    <span className="ml-1 rounded-full bg-muted px-1.5 text-2xs font-semibold tabular-nums text-muted-foreground">
+                      {templates.length}
+                    </span>
+                  </Button>
+                </DropdownMenuTrigger>
+                <DropdownMenuContent
+                  align="start"
+                  className="max-h-72 w-[min(28rem,80vw)] overflow-y-auto"
+                >
+                  <DropdownMenuLabel>
+                    Last {templates.length} successful config(s)
+                  </DropdownMenuLabel>
+                  <DropdownMenuSeparator />
+                  {templates.map((t) => (
+                    <div
+                      key={t.id}
+                      className="flex items-start gap-2 px-2 py-1.5 hover:bg-accent/40"
+                    >
+                      <button
+                        type="button"
+                        onClick={() => loadTemplate(t)}
+                        className="flex flex-1 flex-col items-start gap-0.5 text-left focus-visible:outline-none"
+                        aria-label={`Load template ${t.name}`}
+                      >
+                        <span className="text-xs font-semibold text-foreground">
+                          {t.name}
+                        </span>
+                        <span className="text-2xs text-muted-foreground">
+                          {new Date(t.savedAt).toLocaleString()} ·{" "}
+                          {t.smartMode ? "smart" : "manual"} · {t.osCategory}
+                        </span>
+                        <span className="line-clamp-1 max-w-full font-mono text-3xs text-muted-foreground">
+                          {t.startTaskCmd}
+                        </span>
+                      </button>
+                      <Button
+                        type="button"
+                        variant="ghost"
+                        size="icon-sm"
+                        onClick={() => deleteTemplate(t.id)}
+                        aria-label={`Delete template ${t.name}`}
+                        className="text-muted-foreground hover:text-destructive"
+                      >
+                        <Trash2 className="h-3 w-3" />
+                      </Button>
+                    </div>
+                  ))}
+                </DropdownMenuContent>
+              </DropdownMenu>
+              <span className="text-2xs text-muted-foreground">
+                Auto-saved after each successful dispatch (last{" "}
+                {POOL_TEMPLATES_MAX}). Loads every field except account picks.
+              </span>
+            </div>
+          )}
+
           {state.subscriptions.length > 0 && (
             <div className="flex max-w-[28rem] flex-col gap-1.5">
               <Label htmlFor={subscriptionFieldId}>
@@ -2411,6 +2829,34 @@ const PoolCreationPageInner: React.FC<PoolCreationPageProps> = ({
                   </span>
                 )}
               </label>
+              {/* Catalog freshness chip + manual refresh. The chip exposes
+                  the cache `fetchedAt` so the operator can spot a stale
+                  SKU set before dispatch; the button invalidates the
+                  cached entry — repopulated by visiting /vm-catalog
+                  (or by the next boot prefetch). */}
+              {catalogAvailability.available && catalogAgeLabel && (
+                <span
+                  className="inline-flex items-center gap-1 rounded-md border border-border bg-card px-2 py-1 text-2xs text-muted-foreground"
+                  title={`VM-catalog cache last refreshed ${catalogAgeLabel}. Cache TTL is 7 days for VM SKUs.`}
+                  aria-label={`VM catalog last updated ${catalogAgeLabel}`}
+                >
+                  Last updated {catalogAgeLabel}
+                </span>
+              )}
+              {subscriptionId && (
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="sm"
+                  onClick={handleRefreshCatalog}
+                  aria-label="Refresh VM catalog cache"
+                  title="Clears the cached SKU set for this subscription. Visit the VM Catalog page to repopulate."
+                  className="h-7 gap-1 text-2xs text-muted-foreground"
+                >
+                  <RotateCw className="h-3 w-3" />
+                  Refresh catalog
+                </Button>
+              )}
               {liveCatalogEffective && (
                 <LiveVmSizeSelect
                   multi
@@ -3011,6 +3457,14 @@ const PoolCreationPageInner: React.FC<PoolCreationPageProps> = ({
                     {envDuplicateNames.size} dup
                   </span>
                 )}
+                {envInvalidIndices.size > 0 && (
+                  <span
+                    className="ml-1 inline-flex h-5 items-center rounded-full bg-destructive/15 px-1.5 text-2xs font-semibold text-destructive"
+                    title="One or more env-var names are not valid POSIX identifiers. Fix them before continuing."
+                  >
+                    {envInvalidIndices.size} invalid
+                  </span>
+                )}
               </Label>
               <div
                 className="flex flex-wrap items-center gap-1"
@@ -3126,42 +3580,69 @@ const PoolCreationPageInner: React.FC<PoolCreationPageProps> = ({
             {envVars.map((ev, idx) => {
               const isDup =
                 ev.name.trim() !== "" && envDuplicateNames.has(ev.name);
+              const isInvalid = envInvalidIndices.has(idx);
+              const nameErrorId = `env-name-error-${idx}`;
               return (
-                <div key={idx} className="flex flex-wrap items-end gap-2">
-                  <Input
-                    placeholder="Name"
-                    value={ev.name}
-                    onChange={(e) =>
-                      updateEnvVar(idx, "name", e.target.value)
-                    }
-                    aria-label={`Environment variable ${idx + 1} name`}
-                    className={cn(
-                      "w-[200px] font-mono text-[13px]",
-                      isDup && "border-warning focus-visible:ring-warning",
-                    )}
-                    aria-invalid={isDup || undefined}
-                    title={isDup ? "Duplicate name — only last wins on submit." : undefined}
-                  />
-                  <Input
-                    placeholder="Value"
-                    value={ev.value}
-                    onChange={(e) =>
-                      updateEnvVar(idx, "value", e.target.value)
-                    }
-                    aria-label={`Environment variable ${idx + 1} value`}
-                    className="w-[400px] font-mono text-[13px]"
-                  />
-                  <Button
-                    type="button"
-                    variant="ghost"
-                    size="icon"
-                    title="Remove"
-                    aria-label={`Remove environment variable ${idx + 1}`}
-                    onClick={() => removeEnvVar(idx)}
-                    className="text-destructive hover:bg-destructive/10 hover:text-destructive"
-                  >
-                    <Trash2 />
-                  </Button>
+                <div
+                  key={idx}
+                  className="flex flex-col gap-1"
+                >
+                  <div className="flex flex-wrap items-end gap-2">
+                    <Input
+                      placeholder="Name"
+                      value={ev.name}
+                      onChange={(e) =>
+                        updateEnvVar(idx, "name", e.target.value)
+                      }
+                      aria-label={`Environment variable ${idx + 1} name`}
+                      className={cn(
+                        "w-[200px] font-mono text-[13px]",
+                        isDup && "border-warning focus-visible:ring-warning",
+                        isInvalid &&
+                          "border-destructive focus-visible:ring-destructive",
+                      )}
+                      aria-invalid={isDup || isInvalid || undefined}
+                      aria-describedby={isInvalid ? nameErrorId : undefined}
+                      title={
+                        isInvalid
+                          ? "Invalid POSIX env name."
+                          : isDup
+                            ? "Duplicate name — only last wins on submit."
+                            : undefined
+                      }
+                    />
+                    <Input
+                      placeholder="Value"
+                      value={ev.value}
+                      onChange={(e) =>
+                        updateEnvVar(idx, "value", e.target.value)
+                      }
+                      aria-label={`Environment variable ${idx + 1} value`}
+                      className="w-[400px] font-mono text-[13px]"
+                    />
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      size="icon"
+                      title="Remove"
+                      aria-label={`Remove environment variable ${idx + 1}`}
+                      onClick={() => removeEnvVar(idx)}
+                      className="text-destructive hover:bg-destructive/10 hover:text-destructive"
+                    >
+                      <Trash2 />
+                    </Button>
+                  </div>
+                  {isInvalid && (
+                    <span
+                      id={nameErrorId}
+                      role="alert"
+                      className="text-2xs text-destructive"
+                    >
+                      Invalid POSIX env name. Must start with a letter or
+                      underscore, then contain only letters, digits, and
+                      underscores.
+                    </span>
+                  )}
                 </div>
               );
             })}
@@ -3441,7 +3922,9 @@ const PoolCreationPageInner: React.FC<PoolCreationPageProps> = ({
                       : currentStep === "networking"
                         ? "Subnet ID is invalid."
                         : currentStep === "tasks"
-                          ? "Start task command is required."
+                          ? envHasInvalidNames
+                            ? "Fix the invalid POSIX env-var name(s) to continue."
+                            : "Start task command is required."
                           : "Resolve the highlighted issue to continue."
                   : undefined
             }
@@ -3481,7 +3964,14 @@ const PoolCreationPageInner: React.FC<PoolCreationPageProps> = ({
           <Button
             type="button"
             variant="outline"
-            onClick={() => orchestrator.cancel()}
+            onClick={() => {
+              // Abort the per-submit controller first so the catch-branch
+              // can distinguish operator-cancel from a real error, then
+              // call the orchestrator-wide cancel to mop up any per-agent
+              // work that didn't receive our signal.
+              submitAbortRef.current?.abort();
+              orchestrator.cancel();
+            }}
             aria-label="Stop pool creation"
             className="border-destructive/60 text-destructive hover:bg-destructive/10 hover:text-destructive"
           >

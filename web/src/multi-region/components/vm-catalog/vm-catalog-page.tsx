@@ -61,7 +61,9 @@ import {
   X,
   Zap,
 } from "lucide-react";
-import { useNavigate } from "react-router-dom";
+// COORDINATOR: page now consumes `navigateToPage` from the outlet
+// context (page-router) instead of `useNavigate` directly, so any future
+// path-rewrite happens in one place. `useNavigate` is no longer imported.
 
 import { Button } from "@/components/ui/button";
 import {
@@ -88,8 +90,12 @@ import { cn } from "@/lib/utils";
 
 import { useMultiRegionState } from "../../store/store-context";
 import { useTenantChange } from "../../hooks/use-tenant-change";
+import { usePersistedState } from "../../hooks/use-persisted-state";
+import { useUrlState } from "../../hooks/use-url-state";
 import { getArmTokenForAccount } from "../../auth/msal-auth";
 import { resolveActiveTenantId } from "../../auth/perform-tenant-switch";
+import { auditLog } from "../../services/audit-log";
+import { useDashboardOutletContext } from "../page-router";
 import {
   cachePeek,
   ensureDiskHydrated,
@@ -303,35 +309,40 @@ function getCapString(sku: ComputeVmSku, name: string): string | null {
 }
 
 // ---------------------------------------------------------------------------
-// Local-storage key for pinned SKUs. Scoped per-subscription so a user
-// switching between subs doesn't see stale pins from the previous one.
+// Local-storage keys for browser-persisted state.
+//
+// COORDINATOR: persistence is now driven by `usePersistedState` from
+// `../../hooks/use-persisted-state.ts` rather than the bespoke loadPinned /
+// savePinned helpers that previously lived here. The legacy
+// PINNED_STORAGE_KEY value is retained so existing user pins migrate
+// transparently (the hook will read the legacy bare array via its
+// pre-versioning code path).
 // ---------------------------------------------------------------------------
 
 const PINNED_STORAGE_KEY = "azurebatchmanager.vmcatalog.pinned";
+const COMPARE_STORAGE_KEY = "azurebatchmanager.vmcatalog.compare";
+const SMART_FILTERS_STORAGE_KEY = "azurebatchmanager.vmcatalog.smartFilters";
 
-function loadPinned(): Set<string> {
-  if (typeof window === "undefined") return new Set();
+/**
+ * Decoder for the persisted pinned list. Tolerates the legacy "bare array
+ * of strings" shape that pre-dated the move to `usePersistedState` so users
+ * never lose their favourites on upgrade.
+ */
+function deserializePinned(raw: string): Set<string> | undefined {
   try {
-    const raw = window.localStorage.getItem(PINNED_STORAGE_KEY);
-    if (!raw) return new Set();
-    const arr = JSON.parse(raw) as unknown;
-    if (!Array.isArray(arr)) return new Set();
-    return new Set(arr.filter((x): x is string => typeof x === "string"));
+    const parsed = JSON.parse(raw) as unknown;
+    if (Array.isArray(parsed)) {
+      return new Set(parsed.filter((x): x is string => typeof x === "string"));
+    }
   } catch {
-    return new Set();
+    /* fall through */
   }
+  return undefined;
 }
 
-function savePinned(pinned: Set<string>): void {
-  if (typeof window === "undefined") return;
-  try {
-    window.localStorage.setItem(
-      PINNED_STORAGE_KEY,
-      JSON.stringify(Array.from(pinned)),
-    );
-  } catch {
-    /* localStorage full or blocked — non-fatal */
-  }
+/** Encoder — serialise the Set as a plain array of strings. */
+function serializePinned(pinned: Set<string>): string {
+  return JSON.stringify(Array.from(pinned));
 }
 
 // ---------------------------------------------------------------------------
@@ -733,6 +744,24 @@ interface Filters {
   sort: SortKey;
 }
 
+/**
+ * Filter keys whose mutations mirror to the URL search-params via
+ * `useUrlState`. Chip Sets are intentionally excluded because they don't
+ * serialise cleanly in a flat URL schema. Module-scope so React doesn't
+ * recreate the array each render.
+ */
+const URL_BACKED_FILTER_KEYS: ReadonlySet<string> = new Set([
+  "search",
+  "sort",
+  "vcpuMin",
+  "vcpuMax",
+  "memMin",
+  "memMax",
+  "batchOnly",
+  "includeCpu",
+  "hideUnavailable",
+]);
+
 const DEFAULT_FILTERS: Filters = {
   search: "",
   gpuTypes: new Set(),
@@ -762,6 +791,15 @@ function parseRange(min: string, max: string): { lo: number; hi: number } {
 // ---------------------------------------------------------------------------
 // CSV / JSON export — derived from filteredRows so the exported file
 // mirrors exactly what the user sees on screen.
+//
+// COORDINATOR: there is a shared `ExportMenu` component at
+// `../shared/export-menu.tsx` that handles CSV+JSON download for most list
+// pages. We intentionally roll a local exporter here because the JSON dump
+// embeds the entire `sku.capabilities` map (a dynamic key/value object)
+// alongside derived columns; the shared ExportColumn<T> contract is scalar-
+// per-column and cannot model that nested object faithfully. If the shared
+// helper grows nested-object support, replace the local rowsToCsv /
+// rowsToJson with it (single source of truth for download UX).
 // ---------------------------------------------------------------------------
 
 function csvEscape(v: string | number | null | undefined): string {
@@ -856,6 +894,17 @@ function downloadBlob(filename: string, mime: string, body: string): void {
 
 // ---------------------------------------------------------------------------
 // Chip components
+//
+// COORDINATOR: there is a shared `FilterChipRow` widget at
+// `../shared/filter-chip-row.tsx` consumed by overview / audit-log /
+// security-audit / etc. We deliberately roll a local `Chip` here because
+// the catalog's chip strip is tier-themed (each GPU-type chip carries a
+// `GpuTier` colour scheme tied to the row badges and gradient header).
+// The shared widget exposes only `default | destructive | warning |
+// success | info` tones — not enough for the H100/A100/V100/T4/M60/K80
+// gradient family this page renders. Promoting GpuTier into the shared
+// widget would be the right place to converge, but that's a cross-page
+// refactor not in this task's scope.
 // ---------------------------------------------------------------------------
 
 interface ChipProps {
@@ -1420,25 +1469,79 @@ const VmRowCard: React.FC<VmRowProps> = ({
 
 export const VmCatalogPage: React.FC = () => {
   const state = useMultiRegionState();
-  const navigate = useNavigate();
+  // Path-based navigation via the dashboard outlet — single source of truth
+  // for cross-page routing. `useOutletContext` returns undefined when the
+  // page renders outside the outlet (e.g. storybook / RTL); we fall back to
+  // a silent no-op so test harnesses don't crash on the optional chain.
+  const outletCtx = useDashboardOutletContext() as
+    | { navigateToPage: (path: string) => void }
+    | undefined;
+  const navigateToPage = React.useCallback(
+    (path: string) => {
+      if (outletCtx?.navigateToPage) outletCtx.navigateToPage(path);
+    },
+    [outletCtx],
+  );
   const subs = state.subscriptions ?? [];
   const accounts = state.accounts ?? [];
 
+  // ---- URL-persisted lightweight filter state ----------------------------
+  // Only the high-signal, easily-typed filter values live in the URL so a
+  // shared link reproduces the operator's view without bloating the address
+  // bar with every chip toggle. The chip filters (gpuTypes / categories /
+  // regions / architectures) remain in component state because they form
+  // dynamic Sets that don't serialise cleanly in a flat URL schema.
+  const [urlFilters, setUrlFilters] = useUrlState(
+    {
+      q: "",
+      sort: "gpus",
+      vcpuMin: "",
+      vcpuMax: "",
+      memMin: "",
+      memMax: "",
+      batchOnly: "1",
+      includeCpu: "0",
+      hideUnavailable: "0",
+      sub: "",
+    },
+    { replace: true },
+  );
+
   const [selectedSubId, setSelectedSubId] = React.useState<string>(
-    () => subs[0]?.subscriptionId ?? "",
+    () => urlFilters.sub || subs[0]?.subscriptionId || "",
   );
   React.useEffect(() => {
     if (!selectedSubId && subs.length > 0) {
       setSelectedSubId(subs[0].subscriptionId);
     }
   }, [subs, selectedSubId]);
+  // Mirror selected sub to the URL so deep links round-trip.
+  React.useEffect(() => {
+    if (selectedSubId && urlFilters.sub !== selectedSubId) {
+      setUrlFilters({ sub: selectedSubId });
+    }
+  }, [selectedSubId, urlFilters.sub, setUrlFilters]);
 
   const selectedSub = React.useMemo(
     () => subs.find((s) => s.subscriptionId === selectedSubId),
     [subs, selectedSubId],
   );
 
-  const [filters, setFilters] = React.useState<Filters>(DEFAULT_FILTERS);
+  // Initial Filters seeded from URL — chip filters start empty (not in URL),
+  // text/range/toggle filters hydrate from URL so a shared link lands the
+  // recipient on the same filtered view.
+  const [filters, setFilters] = React.useState<Filters>(() => ({
+    ...DEFAULT_FILTERS,
+    search: urlFilters.q ?? "",
+    sort: (urlFilters.sort as SortKey) || DEFAULT_FILTERS.sort,
+    vcpuMin: urlFilters.vcpuMin ?? "",
+    vcpuMax: urlFilters.vcpuMax ?? "",
+    memMin: urlFilters.memMin ?? "",
+    memMax: urlFilters.memMax ?? "",
+    batchOnly: urlFilters.batchOnly !== "0",
+    includeCpu: urlFilters.includeCpu === "1",
+    hideUnavailable: urlFilters.hideUnavailable === "1",
+  }));
   const [refreshKey, setRefreshKey] = React.useState(0);
   /**
    * Display density. "comfortable" shows full row metadata; "tight" hides
@@ -1448,33 +1551,71 @@ export const VmCatalogPage: React.FC = () => {
    */
   const [density, setDensity] = React.useState<"comfortable" | "tight">("comfortable");
 
-  // Pinned SKUs — persisted across reloads in localStorage. Pinned rows
-  // float to the top of the list and are never hidden by row-cap pagination.
-  const [pinned, setPinned] = React.useState<Set<string>>(() => loadPinned());
-  const togglePin = React.useCallback((skuName: string) => {
-    setPinned((prev) => {
-      const next = new Set(prev);
-      if (next.has(skuName)) next.delete(skuName);
-      else next.add(skuName);
-      savePinned(next);
-      return next;
-    });
-  }, []);
+  // Pinned SKUs — persisted across reloads via the shared `usePersistedState`
+  // hook (single localStorage adapter; see hooks/use-persisted-state.ts).
+  // Pinned rows float to the top of the list and are never hidden by the
+  // row-cap pagination.
+  const [pinned, setPinned] = usePersistedState<Set<string>>(
+    PINNED_STORAGE_KEY,
+    () => new Set<string>(),
+    { serialize: serializePinned, deserialize: deserializePinned },
+  );
+  const togglePin = React.useCallback(
+    (skuName: string) => {
+      setPinned((prev) => {
+        const next = new Set(prev);
+        if (next.has(skuName)) next.delete(skuName);
+        else next.add(skuName);
+        return next;
+      });
+      // Filter mutation (pinning is operator intent against the catalog
+      // view) — recorded as a read-only audit event so the user can trace
+      // their browsing history across sessions.
+      auditLog.record({
+        actor: "self",
+        action: "vm_catalog_toggle_pin",
+        target: `vm:${skuName}`,
+        status: "success",
+      });
+    },
+    [setPinned],
+  );
 
   // SKUs currently in the compare drawer. Capped at COMPARE_MAX so the
-  // side-by-side table stays readable on a normal-width screen.
-  const [compareSet, setCompareSet] = React.useState<Set<string>>(new Set());
+  // side-by-side table stays readable on a normal-width screen. Persisted
+  // so the comparison set survives accidental reloads.
+  const [compareSet, setCompareSet] = usePersistedState<Set<string>>(
+    COMPARE_STORAGE_KEY,
+    () => new Set<string>(),
+    { serialize: serializePinned, deserialize: deserializePinned },
+  );
   const [compareOpen, setCompareOpen] = React.useState(false);
   const [compareDiffOnly, setCompareDiffOnly] = React.useState(false);
-  const toggleCompare = React.useCallback((skuName: string) => {
-    setCompareSet((prev) => {
-      const next = new Set(prev);
-      if (next.has(skuName)) next.delete(skuName);
-      else if (next.size < COMPARE_MAX) next.add(skuName);
-      return next;
-    });
-  }, []);
-  const clearCompare = React.useCallback(() => setCompareSet(new Set()), []);
+  const toggleCompare = React.useCallback(
+    (skuName: string) => {
+      setCompareSet((prev) => {
+        const next = new Set(prev);
+        if (next.has(skuName)) next.delete(skuName);
+        else if (next.size < COMPARE_MAX) next.add(skuName);
+        return next;
+      });
+    },
+    [setCompareSet],
+  );
+  const clearCompare = React.useCallback(
+    () => setCompareSet(new Set()),
+    [setCompareSet],
+  );
+
+  // Smart-filter preference: "best $/cpu in current region" chip.
+  // No live pricing wire today — this is a UI affordance that, when ON,
+  // hoists Burstable + General SKUs (high vCPU-per-dollar families) to the
+  // top of the sort regardless of the user's primary sort key. Persisted
+  // because it's a stable per-user preference.
+  const [smartBestPerCpu, setSmartBestPerCpu] = usePersistedState<boolean>(
+    SMART_FILTERS_STORAGE_KEY,
+    false,
+  );
 
   // Copy-feedback toast — small inline confirmation when the user uses
   // the row-level copy button. Floats up from the bottom-right.
@@ -1776,6 +1917,29 @@ export const VmCatalogPage: React.FC = () => {
         const aPin = pinned.has(a.sku.name) ? 0 : 1;
         const bPin = pinned.has(b.sku.name) ? 0 : 1;
         if (aPin !== bPin) return aPin - bPin;
+
+        // Smart "best $/cpu" affinity — when ON, Burstable + General
+        // families (the most cost-efficient vCPU-per-dollar SKUs) hoist
+        // above the user's primary sort. We don't pull a live price feed
+        // here; the heuristic uses Azure's published family taxonomy as a
+        // proxy. This is intentionally a sort *tie-breaker bias* rather
+        // than a filter so the operator can still see the GPU outliers.
+        if (smartBestPerCpu) {
+          const COST_EFFICIENT: ReadonlySet<WorkloadCategory> = new Set<WorkloadCategory>([
+            "burstable",
+            "general",
+          ]);
+          const aEff = a.category && COST_EFFICIENT.has(a.category) ? 0 : 1;
+          const bEff = b.category && COST_EFFICIENT.has(b.category) ? 0 : 1;
+          if (aEff !== bEff) return aEff - bEff;
+          // Within the cost-efficient bucket, higher vCPUs is preferred
+          // (more bang per VM). Outside it, fall through to the user's
+          // explicit sort key below.
+          if (aEff === 0) {
+            return (b.vCPUs ?? 0) - (a.vCPUs ?? 0);
+          }
+        }
+
         switch (filters.sort) {
           case "gpus":
             return (b.gpuCount ?? 0) - (a.gpuCount ?? 0);
@@ -1790,7 +1954,7 @@ export const VmCatalogPage: React.FC = () => {
             return a.sku.name.localeCompare(b.sku.name);
         }
       });
-  }, [rows, filters, regionsToProbe, catalog.batchSupported, pinned]);
+  }, [rows, filters, regionsToProbe, catalog.batchSupported, pinned, smartBestPerCpu]);
 
   // Roll-up stats — shown in the header pill row so the user gets the
   // shape of the catalog at a glance (and "after filters" deltas).
@@ -1836,23 +2000,64 @@ export const VmCatalogPage: React.FC = () => {
       } catch {
         /* clipboard blocked — non-fatal */
       }
-      navigate(`/pools?vmSize=${encodeURIComponent(vmName)}`);
+      // Audit the cross-page hand-off so the operator's "what did I push to
+      // pool creation" trail is queryable in the audit-log page.
+      auditLog.record({
+        actor: "self",
+        action: "vm_catalog_use_in_pool",
+        target: `vm:${vmName}`,
+        status: "success",
+      });
+      navigateToPage(`/pools?vmSize=${encodeURIComponent(vmName)}`);
     },
-    [navigate],
+    [navigateToPage],
   );
 
   const setFilter = React.useCallback(
-    <K extends keyof Filters>(key: K, value: Filters[K]) =>
-      setFilters((f) => ({ ...f, [key]: value })),
-    [],
+    <K extends keyof Filters>(key: K, value: Filters[K]) => {
+      setFilters((f) => ({ ...f, [key]: value }));
+      // Mirror to URL if this is one of the linkable keys (defined at
+      // module scope so the closure stays referentially stable across
+      // renders — avoids re-creating setFilter on every render).
+      if (URL_BACKED_FILTER_KEYS.has(String(key))) {
+        const k = String(key);
+        const v: string =
+          typeof value === "boolean"
+            ? value
+              ? "1"
+              : "0"
+            : value == null
+              ? ""
+              : String(value);
+        const map: Partial<Record<string, string>> = {};
+        const urlKey = k === "search" ? "q" : k;
+        map[urlKey] = v;
+        setUrlFilters(map);
+      }
+      // Filter mutations are operator intent against a read-only catalog —
+      // record them so the audit log reflects the actual browsing pattern.
+      auditLog.record({
+        actor: "self",
+        action: "vm_catalog_filter",
+        target: `filter:${String(key)}`,
+        status: "success",
+        details: { key: String(key) },
+      });
+    },
+    [setUrlFilters],
   );
 
-  const toggleSetItem = <T,>(set: Set<T>, item: T): Set<T> => {
-    const next = new Set(set);
-    if (next.has(item)) next.delete(item);
-    else next.add(item);
-    return next;
-  };
+  // Stable Set-toggle helper — typed (no `any`) and pure so React can
+  // safely memoize callers that close over it.
+  const toggleSetItem = React.useCallback(
+    <T,>(set: Set<T>, item: T): Set<T> => {
+      const next = new Set(set);
+      if (next.has(item)) next.delete(item);
+      else next.add(item);
+      return next;
+    },
+    [],
+  );
 
   const clearAll = React.useCallback(() => {
     setFilters((f) => ({
@@ -2418,6 +2623,50 @@ export const VmCatalogPage: React.FC = () => {
             placeholder="max"
             onChange={(v) => setFilter("memMax", v)}
           />
+
+          {/* Smart-filter chip — persisted preference; biases the sort
+              toward cost-efficient families without filtering rows out. */}
+          <span className="ml-3 inline-flex items-center gap-1 text-2xs font-semibold uppercase tracking-wider text-muted-foreground">
+            <Sparkles className="h-3 w-3" /> Smart
+          </span>
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <button
+                type="button"
+                onClick={() => {
+                  setSmartBestPerCpu((v) => !v);
+                  auditLog.record({
+                    actor: "self",
+                    action: "vm_catalog_smart_filter",
+                    target: "filter:best_per_cpu",
+                    status: "success",
+                    details: { enabled: !smartBestPerCpu },
+                  });
+                }}
+                aria-pressed={smartBestPerCpu}
+                className={cn(
+                  "rounded-full border px-2.5 py-1 text-xs font-medium transition-all duration-fast",
+                  "hover:-translate-y-px hover:shadow-elev-1 active:translate-y-0",
+                  "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/60",
+                  smartBestPerCpu
+                    ? "border-primary bg-primary/15 text-primary"
+                    : "border-border bg-card text-muted-foreground hover:bg-muted/40",
+                )}
+              >
+                <Sparkles className="mr-1 inline h-3 w-3" />
+                Best $/vCPU
+              </button>
+            </TooltipTrigger>
+            <TooltipContent side="top" className="max-w-xs">
+              <div className="font-medium">Best $/vCPU bias</div>
+              <div className="mt-0.5 text-2xs opacity-80">
+                Hoists Burstable and General-purpose families to the top of
+                the list — these have the highest vCPU-per-dollar ratios in
+                Azure's published catalog. Doesn't filter rows out, so GPU
+                SKUs still appear lower in the list. Persisted across reloads.
+              </div>
+            </TooltipContent>
+          </Tooltip>
         </div>
       </div>
 
@@ -2484,37 +2733,47 @@ export const VmCatalogPage: React.FC = () => {
         )}
       </div>
 
-      <div className="flex flex-col gap-2">
+      <div
+        className="flex flex-col gap-2"
+        role="list"
+        aria-label="VM catalog rows"
+      >
         {filteredRows.slice(0, 200).map((row) => {
+          // Per-row Map build is cheap (regionsToProbe is typically <= 10);
+          // we don't memoize across rows because the catalog.batchSupported
+          // Set identity changes as Batch probes land and we want the row
+          // to re-render at that point anyway. The previous Array.from()
+          // copy is replaced with an in-loop boolean accumulator (saves a
+          // GC churn per row on a 200-row render).
           const supportedRegionMap = new Map<string, boolean>();
+          let anySupported = false;
           for (const r of regionsToProbe) {
             const supported = catalog.batchSupported.has(
               `${row.sku.name.toLowerCase()}::${r}`,
             );
             supportedRegionMap.set(r, supported);
+            if (supported) anySupported = true;
           }
-          const anySupported = Array.from(supportedRegionMap.values()).some(
-            Boolean,
-          );
           const isPinned = pinned.has(row.sku.name);
           const inCompare = compareSet.has(row.sku.name);
           return (
-            <VmRowCard
-              key={row.sku.name}
-              row={row}
-              batchSupportedAnyRegion={anySupported}
-              batchSupportedByRegion={supportedRegionMap}
-              onUseVm={onUseVm}
-              density={density}
-              pinned={isPinned}
-              onTogglePin={() => togglePin(row.sku.name)}
-              inCompare={inCompare}
-              compareDisabled={
-                !inCompare && compareSet.size >= COMPARE_MAX
-              }
-              onToggleCompare={() => toggleCompare(row.sku.name)}
-              onCopyName={() => copyToName(row.sku.name)}
-            />
+            <div role="listitem" key={row.sku.name}>
+              <VmRowCard
+                row={row}
+                batchSupportedAnyRegion={anySupported}
+                batchSupportedByRegion={supportedRegionMap}
+                onUseVm={onUseVm}
+                density={density}
+                pinned={isPinned}
+                onTogglePin={() => togglePin(row.sku.name)}
+                inCompare={inCompare}
+                compareDisabled={
+                  !inCompare && compareSet.size >= COMPARE_MAX
+                }
+                onToggleCompare={() => toggleCompare(row.sku.name)}
+                onCopyName={() => copyToName(row.sku.name)}
+              />
+            </div>
           );
         })}
         {filteredRows.length > 200 && (

@@ -26,10 +26,13 @@ import {
   Activity as ActivityIcon,
   AlertTriangle,
   BarChart3,
+  BellRing,
   Bug,
   CheckCircle2,
+  ChevronRight,
   Clock,
   Filter as FilterIcon,
+  Globe,
   HeartPulse,
   Info as InfoIcon,
   Pause,
@@ -68,8 +71,13 @@ import {
   AgentLogEntry,
   AgentName,
   AgentStatus,
+  ManagedAccount,
 } from "../../store/store-types";
 import { useUrlState } from "../../hooks/use-url-state";
+import { useAbortableEffect } from "../../hooks/use-abortable-effect";
+import { usePersistedState } from "../../hooks/use-persisted-state";
+import { auditLog } from "../../services/audit-log";
+import { useDashboardOutletContext } from "../page-router";
 import { DataTable, type DataTableColumn } from "../shared/enhanced-table";
 import { CopyButton, CopyableText } from "../shared/copy-button";
 import { EmptyState } from "../shared/empty-state";
@@ -79,6 +87,10 @@ import { InfoTooltip } from "../shared/info-tooltip";
 import { PageHeader } from "../shared/page-header";
 import { SkeletonLoader } from "../shared/skeleton-loader";
 import { SummaryStatItem } from "../shared/summary-stat-item";
+import {
+  RegionHealthChart,
+  type RegionHealthRow,
+} from "../shared/region-health-chart";
 import {
   BorderBeam,
   DotPattern,
@@ -201,6 +213,32 @@ const CORRELATION_ID_RE =
 
 /** Bucket-count for sparklines — 24 keeps trends readable without noise. */
 const SPARK_BUCKETS = 24;
+
+/**
+ * Once the last refresh is this old (or older), the page surfaces a "stale
+ * data" warning banner above the summary so the operator knows the view is
+ * no longer live. Five minutes matches the contract §6.4 freshness budget.
+ */
+const STALE_DATA_THRESHOLD_MS = 5 * 60 * 1000;
+
+/**
+ * Persisted alert-threshold defaults. Operators can override these in the
+ * "Alert thresholds" controls; the value is mirrored to localStorage via
+ * `usePersistedState` so it survives reloads and cross-tab sync. When the
+ * filtered error / warning counts cross the threshold the StatCard switches
+ * to `alert` status (pulsing destructive pill) so the eye lands on it.
+ */
+interface AlertThresholds {
+  errors: number;
+  warnings: number;
+  staleSec: number;
+}
+const DEFAULT_ALERT_THRESHOLDS: AlertThresholds = {
+  errors: 1,
+  warnings: 10,
+  staleSec: 300,
+};
+const ALERT_THRESHOLDS_KEY = "monitoring.alertThresholds";
 
 /* ------------------------------------------------------------------ */
 /*  Helpers                                                            */
@@ -330,10 +368,16 @@ const StaleBadge: React.FC<StaleBadgeProps> = ({
   lastRefreshedAt,
   paused,
 }) => {
-  const [now, setNow] = React.useState(Date.now());
-  React.useEffect(() => {
-    const t = setInterval(() => setNow(Date.now()), 1000);
-    return () => clearInterval(t);
+  const [now, setNow] = React.useState(() => Date.now());
+  // Use useAbortableEffect so the wall-clock tick is torn down cleanly even
+  // if the component unmounts mid-tick or a future caller wants to abort the
+  // wall-clock subscription externally (signal-aware cleanup).
+  useAbortableEffect((signal) => {
+    const handle = window.setInterval(() => {
+      if (signal.aborted) return;
+      setNow(Date.now());
+    }, 1000);
+    return () => window.clearInterval(handle);
   }, []);
   const ageSec = Math.max(0, Math.floor((now - lastRefreshedAt) / 1000));
   const tone =
@@ -439,11 +483,23 @@ export interface MonitoringPageProps {
 }
 
 const MonitoringPageInner: React.FC<MonitoringPageProps> = ({
-  orchestrator: _orchestrator,
+  orchestrator,
 }) => {
   const state = useMultiRegionState();
+  // COORDINATOR: we consume `navigateToPage` for the per-region drill-down
+  // (Region Health row → /azure-accounts?region=<r>). The monitoring page is
+  // otherwise a read-only view layer; we intentionally do NOT invoke
+  // `orchestrator.execute(...)` on the refresh tick because (per the task
+  // spec) raw poll events would flood the audit log and the underlying store
+  // is already kept current by the agents that own real-side-effects.
+  // The `orchestrator` prop is still received so the wiring contract stays
+  // explicit at the call-site and we can read its agent id for the audit
+  // trail when the operator mutates a filter or threshold.
+  const { navigateToPage } = useDashboardOutletContext();
+  // `Agent.name` is a required readonly AgentName — typed string, not null.
+  const orchestratorName: string = orchestrator.name;
 
-  // URL-bound state (range, search, levels, agents, statuses, live).
+  // URL-bound state (range, search, levels, agents, statuses, live, region).
   // Per Contract §4.3 every filter survives reload / sharing.
   const [urlState, setUrlState] = useUrlState({
     range: DEFAULT_RANGE as string,
@@ -452,6 +508,7 @@ const MonitoringPageInner: React.FC<MonitoringPageProps> = ({
     levels: "",
     agents: "",
     statuses: "",
+    region: "",
     live: "",
   });
   const range: TimeRange = isValidRange(urlState.range as string)
@@ -474,7 +531,35 @@ const MonitoringPageInner: React.FC<MonitoringPageProps> = ({
       ),
     [urlState.statuses],
   );
+  /**
+   * Per-region multi-select filter (URL-persisted). Region strings are not
+   * a closed enum (Azure mints new regions yearly), so we accept any non-
+   * empty string and rely on the chip row sourced from the live data to
+   * keep the UI tied to currently-present regions.
+   */
+  const selectedRegions = React.useMemo(() => {
+    const raw = (urlState.region as string) ?? "";
+    if (!raw) return [] as string[];
+    const out: string[] = [];
+    const seen = new Set<string>();
+    for (const part of raw.split(",")) {
+      const v = part.trim();
+      if (!v || seen.has(v)) continue;
+      seen.add(v);
+      out.push(v);
+    }
+    return out;
+  }, [urlState.region]);
   const liveTail = (urlState.live as string) === "1";
+
+  // Persisted alert thresholds — `usePersistedState` envelopes the value
+  // and round-trips across reloads / tabs. We expose a typed setter so
+  // mutations remain a single mutation (no partial-shape leaks).
+  const [alertThresholds, setAlertThresholds] = usePersistedState<AlertThresholds>(
+    ALERT_THRESHOLDS_KEY,
+    DEFAULT_ALERT_THRESHOLDS,
+    { version: 1, syncAcrossTabs: true },
+  );
 
   const [autoRefresh, setAutoRefresh] = React.useState(false);
   const [, setTick] = React.useState(0);
@@ -636,13 +721,104 @@ const MonitoringPageInner: React.FC<MonitoringPageProps> = ({
     [selectedStatuses, setUrlState],
   );
 
+  const toggleRegion = React.useCallback(
+    (r: string) => {
+      const next = selectedRegions.includes(r)
+        ? selectedRegions.filter((x) => x !== r)
+        : [...selectedRegions, r];
+      setUrlState({ region: next.join(",") });
+      // Audit only the mutation — region toggles are user intent (worth a
+      // trail), but the per-second wall-clock tick is not.
+      auditLog.record({
+        actor: orchestratorName,
+        action: "monitoring.region_filter_changed",
+        target: `regions:${next.join("+") || "all"}`,
+        status: "success",
+        details: { previous: selectedRegions, next },
+      });
+    },
+    [selectedRegions, setUrlState, orchestratorName],
+  );
+
   const handleClearFilters = React.useCallback(() => {
-    setUrlState({ q: "", levels: "", agents: "", statuses: "" });
-  }, [setUrlState]);
+    setUrlState({ q: "", levels: "", agents: "", statuses: "", region: "" });
+    auditLog.record({
+      actor: orchestratorName,
+      action: "monitoring.filters_cleared",
+      target: "monitoring-page",
+      status: "success",
+    });
+  }, [setUrlState, orchestratorName]);
 
   const toggleLiveTail = React.useCallback(() => {
     setUrlState({ live: liveTail ? "" : "1" });
   }, [liveTail, setUrlState]);
+
+  /**
+   * Drill-down: clicking a region row in the Region Health panel routes to
+   * the Azure Accounts page with the region pre-selected. Path-based nav per
+   * the wiring contract — never call `useNavigate` directly here.
+   */
+  const handleRegionDrillDown = React.useCallback(
+    (region: string) => {
+      navigateToPage(`/azure-accounts?region=${encodeURIComponent(region)}`);
+      auditLog.record({
+        actor: orchestratorName,
+        action: "monitoring.region_drilldown",
+        target: `region:${region}`,
+        status: "success",
+      });
+    },
+    [navigateToPage, orchestratorName],
+  );
+
+  /**
+   * Persist a partial threshold change. Audit-logged because thresholds
+   * directly control which `StatCard` flips to `alert` status — i.e. the
+   * operator's calibration of what counts as "noisy enough to look at".
+   */
+  // Hold the latest committed threshold value in a ref so the audit-log
+  // record (which lives outside the setState updater) doesn't have to
+  // capture the stale render closure. Also lets us avoid double-emit if
+  // the updater re-runs under StrictMode.
+  const alertThresholdsRef = React.useRef(alertThresholds);
+  React.useEffect(() => {
+    alertThresholdsRef.current = alertThresholds;
+  }, [alertThresholds]);
+  const handleThresholdChange = React.useCallback(
+    (patch: Partial<AlertThresholds>) => {
+      const prev = alertThresholdsRef.current;
+      const next: AlertThresholds = { ...prev, ...patch };
+      // Sanitize: clamp to non-negative integers so a typo can't poison
+      // the persisted blob with NaN / negatives that would mute every
+      // alert. Side-effect-free outside the closure.
+      for (const k of Object.keys(next) as (keyof AlertThresholds)[]) {
+        const v = next[k];
+        if (!Number.isFinite(v) || v < 0) next[k] = DEFAULT_ALERT_THRESHOLDS[k];
+      }
+      setAlertThresholds(next);
+      // Audit fires exactly once per user action (the updater isn't doing
+      // it, so StrictMode's double-invoke can't double-emit).
+      auditLog.record({
+        actor: orchestratorName,
+        action: "monitoring.threshold_changed",
+        target: "alert-thresholds",
+        status: "success",
+        details: { previous: prev, next, patch },
+      });
+    },
+    [setAlertThresholds, orchestratorName],
+  );
+
+  const handleResetThresholds = React.useCallback(() => {
+    setAlertThresholds(DEFAULT_ALERT_THRESHOLDS);
+    auditLog.record({
+      actor: orchestratorName,
+      action: "monitoring.thresholds_reset",
+      target: "alert-thresholds",
+      status: "success",
+    });
+  }, [setAlertThresholds, orchestratorName]);
 
   // Time-range filter cutoff (ms epoch). `lastRefreshedAt` is a real dep so
   // the window slides forward on every refresh tick.
@@ -655,10 +831,46 @@ const MonitoringPageInner: React.FC<MonitoringPageProps> = ({
   // last hour" lozenge regardless of which range tab is selected.
   const oneHourAgo = lastRefreshedAt - TIME_RANGE_MS["1h"];
 
-  // ---- Filtered activities (time + status + search) ------------------------
+  // ---- Region health (per-region account counts) --------------------------
+  // Build a stable per-region snapshot of [healthy=created, total=all] for
+  // the RegionHealthChart. `state.accounts` is the source of truth — the
+  // chart re-derives from a memoized projection so we don't re-render on
+  // every store mutation that doesn't touch accounts.
+  const regionHealth = React.useMemo<RegionHealthRow[]>(() => {
+    const all: ManagedAccount[] = state.accounts ?? [];
+    if (all.length === 0) return [];
+    const byRegion = new Map<string, { healthy: number; total: number }>();
+    for (const acc of all) {
+      const r = (acc.region ?? "").trim() || "unknown";
+      const cur = byRegion.get(r) ?? { healthy: 0, total: 0 };
+      cur.total += 1;
+      if (acc.provisioningState === "created") cur.healthy += 1;
+      byRegion.set(r, cur);
+    }
+    const rows: RegionHealthRow[] = [];
+    for (const [name, v] of byRegion.entries()) {
+      rows.push({ name, healthy: v.healthy, total: v.total });
+    }
+    rows.sort((a, b) => a.name.localeCompare(b.name));
+    return rows;
+  }, [state.accounts]);
+
+  /** Set of regions present in current accounts — used to gate region chips. */
+  const knownRegions = React.useMemo(
+    () => regionHealth.map((r) => r.name),
+    [regionHealth],
+  );
+
+  // ---- Filtered activities (time + status + search + region) --------------
+  // Region is matched against the activity `target` string as a case-insensitive
+  // substring — activities embed `region:<name>` / `@ <name>` markers via the
+  // orchestrator's _resolveActivityTarget. This is intentionally loose so the
+  // filter still works for rows whose target format we haven't fully canonicalized.
   const filteredActivities = React.useMemo<Activity[]>(() => {
     const all = state.activities ?? [];
     const result: Activity[] = [];
+    const regionSet = new Set(selectedRegions.map((r) => r.toLowerCase()));
+    const hasRegion = regionSet.size > 0;
     for (const a of all) {
       const ts = parseTimestamp(a.startedAt);
       // Allow rows with unparseable timestamps through the time gate so they
@@ -670,6 +882,17 @@ const MonitoringPageInner: React.FC<MonitoringPageProps> = ({
         !selectedStatuses.includes(a.status)
       ) {
         continue;
+      }
+      if (hasRegion) {
+        const t = a.target.toLowerCase();
+        let matched = false;
+        for (const r of regionSet) {
+          if (t.includes(r)) {
+            matched = true;
+            break;
+          }
+        }
+        if (!matched) continue;
       }
       if (
         !matchesQuery(searchQuery, [
@@ -695,12 +918,14 @@ const MonitoringPageInner: React.FC<MonitoringPageProps> = ({
       if (aBad && bBad) return 0;
       return tb - ta;
     });
-  }, [state.activities, cutoff, selectedStatuses, searchQuery]);
+  }, [state.activities, cutoff, selectedStatuses, searchQuery, selectedRegions]);
 
-  // ---- Filtered logs (time + level + agent + search) -----------------------
+  // ---- Filtered logs (time + level + agent + search + region) -------------
   const filteredLogs = React.useMemo<AgentLogEntry[]>(() => {
     const all = state.agentLogs ?? [];
     const result: AgentLogEntry[] = [];
+    const regionSet = new Set(selectedRegions.map((r) => r.toLowerCase()));
+    const hasRegion = regionSet.size > 0;
     for (const l of all) {
       const ts = parseTimestamp(l.timestamp);
       if (Number.isFinite(ts) && ts < cutoff) continue;
@@ -709,6 +934,24 @@ const MonitoringPageInner: React.FC<MonitoringPageProps> = ({
       }
       if (selectedAgents.length > 0 && !selectedAgents.includes(l.agent)) {
         continue;
+      }
+      if (hasRegion) {
+        // Region appears either inside the message body (agents include
+        // `region=<name>` or `[<name>]` markers) or in the structured
+        // `details` payload. Probe both before dropping the row so the
+        // filter doesn't accidentally swallow legitimate region matches.
+        const blob =
+          (l.message || "").toLowerCase() +
+          " " +
+          (l.details ? safeStringify(l.details, 200).toLowerCase() : "");
+        let matched = false;
+        for (const r of regionSet) {
+          if (blob.includes(r)) {
+            matched = true;
+            break;
+          }
+        }
+        if (!matched) continue;
       }
       if (
         !matchesQuery(searchQuery, [
@@ -738,6 +981,7 @@ const MonitoringPageInner: React.FC<MonitoringPageProps> = ({
     selectedLevels,
     selectedAgents,
     searchQuery,
+    selectedRegions,
   ]);
 
   // Pre-counts (unfiltered, for chip badges so the operator sees totals even
@@ -1317,7 +1561,29 @@ const MonitoringPageInner: React.FC<MonitoringPageProps> = ({
     searchQuery !== "" ||
     selectedLevels.length > 0 ||
     selectedAgents.length > 0 ||
-    selectedStatuses.length > 0;
+    selectedStatuses.length > 0 ||
+    selectedRegions.length > 0;
+
+  // Stale-data signal — true when the operator has been looking at a frozen
+  // snapshot for too long. Tied to a wall-clock tick so it updates without
+  // requiring a refresh / re-render of the whole tree. Uses the persisted
+  // staleSec threshold so each operator can dial in their own freshness
+  // budget. Re-derive on a 5s heartbeat (cheap, no network).
+  const staleThresholdMs = Math.max(
+    10_000,
+    (alertThresholds.staleSec || DEFAULT_ALERT_THRESHOLDS.staleSec) * 1000,
+  );
+  const [staleNow, setStaleNow] = React.useState(() => Date.now());
+  useAbortableEffect((signal) => {
+    const handle = window.setInterval(() => {
+      if (signal.aborted) return;
+      setStaleNow(Date.now());
+    }, 5000);
+    return () => window.clearInterval(handle);
+  }, []);
+  const dataAgeMs = Math.max(0, staleNow - lastRefreshedAt);
+  const isStale = dataAgeMs >= staleThresholdMs;
+  const isVeryStale = dataAgeMs >= STALE_DATA_THRESHOLD_MS;
 
   const activityFilteredOut =
     rangeCounts.actTotal - filteredActivities.length;
@@ -1421,6 +1687,44 @@ const MonitoringPageInner: React.FC<MonitoringPageProps> = ({
         />
       )}
 
+      {/* Stale-data warning — renders only when the last refresh is older
+          than the operator's configured staleSec (or the absolute 5-minute
+          contract budget, whichever is hit first). aria-live="assertive"
+          because crossing 5 min crosses from "you might want to refresh" to
+          "this view is materially out of date". */}
+      {(isStale || isVeryStale) && (
+        <div
+          role="alert"
+          aria-live="assertive"
+          className={cn(
+            "flex flex-wrap items-center justify-between gap-3 rounded-lg border px-4 py-2.5 text-xs",
+            isVeryStale
+              ? "border-destructive/40 bg-destructive/10 text-destructive"
+              : "border-warning/40 bg-warning/10 text-warning",
+          )}
+        >
+          <span className="inline-flex items-center gap-2">
+            <AlertTriangle className="h-4 w-4" aria-hidden />
+            <span className="font-semibold">
+              {isVeryStale ? "Data is more than 5 minutes old" : "Data may be stale"}
+            </span>
+            <span className="text-muted-foreground">
+              · last refreshed {Math.floor(dataAgeMs / 1000)}s ago
+            </span>
+          </span>
+          <Button
+            type="button"
+            variant={isVeryStale ? "default" : "outline"}
+            size="sm"
+            onClick={handleManualRefresh}
+            aria-label="Refresh now to clear stale-data warning"
+          >
+            <RefreshCcw aria-hidden={true} />
+            Refresh now
+          </Button>
+        </div>
+      )}
+
       {/* Metric summary — aria-live on each number announces updates */}
       <section
         className={sectionClass}
@@ -1472,7 +1776,17 @@ const MonitoringPageInner: React.FC<MonitoringPageProps> = ({
               value={summary.errorLogs}
               spark={sparklines.errorLogs}
               tone="destructive"
-              status={summary.errorLogs > 0 ? "alert" : "ok"}
+              // Operator-tunable: a card only flips to `alert` once the
+              // count crosses the persisted threshold. Defaults are 1 for
+              // errors and 10 for warnings — pre-2026 they were hard-coded
+              // to >0, which gave the eye no slack for noisy environments.
+              status={
+                summary.errorLogs >= alertThresholds.errors
+                  ? "alert"
+                  : summary.errorLogs > 0
+                    ? "active"
+                    : "ok"
+              }
               rangeLabel={rangeLabel}
             />
             <StatCard
@@ -1480,7 +1794,13 @@ const MonitoringPageInner: React.FC<MonitoringPageProps> = ({
               value={summary.warnLogs}
               spark={sparklines.warnLogs}
               tone="warning"
-              status={summary.warnLogs > 0 ? "active" : "ok"}
+              status={
+                summary.warnLogs >= alertThresholds.warnings
+                  ? "alert"
+                  : summary.warnLogs > 0
+                    ? "active"
+                    : "ok"
+              }
               rangeLabel={rangeLabel}
             />
             <SummaryStatItem
@@ -1772,6 +2092,14 @@ const MonitoringPageInner: React.FC<MonitoringPageProps> = ({
                   ariaLabel={`Clear ${s} status filter`}
                 />
               ))}
+              {selectedRegions.map((r) => (
+                <ActivePill
+                  key={`rg-${r}`}
+                  label={`region: ${r}`}
+                  onClear={() => toggleRegion(r)}
+                  ariaLabel={`Clear ${r} region filter`}
+                />
+              ))}
               <button
                 type="button"
                 onClick={handleClearFilters}
@@ -1947,6 +2275,136 @@ const MonitoringPageInner: React.FC<MonitoringPageProps> = ({
         )}
       </section>
 
+      {/* Region Health panel — per-region healthy/total bar chart sourced
+          from `state.accounts` (created vs all). Each row is clickable and
+          routes to /azure-accounts?region=<r> for drill-down. The chart
+          component is the canonical RegionHealthChart from shared/ — no
+          inline SVG duplication. */}
+      <section className={sectionClass} aria-label="Region health">
+        <div className="mb-3 flex items-baseline justify-between gap-2">
+          <div className="flex items-center gap-1">
+            <h2 className={cn(sectionHeadingClass, "mb-0")}>
+              <span className="inline-flex items-center gap-1.5">
+                <Globe className="h-4 w-4 text-primary" aria-hidden />
+                Region Health
+              </span>
+            </h2>
+            <InfoTooltip
+              content="Per-region account health — healthy bar = `created` provisioning state, total bar = all accounts in that region. Click a region to drill into the Azure Accounts page filtered to that region."
+              ariaLabel="Region health help"
+            />
+          </div>
+          <div className="flex items-center gap-3 text-2xs text-muted-foreground">
+            <span>{regionHealth.length} regions</span>
+            {selectedRegions.length > 0 && (
+              <span className="inline-flex items-center gap-1 text-primary">
+                <FilterIcon className="h-3 w-3" aria-hidden />
+                {selectedRegions.length} active
+              </span>
+            )}
+          </div>
+        </div>
+        {refreshing ? (
+          <SkeletonLoader variant="list" rows={4} />
+        ) : (
+          <div className="flex flex-col gap-3">
+            <RegionHealthChart regions={regionHealth} />
+            {knownRegions.length > 0 && (
+              <div
+                className="flex flex-wrap items-center gap-1.5 border-t border-border pt-3"
+                role="group"
+                aria-label="Region filter"
+              >
+                <span className="inline-flex items-center gap-1 text-2xs font-semibold uppercase tracking-wider text-muted-foreground">
+                  <FilterIcon className="h-3 w-3" aria-hidden />
+                  Filter / drill-down
+                  <InfoTooltip
+                    size={11}
+                    content="Click a chip to toggle the region filter (applied to activities + logs). Open the arrow to jump to Azure Accounts pre-filtered to that region."
+                    ariaLabel="Region filter help"
+                  />
+                </span>
+                {knownRegions.map((r) => {
+                  const active = selectedRegions.includes(r);
+                  return (
+                    <span key={r} className="inline-flex items-center">
+                      <FilterChip
+                        active={active}
+                        onToggle={() => toggleRegion(r)}
+                        label={r}
+                        ariaLabel={`${active ? "Hide" : "Show"} region ${r}`}
+                      />
+                      <button
+                        type="button"
+                        onClick={() => handleRegionDrillDown(r)}
+                        aria-label={`Drill into Azure Accounts filtered to ${r}`}
+                        className="ml-0.5 inline-flex h-5 w-5 items-center justify-center rounded-sm text-muted-foreground hover:bg-muted/40 hover:text-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+                      >
+                        <ChevronRight className="h-3 w-3" aria-hidden />
+                      </button>
+                    </span>
+                  );
+                })}
+              </div>
+            )}
+          </div>
+        )}
+      </section>
+
+      {/* Alert thresholds — persisted via usePersistedState; controls which
+          StatCard flips to the destructive "alert" pill. Stored under
+          `monitoring.alertThresholds` with cross-tab sync so two tabs of the
+          dashboard agree on what counts as noisy. */}
+      <section className={sectionClass} aria-label="Alert thresholds">
+        <div className="mb-3 flex items-baseline justify-between gap-2">
+          <div className="flex items-center gap-1">
+            <h2 className={cn(sectionHeadingClass, "mb-0")}>
+              <span className="inline-flex items-center gap-1.5">
+                <BellRing className="h-4 w-4 text-warning" aria-hidden />
+                Alert Thresholds
+              </span>
+            </h2>
+            <InfoTooltip
+              content="Tunes when summary cards flip to the destructive 'Attention' pill. Stored locally per browser (synced across tabs) — has no server-side effect."
+              ariaLabel="Alert threshold help"
+            />
+          </div>
+          <Button
+            type="button"
+            variant="ghost"
+            size="sm"
+            onClick={handleResetThresholds}
+            aria-label="Reset alert thresholds to defaults"
+          >
+            Reset to defaults
+          </Button>
+        </div>
+        <div className="grid gap-3 sm:grid-cols-3">
+          <ThresholdField
+            id="thr-errors"
+            label="Errors"
+            description="Errors count to trigger alert"
+            value={alertThresholds.errors}
+            onChange={(v) => handleThresholdChange({ errors: v })}
+          />
+          <ThresholdField
+            id="thr-warnings"
+            label="Warnings"
+            description="Warnings count to trigger alert"
+            value={alertThresholds.warnings}
+            onChange={(v) => handleThresholdChange({ warnings: v })}
+          />
+          <ThresholdField
+            id="thr-stale"
+            label="Stale (seconds)"
+            description="Age before stale banner shows"
+            value={alertThresholds.staleSec}
+            onChange={(v) => handleThresholdChange({ staleSec: v })}
+            min={10}
+          />
+        </div>
+      </section>
+
       {/* Recent Activity */}
       <section
         className={sectionClass}
@@ -2034,6 +2492,85 @@ const MonitoringPageInner: React.FC<MonitoringPageProps> = ({
           />
         )}
       </section>
+    </div>
+  );
+};
+
+/* ------------------------------------------------------------------ */
+/*  ThresholdField — labeled numeric input for alert threshold config   */
+/* ------------------------------------------------------------------ */
+
+interface ThresholdFieldProps {
+  id: string;
+  label: string;
+  description: string;
+  value: number;
+  min?: number;
+  max?: number;
+  onChange: (next: number) => void;
+}
+
+const ThresholdField: React.FC<ThresholdFieldProps> = ({
+  id,
+  label,
+  description,
+  value,
+  min = 0,
+  max = 100000,
+  onChange,
+}) => {
+  // Local string state so partial typing ("12") doesn't immediately commit
+  // (which would also persist the noise to localStorage on every keystroke).
+  // We commit on blur or Enter; intermediate values stay in the input but
+  // not in the persisted blob.
+  const [local, setLocal] = React.useState<string>(() => String(value));
+  React.useEffect(() => {
+    setLocal(String(value));
+  }, [value]);
+  const commit = React.useCallback(() => {
+    const parsed = Number.parseInt(local, 10);
+    if (Number.isFinite(parsed)) {
+      const clamped = Math.max(min, Math.min(max, parsed));
+      if (clamped !== value) onChange(clamped);
+      setLocal(String(clamped));
+    } else {
+      // Reject garbage by snapping back to the committed value.
+      setLocal(String(value));
+    }
+  }, [local, min, max, value, onChange]);
+  return (
+    <div className="flex flex-col gap-1">
+      <Label htmlFor={id} className="text-2xs font-semibold uppercase tracking-wider text-muted-foreground">
+        {label}
+      </Label>
+      <Input
+        id={id}
+        type="number"
+        inputMode="numeric"
+        min={min}
+        max={max}
+        value={local}
+        onChange={(e) => setLocal(e.target.value)}
+        onBlur={commit}
+        onKeyDown={(e) => {
+          if (e.key === "Enter") {
+            e.preventDefault();
+            commit();
+            (e.target as HTMLInputElement).blur();
+          } else if (e.key === "Escape") {
+            setLocal(String(value));
+            (e.target as HTMLInputElement).blur();
+          }
+        }}
+        className="h-8 font-mono text-xs tabular-nums"
+        aria-describedby={`${id}-desc`}
+      />
+      <span
+        id={`${id}-desc`}
+        className="text-2xs text-muted-foreground"
+      >
+        {description}
+      </span>
     </div>
   );
 };

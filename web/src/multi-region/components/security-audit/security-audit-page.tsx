@@ -30,6 +30,7 @@ import * as React from "react";
 import {
   AlertTriangle,
   CheckCircle2,
+  Clock,
   ExternalLink,
   FileText,
   Filter as FilterIcon,
@@ -66,7 +67,9 @@ import { cn } from "@/lib/utils";
 
 import { resolveActiveTenantId } from "../../auth/perform-tenant-switch";
 import { useArmToken } from "../../auth/use-arm-token";
+import { usePersistedState } from "../../hooks/use-persisted-state";
 import { useTenantChange } from "../../hooks/use-tenant-change";
+import { useUrlState } from "../../hooks/use-url-state";
 import { auditLog } from "../../services/audit-log";
 import { useMultiRegionState } from "../../store/store-context";
 
@@ -78,6 +81,14 @@ import { InfoTooltip } from "../shared/info-tooltip";
 import { PageHeader } from "../shared/page-header";
 import { SummaryStatItem } from "../shared/summary-stat-item";
 import { TokenExpiryBadge } from "../shared/token-expiry-badge";
+
+// COORDINATOR: this page intentionally renders findings with the raw
+// `@/components/ui/table` widget rather than `../shared/enhanced-table` —
+// each finding row carries two inline tooltips ("why it matters" /
+// "remediation") plus a CopyButton + Portal link in the actions cell,
+// which is more layout than EnhancedTable's cell renderer cleanly
+// expresses today. If EnhancedTable later grows per-row expand/tooltip
+// slots, this page is a good candidate to migrate.
 
 import {
   compareFindings,
@@ -92,6 +103,7 @@ import {
   ResourceType,
   SEVERITY_BADGE_VARIANT,
   SEVERITY_LABEL,
+  SEVERITY_WEIGHT,
   Severity,
   StorageAccountResource,
   summarizeFindings,
@@ -316,6 +328,10 @@ async function scanSubscription(
 
 const ALL_SEVERITIES: Severity[] = ["critical", "high", "medium", "info"];
 const ALL_RESOURCE_TYPES: ResourceType[] = ["storage", "keyvault"];
+// Findings older than this are considered "stale / unfixed". 30 days
+// is the typical SLA window in MicroBurst / Prowler default policies
+// (NIST 800-53 SI-2 "Flaw Remediation" timing target).
+const STALE_THRESHOLD_MS = 30 * 24 * 60 * 60 * 1000;
 
 function resourceTypeLabel(t: ResourceType): string {
   return t === "storage" ? "Storage Account" : "Key Vault";
@@ -505,7 +521,14 @@ const SecurityAuditPageInner: React.FC = () => {
         }
         let token: string | null = null;
         try {
-          token = await getArmTokenForAccount(acct.homeAccountId);
+          // Pass the SUBSCRIPTION's tenant id (not the account's home
+          // tenant) so multi-tenant guests / Lighthouse-delegated subs
+          // get a token scoped to the right directory. Home-tenant
+          // tokens would 401 on a sub that lives in a guested tenant.
+          token = await getArmTokenForAccount(
+            acct.homeAccountId,
+            sub.tenantId,
+          );
         } catch (err) {
           aggWarnings.push({
             kind: "warning",
@@ -561,6 +584,21 @@ const SecurityAuditPageInner: React.FC = () => {
       setLastScanAt(now);
       setLastScannedScope(targets);
 
+      // Maintain the "first-seen" timestamp map: stamp every brand-new
+      // finding-id with `Date.now()` and prune ids that no longer appear
+      // (the issue was fixed — we shouldn't keep accumulating stale
+      // localStorage entries forever).
+      const nowMs = Date.now();
+      const presentIds = new Set(aggFindings.map((f) => f.id));
+      setFirstSeenAt((prev) => {
+        const next: FirstSeenMap = {};
+        // Keep entries for findings we still see, brand-new ones get `now`.
+        for (const id of presentIds) {
+          next[id] = prev[id] ?? nowMs;
+        }
+        return next;
+      });
+
       // Audit log — success path. One entry per scan, with aggregate
       // counts so the audit-log page shows the scan dimensions
       // without us having to log per-finding spam.
@@ -609,33 +647,141 @@ const SecurityAuditPageInner: React.FC = () => {
     [],
   );
 
-  // ----------------- Filters -----------------
-  const [activeSeverities, setActiveSeverities] = React.useState<Set<Severity>>(
-    () => new Set<Severity>(ALL_SEVERITIES),
+  // ----------------- Filters (URL-synced for deep-linkable views) -----------------
+  // Severity / resource-type filter sets and the search box live in the
+  // URL so an operator can paste a deep-link into Slack and the same
+  // filtered view loads on the other end. `criticalHighOnly` is a
+  // boolean toggle ("1" = on).
+  //
+  // The hook treats the `initial` literal as render-stable (see
+  // `useUrlState` contract) — we hoist a stable record literal up here
+  // so the keys + array typing are unambiguous.
+  const URL_INITIAL = React.useMemo(
+    () => ({
+      sev: ALL_SEVERITIES as readonly string[] as string[],
+      type: ALL_RESOURCE_TYPES as readonly string[] as string[],
+      q: "",
+      crit: "",
+      stale: "",
+    }),
+    [],
   );
-  const [activeResourceTypes, setActiveResourceTypes] = React.useState<
-    Set<ResourceType>
-  >(() => new Set<ResourceType>(ALL_RESOURCE_TYPES));
-  const [searchText, setSearchText] = React.useState("");
-  const [criticalHighOnly, setCriticalHighOnly] = React.useState(false);
+  const [urlState, setUrlState] = useUrlState(URL_INITIAL);
 
-  const toggleSeverity = React.useCallback((s: Severity) => {
-    setActiveSeverities((prev) => {
-      const next = new Set(prev);
+  const activeSeverities = React.useMemo<Set<Severity>>(() => {
+    const raw = urlState.sev;
+    const arr = Array.isArray(raw)
+      ? (raw as string[])
+      : typeof raw === "string" && raw.length > 0
+        ? raw.split(",")
+        : ALL_SEVERITIES;
+    const valid = arr.filter((s): s is Severity =>
+      (ALL_SEVERITIES as readonly string[]).includes(s),
+    );
+    return new Set<Severity>(valid.length > 0 ? valid : ALL_SEVERITIES);
+  }, [urlState.sev]);
+
+  const activeResourceTypes = React.useMemo<Set<ResourceType>>(() => {
+    const raw = urlState.type;
+    const arr = Array.isArray(raw)
+      ? (raw as string[])
+      : typeof raw === "string" && raw.length > 0
+        ? raw.split(",")
+        : ALL_RESOURCE_TYPES;
+    const valid = arr.filter((t): t is ResourceType =>
+      (ALL_RESOURCE_TYPES as readonly string[]).includes(t),
+    );
+    return new Set<ResourceType>(
+      valid.length > 0 ? valid : ALL_RESOURCE_TYPES,
+    );
+  }, [urlState.type]);
+
+  const searchText =
+    typeof urlState.q === "string" ? urlState.q : "";
+  const criticalHighOnly =
+    (typeof urlState.crit === "string" && urlState.crit === "1") ||
+    (Array.isArray(urlState.crit) && urlState.crit[0] === "1");
+  const showStaleOnly =
+    (typeof urlState.stale === "string" && urlState.stale === "1") ||
+    (Array.isArray(urlState.stale) && urlState.stale[0] === "1");
+
+  // Audit-log helper — fires once per *change* (not per render). We only
+  // record human-driven filter mutations so the audit-log page isn't
+  // flooded with the URL-restore round-trip on first mount.
+  const recordFilterChange = React.useCallback(
+    (kind: string, value: unknown) => {
+      auditLog.record({
+        actor: primaryAccount?.username ?? "(unknown)",
+        action: "security_audit_filter",
+        target: kind,
+        status: "success",
+        details: { value },
+      });
+    },
+    [primaryAccount?.username],
+  );
+
+  const toggleSeverity = React.useCallback(
+    (s: Severity) => {
+      const next = new Set(activeSeverities);
       if (next.has(s)) next.delete(s);
       else next.add(s);
-      return next;
-    });
-  }, []);
+      setUrlState({ sev: Array.from(next) });
+      recordFilterChange("severity-toggle", Array.from(next));
+    },
+    [activeSeverities, setUrlState, recordFilterChange],
+  );
 
-  const toggleResourceType = React.useCallback((t: ResourceType) => {
-    setActiveResourceTypes((prev) => {
-      const next = new Set(prev);
+  const toggleResourceType = React.useCallback(
+    (t: ResourceType) => {
+      const next = new Set(activeResourceTypes);
       if (next.has(t)) next.delete(t);
       else next.add(t);
-      return next;
-    });
-  }, []);
+      setUrlState({ type: Array.from(next) });
+      recordFilterChange("resource-type-toggle", Array.from(next));
+    },
+    [activeResourceTypes, setUrlState, recordFilterChange],
+  );
+
+  const setSearchText = React.useCallback(
+    (q: string) => setUrlState({ q }),
+    [setUrlState],
+  );
+  const setCriticalHighOnly = React.useCallback(
+    (v: boolean) => {
+      setUrlState({ crit: v ? "1" : "" });
+      recordFilterChange("critical-high-only", v);
+    },
+    [setUrlState, recordFilterChange],
+  );
+  const setShowStaleOnly = React.useCallback(
+    (v: boolean) => {
+      setUrlState({ stale: v ? "1" : "" });
+      recordFilterChange("stale-only", v);
+    },
+    [setUrlState, recordFilterChange],
+  );
+
+  // ----------------- Finding "first seen" tracking -----------------
+  // Persist when each finding-id was first observed so the "older than
+  // 30 days" filter chip has something to compare against. The map is
+  // pruned to ids currently present in the findings list whenever a
+  // new scan completes (in the scan effect below).
+  type FirstSeenMap = Record<string, number /* ms since epoch */>;
+  const [firstSeenAt, setFirstSeenAt] = usePersistedState<FirstSeenMap>(
+    "security-audit:first-seen-v1",
+    () => ({}),
+    { version: 1 },
+  );
+
+  // Threshold for the "stale" chip — finding-id first observed more
+  // than 30 days ago and still appears in the latest scan.
+  // Re-snapshots whenever a scan completes (so "now - 30d" reflects the
+  // latest scan, not the first render hours ago).
+  const staleThreshold = React.useMemo(
+    () => Date.now() - STALE_THRESHOLD_MS,
+    [lastScanAt],
+  );
 
   // Filtered findings + warnings — warnings always show (they're
   // about scan health, not finding severity).
@@ -648,6 +794,10 @@ const SecurityAuditPageInner: React.FC = () => {
     return findings.filter((f) => {
       if (!sevPredicate(f)) return false;
       if (!activeResourceTypes.has(f.resourceType)) return false;
+      if (showStaleOnly) {
+        const firstSeen = firstSeenAt[f.id];
+        if (firstSeen == null || firstSeen > staleThreshold) return false;
+      }
       if (!q) return true;
       const hay = [
         f.resourceName,
@@ -655,6 +805,7 @@ const SecurityAuditPageInner: React.FC = () => {
         f.region,
         f.subscriptionName,
         f.title,
+        f.ruleId,
       ]
         .join(" ")
         .toLowerCase();
@@ -666,18 +817,14 @@ const SecurityAuditPageInner: React.FC = () => {
     activeResourceTypes,
     searchText,
     criticalHighOnly,
+    showStaleOnly,
+    firstSeenAt,
+    staleThreshold,
   ]);
 
-  // Display rows = filtered findings + warning rows. Warnings ride
-  // along at the top so they aren't buried under hundreds of findings.
-  const displayRows: DisplayRow[] = React.useMemo(() => {
-    const warnRows: DisplayRow[] = scanWarnings;
-    const findRows: DisplayRow[] = filteredFindings.map((f) => ({
-      kind: "finding" as const,
-      ...f,
-    }));
-    return [...warnRows, ...findRows];
-  }, [filteredFindings, scanWarnings]);
+  // (The `displayRows` shape used to be computed twice — once unsorted
+  // and once after sort. The unsorted one was dead code, so it's been
+  // removed. `sortedDisplayRows` below is the only render-bound list.)
 
   // ----------------- Sort -----------------
   type SortColumn = "name" | "type" | "severity" | "rg";
@@ -693,22 +840,29 @@ const SecurityAuditPageInner: React.FC = () => {
         return a.resourceName.localeCompare(b.resourceName) * dir;
       }
       if (sortColumn === "type") {
-        return (
-          (a.resourceType < b.resourceType
-            ? -1
-            : a.resourceType > b.resourceType
-              ? 1
-              : 0) * dir
-        );
+        const t = a.resourceType < b.resourceType
+          ? -1
+          : a.resourceType > b.resourceType
+            ? 1
+            : 0;
+        // Stable secondary by name asc when types tie.
+        return t !== 0 ? t * dir : a.resourceName.localeCompare(b.resourceName);
       }
       if (sortColumn === "rg") {
-        return a.resourceGroup.localeCompare(b.resourceGroup) * dir;
+        const c = a.resourceGroup.localeCompare(b.resourceGroup) * dir;
+        // Stable secondary by name asc when RGs tie.
+        return c !== 0 ? c : a.resourceName.localeCompare(b.resourceName);
       }
-      // severity: default secondary sort by name asc when tied
-      const sevCmp = compareFindings(a, b);
-      // compareFindings is descending by severity already; flip
-      // when the user wants ascending.
-      return sortDir === "desc" ? sevCmp : -sevCmp;
+      // severity:
+      //   - flip primary by direction (desc shows critical-first, asc shows
+      //     none-first);
+      //   - tie-break by name ASC regardless of direction so within-severity
+      //     rows stay alphabetically predictable.
+      const sevDiff =
+        (SEVERITY_WEIGHT[b.severity] - SEVERITY_WEIGHT[a.severity]) *
+        (sortDir === "desc" ? 1 : -1);
+      if (sevDiff !== 0) return sevDiff;
+      return a.resourceName.localeCompare(b.resourceName);
     });
     return findOnly;
   }, [filteredFindings, sortColumn, sortDir]);
@@ -753,23 +907,29 @@ const SecurityAuditPageInner: React.FC = () => {
   // When the operator switches the active tenant in the sidebar, swap
   // the picked subscription scope to the subs owned by that account.
   // Mirrors the canonical pattern from invite-user-page.tsx, adapted
-  // for this page's multi-select scope.
-  useTenantChange(undefined, (detail) => {
-    const candidate = detail.homeAccountId;
-    const ownedSubs = allSubscriptions.filter(
-      (s) => s.homeAccountId === candidate,
-    );
-    if (ownedSubs.length === 0) return;
-    const ownedIds = new Set(ownedSubs.map((s) => s.subscriptionId));
-    // Skip if the current selection is already exactly this account's subs.
-    if (
-      selectedSubIds.size === ownedIds.size &&
-      Array.from(selectedSubIds).every((id) => ownedIds.has(id))
-    ) {
-      return;
-    }
-    setSelectedSubIds(ownedIds);
-  });
+  // for this page's multi-select scope. The hook stashes its callback
+  // in a ref so the listener always sees the latest closure — we still
+  // wrap in useCallback for narrative clarity / future stability.
+  const onTenantChanged = React.useCallback(
+    (detail: { homeAccountId: string }) => {
+      const candidate = detail.homeAccountId;
+      const ownedSubs = allSubscriptions.filter(
+        (s) => s.homeAccountId === candidate,
+      );
+      if (ownedSubs.length === 0) return;
+      const ownedIds = new Set(ownedSubs.map((s) => s.subscriptionId));
+      // Skip if the current selection is already exactly this account's subs.
+      if (
+        selectedSubIds.size === ownedIds.size &&
+        Array.from(selectedSubIds).every((id) => ownedIds.has(id))
+      ) {
+        return;
+      }
+      setSelectedSubIds(ownedIds);
+    },
+    [allSubscriptions, selectedSubIds],
+  );
+  useTenantChange(undefined, onTenantChanged);
 
   // ----------------- Export -----------------
   const exportColumns = React.useMemo(
@@ -804,6 +964,8 @@ const SecurityAuditPageInner: React.FC = () => {
         resourceTypes: Array.from(activeResourceTypes),
         searchText: searchText.trim(),
         criticalHighOnly,
+        showStaleOnly,
+        staleThresholdDays: 30,
       },
       scanned: scanCounts,
       summary,
@@ -815,6 +977,7 @@ const SecurityAuditPageInner: React.FC = () => {
       activeResourceTypes,
       searchText,
       criticalHighOnly,
+      showStaleOnly,
       scanCounts,
       summary,
     ],
@@ -824,6 +987,30 @@ const SecurityAuditPageInner: React.FC = () => {
   const titleId = React.useId();
   const searchId = React.useId();
   const critOnlyId = React.useId();
+  const staleOnlyId = React.useId();
+
+  // Count of findings older than 30 days (for the chip badge) — pulled
+  // from the unfiltered list so the number reflects reality even when
+  // the chip itself is hiding rows.
+  const staleCount = React.useMemo(() => {
+    let n = 0;
+    for (const f of findings) {
+      const t = firstSeenAt[f.id];
+      if (t != null && t <= staleThreshold) n += 1;
+    }
+    return n;
+  }, [findings, firstSeenAt, staleThreshold]);
+
+  const clearFilters = React.useCallback(() => {
+    setUrlState({
+      sev: ALL_SEVERITIES as readonly string[] as string[],
+      type: ALL_RESOURCE_TYPES as readonly string[] as string[],
+      q: "",
+      crit: "",
+      stale: "",
+    });
+    recordFilterChange("clear-filters", null);
+  }, [setUrlState, recordFilterChange]);
 
   return (
     <div
@@ -1097,20 +1284,42 @@ const SecurityAuditPageInner: React.FC = () => {
             Critical + High only
           </Label>
         </div>
+        <span className="h-4 w-px bg-border" aria-hidden />
+        {/* "Stale" chip — findings whose finding-id was first observed
+            more than 30 days ago AND still appears in the most recent
+            scan. Persists across reloads via usePersistedState. */}
+        <div className="flex items-center gap-1.5">
+          <Switch
+            id={staleOnlyId}
+            checked={showStaleOnly}
+            onCheckedChange={(v) => setShowStaleOnly(Boolean(v))}
+            aria-label="Show only findings older than 30 days"
+          />
+          <Label
+            htmlFor={staleOnlyId}
+            className="inline-flex cursor-pointer items-center gap-1 text-2xs"
+            title="Findings first observed more than 30 days ago and still present in the latest scan"
+          >
+            <Clock className="h-3 w-3" aria-hidden />
+            Unfixed &gt; 30 days
+            <span
+              className="tabular-nums text-muted-foreground"
+              aria-label={`${staleCount} stale finding${staleCount === 1 ? "" : "s"}`}
+            >
+              ({staleCount})
+            </span>
+          </Label>
+        </div>
         {(activeSeverities.size < ALL_SEVERITIES.length ||
           activeResourceTypes.size < ALL_RESOURCE_TYPES.length ||
           searchText.trim() ||
-          criticalHighOnly) && (
+          criticalHighOnly ||
+          showStaleOnly) && (
           <Button
             type="button"
             variant="ghost"
             size="sm"
-            onClick={() => {
-              setActiveSeverities(new Set(ALL_SEVERITIES));
-              setActiveResourceTypes(new Set(ALL_RESOURCE_TYPES));
-              setSearchText("");
-              setCriticalHighOnly(false);
-            }}
+            onClick={clearFilters}
             aria-label="Clear filters"
           >
             <X className="h-3 w-3" />

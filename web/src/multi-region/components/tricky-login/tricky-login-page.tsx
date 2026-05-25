@@ -34,16 +34,17 @@
  * nav file (per the spec's hard constraints).
  */
 import * as React from "react";
-import { useNavigate } from "react-router-dom";
 import {
   AlertTriangle,
   Award,
   CheckCircle2,
   ChevronDown,
   ClipboardCopy,
+  Clock,
   Eye,
   EyeOff,
   ExternalLink,
+  FileText,
   Globe,
   Info,
   KeyRound,
@@ -54,6 +55,8 @@ import {
   Shield,
   ShieldCheck,
   Sparkles,
+  Star,
+  Trash2,
   Users,
   Wand2,
   XCircle,
@@ -118,6 +121,9 @@ import {
 } from "../../store/store-context";
 import type { AzureLoginAccount } from "../../store/store-types";
 import type { TenantInfo } from "../../services/types";
+import { useDashboardOutletContext } from "../page-router";
+import { useAbortableEffect } from "../../hooks/use-abortable-effect";
+import { usePersistedState } from "../../hooks/use-persisted-state";
 
 import { CopyButton, CopyableText } from "../shared/copy-button";
 import { EmptyState } from "../shared/empty-state";
@@ -220,7 +226,9 @@ function formatClaimValue(name: string, value: unknown): string {
 export const TrickyLoginPage: React.FC = () => {
   const state = useMultiRegionState();
   const store = useMultiRegionStore();
-  const navigate = useNavigate();
+  // Canonical wiring contract: path-based navigation via the outlet context's
+  // navigateToPage. Avoids importing react-router-dom directly from a page.
+  const { navigateToPage } = useDashboardOutletContext();
 
   /* --- Mount lifecycle: every async path checks this so we don't
    * setState-after-unmount when an operator navigates away mid-mint. */
@@ -341,6 +349,190 @@ export const TrickyLoginPage: React.FC = () => {
    * ---------------------------------------------------------------- */
   const [method, setMethod] = React.useState<TrickyLoginMethod>("auto");
 
+  /* ----------------------------------------------------------------
+   * B.2. Persisted preferences — recently used login methods +
+   * saved tenant shortcuts. HARD: NEVER contain token material.
+   *
+   * Both lists store METADATA ONLY (method + accountHint, tenantId +
+   * label). They survive reload via usePersistedState (localStorage,
+   * envelope-versioned). On every write, an inline filter strips
+   * anything resembling a JWT to make accidental token-leakage a
+   * static impossibility — even if some upstream code path passes
+   * a token-like value.
+   * ---------------------------------------------------------------- */
+  interface RecentLoginMethodEntry {
+    /** The mint method used. */
+    method: TrickyLoginMethod;
+    /** Display hint for the account — UPN or display name. NO oid, NO claims. */
+    accountHint: string;
+    /** Extended audience id. */
+    audience: TrickyAudienceId;
+    /** ISO timestamp of last use. */
+    lastUsedAt: string;
+    /** How many times this method+audience pair has been used. */
+    useCount: number;
+  }
+  interface SavedTenantShortcut {
+    /** Lower-cased GUID. */
+    tenantId: string;
+    /** Operator-friendly label (display name or default domain). */
+    label: string;
+    /** ISO timestamp added. */
+    addedAt: string;
+  }
+
+  const RECENT_METHODS_CAP = 8;
+  const SAVED_TENANTS_CAP = 16;
+  // Compile-time guard against accidental token capture. The shape uses
+  // string keys defined above; this regex screens for JWT-like 3-segment
+  // base64url strings >120 chars (a real AAD token is always >>120).
+  const looksLikeJwt = React.useCallback(
+    (v: unknown): boolean =>
+      typeof v === "string" &&
+      v.length > 120 &&
+      /^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/.test(v),
+    [],
+  );
+
+  const [recentMethods, setRecentMethods] = usePersistedState<
+    RecentLoginMethodEntry[]
+  >("tricky-login:recent-methods:v1", [], {
+    version: 1,
+    deserialize: (raw) => {
+      try {
+        const parsed = JSON.parse(raw);
+        if (!Array.isArray(parsed)) return [];
+        // Defensive filter — drop any row that smuggled in token-like data.
+        return parsed.filter(
+          (r): r is RecentLoginMethodEntry =>
+            !!r &&
+            typeof r === "object" &&
+            typeof r.method === "string" &&
+            typeof r.accountHint === "string" &&
+            !looksLikeJwt(r.accountHint) &&
+            typeof r.audience === "string" &&
+            !looksLikeJwt(r.audience) &&
+            typeof r.lastUsedAt === "string" &&
+            typeof r.useCount === "number",
+        );
+      } catch {
+        return [];
+      }
+    },
+  });
+
+  const [savedTenants, setSavedTenants] = usePersistedState<
+    SavedTenantShortcut[]
+  >("tricky-login:saved-tenants:v1", [], {
+    version: 1,
+    deserialize: (raw) => {
+      try {
+        const parsed = JSON.parse(raw);
+        if (!Array.isArray(parsed)) return [];
+        return parsed.filter(
+          (r): r is SavedTenantShortcut =>
+            !!r &&
+            typeof r === "object" &&
+            typeof r.tenantId === "string" &&
+            !looksLikeJwt(r.tenantId) &&
+            typeof r.label === "string" &&
+            !looksLikeJwt(r.label) &&
+            typeof r.addedAt === "string",
+        );
+      } catch {
+        return [];
+      }
+    },
+  });
+
+  /** Note a (method, audience, accountHint) tuple so it shows up in recents. */
+  const rememberMethod = React.useCallback(
+    (
+      methodUsed: TrickyLoginMethod,
+      audience: TrickyAudienceId,
+      accountHint: string,
+    ) => {
+      // Defense-in-depth: refuse to remember anything that looks like a JWT.
+      if (looksLikeJwt(accountHint) || looksLikeJwt(audience)) return;
+      setRecentMethods((prev) => {
+        const key = `${methodUsed}|${audience}|${accountHint}`;
+        const existing = prev.find(
+          (r) => `${r.method}|${r.audience}|${r.accountHint}` === key,
+        );
+        const next: RecentLoginMethodEntry = existing
+          ? {
+              ...existing,
+              lastUsedAt: new Date().toISOString(),
+              useCount: existing.useCount + 1,
+            }
+          : {
+              method: methodUsed,
+              audience,
+              accountHint,
+              lastUsedAt: new Date().toISOString(),
+              useCount: 1,
+            };
+        const remaining = prev.filter(
+          (r) => `${r.method}|${r.audience}|${r.accountHint}` !== key,
+        );
+        return [next, ...remaining].slice(0, RECENT_METHODS_CAP);
+      });
+    },
+    [looksLikeJwt, setRecentMethods],
+  );
+
+  /** Save the current target tenant to the shortcuts list. */
+  const handleSaveTenantShortcut = React.useCallback(() => {
+    if (!targetTenantId) return;
+    const label = findTenantLabel(tenantChoices, targetTenantId);
+    if (looksLikeJwt(targetTenantId) || looksLikeJwt(label)) return;
+    setSavedTenants((prev) => {
+      const exists = prev.some(
+        (s) => s.tenantId.toLowerCase() === targetTenantId.toLowerCase(),
+      );
+      if (exists) return prev;
+      const next: SavedTenantShortcut = {
+        tenantId: targetTenantId.toLowerCase(),
+        label,
+        addedAt: new Date().toISOString(),
+      };
+      return [next, ...prev].slice(0, SAVED_TENANTS_CAP);
+    });
+    store.addNotification({
+      type: "success",
+      message: `Saved tenant ${label} to shortcuts.`,
+    });
+  }, [
+    targetTenantId,
+    tenantChoices,
+    setSavedTenants,
+    store,
+    looksLikeJwt,
+  ]);
+
+  /** Remove a saved tenant shortcut. */
+  const handleRemoveTenantShortcut = React.useCallback(
+    (tid: string) => {
+      setSavedTenants((prev) =>
+        prev.filter((s) => s.tenantId.toLowerCase() !== tid.toLowerCase()),
+      );
+    },
+    [setSavedTenants],
+  );
+
+  /** Activate a saved tenant shortcut — sets it as the target picker value. */
+  const handleApplyTenantShortcut = React.useCallback(
+    (tid: string) => {
+      setTargetTenantId(tid);
+    },
+    [],
+  );
+
+  /** Clear all recent methods (NOT the history table — that's separate). */
+  const handleClearRecentMethods = React.useCallback(() => {
+    setRecentMethods([]);
+  }, [setRecentMethods]);
+
   // Imported RT lookup for the FOCI path. We expose its originating client
   // label in the discovery row so the operator knows which RT we'd spend.
   const importedRt: ImportedRefreshTokenEntry | null = React.useMemo(() => {
@@ -422,21 +614,14 @@ export const TrickyLoginPage: React.FC = () => {
    * vault but only ONE active-tenant switch at the end. Persisted in
    * sessionStorage so the choice carries across page reloads.
    */
-  const [autoActivateOnSuccess, setAutoActivateOnSuccess] = React.useState<boolean>(() => {
-    if (typeof window === "undefined") return true;
-    const stored = window.sessionStorage.getItem(
-      "tricky-login:auto-activate",
-    );
-    if (stored === null) return true; // default ON
-    return stored === "1";
-  });
-  React.useEffect(() => {
-    if (typeof window === "undefined") return;
-    window.sessionStorage.setItem(
-      "tricky-login:auto-activate",
-      autoActivateOnSuccess ? "1" : "0",
-    );
-  }, [autoActivateOnSuccess]);
+  // usePersistedState pins this preference across reloads. The value is a
+  // boolean flag — NEVER token material — so localStorage persistence is
+  // safe (verified: no code path here writes a token to this key).
+  const [autoActivateOnSuccess, setAutoActivateOnSuccess] = usePersistedState<boolean>(
+    "tricky-login:auto-activate",
+    true,
+    { version: 1 },
+  );
 
   /* ----------------------------------------------------------------
    * E. History (session-scoped, capped at 20)
@@ -498,33 +683,40 @@ export const TrickyLoginPage: React.FC = () => {
   );
   const [realmLoading, setRealmLoading] = React.useState(false);
   const [realmError, setRealmError] = React.useState<string | null>(null);
-  React.useEffect(() => {
-    setRealmProbe(null);
-    setRealmError(null);
-    setRealmLoading(false);
-    if (!sourceAccount || !targetTenantId) return;
-    const upn = sourceAccount.username;
-    if (!upn || !upn.includes("@")) return;
-    const cacheKey = upn.toLowerCase();
-    const cached = realmCacheRef.current.get(cacheKey);
-    if (cached) {
-      setRealmProbe(cached);
-      return;
-    }
-    let cancelled = false;
-    setRealmLoading(true);
-    const url = `https://login.microsoftonline.com/getuserrealm.srf?login=${encodeURIComponent(
-      upn,
-    )}&xml=1`;
-    // Cheap CORS-permissive endpoint. If the browser blocks it (privacy
-    // extension, corp proxy), fall through to a soft error.
-    fetch(url, { method: "GET", credentials: "omit" })
-      .then(async (resp) => {
+  // useAbortableEffect: the realm-discovery fetch gets a signal tied to
+  // the effect's lifetime. Unmount or dep-change aborts the in-flight
+  // request so the response never updates a stale component.
+  useAbortableEffect(
+    async (signal) => {
+      setRealmProbe(null);
+      setRealmError(null);
+      setRealmLoading(false);
+      if (!sourceAccount || !targetTenantId) return;
+      const upn = sourceAccount.username;
+      if (!upn || !upn.includes("@")) return;
+      const cacheKey = upn.toLowerCase();
+      const cached = realmCacheRef.current.get(cacheKey);
+      if (cached) {
+        setRealmProbe(cached);
+        return;
+      }
+      setRealmLoading(true);
+      const url = `https://login.microsoftonline.com/getuserrealm.srf?login=${encodeURIComponent(
+        upn,
+      )}&xml=1`;
+      try {
+        // Cheap CORS-permissive endpoint. Passing the abort signal means
+        // unmount / dep change cancels the fetch (no more orphan promise
+        // landing in setRealmProbe after the page is gone).
+        const resp = await fetch(url, {
+          method: "GET",
+          credentials: "omit",
+          signal,
+        });
+        if (signal.aborted) return;
         if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
-        return resp.text();
-      })
-      .then((xml) => {
-        if (cancelled) return;
+        const xml = await resp.text();
+        if (signal.aborted) return;
         // Tag-extraction via regex — DOMParser would be cleaner but the
         // realm-discovery XML is tiny, well-formed, and we only need a
         // handful of leaf elements. Keeping it regex-based avoids
@@ -547,25 +739,26 @@ export const TrickyLoginPage: React.FC = () => {
           domainName: tag("DomainName"),
         };
         realmCacheRef.current.set(cacheKey, result);
-        if (mountedRef.current) {
-          setRealmProbe(result);
-          setRealmLoading(false);
+        if (signal.aborted || !mountedRef.current) return;
+        setRealmProbe(result);
+        setRealmLoading(false);
+      } catch (err) {
+        // AbortError is the planned outcome of an unmount/dep-change —
+        // swallow it silently.
+        if (
+          (err as { name?: string } | null)?.name === "AbortError" ||
+          signal.aborted
+        ) {
+          return;
         }
-      })
-      .catch((err) => {
-        if (cancelled) return;
-        if (mountedRef.current) {
-          setRealmError(
-            err instanceof Error ? err.message : String(err),
-          );
-          setRealmLoading(false);
-        }
-      });
-    return () => {
-      cancelled = true;
-    };
+        if (!mountedRef.current) return;
+        setRealmError(err instanceof Error ? err.message : String(err));
+        setRealmLoading(false);
+      }
+    },
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [sourceAccount?.username, targetTenantId]);
+    [sourceAccount?.username, targetTenantId],
+  );
 
   /* ----------------------------------------------------------------
    * Token tracker for the page header — driven by the source account.
@@ -933,6 +1126,13 @@ export const TrickyLoginPage: React.FC = () => {
           setMintSubStep(null);
           pushHistory(toHistoryRow(finalResult));
         }
+        // Record the method + audience pair as a recent (NO tokens — only
+        // metadata strings the persisted-state deserializer also screens).
+        rememberMethod(
+          attemptMethod,
+          localAudienceId,
+          sourceAccount.username || sourceAccount.homeAccountId,
+        );
         // Audit: never log token material — only metadata.
         auditLog.record({
           actor: sourceAccount.username || sourceAccount.homeAccountId,
@@ -1003,6 +1203,8 @@ export const TrickyLoginPage: React.FC = () => {
       audienceId,
       customScope,
       tenantChoices,
+      rememberMethod,
+      pushHistory,
     ],
   );
 
@@ -1516,20 +1718,24 @@ export const TrickyLoginPage: React.FC = () => {
   const handleOpenInImporter = React.useCallback(() => {
     if (!result || result.status !== "success" || !result.accessToken) return;
     try {
+      // sessionStorage handoff is the contract the Token Importer page reads
+      // from. Token material exits THIS page only at the moment the operator
+      // explicitly clicks "Open Token Importer" — it never lands in the
+      // audit log or in any persisted state (history rows / preferences).
       if (typeof window !== "undefined") {
         window.sessionStorage.setItem(
           TOKEN_IMPORTER_SESSION_KEY,
           result.accessToken,
         );
       }
-      navigate("/token-importer");
+      navigateToPage("/token-importer");
     } catch (err) {
       store.addNotification({
         type: "error",
         message: `Could not navigate: ${err instanceof Error ? err.message : String(err)}`,
       });
     }
-  }, [result, store, navigate]);
+  }, [result, store, navigateToPage]);
 
   /** Copy the raw token to clipboard, toast on success. */
   const handleCopyToken = React.useCallback(async () => {
@@ -1549,6 +1755,186 @@ export const TrickyLoginPage: React.FC = () => {
     }
   }, [result, store]);
 
+  /**
+   * Build a sanitized auth-diagnostics blob the operator can paste into
+   * support tickets / Slack threads. HARD constraint enforced here: no
+   * access_token, refresh_token, id_token, device_code, or claim values
+   * that could uniquely identify a session. Only structural metadata.
+   *
+   * What IS included:
+   *   - The page version stamp.
+   *   - Source-account presence, count of signed-in accounts.
+   *   - Whether an imported RT exists (presence only).
+   *   - The target tenant id + tenant-label.
+   *   - The chosen method + audience.
+   *   - Last mint outcome (status / method-used / error-code only).
+   *   - Federation realm probe result (status/protocol/STS host).
+   *   - Discovery flags for each method.
+   *   - Recent-methods count + saved-tenant count.
+   *
+   * What is NEVER included:
+   *   - accessToken, refreshToken, claims content.
+   *   - Imported RT raw value.
+   *   - Auto-attempt detail strings (those may contain AAD error_descriptions
+   *     that sometimes carry account hints — we redact to bucket counts).
+   */
+  const handleCopyDiagnostics = React.useCallback(async () => {
+    // Compute a freshly-redacted diagnostics blob each click — no cached
+    // value that could leak after a re-mint.
+    const stsHost = (() => {
+      const u = realmProbe?.stsUrl ?? realmProbe?.authUrl;
+      if (!u) return null;
+      try {
+        return new URL(u).host;
+      } catch {
+        return null;
+      }
+    })();
+    const diag = {
+      app: "tricky-login",
+      capturedAt: new Date().toISOString(),
+      sourceAccount: {
+        signedIn: !!sourceAccount,
+        accountsCount: azureAccounts.length,
+        // upn-domain only — strip local-part to avoid PII leakage.
+        usernameDomain: sourceAccount?.username?.split("@")[1] ?? null,
+        tenantId: sourceAccount?.tenantId ?? null,
+        activeTenantId: activeTenantId ?? null,
+      },
+      target: {
+        tenantId: targetTenantId || null,
+        tenantLabelKnown:
+          !!targetTenantId &&
+          tenantChoices.some(
+            (t) =>
+              (t.tenantId ?? "").toLowerCase() ===
+              targetTenantId.toLowerCase(),
+          ),
+        tenantsListLoaded: tenantChoices.length > 0,
+        tenantsListSize: tenantChoices.length,
+      },
+      method: {
+        chosen: method,
+        importedRtPresent: !!importedRt,
+      },
+      audience: {
+        chosen: audienceId,
+        msalSilentSupported: getAudienceChoice(audienceId).msalSilentSupported,
+      },
+      discovery: {
+        msalSilent: availability.msalSilent.available,
+        fociExchange: availability.fociExchange.available,
+        directTenantRt: availability.directTenantRt.available,
+      },
+      lastResult: result
+        ? {
+            status: result.status,
+            methodUsed: result.methodUsed,
+            extendedAudience: result.extendedAudience ?? null,
+            durationMs: result.durationMs,
+            errorCode: result.errorCode ?? null,
+            // Boolean only — never the value.
+            hadRefreshToken: !!result.refreshToken,
+            tidMatch:
+              !!result.claims?.tid &&
+              typeof result.claims.tid === "string" &&
+              (result.claims.tid as string).toLowerCase() ===
+                result.targetTenantId.toLowerCase(),
+          }
+        : null,
+      autoAttempts: {
+        total: autoAttempts.length,
+        successes: autoAttempts.filter((a) => a.status === "success").length,
+        failures: autoAttempts.filter((a) => a.status === "failure").length,
+      },
+      federation: {
+        probed: !!realmProbe,
+        status: realmProbe?.status ?? null,
+        protocol: realmProbe?.federationProtocol ?? null,
+        stsHost,
+        probeError: !!realmError,
+      },
+      session: {
+        historyRows: history.length,
+        successes: history.filter((h) => h.status === "success").length,
+        failures: history.filter((h) => h.status === "failure").length,
+        recentMethodsTracked: recentMethods.length,
+        savedTenantShortcuts: savedTenants.length,
+        batchRowsLastRun: batchMintResults.length,
+      },
+    };
+    const blob = JSON.stringify(diag, null, 2);
+    try {
+      await navigator.clipboard.writeText(blob);
+      store.addNotification({
+        type: "success",
+        message: "Sanitized auth diagnostics copied (no token material).",
+      });
+      auditLog.record({
+        actor:
+          sourceAccount?.username ??
+          sourceAccount?.homeAccountId ??
+          "(no source account)",
+        action: "tricky_login_copy_diagnostics",
+        target: "tricky-login page",
+        status: "success",
+        details: {
+          targetTenantId: targetTenantId || null,
+          method,
+          audience: audienceId,
+          historyRows: history.length,
+        },
+      });
+    } catch {
+      store.addNotification({
+        type: "warning",
+        message:
+          "Clipboard unavailable — see browser devtools for a fallback log.",
+      });
+      // Last-resort fallback so the support flow doesn't dead-end.
+      try {
+        // eslint-disable-next-line no-console
+        console.info("[tricky-login diagnostics]", diag);
+      } catch {
+        /* no-op */
+      }
+    }
+  }, [
+    realmProbe,
+    realmError,
+    sourceAccount,
+    azureAccounts.length,
+    activeTenantId,
+    targetTenantId,
+    tenantChoices,
+    method,
+    importedRt,
+    audienceId,
+    availability,
+    result,
+    autoAttempts,
+    history,
+    recentMethods.length,
+    savedTenants.length,
+    batchMintResults.length,
+    store,
+  ]);
+
+  // Tracker for the deferred replay timer so unmount tears it down. The
+  // setState calls above schedule a re-render and we need to defer the
+  // mint until those state writes have committed; raw setTimeout without
+  // cleanup would fire after the page unmounted and trigger a stale mint.
+  const replayTimerRef = React.useRef<number | null>(null);
+  React.useEffect(
+    () => () => {
+      if (replayTimerRef.current !== null) {
+        window.clearTimeout(replayTimerRef.current);
+        replayTimerRef.current = null;
+      }
+    },
+    [],
+  );
+
   /** Replay a history row (re-runs the same source/target/method/audience). */
   const handleReplay = React.useCallback(
     (row: TrickyLoginHistoryRow) => {
@@ -1560,6 +1946,22 @@ export const TrickyLoginPage: React.FC = () => {
         store.addNotification({
           type: "error",
           message: `Cannot replay — source account ${row.sourceAccountLabel} is no longer signed in.`,
+        });
+        // Record the abandoned replay so the audit log shows the operator
+        // tried (failed-precondition variant — no token material involved).
+        auditLog.record({
+          actor: row.sourceAccountLabel,
+          action: "tricky_login_replay",
+          target: `${row.targetTenantLabel} (${row.targetTenantId})`,
+          status: "failure",
+          error: "source account no longer signed in",
+          details: {
+            sourceAccountId: row.sourceAccountId,
+            targetTenantId: row.targetTenantId,
+            method: row.methodUsed,
+            audience: row.audience,
+            extendedAudience: row.extendedAudience ?? null,
+          },
         });
         return;
       }
@@ -1580,8 +1982,17 @@ export const TrickyLoginPage: React.FC = () => {
         setAudienceId(extAud);
       }
       setMethod(row.methodUsed);
-      // Defer the mint by a tick so the state writes commit first.
-      window.setTimeout(() => void doMint(row.methodUsed, true), 50);
+      // Cancel any in-flight deferred replay before scheduling a new one.
+      if (replayTimerRef.current !== null) {
+        window.clearTimeout(replayTimerRef.current);
+      }
+      // Defer the mint by a tick so the state writes commit first. The
+      // timer id is stored so an unmount cancels the pending call (no
+      // stale doMint on an unmounted page).
+      replayTimerRef.current = window.setTimeout(() => {
+        replayTimerRef.current = null;
+        void doMint(row.methodUsed, true);
+      }, 50);
     },
     [azureAccounts, doMint, store],
   );
@@ -1670,7 +2081,13 @@ export const TrickyLoginPage: React.FC = () => {
 
       {!noAccounts && (
         <>
-          {/* ─── Summary stat row ─────────────────────────────────── */}
+          {/* ─── Summary stat row ───────────────────────────────────
+              KPI tiles + a "current auth context" pill showing which
+              flow is active (which source account + active tenant +
+              imported-RT presence). The latter is meant as a glance-
+              friendly answer to "what identity will this page actually
+              use?" — a question operators ask first when they hit a
+              page with this much auth surface. */}
           <div
             className="flex flex-wrap gap-2"
             role="group"
@@ -1698,6 +2115,53 @@ export const TrickyLoginPage: React.FC = () => {
               tone={summary.crossTenantGuests > 0 ? "warning" : undefined}
               hint="distinct target tids"
             />
+            {/*
+              "Current auth context" KPI tile. Renders a compact
+              one-line digest of the identity the page will mint FROM
+              if the operator clicks Mint right now: source-account
+              UPN + active tenant + imported-RT presence + chosen
+              method. Token material is NEVER included — only the
+              shape of the auth context.
+            */}
+            <div
+              className="flex min-w-[18rem] flex-col gap-1 rounded-md border bg-card/40 px-3 py-2"
+              role="group"
+              aria-label="Current auth context"
+            >
+              <div className="flex items-center gap-1.5 text-2xs uppercase tracking-wider text-muted-foreground">
+                <Shield className="h-3 w-3" aria-hidden />
+                Current auth context
+              </div>
+              <div className="flex flex-wrap items-center gap-1.5 text-xs">
+                {sourceAccount ? (
+                  <Badge variant="outline" className="gap-1 font-mono text-2xs">
+                    <Users className="h-3 w-3" aria-hidden />
+                    {sourceAccount.username || sourceAccount.homeAccountId}
+                  </Badge>
+                ) : (
+                  <Badge variant="outline">no source</Badge>
+                )}
+                <Badge variant="outline" className="gap-1 text-2xs">
+                  <Globe className="h-3 w-3" aria-hidden />
+                  {findTenantLabel(tenantChoices, activeTenantId)}
+                </Badge>
+                <Badge
+                  variant={importedRt ? "info" : "outline"}
+                  className="gap-1 text-2xs"
+                  title={
+                    importedRt
+                      ? "An imported refresh token is available for FOCI exchange."
+                      : "No imported RT — FOCI exchange method unavailable."
+                  }
+                >
+                  <KeyRound className="h-3 w-3" aria-hidden />
+                  RT {importedRt ? "ready" : "none"}
+                </Badge>
+                <Badge variant="outline" className="text-2xs">
+                  Method: {methodShortLabel(method)}
+                </Badge>
+              </div>
+            </div>
           </div>
 
           {/* ─── Top-level flow selector ──────────────────────────
@@ -1841,6 +2305,91 @@ export const TrickyLoginPage: React.FC = () => {
                     This is the source account's active tenant — no mint would be performed.
                   </p>
                 )}
+
+                {/* Saved tenant shortcuts — METADATA ONLY (tenantId +
+                    label). Stored in localStorage via usePersistedState,
+                    schema v1, deserializer screens for JWT-shaped values
+                    so a corrupt store can't smuggle tokens into the UI.
+                    Clicking a chip re-applies the tenant id to the
+                    picker; the × removes the chip. */}
+                <div
+                  className="flex flex-wrap items-center gap-1.5 pt-1"
+                  role="group"
+                  aria-label="Saved tenant shortcuts"
+                >
+                  <span className="text-2xs uppercase tracking-wider text-muted-foreground">
+                    Shortcuts
+                  </span>
+                  {savedTenants.length === 0 ? (
+                    <span className="text-2xs italic text-muted-foreground">
+                      none yet
+                    </span>
+                  ) : (
+                    savedTenants.map((s) => {
+                      const isCurrent =
+                        targetTenantId &&
+                        targetTenantId.toLowerCase() ===
+                          s.tenantId.toLowerCase();
+                      return (
+                        <span
+                          key={s.tenantId}
+                          className={cn(
+                            "inline-flex items-center gap-1 rounded-full border px-2 py-0.5 text-2xs",
+                            isCurrent
+                              ? "border-primary/60 bg-primary/10"
+                              : "border-border bg-card/30",
+                          )}
+                        >
+                          <button
+                            type="button"
+                            onClick={() =>
+                              handleApplyTenantShortcut(s.tenantId)
+                            }
+                            className="inline-flex items-center gap-1 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+                            title={`Apply tenant shortcut: ${s.label} (${s.tenantId})`}
+                            aria-label={`Apply tenant shortcut ${s.label}`}
+                          >
+                            <Star
+                              className="h-3 w-3 text-warning"
+                              aria-hidden
+                            />
+                            {s.label}
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() =>
+                              handleRemoveTenantShortcut(s.tenantId)
+                            }
+                            className="-mr-1 inline-flex h-4 w-4 items-center justify-center rounded text-muted-foreground hover:text-destructive focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+                            aria-label={`Remove tenant shortcut ${s.label}`}
+                            title="Remove shortcut"
+                          >
+                            <XCircle className="h-3 w-3" aria-hidden />
+                          </button>
+                        </span>
+                      );
+                    })
+                  )}
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    onClick={handleSaveTenantShortcut}
+                    disabled={
+                      !targetTenantId ||
+                      savedTenants.some(
+                        (s) =>
+                          s.tenantId.toLowerCase() ===
+                          targetTenantId.toLowerCase(),
+                      )
+                    }
+                    className="h-6 gap-1 px-2 text-2xs"
+                    title="Pin the current target tenant to the shortcuts list (metadata only — no token material persists)."
+                    aria-label="Pin current tenant to shortcuts"
+                  >
+                    <Star className="h-3 w-3" aria-hidden />
+                    Pin current
+                  </Button>
+                </div>
               </div>
             </CardContent>
           </Card>
@@ -1898,7 +2447,11 @@ export const TrickyLoginPage: React.FC = () => {
                 <Label className="text-xs uppercase tracking-wider text-muted-foreground">
                   Method
                 </Label>
-                <div className="flex flex-wrap gap-2">
+                <div
+                  className="flex flex-wrap gap-2"
+                  role="radiogroup"
+                  aria-label="Mint method"
+                >
                   {(
                     [
                       {
@@ -1934,7 +2487,9 @@ export const TrickyLoginPage: React.FC = () => {
                             ? "border-primary/60 bg-primary/10 text-foreground"
                             : "border-border text-muted-foreground hover:bg-muted/40 hover:text-foreground",
                         )}
-                        aria-pressed={selected}
+                        role="radio"
+                        aria-checked={selected}
+                        aria-label={`${m.label}: ${m.hint}`}
                       >
                         <Icon className="h-3.5 w-3.5" aria-hidden />
                         <span>{m.label}</span>
@@ -1945,6 +2500,86 @@ export const TrickyLoginPage: React.FC = () => {
                       </button>
                     );
                   })}
+                </div>
+              </div>
+
+              {/* Recently-used login methods. Persisted across reloads
+                  via usePersistedState (localStorage envelope-versioned).
+                  Each entry stores ONLY: method id, audience id, account
+                  hint (UPN string), last-used timestamp, use count. NO
+                  token material — the deserializer screens JWT-shaped
+                  strings on read, and rememberMethod refuses to record
+                  anything that looks like a JWT. Click a chip to apply
+                  the (method, audience) pair to the pickers; the operator
+                  still picks the target tenant separately. */}
+              <div
+                className="flex flex-col gap-1 pt-1"
+                role="group"
+                aria-label="Recently used login methods"
+              >
+                <div className="flex items-center gap-2">
+                  <Label className="text-xs uppercase tracking-wider text-muted-foreground">
+                    Recently used
+                  </Label>
+                  <InfoTooltip content="Method + audience pairs you used recently. Stored as metadata only (no tokens, no claims). Click to re-apply; the X clears the entire list." />
+                  {recentMethods.length > 0 && (
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      onClick={handleClearRecentMethods}
+                      className="ml-auto h-6 gap-1 px-2 text-2xs"
+                      title="Clear the recent-methods list (does not affect history)."
+                      aria-label="Clear recent methods"
+                    >
+                      <Trash2 className="h-3 w-3" aria-hidden />
+                      Clear
+                    </Button>
+                  )}
+                </div>
+                <div className="flex flex-wrap gap-1.5">
+                  {recentMethods.length === 0 ? (
+                    <span className="text-2xs italic text-muted-foreground">
+                      none yet — successful mints appear here
+                    </span>
+                  ) : (
+                    recentMethods.map((r) => {
+                      const isCurrentPair =
+                        method === r.method && audienceId === r.audience;
+                      return (
+                        <button
+                          key={`${r.method}|${r.audience}|${r.accountHint}`}
+                          type="button"
+                          onClick={() => {
+                            setMethod(r.method);
+                            setAudienceId(r.audience);
+                            if (r.audience !== "custom") {
+                              setCustomScope(getAudienceChoice(r.audience).scope);
+                            }
+                          }}
+                          className={cn(
+                            "inline-flex items-center gap-1 rounded-full border px-2 py-0.5 text-2xs transition-colors duration-150 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring",
+                            isCurrentPair
+                              ? "border-primary/60 bg-primary/10"
+                              : "border-border bg-card/30 hover:bg-muted/40",
+                          )}
+                          aria-label={`Apply method ${methodShortLabel(r.method)} with audience ${r.audience.toUpperCase()} (used ${r.useCount}× by ${r.accountHint})`}
+                          title={`Last used ${r.lastUsedAt} by ${r.accountHint}; click to re-apply method + audience`}
+                        >
+                          <Clock className="h-3 w-3" aria-hidden />
+                          <span className="font-mono">
+                            {methodShortLabel(r.method)}
+                          </span>
+                          <span className="text-muted-foreground">·</span>
+                          <span className="font-mono uppercase">
+                            {r.audience}
+                          </span>
+                          <span className="text-3xs text-muted-foreground">
+                            ×{r.useCount}
+                          </span>
+                        </button>
+                      );
+                    })
+                  )}
                 </div>
               </div>
             </CardContent>
@@ -2102,6 +2737,22 @@ export const TrickyLoginPage: React.FC = () => {
                 >
                   <Sparkles className="h-4 w-4" aria-hidden />
                   Batch mint 12 audiences
+                </Button>
+                {/* Copy a sanitized auth-diagnostics blob — useful for
+                    support tickets / screen-share triage. The handler
+                    builds a fresh redacted JSON on every click (no
+                    cached version that could leak after a re-mint) and
+                    excludes accessToken, refreshToken, raw claims, and
+                    AAD error_description strings. */}
+                <Button
+                  variant="ghost"
+                  onClick={() => void handleCopyDiagnostics()}
+                  className="gap-2"
+                  title="Copy a sanitized auth-diagnostics blob (no token material, no claims) to the clipboard."
+                  aria-label="Copy sanitized auth diagnostics"
+                >
+                  <FileText className="h-4 w-4" aria-hidden />
+                  Copy auth diagnostics
                 </Button>
                 {mintSubStep && (
                   <span className="flex items-center gap-1.5 text-2xs text-muted-foreground">

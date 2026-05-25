@@ -74,6 +74,11 @@ import { InfoTooltip } from "../shared/info-tooltip";
 import { PageHeader } from "../shared/page-header";
 import { SummaryStatItem } from "../shared/summary-stat-item";
 
+import { auditLog } from "../../services/audit-log";
+import { useUrlState } from "../../hooks/use-url-state";
+import { usePersistedState } from "../../hooks/use-persisted-state";
+import { useAbortableEffect } from "../../hooks/use-abortable-effect";
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -213,6 +218,27 @@ const SORT_OPTIONS: Array<{ value: SortKey; label: string }> = [
   { value: "refill-desc", label: "Refill rate (fastest first)" },
   { value: "sub-asc", label: "Subscription (A → Z)" },
 ];
+
+const VALID_STATE_FILTERS: ReadonlySet<StateFilter> = new Set<StateFilter>([
+  "all",
+  "closed",
+  "half_open",
+  "open",
+]);
+const VALID_FAMILY_FILTERS: ReadonlySet<FamilyFilter> = new Set<FamilyFilter>([
+  "all",
+  "arm",
+  "graph",
+  "batch",
+  "other",
+]);
+const VALID_SORT_KEYS: ReadonlySet<SortKey> = new Set<SortKey>([
+  "smart",
+  "refill-asc",
+  "refill-desc",
+  "recent-desc",
+  "sub-asc",
+]);
 
 // ---------------------------------------------------------------------------
 // Card: per-(sub, family) state
@@ -568,29 +594,104 @@ export const ThrottlePage: React.FC = () => {
 
   // Tick every second so countdowns and "X seconds ago" stay current
   // even when no observe() events are firing. Pausable so an operator
-  // reading mid-incident isn't fighting flashing numbers.
+  // reading mid-incident isn't fighting flashing numbers. The "polling"
+  // loop is wired through useAbortableEffect so unmounting (or pausing)
+  // tears the timer down deterministically.
   const [paused, setPaused] = React.useState(false);
   const [nowTick, setNowTick] = React.useState(0);
-  React.useEffect(() => {
-    if (paused) return;
-    const t = window.setInterval(() => setNowTick((n) => n + 1), 1_000);
-    return () => window.clearInterval(t);
-  }, [paused]);
+  useAbortableEffect(
+    (signal) => {
+      if (paused) return;
+      const t = window.setInterval(() => {
+        if (signal.aborted) return;
+        setNowTick((n) => n + 1);
+      }, 1_000);
+      return () => window.clearInterval(t);
+    },
+    [paused],
+  );
 
-  // --- Filter / sort UI state -----------------------------------------------
-  const [searchText, setSearchText] = React.useState("");
-  const [stateFilter, setStateFilter] = React.useState<StateFilter>("all");
-  const [familyFilter, setFamilyFilter] = React.useState<FamilyFilter>("all");
-  const [sortKey, setSortKey] = React.useState<SortKey>("smart");
+  // --- Filter / sort UI state — URL-synced so deep-links survive reload ----
+  // Default schema is render-stable per useUrlState contract.
+  const [urlFilters, setUrlFilters] = useUrlState<{
+    q: string;
+    state: string;
+    family: string;
+    sort: string;
+  }>(
+    {
+      q: "",
+      state: "all",
+      family: "all",
+      sort: "smart",
+    },
+    { replace: true },
+  );
+  // Validate URL-derived values against the closed enum sets — a hand-edited
+  // URL with `?state=garbage` would otherwise leak through and break the
+  // filter comparator. Falls back to the default on any mismatch.
+  const searchText = urlFilters.q;
+  const stateFilter: StateFilter = VALID_STATE_FILTERS.has(
+    urlFilters.state as StateFilter,
+  )
+    ? (urlFilters.state as StateFilter)
+    : "all";
+  const familyFilter: FamilyFilter = VALID_FAMILY_FILTERS.has(
+    urlFilters.family as FamilyFilter,
+  )
+    ? (urlFilters.family as FamilyFilter)
+    : "all";
+  const sortKey: SortKey = VALID_SORT_KEYS.has(urlFilters.sort as SortKey)
+    ? (urlFilters.sort as SortKey)
+    : "smart";
+
+  const setSearchText = React.useCallback(
+    (next: string) => setUrlFilters({ q: next }),
+    [setUrlFilters],
+  );
+  const setStateFilter = React.useCallback(
+    (next: StateFilter) => setUrlFilters({ state: next }),
+    [setUrlFilters],
+  );
+  const setFamilyFilter = React.useCallback(
+    (next: FamilyFilter) => setUrlFilters({ family: next }),
+    [setUrlFilters],
+  );
+  const setSortKey = React.useCallback(
+    (next: SortKey) => setUrlFilters({ sort: next }),
+    [setUrlFilters],
+  );
+
+  // Persisted threshold for the capacity-warning banner. Operator chooses
+  // a percentage of baseline refill — when the average drops below it, the
+  // page surfaces a warning chip. Stored cross-tab so paired operators see
+  // the same alert thresholds.
+  const [warnAtPct, setWarnAtPct] = usePersistedState<number>(
+    "throttle.warnAtPct",
+    80,
+    { version: 1, syncAcrossTabs: true },
+  );
+
   const [resetAllOpen, setResetAllOpen] = React.useState(false);
   const [clearHistoryOpen, setClearHistoryOpen] = React.useState(false);
 
   // Per-row Reset handler — drops the entry from the throttle store so the
   // card disappears. The next observe() from the live guard will repopulate
   // it. Stable callback so the per-card React.memo doesn't churn.
+  //
+  // Throttle policy mutations affect ARM call rate *globally* (every page
+  // shares the same RequestGuard), so they are audited per Project rule
+  // "auditLog.record on throttle policy mutations".
   const handleResetCircuit = React.useCallback(
     (subscriptionId: string, family: EndpointFamily) => {
       store.resetThrottleCircuit(subscriptionId, family);
+      auditLog.record({
+        actor: "operator",
+        action: "throttle.reset_circuit",
+        target: `circuit:${subscriptionId}::${family}`,
+        details: { subscriptionId, family },
+        status: "success",
+      });
     },
     [store],
   );
@@ -719,6 +820,68 @@ export const ThrottlePage: React.FC = () => {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [stats.history, Math.floor(nowTick / 60)]);
 
+  // KPI tiles — derived stats surfaced via SummaryStatItem. All memoized so
+  // they only recompute when the underlying entries (or the once-per-minute
+  // wall-clock bucket) change.
+  const kpiStats = React.useMemo(() => {
+    const baseline = ASSUMED_BASELINE_REFILL_PER_SEC;
+    let sumPct = 0;
+    let slowestPct = 100;
+    let slowestKey: string | undefined;
+    for (const e of allEntries) {
+      const pct = Math.min(
+        100,
+        Math.round((e.entry.refillPerSec / baseline) * 100),
+      );
+      sumPct += pct;
+      if (pct < slowestPct) {
+        slowestPct = pct;
+        slowestKey = `${e.subscriptionId}::${e.family}`;
+      }
+    }
+    const avgPct =
+      allEntries.length > 0 ? Math.round(sumPct / allEntries.length) : 100;
+    return {
+      avgPct,
+      slowestPct: allEntries.length > 0 ? slowestPct : 100,
+      slowestKey,
+    };
+  }, [allEntries]);
+
+  // Transitions in the last minute — proxy for current 429 churn rate.
+  const transitionsLastMin = React.useMemo(() => {
+    const cutoff = Date.now() - 60_000;
+    let count = 0;
+    for (const t of stats.history) {
+      const ts = new Date(t.timestamp).getTime();
+      if (!Number.isNaN(ts) && ts >= cutoff) count++;
+    }
+    return count;
+    // re-eval every 5s as the 60-second window slides. nowTick fires every
+    // second, so divide by 5 to throttle the recompute.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [stats.history, Math.floor(nowTick / 5)]);
+
+  // Live-tail of the last 50 transitions, newest first — feeds the live-tail
+  // section. Kept separate from `filteredHistory` so it ignores filters and
+  // always shows the operator the very latest events. The store already
+  // caps history at 50, so this is just a reversed copy.
+  const liveTail = React.useMemo(() => {
+    const arr = stats.history;
+    const out: ThrottleTransition[] = [];
+    // copy in reverse — manual loop is cheaper than .slice().reverse() for
+    // hot updates.
+    for (let i = arr.length - 1; i >= 0; i--) out.push(arr[i]!);
+    return out;
+  }, [stats.history]);
+
+  // Threshold-breach check — surfaces a banner when average refill drops
+  // below the operator-set `warnAtPct` (capacity-loss alert).
+  const thresholdBreach = React.useMemo(() => {
+    if (allEntries.length === 0) return false;
+    return kpiStats.avgPct < warnAtPct;
+  }, [allEntries.length, kpiStats.avgPct, warnAtPct]);
+
   // Group transitions into recency buckets for the history log so the
   // reader's eye lands on "what happened in the last hour" first. The
   // bucketing key (`now`) re-evaluates when the wall-clock day rolls over,
@@ -826,8 +989,18 @@ export const ThrottlePage: React.FC = () => {
     for (const e of entries) {
       store.resetThrottleCircuit(e.subscriptionId, e.family);
     }
+    auditLog.record({
+      actor: "operator",
+      action: "throttle.reset_visible",
+      target: `circuits:${entries.length}`,
+      details: {
+        count: entries.length,
+        filters: { searchText, stateFilter, familyFilter, sortKey },
+      },
+      status: "success",
+    });
     setResetAllOpen(false);
-  }, [entries, store]);
+  }, [entries, store, searchText, stateFilter, familyFilter, sortKey]);
   const handleCancelResetAll = React.useCallback(
     () => setResetAllOpen(false),
     [],
@@ -844,9 +1017,21 @@ export const ThrottlePage: React.FC = () => {
     // entry currently tracked. (If the underlying breaker is still firing,
     // future transitions will repopulate.) This avoids reaching into store
     // internals from a page-scoped edit.
+    //
+    // COORDINATOR: a future `clearThrottleHistory()` on the store would
+    // also drop `throttleStats.history` (currently it only ages out at 50);
+    // adding it would make this handler a one-call wipe instead of a sweep
+    // across every entry.
     for (const e of allEntries) {
       store.resetThrottleCircuit(e.subscriptionId, e.family);
     }
+    auditLog.record({
+      actor: "operator",
+      action: "throttle.clear_all",
+      target: `circuits:${allEntries.length}`,
+      details: { count: allEntries.length },
+      status: "success",
+    });
     setClearHistoryOpen(false);
   }, [allEntries, store]);
   const handleCancelClearHistory = React.useCallback(
@@ -861,14 +1046,28 @@ export const ThrottlePage: React.FC = () => {
     familyFilter !== "all";
 
   const handleClearFilters = React.useCallback(() => {
-    setSearchText("");
-    setStateFilter("all");
-    setFamilyFilter("all");
-  }, []);
+    setUrlFilters({ q: "", state: "all", family: "all" });
+  }, [setUrlFilters]);
 
   const handleTogglePaused = React.useCallback(
     () => setPaused((p) => !p),
     [],
+  );
+
+  // Threshold input — clamps to 0…100 so the persisted value can never break
+  // the comparator. Empty string falls back to the default of 80.
+  const handleChangeThreshold = React.useCallback(
+    (raw: string) => {
+      if (raw === "") {
+        setWarnAtPct(80);
+        return;
+      }
+      const parsed = Number.parseInt(raw, 10);
+      if (Number.isNaN(parsed)) return;
+      const clamped = Math.max(0, Math.min(100, parsed));
+      setWarnAtPct(clamped);
+    },
+    [setWarnAtPct],
   );
 
   // Section visibility — distinguish "no traffic" vs "no matches".
@@ -1026,6 +1225,108 @@ export const ThrottlePage: React.FC = () => {
           accent="info"
         />
       </div>
+
+      {/* KPI tile row — fine-grained metrics via SummaryStatItem. */}
+      <div
+        className="flex flex-wrap gap-2"
+        role="group"
+        aria-label="Throttle KPIs"
+      >
+        <SummaryStatItem
+          label="Avg refill %"
+          value={`${kpiStats.avgPct}%`}
+          hint="of baseline"
+          tone={
+            kpiStats.avgPct >= 90
+              ? "success"
+              : kpiStats.avgPct >= warnAtPct
+                ? "info"
+                : "warning"
+          }
+          ariaLabel={`Average refill ${kpiStats.avgPct} percent of baseline`}
+        />
+        <SummaryStatItem
+          label="Slowest %"
+          value={`${kpiStats.slowestPct}%`}
+          hint={kpiStats.slowestKey ? shortSub(kpiStats.slowestKey.split("::")[0] ?? "") : undefined}
+          tone={
+            kpiStats.slowestPct >= 80
+              ? "success"
+              : kpiStats.slowestPct >= 50
+                ? "info"
+                : "destructive"
+          }
+          ariaLabel={`Slowest circuit at ${kpiStats.slowestPct} percent of baseline`}
+        />
+        <SummaryStatItem
+          label="Transitions / min"
+          value={transitionsLastMin}
+          hint="churn rate"
+          tone={
+            transitionsLastMin === 0
+              ? "success"
+              : transitionsLastMin < 5
+                ? "info"
+                : "warning"
+          }
+          ariaLabel={`${transitionsLastMin} circuit transitions in the last minute`}
+        />
+        <SummaryStatItem
+          label="History buffer"
+          value={`${stats.history.length} / 50`}
+          tone="muted"
+          ariaLabel={`History buffer holding ${stats.history.length} of 50 transitions`}
+        />
+
+        {/* Persisted threshold control — operator picks the alert floor. */}
+        <label className="ml-auto flex items-center gap-2 rounded-lg border bg-card/70 px-3 py-2 text-2xs font-medium uppercase tracking-wider text-muted-foreground">
+          Warn below
+          <Input
+            type="number"
+            inputMode="numeric"
+            min={0}
+            max={100}
+            value={warnAtPct}
+            onChange={(e) => handleChangeThreshold(e.target.value)}
+            className="h-7 w-16 text-xs tabular-nums"
+            aria-label="Warn when average refill falls below percent"
+          />
+          <span className="text-foreground">%</span>
+          <InfoTooltip
+            ariaLabel="Threshold help"
+            content={
+              <span>
+                When the average refill rate (across all tracked
+                subscriptions) drops below this percentage of baseline, a
+                warning banner appears below. Persisted across reloads and
+                synced across tabs.
+              </span>
+            }
+          />
+        </label>
+      </div>
+
+      {/* Threshold breach banner — only when an operator-set floor is crossed. */}
+      {thresholdBreach && (
+        <div
+          role="status"
+          className="flex items-start gap-2 rounded-md border border-warning/40 bg-warning/5 p-3 text-xs text-warning"
+        >
+          <CircleAlert className="mt-0.5 h-4 w-4 shrink-0" aria-hidden />
+          <div className="flex-1">
+            <p className="font-semibold">
+              Average refill rate at <span className="tabular-nums">{kpiStats.avgPct}%</span>{" "}
+              is below the {warnAtPct}% warning threshold.
+            </p>
+            <p className="mt-0.5 text-warning/80">
+              Capacity has degraded across tracked subscriptions. Expect
+              slower request fan-out until rates recover. Adjust the
+              threshold in the KPI row, or reset visible circuits to clear
+              displayed state.
+            </p>
+          </div>
+        </div>
+      )}
 
       {/* Toolbar: search + state chips + family chips + sort selector. */}
       <section
@@ -1284,6 +1585,49 @@ export const ThrottlePage: React.FC = () => {
           </div>
         )}
       </section>
+
+      {/* Live tail — the most recent 50 transitions in raw chronological
+          order, unfiltered, capped to a scrollable strip. Designed for
+          mid-incident "watch the storm" usage; the grouped section below
+          is the slower analytical view. */}
+      {liveTail.length > 0 && (
+        <section
+          className="rounded-xl border border-border bg-surface-base/40 p-3"
+          aria-label="Live tail of throttle transitions"
+        >
+          <div className="mb-2 flex items-center gap-2">
+            <span
+              className="live-pulse-dot"
+              style={{ ["--live-tone" as never]: "var(--primary)" }}
+              aria-hidden
+            />
+            <span className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">
+              Live tail
+            </span>
+            <span className="text-2xs text-muted-foreground tabular-nums">
+              ({liveTail.length} latest)
+            </span>
+            <InfoTooltip
+              ariaLabel="What the live tail shows"
+              content="The newest transitions across every subscription / family, ignoring filters. Use the grouped Recent transitions section below for filtered analytics."
+            />
+          </div>
+          <div
+            className="flex max-h-48 flex-col gap-1 overflow-y-auto pr-1"
+            role="log"
+            aria-live="polite"
+            aria-atomic="false"
+          >
+            {liveTail.map((t, i) => (
+              <TransitionRow
+                key={`tail-${t.timestamp}-${i}`}
+                t={t}
+                nowTick={nowTick}
+              />
+            ))}
+          </div>
+        </section>
+      )}
 
       {/* Transition history — grouped by recency so the reader sees
           "what just happened" before "what happened yesterday". */}
