@@ -1,0 +1,32 @@
+export interface GeneratedResourceStrings {
+    "lib.react.account.parameter.name.label": string;
+    "lib.react.common.close": string;
+    "lib.react.common.disabled": string;
+    "lib.react.common.enabled": string;
+    "lib.react.common.general": string;
+    "lib.react.common.message": string;
+    "lib.react.common.name": string;
+    "lib.react.common.no": string;
+    "lib.react.common.search": string;
+    "lib.react.common.time": string;
+    "lib.react.common.yes": string;
+    "lib.react.pool.infoBox.nodeCommsModeDiffers.message": string;
+    "lib.react.pool.notFound": string;
+    "lib.react.pool.parameter.currentNodeCommunicationMode.label": string;
+    "lib.react.pool.parameter.targetNodeCommunicationMode.label": string;
+    "lib.react.vmExtension.autoUpdate": string;
+    "lib.react.vmExtension.detailedStatus": string;
+    "lib.react.vmExtension.extensionProperties": string;
+    "lib.react.vmExtension.latestStatus": string;
+    "lib.react.vmExtension.level": string;
+    "lib.react.vmExtension.name": string;
+    "lib.react.vmExtension.noResult": string;
+    "lib.react.vmExtension.provisioningState": string;
+    "lib.react.vmExtension.publisher": string;
+    "lib.react.vmExtension.search": string;
+    "lib.react.vmExtension.settings": string;
+    "lib.react.vmExtension.status": string;
+    "lib.react.vmExtension.type": string;
+    "lib.react.vmExtension.version": string;
+    "lib.react.vmExtension.viewDetailedStatus": string;
+}

@@ -1,0 +1,84 @@
+# Dependencies
+node_modules/
+*/node_modules/
+**/node_modules/
+
+# Build output
+dist/
+build/
+out/
+*.tsbuildinfo
+.cache/
+.parcel-cache/
+
+# Lerna package compile output (tsc emits these)
+packages/*/lib/
+packages/*/lib-cjs/
+packages/*/build/
+
+# Logs
+*.log
+dev-server-stdout.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+lerna-debug.log*
+
+# Environment / secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+secrets.json
+credentials.json
+
+# IDE / editor
+.vscode/*
+!.vscode/extensions.json
+!.vscode/settings.example.json
+.idea/
+*.iml
+.DS_Store
+Thumbs.db
+
+# Test artifacts
+coverage/
+.nyc_output/
+*.lcov
+junit.xml
+
+# Playwright / browser automation artifacts
+.playwright-mcp/
+playwright-report/
+test-results/
+.last-run.json
+# Persistent profile dir for the dev-server's webui auto-sign-in flow
+web/dev-server/.playwright-profile-webui/
+# Cross-browser shared MSAL cache (tokens — never commit)
+web/dev-server/.shared-msal-cache.json
+# Disk-backed cache for VM catalog snapshots (large, regenerable)
+web/dev-server/.disk-cache/
+
+# Local developer screenshots / scratch files
+*.png
+!web/resources/**/*.png
+!packages/**/resources/**/*.png
+
+# Claude Code local state
+.claude/
+.claude-*
+
+# OS-level junk
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+
+# Lerna / Yarn / npm
+.lerna-cache/
+.yarn/cache
+.yarn/install-state.gz
+.pnp.*
+
+# TypeScript incremental
+*.tsbuildinfo

@@ -1,0 +1,1662 @@
+/**
+ * Role Assignment Visualizer — defensive RBAC audit page.
+ *
+ * Stormspotter-inspired (Microsoft's Azure Red Team graph tool) but
+ * purpose-built for tenant ADMINS auditing THEIR OWN environment:
+ *
+ *   1. Operator picks an account + one-or-more accessible subscriptions.
+ *   2. For each picked sub, we hit
+ *      `Microsoft.Authorization/roleAssignments` at the sub scope and
+ *      `Microsoft.Authorization/roleDefinitions` (with permissions
+ *      included — see `fetchRoleDefinitionsWithPermissions` below).
+ *   3. Principal display names are resolved via Graph
+ *      `directoryObjects/getByIds` per the sub's tenant.
+ *   4. For every GROUP principal that holds a critical-tier role, we
+ *      best-effort enumerate transitive members via
+ *      `groups/{id}/transitiveMembers` so group-mediated inheritance
+ *      lights up in the escalation column. Permission failures degrade
+ *      gracefully (the group simply doesn't expand) — never block the
+ *      page render.
+ *   5. Helpers classify everything into tiers + detect escalation
+ *      patterns; the page is just rendering.
+ *
+ * Audit: every probe writes a single `role_graph_probe` audit-log entry
+ * with the per-sub assignment + principal + escalation counts. Failures
+ * land in the same entry under `status: "failure"`.
+ *
+ * NO graph library — we render the principal → role → scope hierarchy
+ * as a collapsible Tailwind tree. The visual cues are tier badges +
+ * escalation alerts inline so the operator can spot risk at a glance.
+ */
+import * as React from "react";
+import {
+  AlertTriangle,
+  CheckCircle2,
+  ChevronDown,
+  ChevronRight,
+  Crown,
+  Filter,
+  Key,
+  Loader2,
+  Network,
+  RefreshCw,
+  Search,
+  Shield,
+  ShieldAlert,
+  ShieldCheck,
+  User,
+  Users,
+  UserX,
+  X,
+  Zap,
+} from "lucide-react";
+
+import { Alert, AlertDescription } from "@/components/ui/alert";
+import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
+import {
+  Card,
+  CardContent,
+  CardDescription,
+  CardHeader,
+  CardTitle,
+} from "@/components/ui/card";
+import { Checkbox } from "@/components/ui/checkbox";
+import { Input } from "@/components/ui/input";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
+import { cn, formatNumber, pluralize } from "@/lib/utils";
+
+import { getActiveTenant, getGraphTokenForAccount } from "../../auth/msal-auth";
+import { resolveActiveTenantId } from "../../auth/perform-tenant-switch";
+import { useArmToken } from "../../auth/use-arm-token";
+import { useTenantChange } from "../../hooks/use-tenant-change";
+import { auditLog } from "../../services/audit-log";
+import {
+  getPrincipalsByIds,
+  listSubscriptionRoleAssignments,
+  type ResolvedPrincipal,
+  type RoleAssignmentRow,
+} from "../../services";
+import { useMultiRegionState } from "../../store/store-context";
+
+import { EmptyState } from "../shared/empty-state";
+import { ExportMenu, type ExportColumn } from "../shared/export-menu";
+import { PageHeader } from "../shared/page-header";
+import { SignInRequired } from "../shared/sign-in-required";
+import { SkeletonLoader } from "../shared/skeleton-loader";
+import { SummaryStatItem } from "../shared/summary-stat-item";
+import { TokenExpiryBadge } from "../shared/token-expiry-badge";
+import type { PageKey } from "../shared/sidebar-nav";
+
+import {
+  applyFilters,
+  classifyRoleTier,
+  classifyScopeLevel,
+  computeStats,
+  describeScope,
+  EMPTY_FILTERS,
+  groupByPrincipal,
+  PRIVILEGE_TIER_META,
+  type EscalationCategory,
+  type EscalationFinding,
+  type PrincipalAssignment,
+  type PrincipalSummary,
+  type PrivilegeTier,
+  type ResolvedGroupMember,
+  type RoleDefinitionForTier,
+  type RoleGraphFilters,
+} from "./role-graph-helpers";
+
+const ARM_BASE = "https://management.azure.com";
+const GRAPH_BASE = "https://graph.microsoft.com/v1.0";
+const ARM_ROLE_API = "2022-04-01";
+
+const PRINCIPAL_TYPE_OPTIONS = [
+  "User",
+  "Group",
+  "ServicePrincipal",
+  "Application",
+] as const;
+
+export interface RoleGraphPageProps {
+  onNavigate?: (k: PageKey) => void;
+}
+
+/** Friendly principal-type → Lucide icon mapping. */
+function principalIcon(type: string): React.FC<{ className?: string }> {
+  if (type === "User") return User;
+  if (type === "Group") return Users;
+  if (type === "ServicePrincipal" || type === "Application") return Shield;
+  return Key;
+}
+
+/**
+ * Fetch role definitions WITH permissions for one subscription.
+ *
+ * The existing `listSubscriptionRoleDefinitions` helper strips
+ * `properties.permissions` to keep its surface small for the Sub
+ * Manager picker — but the tier classifier here needs those actions
+ * to evaluate CUSTOM roles. We use a plain fetch (NOT modifying the
+ * service file per the page constraints) to read the same endpoint
+ * with the full permissions payload.
+ *
+ * Pagination is handled via `@odata.nextLink` walks; failures throw
+ * so the caller can record the audit failure entry.
+ */
+async function fetchRoleDefinitionsWithPermissions(
+  subscriptionId: string,
+  armToken: string,
+  signal?: AbortSignal,
+): Promise<RoleDefinitionForTier[]> {
+  const initialUrl =
+    `${ARM_BASE}/subscriptions/${encodeURIComponent(subscriptionId)}` +
+    `/providers/Microsoft.Authorization/roleDefinitions` +
+    `?api-version=${ARM_ROLE_API}`;
+  const out: RoleDefinitionForTier[] = [];
+  let url: string | undefined = initialUrl;
+  while (url) {
+    if (signal?.aborted) throw new Error("Aborted");
+    const resp: Response = await fetch(url, {
+      headers: {
+        Authorization: `Bearer ${armToken}`,
+        Accept: "application/json",
+      },
+      ...(signal ? { signal } : {}),
+    });
+    if (!resp.ok) {
+      let msg = `ARM roleDefinitions failed: ${resp.status}`;
+      try {
+        const body = (await resp.json()) as {
+          error?: { message?: string };
+        };
+        if (body?.error?.message) msg = body.error.message;
+      } catch {
+        /* ignore */
+      }
+      throw new Error(msg);
+    }
+    const body = (await resp.json()) as {
+      value?: Array<{
+        id?: string;
+        name?: string;
+        properties?: {
+          roleName?: string;
+          type?: string;
+          permissions?: Array<{
+            actions?: string[];
+            notActions?: string[];
+            dataActions?: string[];
+            notDataActions?: string[];
+          }>;
+        };
+      }>;
+      ["@odata.nextLink"]?: string;
+    };
+    for (const r of body.value ?? []) {
+      if (!r.name) continue;
+      out.push({
+        id: r.name,
+        name: r.properties?.roleName ?? r.name,
+        type: r.properties?.type,
+        permissions: (r.properties?.permissions ?? []).map((p) => ({
+          actions: p.actions ?? [],
+          notActions: p.notActions ?? [],
+          dataActions: p.dataActions ?? [],
+          notDataActions: p.notDataActions ?? [],
+        })),
+      });
+    }
+    url = body["@odata.nextLink"];
+  }
+  return out;
+}
+
+/**
+ * Best-effort enumeration of a group's transitive members via Graph.
+ *
+ * We deliberately swallow per-group errors (returning an empty array)
+ * because the calling page must NEVER hard-fail if it can't see one
+ * group — operators commonly run this with a service principal that
+ * has subscription Reader but no Graph Group.Read.All consent. Worst
+ * case: group-mediated escalation simply doesn't light up, and the
+ * UI shows the group as a flat principal row.
+ */
+async function fetchGroupTransitiveMembers(
+  groupId: string,
+  tenantId: string,
+  graphToken: string,
+  signal?: AbortSignal,
+): Promise<ResolvedGroupMember[]> {
+  // The endpoint accepts simple `$select` to limit fields. Tenant id
+  // is encoded into the graph base, NOT the URL path — Graph routes
+  // by token tenant. We pass tenantId to the audit string only.
+  void tenantId;
+  const url =
+    `${GRAPH_BASE}/groups/${encodeURIComponent(groupId)}/transitiveMembers` +
+    `?$select=id,displayName,userPrincipalName,mail`;
+  const out: ResolvedGroupMember[] = [];
+  let next: string | undefined = url;
+  while (next) {
+    if (signal?.aborted) return out;
+    try {
+      const resp = await fetch(next, {
+        headers: {
+          Authorization: `Bearer ${graphToken}`,
+          Accept: "application/json",
+        },
+        ...(signal ? { signal } : {}),
+      });
+      if (!resp.ok) {
+        // Soft-fail: insufficient privileges, etc. Return whatever we
+        // collected so far (typically empty).
+        return out;
+      }
+      const body = (await resp.json()) as {
+        value?: Array<Record<string, unknown>>;
+        ["@odata.nextLink"]?: string;
+      };
+      for (const m of body.value ?? []) {
+        const id = String(m.id ?? "");
+        if (!id) continue;
+        const odata = String(m["@odata.type"] ?? "").toLowerCase();
+        const type = odata.includes("user")
+          ? "User"
+          : odata.includes("group")
+            ? "Group"
+            : odata.includes("serviceprincipal")
+              ? "ServicePrincipal"
+              : "Unknown";
+        out.push({
+          id,
+          displayName:
+            (m.displayName as string | undefined) ??
+            (m.userPrincipalName as string | undefined) ??
+            id,
+          type,
+          signInName:
+            (m.userPrincipalName as string | undefined) ??
+            (m.mail as string | undefined),
+        });
+      }
+      next = body["@odata.nextLink"];
+    } catch {
+      return out; // soft fail: never throw
+    }
+  }
+  return out;
+}
+
+/**
+ * One probe target. We loop over these so the operator can audit
+ * multiple subs in a single click.
+ */
+interface ProbeTarget {
+  subscriptionId: string;
+  displayName: string;
+  tenantId: string;
+}
+
+/** Per-sub probe result, before we fold into the global summaries. */
+interface SubProbeResult {
+  subscriptionId: string;
+  displayName: string;
+  tenantId: string;
+  assignments: RoleAssignmentRow[];
+  roleDefs: RoleDefinitionForTier[];
+  principals: ResolvedPrincipal[];
+  error?: string;
+}
+
+// ---------------------------------------------------------------------------
+// Tier badge — uses the variant mapping from PRIVILEGE_TIER_META.
+// ---------------------------------------------------------------------------
+
+const TierBadge: React.FC<{ tier: PrivilegeTier; className?: string }> = ({
+  tier,
+  className,
+}) => {
+  const meta = PRIVILEGE_TIER_META[tier];
+  return (
+    <Badge
+      variant={meta.badgeVariant}
+      className={cn("text-2xs", className)}
+      title={meta.description}
+    >
+      {tier === "critical" && (
+        <ShieldAlert className="mr-1 h-3 w-3" aria-hidden />
+      )}
+      {tier === "privileged" && (
+        <Crown className="mr-1 h-3 w-3" aria-hidden />
+      )}
+      {tier === "write" && <Zap className="mr-1 h-3 w-3" aria-hidden />}
+      {tier === "readonly" && <ShieldCheck className="mr-1 h-3 w-3" aria-hidden />}
+      {meta.label}
+    </Badge>
+  );
+};
+
+// ---------------------------------------------------------------------------
+// Escalation alert row inside an expanded principal.
+// ---------------------------------------------------------------------------
+
+const EscalationRow: React.FC<{
+  finding: EscalationFinding;
+}> = ({ finding }) => {
+  const variant: "destructive" | "warning" =
+    finding.category === "direct" ? "destructive" : "warning";
+  return (
+    <Alert
+      variant={variant === "destructive" ? "destructive" : undefined}
+      className={cn(
+        "border",
+        variant === "destructive" &&
+          "border-destructive/40 bg-destructive/10 text-destructive",
+        variant === "warning" &&
+          "border-warning/40 bg-warning/10 text-warning",
+      )}
+    >
+      <AlertTriangle className="h-3.5 w-3.5" />
+      <AlertDescription>
+        <div className="text-xs font-medium">{finding.headline}</div>
+        <p className="m-0 mt-0.5 text-2xs opacity-90">{finding.detail}</p>
+        {finding.viaPrincipalId && (
+          <p className="m-0 mt-0.5 font-mono text-2xs opacity-70">
+            via {finding.viaPrincipalId.substring(0, 8)}…
+          </p>
+        )}
+      </AlertDescription>
+    </Alert>
+  );
+};
+
+// ---------------------------------------------------------------------------
+// Single principal "node" — collapsible header + expanded assignment list.
+// ---------------------------------------------------------------------------
+
+const PrincipalNode: React.FC<{
+  summary: PrincipalSummary;
+  expanded: boolean;
+  onToggle: () => void;
+}> = ({ summary, expanded, onToggle }) => {
+  const Icon = principalIcon(summary.principalType);
+  const meta = PRIVILEGE_TIER_META[summary.highestTier];
+  const accentTint =
+    summary.highestTier === "critical"
+      ? "border-destructive/40 bg-destructive/5"
+      : summary.highestTier === "privileged"
+        ? "border-warning/40 bg-warning/5"
+        : summary.hasEscalation
+          ? "border-warning/40 bg-warning/5"
+          : "border-border bg-card";
+
+  return (
+    <div className={cn("overflow-hidden rounded-md border", accentTint)}>
+      <button
+        type="button"
+        onClick={onToggle}
+        className="flex w-full flex-wrap items-center gap-2 px-3 py-2 text-left text-xs transition-colors hover:bg-accent/30 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+        aria-expanded={expanded}
+        aria-controls={`principal-body-${summary.principalId}`}
+      >
+        {expanded ? (
+          <ChevronDown className="h-3.5 w-3.5 shrink-0" aria-hidden />
+        ) : (
+          <ChevronRight className="h-3.5 w-3.5 shrink-0" aria-hidden />
+        )}
+        <Icon className="h-3.5 w-3.5 shrink-0 text-muted-foreground" aria-hidden />
+        <span className="flex min-w-0 flex-1 flex-col">
+          <span className="flex flex-wrap items-center gap-1 truncate font-medium">
+            <span className="truncate">{summary.displayName}</span>
+            {summary.isGuest && (
+              <Badge variant="warning" className="ml-1 text-2xs">
+                <UserX className="mr-1 h-3 w-3" aria-hidden />
+                Guest
+              </Badge>
+            )}
+            {summary.hasEscalation && (
+              <Badge variant="destructive" className="ml-1 text-2xs">
+                <AlertTriangle className="mr-1 h-3 w-3" aria-hidden />
+                Escalation
+              </Badge>
+            )}
+          </span>
+          <span className="flex flex-wrap items-center gap-1 text-2xs text-muted-foreground">
+            {summary.signInName && (
+              <span className="truncate font-mono">{summary.signInName}</span>
+            )}
+            {summary.signInName && <span className="opacity-60">·</span>}
+            <span className="font-mono opacity-70">
+              {summary.principalId.substring(0, 8)}…
+            </span>
+          </span>
+        </span>
+        <Badge variant="secondary" className="text-2xs">
+          {summary.principalType}
+        </Badge>
+        <Badge variant="outline" className="text-2xs">
+          {summary.assignmentCount}{" "}
+          {summary.assignmentCount === 1 ? "role" : "roles"}
+        </Badge>
+        <TierBadge tier={summary.highestTier} />
+        <span className="sr-only">
+          highest tier: {meta.label} ({meta.description})
+        </span>
+      </button>
+      {expanded && (
+        <div
+          id={`principal-body-${summary.principalId}`}
+          className="flex flex-col gap-2 border-t border-border/60 bg-background/40 p-2"
+        >
+          {summary.escalations.length > 0 && (
+            <div className="flex flex-col gap-1">
+              {summary.escalations.map((f, idx) => (
+                <EscalationRow key={`${f.category}-${idx}`} finding={f} />
+              ))}
+            </div>
+          )}
+          <ul className="flex flex-col gap-1">
+            {summary.assignments.map((a) => (
+              <AssignmentRow key={a.assignmentId} assignment={a} />
+            ))}
+          </ul>
+          {summary.groupMembers && summary.groupMembers.length > 0 && (
+            <details className="rounded border border-border/60 bg-muted/30 p-2 text-2xs">
+              <summary className="cursor-pointer font-medium text-muted-foreground">
+                Transitive group members ({summary.groupMembers.length})
+              </summary>
+              <ul className="mt-1.5 flex flex-col gap-0.5">
+                {summary.groupMembers.slice(0, 50).map((m) => {
+                  const MIcon = principalIcon(m.type);
+                  return (
+                    <li
+                      key={m.id}
+                      className="flex items-center gap-1.5"
+                      title={m.id}
+                    >
+                      <MIcon className="h-3 w-3 text-muted-foreground" aria-hidden />
+                      <span className="truncate">{m.displayName}</span>
+                      {m.signInName && (
+                        <span className="truncate font-mono text-muted-foreground/80">
+                          {m.signInName}
+                        </span>
+                      )}
+                    </li>
+                  );
+                })}
+                {summary.groupMembers.length > 50 && (
+                  <li className="italic text-muted-foreground/80">
+                    … and {summary.groupMembers.length - 50} more
+                  </li>
+                )}
+              </ul>
+            </details>
+          )}
+        </div>
+      )}
+    </div>
+  );
+};
+
+const AssignmentRow: React.FC<{ assignment: PrincipalAssignment }> = ({
+  assignment,
+}) => {
+  return (
+    <li className="flex flex-wrap items-center gap-1.5 rounded border border-border/40 bg-card/40 px-2 py-1 text-2xs">
+      <TierBadge tier={assignment.tier} />
+      <span className="truncate font-medium">{assignment.roleName}</span>
+      <span className="opacity-60">@</span>
+      <Badge variant="outline" className="text-2xs">
+        {describeScope(assignment.scope)}
+      </Badge>
+      {assignment.subscriptionDisplayName && (
+        <span className="truncate text-muted-foreground">
+          in {assignment.subscriptionDisplayName}
+        </span>
+      )}
+      {assignment.atSubScope ? (
+        <Badge variant="outline" className="text-2xs">
+          at scope
+        </Badge>
+      ) : (
+        <Badge variant="secondary" className="text-2xs">
+          inherited
+        </Badge>
+      )}
+      {assignment.createdOn && (
+        <span
+          className="ml-auto font-mono text-3xs opacity-70"
+          title={assignment.createdOn}
+        >
+          {assignment.createdOn.slice(0, 10)}
+        </span>
+      )}
+    </li>
+  );
+};
+
+// ---------------------------------------------------------------------------
+// Multi-subscription picker — checkboxes inside a scrollable card.
+// ---------------------------------------------------------------------------
+
+interface SubscriptionOption {
+  subscriptionId: string;
+  displayName: string;
+  tenantId: string;
+}
+
+const SubscriptionPicker: React.FC<{
+  options: SubscriptionOption[];
+  selected: Set<string>;
+  onToggle: (id: string) => void;
+  onToggleAll: (next: boolean) => void;
+  disabled?: boolean;
+}> = ({ options, selected, onToggle, onToggleAll, disabled }) => {
+  const allSelected =
+    options.length > 0 && options.every((o) => selected.has(o.subscriptionId));
+  return (
+    <div className="flex flex-col gap-1.5">
+      <div className="flex items-center justify-between gap-2">
+        <span className="text-2xs font-medium uppercase tracking-wider text-muted-foreground">
+          Subscriptions ({selected.size}/{options.length})
+        </span>
+        <Button
+          type="button"
+          size="sm"
+          variant="ghost"
+          className="h-6 px-2 text-2xs"
+          onClick={() => onToggleAll(!allSelected)}
+          disabled={disabled || options.length === 0}
+        >
+          {allSelected ? "Clear all" : "Select all"}
+        </Button>
+      </div>
+      <div className="max-h-48 overflow-y-auto rounded border border-border bg-background/40 p-1.5">
+        {options.length === 0 ? (
+          <p className="px-1 py-2 text-2xs text-muted-foreground">
+            No subscriptions discovered for this account.
+          </p>
+        ) : (
+          options.map((o) => {
+            const isChecked = selected.has(o.subscriptionId);
+            return (
+              <label
+                key={o.subscriptionId}
+                className={cn(
+                  "flex items-center gap-2 rounded px-1.5 py-1 text-2xs hover:bg-accent/30",
+                  isChecked && "bg-accent/20",
+                )}
+              >
+                <Checkbox
+                  checked={isChecked}
+                  disabled={disabled}
+                  onCheckedChange={() => onToggle(o.subscriptionId)}
+                  aria-label={`Audit subscription ${o.displayName}`}
+                />
+                <span className="flex min-w-0 flex-1 flex-col">
+                  <span className="truncate font-medium">{o.displayName}</span>
+                  <span className="truncate font-mono text-3xs text-muted-foreground">
+                    {o.subscriptionId}
+                  </span>
+                </span>
+              </label>
+            );
+          })
+        )}
+      </div>
+    </div>
+  );
+};
+
+// ---------------------------------------------------------------------------
+// Main page component
+// ---------------------------------------------------------------------------
+
+export const RoleGraphPage: React.FC<RoleGraphPageProps> = ({ onNavigate }) => {
+  const state = useMultiRegionState();
+  const azureAccounts = state.azureAccounts ?? [];
+  const activeAccounts = React.useMemo(
+    () =>
+      azureAccounts.filter(
+        (a) => a.status === "active" && !!a.homeAccountId && !!a.tenantId,
+      ),
+    [azureAccounts],
+  );
+
+  // -------- Account picker --------
+  const [accountId, setAccountId] = React.useState<string>("");
+  React.useEffect(() => {
+    if (activeAccounts.length === 0) {
+      if (accountId) setAccountId("");
+      return;
+    }
+    if (!activeAccounts.some((a) => a.homeAccountId === accountId)) {
+      setAccountId(activeAccounts[0]!.homeAccountId);
+    }
+  }, [activeAccounts, accountId]);
+  const account = React.useMemo(
+    () => activeAccounts.find((a) => a.homeAccountId === accountId) ?? null,
+    [activeAccounts, accountId],
+  );
+
+  // -------- ARM-token tracker (drives TokenExpiryBadge) --------
+  const armTokenTracker = useArmToken(
+    account?.homeAccountId,
+    account ? resolveActiveTenantId(account) : undefined,
+  );
+
+  // -------- Subscription picker --------
+  const subscriptionOptions: SubscriptionOption[] = React.useMemo(() => {
+    if (!account) return [];
+    return account.subscriptions
+      .filter((s) => s.state === "Enabled" || s.state === "Warned")
+      .map((s) => ({
+        subscriptionId: s.subscriptionId,
+        displayName: s.displayName || s.subscriptionId,
+        tenantId: s.tenantId,
+      }));
+  }, [account]);
+
+  const [selectedSubs, setSelectedSubs] = React.useState<Set<string>>(
+    () => new Set(),
+  );
+  // When the account changes, reset to "auto-pick all subs (max 5)".
+  React.useEffect(() => {
+    if (!account) {
+      setSelectedSubs(new Set());
+      return;
+    }
+    const ids = subscriptionOptions
+      .slice(0, 5)
+      .map((o) => o.subscriptionId);
+    setSelectedSubs(new Set(ids));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [account?.homeAccountId, subscriptionOptions.length]);
+
+  const toggleSub = React.useCallback((id: string) => {
+    setSelectedSubs((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  }, []);
+  const toggleAllSubs = React.useCallback(
+    (selectAll: boolean) => {
+      if (selectAll) {
+        setSelectedSubs(
+          new Set(subscriptionOptions.map((o) => o.subscriptionId)),
+        );
+      } else {
+        setSelectedSubs(new Set());
+      }
+    },
+    [subscriptionOptions],
+  );
+
+  // -------- Probe state --------
+  const [probing, setProbing] = React.useState(false);
+  const [probeError, setProbeError] = React.useState<string | null>(null);
+  const [probeWarnings, setProbeWarnings] = React.useState<string[]>([]);
+  const [probedAt, setProbedAt] = React.useState<string | null>(null);
+  const [subResults, setSubResults] = React.useState<SubProbeResult[]>([]);
+  const [groupMembers, setGroupMembers] = React.useState<
+    Map<string, ResolvedGroupMember[]>
+  >(() => new Map());
+  const abortRef = React.useRef<AbortController | null>(null);
+
+  const runProbe = React.useCallback(async () => {
+    if (!account) return;
+    const targets: ProbeTarget[] = Array.from(selectedSubs)
+      .map((id) => subscriptionOptions.find((o) => o.subscriptionId === id))
+      .filter((o): o is SubscriptionOption => !!o)
+      .map((o) => ({
+        subscriptionId: o.subscriptionId,
+        displayName: o.displayName,
+        tenantId: o.tenantId,
+      }));
+    if (targets.length === 0) {
+      setProbeError("Pick at least one subscription to audit.");
+      return;
+    }
+    // Cancel any in-flight probe before starting a new one.
+    abortRef.current?.abort();
+    const ctrl = new AbortController();
+    abortRef.current = ctrl;
+
+    setProbing(true);
+    setProbeError(null);
+    setProbeWarnings([]);
+    setSubResults([]);
+    setGroupMembers(new Map());
+
+    const warnings: string[] = [];
+    const results: SubProbeResult[] = [];
+
+    try {
+      // ARM token from the active tenant — useArmToken's value is already
+      // following the operator's active tenant, but if it hasn't acquired
+      // yet we fall back to a one-shot refresh via the tracker.
+      let armToken = armTokenTracker.token;
+      if (!armToken) {
+        armToken = await armTokenTracker.refresh();
+      }
+      if (!armToken) {
+        throw new Error("Couldn't acquire an ARM token for the picked account.");
+      }
+
+      // ---- Per-sub probes (sequential to play nice with throttling) ----
+      for (const tgt of targets) {
+        if (ctrl.signal.aborted) return;
+        const r: SubProbeResult = {
+          subscriptionId: tgt.subscriptionId,
+          displayName: tgt.displayName,
+          tenantId: tgt.tenantId,
+          assignments: [],
+          roleDefs: [],
+          principals: [],
+        };
+        try {
+          const [assignments, roleDefs] = await Promise.all([
+            listSubscriptionRoleAssignments(tgt.subscriptionId, armToken),
+            fetchRoleDefinitionsWithPermissions(
+              tgt.subscriptionId,
+              armToken,
+              ctrl.signal,
+            ),
+          ]);
+          r.assignments = assignments;
+          r.roleDefs = roleDefs;
+          // Resolve principals via Graph in the sub's tenant.
+          try {
+            const graphToken = await getGraphTokenForAccount(
+              account.homeAccountId,
+              tgt.tenantId,
+            );
+            const ids = Array.from(
+              new Set(assignments.map((a) => a.principalId).filter(Boolean)),
+            );
+            r.principals = await getPrincipalsByIds(
+              tgt.tenantId,
+              ids,
+              graphToken,
+            );
+          } catch (graphErr) {
+            warnings.push(
+              `Graph principals not resolved for ${tgt.displayName}: ${
+                graphErr instanceof Error ? graphErr.message : String(graphErr)
+              }`,
+            );
+          }
+        } catch (subErr) {
+          r.error =
+            subErr instanceof Error ? subErr.message : String(subErr);
+          warnings.push(
+            `${tgt.displayName}: ${r.error}`,
+          );
+        }
+        results.push(r);
+      }
+
+      // ---- Group-mediated probe: best-effort transitive members for
+      //      every GROUP principal whose highest tier is critical. We
+      //      compute the tiers first via the helper to keep this scope-
+      //      aware, then walk the union of crit-tier groups. ----
+      const allPrincipals = new Map<string, ResolvedPrincipal>();
+      for (const r of results) {
+        for (const p of r.principals) {
+          if (!allPrincipals.has(p.id)) allPrincipals.set(p.id, p);
+        }
+      }
+      const criticalGroupIds = new Set<string>();
+      for (const r of results) {
+        const roleById = new Map(r.roleDefs.map((d) => [d.id, d]));
+        for (const a of r.assignments) {
+          const tier = classifyRoleTier(
+            roleById.get(a.roleDefinitionId),
+            a.roleDefinitionId,
+            a.scope,
+          );
+          if (tier !== "critical") continue;
+          const principal = allPrincipals.get(a.principalId);
+          const isGroup =
+            principal?.type === "Group" || a.principalType === "Group";
+          if (isGroup) criticalGroupIds.add(a.principalId);
+        }
+      }
+      const memberMap = new Map<string, ResolvedGroupMember[]>();
+      if (criticalGroupIds.size > 0) {
+        // Use the FIRST target's tenant for the Graph token — group
+        // resolution is normally only meaningful when all subs share a
+        // tenant. For multi-tenant cases we still try the first; the
+        // soft-failing fetcher returns [] which the UI handles.
+        const firstTenant = targets[0]!.tenantId;
+        try {
+          const graphToken = await getGraphTokenForAccount(
+            account.homeAccountId,
+            firstTenant,
+          );
+          // Cap concurrent group probes to avoid hammering Graph if the
+          // tenant has many critical-group assignments.
+          const groupIds = Array.from(criticalGroupIds);
+          for (let i = 0; i < groupIds.length; i++) {
+            if (ctrl.signal.aborted) break;
+            const gId = groupIds[i]!;
+            const members = await fetchGroupTransitiveMembers(
+              gId,
+              firstTenant,
+              graphToken,
+              ctrl.signal,
+            );
+            if (members.length > 0) memberMap.set(gId, members);
+          }
+        } catch (gErr) {
+          warnings.push(
+            `Group membership expansion partially skipped: ${
+              gErr instanceof Error ? gErr.message : String(gErr)
+            }`,
+          );
+        }
+      }
+
+      if (ctrl.signal.aborted) return;
+      setSubResults(results);
+      setGroupMembers(memberMap);
+      setProbeWarnings(warnings);
+      setProbedAt(new Date().toISOString());
+      setProbing(false);
+
+      // ---- Audit (success path) ----
+      // We compute lightweight counts here so the audit row contains the
+      // headline numbers without us needing to redo the helper math.
+      const totalAssignments = results.reduce(
+        (acc, r) => acc + r.assignments.length,
+        0,
+      );
+      const uniquePrincipals = new Set(
+        results.flatMap((r) => r.assignments.map((a) => a.principalId)),
+      ).size;
+      const escalationCount = results.reduce((acc, r) => {
+        const roleById = new Map(r.roleDefs.map((d) => [d.id, d]));
+        let local = 0;
+        for (const a of r.assignments) {
+          const tier = classifyRoleTier(
+            roleById.get(a.roleDefinitionId),
+            a.roleDefinitionId,
+            a.scope,
+          );
+          if (
+            tier === "critical" &&
+            (classifyScopeLevel(a.scope) === "subscription" ||
+              classifyScopeLevel(a.scope) === "managementGroup")
+          ) {
+            local++;
+          }
+        }
+        return acc + local;
+      }, 0);
+      auditLog.record({
+        actor: account.username,
+        action: "role_graph_probe",
+        target: targets.map((t) => t.displayName).join(", "),
+        status: warnings.length > 0 ? "success" : "success",
+        details: {
+          subscriptionIds: targets.map((t) => t.subscriptionId),
+          assignmentCount: totalAssignments,
+          principalCount: uniquePrincipals,
+          escalationCount,
+          warnings: warnings.length,
+        },
+      });
+    } catch (err) {
+      if (ctrl.signal.aborted) return;
+      const msg = err instanceof Error ? err.message : String(err);
+      setProbeError(msg);
+      setProbing(false);
+      auditLog.record({
+        actor: account.username,
+        action: "role_graph_probe",
+        target: targets.map((t) => t.displayName).join(", "),
+        status: "failure",
+        error: msg,
+        details: { subscriptionIds: targets.map((t) => t.subscriptionId) },
+      });
+    }
+  }, [account, selectedSubs, subscriptionOptions, armTokenTracker]);
+
+  // Cancel in-flight probe on unmount.
+  React.useEffect(() => {
+    return () => {
+      abortRef.current?.abort();
+    };
+  }, []);
+
+  // -------- Build summaries via helpers (memoised) --------
+  const summaries: PrincipalSummary[] = React.useMemo(() => {
+    if (subResults.length === 0) return [];
+    // Flatten + tier-classify every assignment, joined with the sub's
+    // display name for friendly export rows.
+    const flatAssignments: Array<
+      PrincipalAssignment & { principalId: string; principalType: string }
+    > = [];
+    const principalLookup = new Map<
+      string,
+      { displayName: string; type: string; signInName?: string }
+    >();
+    for (const r of subResults) {
+      const roleById = new Map(r.roleDefs.map((d) => [d.id, d]));
+      const roleNameById = new Map(r.roleDefs.map((d) => [d.id, d.name]));
+      // Track this sub's scope so we know "at sub scope" without leaking
+      // into a closure scope from elsewhere.
+      const subScope = `/subscriptions/${r.subscriptionId}`.toLowerCase();
+      for (const a of r.assignments) {
+        const def = roleById.get(a.roleDefinitionId);
+        const tier = classifyRoleTier(def, a.roleDefinitionId, a.scope);
+        flatAssignments.push({
+          assignmentId: a.id,
+          roleDefinitionId: a.roleDefinitionId,
+          roleName: roleNameById.get(a.roleDefinitionId) ?? a.roleDefinitionId,
+          tier,
+          scope: a.scope,
+          scopeLevel: classifyScopeLevel(a.scope),
+          atSubScope:
+            a.scope.toLowerCase() === subScope ||
+            a.scope.toLowerCase().startsWith(`${subScope}/`),
+          createdOn: a.createdOn,
+          subscriptionId: r.subscriptionId,
+          subscriptionDisplayName: r.displayName,
+          principalId: a.principalId,
+          principalType: a.principalType,
+        });
+      }
+      for (const p of r.principals) {
+        if (!principalLookup.has(p.id)) {
+          principalLookup.set(p.id, {
+            displayName: p.displayName,
+            type: p.type,
+            signInName: p.signInName,
+          });
+        }
+      }
+    }
+    return groupByPrincipal({
+      assignments: flatAssignments,
+      principalLookup,
+      groupMembersByGroupId: groupMembers,
+    });
+  }, [subResults, groupMembers]);
+
+  // -------- Filters --------
+  const [filters, setFilters] = React.useState<RoleGraphFilters>(EMPTY_FILTERS);
+  const updateFilter = React.useCallback(
+    (patch: Partial<RoleGraphFilters>) => {
+      setFilters((prev) => ({ ...prev, ...patch }));
+    },
+    [],
+  );
+  const toggleTierFilter = React.useCallback((t: PrivilegeTier) => {
+    setFilters((prev) => {
+      const has = prev.tiers.includes(t);
+      return {
+        ...prev,
+        tiers: has ? prev.tiers.filter((x) => x !== t) : [...prev.tiers, t],
+      };
+    });
+  }, []);
+  const togglePrincipalType = React.useCallback((pt: string) => {
+    setFilters((prev) => {
+      const has = prev.principalTypes.includes(pt);
+      return {
+        ...prev,
+        principalTypes: has
+          ? prev.principalTypes.filter((x) => x !== pt)
+          : [...prev.principalTypes, pt],
+      };
+    });
+  }, []);
+  const clearFilters = React.useCallback(() => {
+    setFilters(EMPTY_FILTERS);
+  }, []);
+  const filteredSummaries = React.useMemo(
+    () => applyFilters(summaries, filters),
+    [summaries, filters],
+  );
+
+  // -------- Expansion state --------
+  const [expanded, setExpanded] = React.useState<Set<string>>(() => new Set());
+  const toggleExpanded = React.useCallback((id: string) => {
+    setExpanded((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  }, []);
+  // Auto-expand all escalation-flagged principals on initial render so the
+  // operator sees risk without clicking. Subsequent toggles are user-driven.
+  React.useEffect(() => {
+    if (summaries.length === 0) return;
+    const next = new Set<string>();
+    for (const s of summaries) {
+      if (s.hasEscalation) next.add(s.principalId);
+    }
+    setExpanded(next);
+  }, [summaries]);
+
+  // -------- Summary stats --------
+  const stats = React.useMemo(() => computeStats(summaries), [summaries]);
+  const filteredStats = React.useMemo(
+    () => computeStats(filteredSummaries),
+    [filteredSummaries],
+  );
+
+  // -------- Export columns --------
+  const exportRows = React.useMemo(() => {
+    type Row = {
+      principalId: string;
+      displayName: string;
+      principalType: string;
+      signInName: string;
+      isGuest: boolean;
+      highestTier: PrivilegeTier;
+      assignmentCount: number;
+      escalationCategories: string;
+      role: string;
+      scope: string;
+      scopeLevel: string;
+      subscription: string;
+      atSubScope: boolean;
+      tier: PrivilegeTier;
+    };
+    const rows: Row[] = [];
+    for (const s of filteredSummaries) {
+      for (const a of s.assignments) {
+        rows.push({
+          principalId: s.principalId,
+          displayName: s.displayName,
+          principalType: s.principalType,
+          signInName: s.signInName ?? "",
+          isGuest: s.isGuest,
+          highestTier: s.highestTier,
+          assignmentCount: s.assignmentCount,
+          escalationCategories: s.escalations
+            .map((e) => e.category)
+            .join("|"),
+          role: a.roleName,
+          scope: a.scope,
+          scopeLevel: a.scopeLevel,
+          subscription: a.subscriptionDisplayName ?? a.subscriptionId,
+          atSubScope: a.atSubScope,
+          tier: a.tier,
+        });
+      }
+    }
+    return rows;
+  }, [filteredSummaries]);
+  const exportColumns: ExportColumn<(typeof exportRows)[number]>[] = React.useMemo(
+    () => [
+      { header: "principalId", accessor: (r) => r.principalId },
+      { header: "displayName", accessor: (r) => r.displayName },
+      { header: "principalType", accessor: (r) => r.principalType },
+      { header: "signInName", accessor: (r) => r.signInName },
+      { header: "isGuest", accessor: (r) => r.isGuest },
+      { header: "highestTier", accessor: (r) => r.highestTier },
+      { header: "assignmentCount", accessor: (r) => r.assignmentCount },
+      {
+        header: "escalationCategories",
+        accessor: (r) => r.escalationCategories,
+      },
+      { header: "role", accessor: (r) => r.role },
+      { header: "tier", accessor: (r) => r.tier },
+      { header: "scope", accessor: (r) => r.scope },
+      { header: "scopeLevel", accessor: (r) => r.scopeLevel },
+      { header: "subscription", accessor: (r) => r.subscription },
+      { header: "atSubScope", accessor: (r) => r.atSubScope },
+    ],
+    [],
+  );
+  const exportMetadata = React.useMemo(
+    () => ({
+      page: "role-graph",
+      generatedAt: new Date().toISOString(),
+      account: account ? account.username : null,
+      subscriptionsAudited: Array.from(selectedSubs),
+      probedAt,
+      filters,
+      summary: filteredStats,
+      escalationDetail: filteredSummaries
+        .filter((s) => s.hasEscalation)
+        .map((s) => ({
+          principalId: s.principalId,
+          displayName: s.displayName,
+          escalations: s.escalations,
+        })),
+    }),
+    [
+      account,
+      selectedSubs,
+      probedAt,
+      filters,
+      filteredStats,
+      filteredSummaries,
+    ],
+  );
+
+  // -------- Global tenant-switch listener --------
+  useTenantChange(undefined, (detail) => {
+    const candidate = detail.homeAccountId;
+    if (!activeAccounts.some((a) => a.homeAccountId === candidate)) return;
+    if (accountId === candidate) return;
+    setAccountId(candidate);
+  });
+
+  // -------- Render: sign-in gate --------
+  if (activeAccounts.length === 0) {
+    return (
+      <div className="flex flex-col gap-4">
+        <PageHeader
+          title="Role Assignment Visualizer"
+          description="Audit who holds what RBAC role at what scope across your subscriptions — Stormspotter-style attack-graph analysis for defenders."
+        />
+        <SignInRequired
+          whatYouCantDo="Audit role assignments"
+          why="an Azure account with reader access on the subscription(s) you want to audit"
+          onNavigate={onNavigate}
+        />
+      </div>
+    );
+  }
+
+  // -------- Render: main page --------
+  const hasFilters =
+    !!filters.search ||
+    filters.tiers.length > 0 ||
+    filters.principalTypes.length > 0 ||
+    filters.escalation !== "all" ||
+    filters.scope !== "all";
+
+  return (
+    <div className="flex flex-col gap-4">
+      <PageHeader
+        title="Role Assignment Visualizer"
+        description="Audit who holds what RBAC role at what scope across your subscriptions. Privilege tiers, escalation paths, and group-mediated inheritance — surfaced for defensive auditing."
+      >
+        <TokenExpiryBadge
+          secondsUntilExpiry={armTokenTracker.secondsUntilExpiry}
+          loading={armTokenTracker.loading}
+          onRefresh={armTokenTracker.refresh}
+          needsReauth={armTokenTracker.needsReauth}
+          onReauth={() =>
+            void armTokenTracker.reauth({
+              loginHint: account?.username,
+            })
+          }
+        />
+        {probedAt && (
+          <Badge variant="outline" className="text-2xs">
+            <Network className="mr-1 h-3 w-3" aria-hidden />
+            Last probe: {new Date(probedAt).toLocaleTimeString()}
+          </Badge>
+        )}
+      </PageHeader>
+
+      {/* Probe controls */}
+      <Card>
+        <CardHeader>
+          <CardTitle className="text-sm">Audit scope</CardTitle>
+          <CardDescription className="text-xs">
+            Pick the account + subscription(s) you want to audit. We read role
+            assignments + role definitions at the subscription scope (including
+            inherited rows) and resolve principal display names via Graph.
+          </CardDescription>
+        </CardHeader>
+        <CardContent className="flex flex-col gap-3">
+          <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
+            <div className="flex flex-col gap-1.5">
+              <label
+                htmlFor="role-graph-account"
+                className="text-2xs font-medium uppercase tracking-wider text-muted-foreground"
+              >
+                Account
+              </label>
+              <Select
+                value={accountId}
+                onValueChange={(v) => setAccountId(v)}
+                disabled={activeAccounts.length === 0 || probing}
+              >
+                <SelectTrigger id="role-graph-account" className="text-xs">
+                  <SelectValue placeholder="Pick a signed-in account" />
+                </SelectTrigger>
+                <SelectContent>
+                  {activeAccounts.map((a) => (
+                    <SelectItem key={a.homeAccountId} value={a.homeAccountId}>
+                      <span className="flex flex-col">
+                        <span className="font-medium">
+                          {a.name || a.username}
+                        </span>
+                        <span className="text-2xs text-muted-foreground">
+                          {a.username} ·{" "}
+                          {pluralize(a.subscriptions.length, "subscription")}
+                        </span>
+                      </span>
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+              {account && (
+                <p className="text-3xs text-muted-foreground">
+                  Active tenant:{" "}
+                  <span className="font-mono">
+                    {getActiveTenant(account.homeAccountId) ?? resolveActiveTenantId(account)}
+                  </span>
+                </p>
+              )}
+            </div>
+            <SubscriptionPicker
+              options={subscriptionOptions}
+              selected={selectedSubs}
+              onToggle={toggleSub}
+              onToggleAll={toggleAllSubs}
+              disabled={probing || !account}
+            />
+          </div>
+          <div className="flex flex-wrap items-center gap-2">
+            <Button
+              type="button"
+              variant="default"
+              size="sm"
+              onClick={() => void runProbe()}
+              disabled={
+                probing || selectedSubs.size === 0 || !account
+              }
+              aria-label="Run audit probe"
+            >
+              {probing ? (
+                <Loader2 className="h-3.5 w-3.5 animate-spin motion-reduce:animate-none" />
+              ) : (
+                <RefreshCw className="h-3.5 w-3.5" aria-hidden />
+              )}
+              {probing
+                ? "Probing…"
+                : probedAt
+                  ? "Re-run probe"
+                  : "Run probe"}
+            </Button>
+            {probing && (
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                onClick={() => abortRef.current?.abort()}
+              >
+                Cancel
+              </Button>
+            )}
+            <ExportMenu
+              rows={exportRows}
+              columns={exportColumns}
+              filename={`role-graph-${account?.username ?? "audit"}`}
+              jsonMetadata={exportMetadata}
+              disabled={probing}
+              label="Export"
+            />
+            {probedAt && (
+              <span className="text-2xs text-muted-foreground">
+                {summaries.length === 0
+                  ? "No assignments returned."
+                  : `${formatNumber(summaries.length)} ${pluralize(summaries.length, "principal")} across ${pluralize(subResults.length, "subscription")}`}
+              </span>
+            )}
+          </div>
+          {probeError && (
+            <Alert variant="destructive">
+              <AlertTriangle className="h-4 w-4" />
+              <AlertDescription className="text-xs">
+                {probeError}
+              </AlertDescription>
+            </Alert>
+          )}
+          {probeWarnings.length > 0 && (
+            <Alert>
+              <AlertTriangle className="h-4 w-4" />
+              <AlertDescription>
+                <div className="text-xs font-medium">
+                  Partial probe — {probeWarnings.length}{" "}
+                  {pluralize(probeWarnings.length, "warning")}
+                </div>
+                <ul className="ml-4 mt-1 list-disc text-2xs">
+                  {probeWarnings.slice(0, 5).map((w, i) => (
+                    <li key={i}>{w}</li>
+                  ))}
+                  {probeWarnings.length > 5 && (
+                    <li>… and {probeWarnings.length - 5} more</li>
+                  )}
+                </ul>
+              </AlertDescription>
+            </Alert>
+          )}
+        </CardContent>
+      </Card>
+
+      {/* Summary stats */}
+      {(probedAt || probing) && (
+        <div
+          className="flex flex-wrap gap-2"
+          role="group"
+          aria-label="Audit summary"
+        >
+          <SummaryStatItem
+            label="Assignments"
+            value={stats.totalAssignments}
+            hint={
+              hasFilters
+                ? `${formatNumber(filteredStats.totalAssignments)} after filter`
+                : undefined
+            }
+          />
+          <SummaryStatItem
+            label="Unique principals"
+            value={stats.uniquePrincipals}
+            hint={
+              hasFilters
+                ? `${formatNumber(filteredStats.uniquePrincipals)} after filter`
+                : undefined
+            }
+          />
+          <SummaryStatItem
+            label="Tier 0 (critical)"
+            value={stats.tier0Count}
+            tone={stats.tier0Count > 0 ? "destructive" : "muted"}
+          />
+          <SummaryStatItem
+            label="Tier 1 (privileged)"
+            value={stats.tier1Count}
+            tone={stats.tier1Count > 0 ? "warning" : "muted"}
+          />
+          <SummaryStatItem
+            label="Escalation paths"
+            value={stats.escalationCount}
+            tone={stats.escalationCount > 0 ? "destructive" : "muted"}
+          />
+          <SummaryStatItem
+            label="Privileged guests"
+            value={stats.guestPrivilegedCount}
+            tone={stats.guestPrivilegedCount > 0 ? "warning" : "muted"}
+          />
+        </div>
+      )}
+
+      {/* Filter toolbar */}
+      {probedAt && summaries.length > 0 && (
+        <Card>
+          <CardContent className="flex flex-col gap-3 pt-4">
+            <div className="flex flex-wrap items-center gap-2">
+              <div className="relative flex-1 min-w-[200px]">
+                <Search className="absolute left-2 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
+                <Input
+                  value={filters.search}
+                  onChange={(e) => updateFilter({ search: e.target.value })}
+                  placeholder="Search by name, UPN, principal id, or role…"
+                  className="h-8 pl-7 text-xs"
+                  aria-label="Filter principals"
+                />
+                {filters.search && (
+                  <button
+                    type="button"
+                    onClick={() => updateFilter({ search: "" })}
+                    className="absolute right-2 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground"
+                    aria-label="Clear search"
+                  >
+                    <X className="h-3 w-3" />
+                  </button>
+                )}
+              </div>
+              <Select
+                value={filters.escalation}
+                onValueChange={(v) =>
+                  updateFilter({
+                    escalation: v as RoleGraphFilters["escalation"],
+                  })
+                }
+              >
+                <SelectTrigger className="h-8 w-44 text-xs">
+                  <SelectValue placeholder="Escalation status" />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="all">Any escalation status</SelectItem>
+                  <SelectItem value="any">Any escalation finding</SelectItem>
+                  <SelectItem value="direct">Direct elevation</SelectItem>
+                  <SelectItem value="groupMediated">
+                    Group-mediated
+                  </SelectItem>
+                  <SelectItem value="crossTenantGuest">
+                    Cross-tenant guest
+                  </SelectItem>
+                </SelectContent>
+              </Select>
+              <Select
+                value={filters.scope}
+                onValueChange={(v) =>
+                  updateFilter({ scope: v as RoleGraphFilters["scope"] })
+                }
+              >
+                <SelectTrigger className="h-8 w-44 text-xs">
+                  <SelectValue placeholder="Scope" />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="all">Any scope</SelectItem>
+                  <SelectItem value="subscription">
+                    Subscription scope
+                  </SelectItem>
+                  <SelectItem value="resourceGroup">
+                    Resource-group scope
+                  </SelectItem>
+                  <SelectItem value="resource">Resource scope</SelectItem>
+                </SelectContent>
+              </Select>
+              {hasFilters && (
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="sm"
+                  onClick={clearFilters}
+                  className="h-8 px-2 text-2xs"
+                >
+                  Clear filters
+                </Button>
+              )}
+            </div>
+            <div className="flex flex-wrap items-center gap-2">
+              <span className="flex items-center gap-1 text-2xs font-medium uppercase tracking-wider text-muted-foreground">
+                <Filter className="h-3 w-3" aria-hidden />
+                Tier
+              </span>
+              {(["critical", "privileged", "write", "readonly"] as const).map(
+                (t) => {
+                  const meta = PRIVILEGE_TIER_META[t];
+                  const active = filters.tiers.includes(t);
+                  return (
+                    <button
+                      key={t}
+                      type="button"
+                      onClick={() => toggleTierFilter(t)}
+                      className="focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring rounded-full"
+                      aria-pressed={active}
+                    >
+                      <Badge
+                        variant={active ? meta.badgeVariant : "outline"}
+                        className={cn(
+                          "cursor-pointer text-2xs",
+                          !active && "opacity-60",
+                        )}
+                      >
+                        {meta.label}
+                      </Badge>
+                    </button>
+                  );
+                },
+              )}
+              <span className="ml-3 flex items-center gap-1 text-2xs font-medium uppercase tracking-wider text-muted-foreground">
+                Type
+              </span>
+              {PRINCIPAL_TYPE_OPTIONS.map((pt) => {
+                const active = filters.principalTypes.includes(pt);
+                return (
+                  <button
+                    key={pt}
+                    type="button"
+                    onClick={() => togglePrincipalType(pt)}
+                    className="focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring rounded-full"
+                    aria-pressed={active}
+                  >
+                    <Badge
+                      variant={active ? "default" : "outline"}
+                      className={cn(
+                        "cursor-pointer text-2xs",
+                        !active && "opacity-60",
+                      )}
+                    >
+                      {pt}
+                    </Badge>
+                  </button>
+                );
+              })}
+            </div>
+          </CardContent>
+        </Card>
+      )}
+
+      {/* Per-sub probe failure summary */}
+      {subResults.some((r) => !!r.error) && (
+        <Alert variant="destructive">
+          <AlertTriangle className="h-4 w-4" />
+          <AlertDescription>
+            <div className="text-xs font-medium">
+              {subResults.filter((r) => !!r.error).length} subscription
+              {subResults.filter((r) => !!r.error).length === 1 ? "" : "s"}{" "}
+              failed
+            </div>
+            <ul className="ml-4 mt-1 list-disc text-2xs">
+              {subResults
+                .filter((r) => !!r.error)
+                .map((r) => (
+                  <li key={r.subscriptionId}>
+                    <span className="font-medium">{r.displayName}</span>:{" "}
+                    {r.error}
+                  </li>
+                ))}
+            </ul>
+          </AlertDescription>
+        </Alert>
+      )}
+
+      {/* Loading skeleton */}
+      {probing && summaries.length === 0 && (
+        <SkeletonLoader rows={4} columns={3} className="mt-1" />
+      )}
+
+      {/* Empty state */}
+      {probedAt && !probing && summaries.length === 0 && !probeError && (
+        <EmptyState
+          icon={Network}
+          title="No role assignments returned"
+          description="Either the picked subscriptions have no role assignments visible to the audit account, or every sub probe failed. Check the per-sub errors above."
+        />
+      )}
+
+      {/* Filtered-but-empty */}
+      {summaries.length > 0 && filteredSummaries.length === 0 && (
+        <EmptyState
+          icon={Search}
+          title="No principals match your filters"
+          description="Clear filters to see all principals from the last probe."
+          action={{
+            label: "Clear filters",
+            onClick: clearFilters,
+            icon: X,
+          }}
+        />
+      )}
+
+      {/* Initial empty state — pre-probe */}
+      {!probedAt && !probing && (
+        <EmptyState
+          icon={Shield}
+          title="Run a probe to see the role graph"
+          description="Pick one or more subscriptions above and click Run probe. Results are session-local — nothing is persisted server-side."
+          action={{
+            label: "Run probe",
+            onClick: () => void runProbe(),
+            icon: RefreshCw,
+          }}
+        />
+      )}
+
+      {/* Tree of principals */}
+      {filteredSummaries.length > 0 && (
+        <div className="flex flex-col gap-2">
+          <div className="flex items-center justify-between gap-2">
+            <h2 className="text-sm font-semibold">
+              Principals ({formatNumber(filteredSummaries.length)})
+            </h2>
+            <div className="flex gap-1">
+              <Button
+                type="button"
+                variant="ghost"
+                size="sm"
+                className="h-7 px-2 text-2xs"
+                onClick={() =>
+                  setExpanded(
+                    new Set(filteredSummaries.map((s) => s.principalId)),
+                  )
+                }
+              >
+                Expand all
+              </Button>
+              <Button
+                type="button"
+                variant="ghost"
+                size="sm"
+                className="h-7 px-2 text-2xs"
+                onClick={() => setExpanded(new Set())}
+              >
+                Collapse all
+              </Button>
+            </div>
+          </div>
+          <div className="flex flex-col gap-1.5">
+            {filteredSummaries.map((s) => (
+              <PrincipalNode
+                key={s.principalId}
+                summary={s}
+                expanded={expanded.has(s.principalId)}
+                onToggle={() => toggleExpanded(s.principalId)}
+              />
+            ))}
+          </div>
+          {filteredStats.tier0Count === 0 &&
+            filteredStats.tier1Count === 0 &&
+            filteredStats.escalationCount === 0 && (
+              <Alert>
+                <CheckCircle2 className="h-4 w-4" />
+                <AlertDescription className="text-xs">
+                  No critical or privileged tier assignments and no escalation
+                  paths found in this view. Filters: {hasFilters ? "active" : "none"}.
+                </AlertDescription>
+              </Alert>
+            )}
+        </div>
+      )}
+    </div>
+  );
+};
+
+// Re-export the unused `EscalationCategory` so any future tests that import
+// the page module's exports continue to see it from the helpers (kept as a
+// type-only re-export so it doesn't bloat the bundle).
+export type { EscalationCategory };

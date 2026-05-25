@@ -1,0 +1,477 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/*
+ * Design tokens. CSS variables drive both Tailwind theme extensions and any
+ * runtime consumers (Monaco theme sync, status badges, etc.). Values are
+ * stored as raw HSL triplets (no `hsl()` wrapper) so Tailwind can compose
+ * them with alpha modifiers via `<alpha-value>`.
+ *
+ * Palette anchors come from the legacy Fluent dark theme so the migration
+ * is visually continuous: Azure blue #0078d4, dark surfaces #1e1e1e/#2a2a2a,
+ * success #107c10, error #d13438.
+ */
+@layer base {
+    :root,
+    .dark {
+        /*
+         * Refreshed dark palette. Personality color shifted off the
+         * standard Azure blue toward a richer cyan-violet (primary 198°
+         * cyan, accent 268° violet) so the chrome reads as bespoke
+         * rather than a stock dashboard theme. Surfaces gain a slight
+         * cool tint (deep blue-black) instead of pure neutral grey.
+         *
+         * Companion CSS variables for gradients are declared below the
+         * base tokens so utilities like .gradient-primary,
+         * .gradient-text-primary, .glass-surface can compose without
+         * recomputing the stops per-call.
+         */
+        --surface-base: 222 25% 7%;        /* #0e1117 deep blue-black canvas */
+        --surface-raised: 222 22% 11%;     /* #161b25 panels */
+        --surface-overlay: 222 22% 14%;    /* dialogs / popovers */
+        --surface-sunken: 222 28% 5%;      /* inset wells, deeper than base */
+
+        --background: 222 25% 7%;
+        --foreground: 220 15% 94%;
+
+        --card: 222 22% 11%;
+        --card-foreground: 220 15% 94%;
+
+        --popover: 222 22% 13%;
+        --popover-foreground: 220 15% 94%;
+
+        --primary: 198 92% 56%;            /* #2bb8f5 vivid cyan */
+        --primary-foreground: 222 35% 8%;
+
+        --secondary: 222 18% 18%;
+        --secondary-foreground: 220 15% 94%;
+
+        --muted: 222 18% 14%;
+        --muted-foreground: 220 12% 62%;
+
+        --accent: 268 84% 67%;             /* #9d6dee electric violet */
+        --accent-foreground: 0 0% 100%;
+
+        --destructive: 348 84% 60%;        /* #ec4570 hot magenta-red */
+        --destructive-foreground: 0 0% 100%;
+
+        --border: 222 18% 18%;
+        --input: 222 22% 14%;
+        --ring: 198 92% 56%;
+
+        /* Domain-semantic colors — kept distinct from primary/accent */
+        --success: 152 68% 48%;            /* #2dcf85 mint */
+        --success-foreground: 222 35% 8%;
+        --warning: 38 92% 58%;             /* #f5a93c amber */
+        --warning-foreground: 222 35% 8%;
+        --info: 198 92% 56%;
+        --info-foreground: 222 35% 8%;
+        --error: 348 84% 60%;
+        --error-foreground: 0 0% 100%;
+
+        /* Gradient stops — used by .gradient-primary, glow utilities */
+        --gradient-primary-start: 198 92% 56%;   /* cyan */
+        --gradient-primary-mid: 220 90% 62%;     /* azure */
+        --gradient-primary-end: 268 84% 67%;     /* violet */
+
+        --radius: 0.5rem;
+    }
+
+    .light {
+        --surface-base: 0 0% 100%;
+        --surface-raised: 0 0% 98%;
+        --surface-overlay: 0 0% 100%;
+        --surface-sunken: 0 0% 96%;
+
+        --background: 0 0% 100%;
+        --foreground: 0 0% 9%;
+
+        --card: 0 0% 100%;
+        --card-foreground: 0 0% 9%;
+
+        --popover: 0 0% 100%;
+        --popover-foreground: 0 0% 9%;
+
+        --primary: 206 100% 36%;
+        --primary-foreground: 0 0% 100%;
+
+        --secondary: 0 0% 96%;
+        --secondary-foreground: 0 0% 9%;
+
+        --muted: 0 0% 96%;
+        --muted-foreground: 0 0% 45%;
+
+        --accent: 206 100% 42%;
+        --accent-foreground: 0 0% 100%;
+
+        --destructive: 358 64% 47%;
+        --destructive-foreground: 0 0% 100%;
+
+        --border: 0 0% 90%;
+        --input: 0 0% 90%;
+        --ring: 206 100% 42%;
+
+        --success: 120 70% 30%;
+        --success-foreground: 0 0% 100%;
+        --warning: 38 95% 45%;
+        --warning-foreground: 0 0% 9%;
+        --info: 206 100% 36%;
+        --info-foreground: 0 0% 100%;
+        --error: 358 64% 47%;
+        --error-foreground: 0 0% 100%;
+    }
+
+    * {
+        border-color: hsl(var(--border));
+    }
+
+    html,
+    body,
+    #batch-explorer-root {
+        height: 100%;
+    }
+
+    body {
+        /*
+         * Layered background: deep base + two soft radial gradients (cyan
+         * top-left, violet bottom-right) + a hairline noise texture so
+         * surfaces don't feel like flat grey rectangles. The radials use
+         * the same CSS tokens that drive accents — change a token and the
+         * whole ambiance shifts.
+         */
+        background-color: hsl(var(--background));
+        background-image:
+            radial-gradient(
+                circle at 0% 0%,
+                hsl(var(--gradient-primary-start) / 0.08) 0%,
+                transparent 45%
+            ),
+            radial-gradient(
+                circle at 100% 100%,
+                hsl(var(--gradient-primary-end) / 0.08) 0%,
+                transparent 45%
+            ),
+            url("data:image/svg+xml;utf8,%3Csvg viewBox='0 0 200 200' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.85' numOctaves='2' stitchTiles='stitch'/%3E%3CfeColorMatrix values='0 0 0 0 1 0 0 0 0 1 0 0 0 0 1 0 0 0 0.018 0'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");
+        background-attachment: fixed;
+        color: hsl(var(--foreground));
+        font-family:
+            "Inter",
+            "Segoe UI",
+            system-ui,
+            -apple-system,
+            BlinkMacSystemFont,
+            "Helvetica Neue",
+            Arial,
+            sans-serif;
+        font-feature-settings:
+            "rlig" 1,
+            "calt" 1,
+            "ss01" 1;
+        -webkit-font-smoothing: antialiased;
+    }
+
+    /*
+     * Density modes — toggleable from UserPreferences. The DataTable component
+     * (src/multi-region/components/shared/enhanced-table.tsx) reads
+     * --row-height, --row-padding-y, --header-padding-y, and --table-font-size
+     * directly via the `density` Tailwind variants below.
+     */
+    .density-compact {
+        --row-height: 28px;
+        --row-padding-y: 0.25rem;     /* 4px */
+        --row-padding-x: 0.5rem;      /* 8px */
+        --header-padding-y: 0.375rem; /* 6px */
+        --header-font-size: 0.6875rem;
+        --table-font-size: 0.75rem;   /* 12px */
+        --gutter-y: 0.375rem;
+        --cell-line-height: 1rem;
+    }
+
+    .density-comfortable {
+        --row-height: 36px;
+        --row-padding-y: 0.5rem;      /* 8px */
+        --row-padding-x: 0.75rem;     /* 12px */
+        --header-padding-y: 0.625rem; /* 10px */
+        --header-font-size: 0.75rem;
+        --table-font-size: 0.875rem;  /* 14px */
+        --gutter-y: 0.625rem;
+        --cell-line-height: 1.25rem;
+    }
+
+    /* Default to comfortable when the class isn't set yet — avoids unstyled
+     * tables on first paint before the DensityToggle effect runs. */
+    :root {
+        --row-height: 36px;
+        --row-padding-y: 0.5rem;
+        --row-padding-x: 0.75rem;
+        --header-padding-y: 0.625rem;
+        --header-font-size: 0.75rem;
+        --table-font-size: 0.875rem;
+        --gutter-y: 0.625rem;
+        --cell-line-height: 1.25rem;
+    }
+}
+
+@layer utilities {
+    /*
+     * Identity-defining utilities. Drop these on the right surfaces and
+     * the chrome stops feeling like a stock dashboard. Keep them token-
+     * driven so a single CSS-var change cascades app-wide.
+     *
+     *   .gradient-primary       — fills with the cyan→azure→violet stops
+     *   .gradient-text-primary  — gradient text on display headings
+     *   .gradient-border        — 1px gradient border via mask-composite
+     *   .glass-surface          — backdrop-blur + translucent panel
+     *   .accent-rail            — vertical glow rail, used by sidebar active
+     */
+
+    .gradient-primary {
+        background-image: linear-gradient(
+            135deg,
+            hsl(var(--gradient-primary-start)) 0%,
+            hsl(var(--gradient-primary-mid)) 50%,
+            hsl(var(--gradient-primary-end)) 100%
+        );
+    }
+
+    .gradient-text-primary {
+        background-image: linear-gradient(
+            135deg,
+            hsl(var(--gradient-primary-start)) 0%,
+            hsl(var(--gradient-primary-mid)) 50%,
+            hsl(var(--gradient-primary-end)) 100%
+        );
+        background-clip: text;
+        -webkit-background-clip: text;
+        color: transparent;
+        -webkit-text-fill-color: transparent;
+    }
+
+    .gradient-border {
+        position: relative;
+    }
+    .gradient-border::before {
+        content: "";
+        position: absolute;
+        inset: 0;
+        padding: 1px;
+        border-radius: inherit;
+        background: linear-gradient(
+            135deg,
+            hsl(var(--gradient-primary-start) / 0.6),
+            hsl(var(--gradient-primary-end) / 0.6)
+        );
+        -webkit-mask:
+            linear-gradient(#fff 0 0) content-box,
+            linear-gradient(#fff 0 0);
+        -webkit-mask-composite: xor;
+        mask-composite: exclude;
+        pointer-events: none;
+    }
+
+    .glass-surface {
+        background-color: hsl(var(--card) / 0.65);
+        backdrop-filter: blur(14px) saturate(140%);
+        -webkit-backdrop-filter: blur(14px) saturate(140%);
+        border: 1px solid hsl(var(--border) / 0.6);
+    }
+
+    .accent-rail {
+        position: relative;
+    }
+    .accent-rail::before {
+        content: "";
+        position: absolute;
+        left: 0;
+        top: 8%;
+        bottom: 8%;
+        width: 3px;
+        border-radius: 2px;
+        background: linear-gradient(
+            180deg,
+            hsl(var(--gradient-primary-start)),
+            hsl(var(--gradient-primary-end))
+        );
+        box-shadow:
+            0 0 8px 0 hsl(var(--gradient-primary-start) / 0.7),
+            0 0 14px 0 hsl(var(--gradient-primary-end) / 0.4);
+    }
+
+    /*
+     * Canonical focus ring per Design Contract §2.9. Used by interactive
+     * surfaces that don't already use a Radix primitive's built-in ring.
+     */
+    .focus-ring {
+        outline: none;
+        box-shadow:
+            0 0 0 2px hsl(var(--background)),
+            0 0 0 4px hsl(var(--ring) / 0.6);
+    }
+
+    /* Density-aware table cell utilities — read by DataTable. */
+    .table-cell-row {
+        height: var(--row-height);
+        padding-top: var(--row-padding-y);
+        padding-bottom: var(--row-padding-y);
+        padding-left: var(--row-padding-x);
+        padding-right: var(--row-padding-x);
+        font-size: var(--table-font-size);
+        line-height: var(--cell-line-height);
+    }
+
+    .table-cell-header {
+        padding-top: var(--header-padding-y);
+        padding-bottom: var(--header-padding-y);
+        padding-left: var(--row-padding-x);
+        padding-right: var(--row-padding-x);
+        font-size: var(--header-font-size);
+        font-weight: 600;
+        text-transform: uppercase;
+        letter-spacing: 0.025em;
+    }
+
+    /* Respects user's reduced-motion preference. Prefer this over bespoke
+     * @media checks at component level. */
+    @media (prefers-reduced-motion: reduce) {
+        .motion-safe-only {
+            transition-property: none !important;
+            animation: none !important;
+            transform: none !important;
+        }
+    }
+
+    /*
+     * Live "alive" motion utilities. Keep things subtle — these communicate
+     * "this is real-time data" without being attention-grabbing. All respect
+     * prefers-reduced-motion via the @media block at the bottom of this layer.
+     *
+     * - .live-pulse-dot       : a small status dot (success/warning/destructive
+     *                           tone via CSS var --live-tone) that emits a
+     *                           soft expanding ring 1×/sec. Used for healthy-
+     *                           region indicators, "live" agent statuses.
+     * - .live-glow-bar         : a progress bar that emits a soft glowing
+     *                           edge while filling. Color follows --live-tone.
+     * - .live-graph-shimmer    : a graph/sparkline overlay that briefly
+     *                           shimmers when data refreshes. Apply only
+     *                           during a known refresh tick.
+     */
+
+    .live-pulse-dot {
+        position: relative;
+        display: inline-block;
+        width: 0.5rem;
+        height: 0.5rem;
+        border-radius: 9999px;
+        background-color: hsl(var(--live-tone, var(--success)));
+    }
+
+    .live-pulse-dot::before {
+        content: "";
+        position: absolute;
+        inset: 0;
+        border-radius: 9999px;
+        background-color: hsl(var(--live-tone, var(--success)) / 0.5);
+        animation: live-ping 1.5s cubic-bezier(0, 0, 0.2, 1) infinite;
+    }
+
+    @keyframes live-ping {
+        0% {
+            transform: scale(1);
+            opacity: 0.65;
+        }
+        70% {
+            transform: scale(2.4);
+            opacity: 0;
+        }
+        100% {
+            transform: scale(2.4);
+            opacity: 0;
+        }
+    }
+
+    .live-glow-bar {
+        position: relative;
+        overflow: hidden;
+        box-shadow:
+            0 0 6px 0 hsl(var(--live-tone, var(--primary)) / 0.55),
+            0 0 12px 0 hsl(var(--live-tone, var(--primary)) / 0.35);
+        animation: live-glow-pulse 2s ease-in-out infinite;
+    }
+
+    .live-glow-bar::after {
+        content: "";
+        position: absolute;
+        inset: 0;
+        background: linear-gradient(
+            90deg,
+            transparent,
+            hsl(var(--live-tone, var(--primary)) / 0.55),
+            transparent
+        );
+        animation: live-glow-sweep 1.8s linear infinite;
+    }
+
+    @keyframes live-glow-pulse {
+        0%,
+        100% {
+            box-shadow:
+                0 0 6px 0 hsl(var(--live-tone, var(--primary)) / 0.45),
+                0 0 12px 0 hsl(var(--live-tone, var(--primary)) / 0.25);
+        }
+        50% {
+            box-shadow:
+                0 0 10px 0 hsl(var(--live-tone, var(--primary)) / 0.7),
+                0 0 18px 0 hsl(var(--live-tone, var(--primary)) / 0.45);
+        }
+    }
+
+    @keyframes live-glow-sweep {
+        0% {
+            transform: translateX(-100%);
+        }
+        100% {
+            transform: translateX(100%);
+        }
+    }
+
+    .live-graph-shimmer {
+        position: relative;
+        overflow: hidden;
+    }
+
+    .live-graph-shimmer::after {
+        content: "";
+        position: absolute;
+        inset: 0;
+        background: linear-gradient(
+            110deg,
+            transparent 30%,
+            hsl(var(--primary) / 0.12) 50%,
+            transparent 70%
+        );
+        animation: live-shimmer 2.4s ease-in-out infinite;
+        pointer-events: none;
+    }
+
+    @keyframes live-shimmer {
+        0% {
+            transform: translateX(-100%);
+        }
+        100% {
+            transform: translateX(100%);
+        }
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+        .live-pulse-dot::before,
+        .live-glow-bar,
+        .live-glow-bar::after,
+        .live-graph-shimmer::after {
+            animation: none !important;
+        }
+        .live-glow-bar {
+            box-shadow: none !important;
+        }
+    }
+}

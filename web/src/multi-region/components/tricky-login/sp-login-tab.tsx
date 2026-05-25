@@ -1,0 +1,832 @@
+/**
+ * Service Principal credential login tab — sibling of the user-account
+ * tricky-login flow, mounted under the Tricky Login page as a second
+ * top-level Tabs section.
+ *
+ * Three sub-modes:
+ *   1. Client Secret   — `grant_type=client_credentials` (app-only token).
+ *   2. Certificate     — out-of-scope for a browser SPA (private-key
+ *      assertion signing needs WebCrypto + DER parsing; we surface a
+ *      explanation note instead of silently failing).
+ *   3. OBO (On-Behalf-Of) — `grant_type=urn:ietf:params:oauth:grant-type:
+ *      jwt-bearer` with a user access token as the assertion, exchanged
+ *      for a downstream-scoped token via the same client.
+ *
+ * Both POST flows go through the same dev-server `/api/auth/proxy-token`
+ * relay MSAL uses (`x-proxy-target` header → AAD's
+ * `/oauth2/v2.0/token`). This dodges AAD's browser CORS reject on direct
+ * `client_credentials` POSTs (AAD only sets CORS headers for public-client
+ * `authorization_code` + `refresh_token` grants).
+ *
+ * Audit:
+ *   action: tricky_login_sp_mint
+ *   details: { tenantId, clientId, scope, mode, durationMs }
+ *   NEVER includes the secret, NEVER includes the returned token.
+ *
+ * The result panel renders decoded claims, a copy button, and an
+ * "Import to vault" button that uses the same `previewToken` +
+ * `importToken` plumbing as the user-flow result panel.
+ */
+import * as React from "react";
+import {
+  AlertTriangle,
+  CheckCircle2,
+  ClipboardCopy,
+  Eye,
+  EyeOff,
+  KeyRound,
+  Lock,
+  Loader2,
+  ShieldAlert,
+  Sparkles,
+  XCircle,
+} from "lucide-react";
+
+import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
+import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
+import {
+  Card,
+  CardContent,
+  CardDescription,
+  CardHeader,
+  CardTitle,
+} from "@/components/ui/card";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
+import {
+  Tabs,
+  TabsContent,
+  TabsList,
+  TabsTrigger,
+} from "@/components/ui/tabs";
+import { cn } from "@/lib/utils";
+
+import { decodeJwtClaimsUnsafe } from "../../auth/msal-auth";
+import {
+  classifyAudience,
+  importToken,
+  previewToken,
+} from "../../auth/imported-tokens";
+import { auditLog } from "../../services/audit-log";
+import { useMultiRegionStore } from "../../store/store-context";
+
+import { CopyButton } from "../shared/copy-button";
+import { InfoTooltip } from "../shared/info-tooltip";
+
+import {
+  extractAadErrorCode,
+  fmtDuration,
+  formatExpiresIn,
+  maskToken,
+  CLAIM_EXPLAIN,
+} from "./tricky-login-helpers";
+
+/* ------------------------------------------------------------------ */
+/* Mode + result types                                                 */
+/* ------------------------------------------------------------------ */
+
+type SpMintMode = "secret" | "certificate" | "obo";
+
+interface SpMintResult {
+  status: "success" | "failure";
+  mode: SpMintMode;
+  tenantId: string;
+  clientId: string;
+  scope: string;
+  durationMs: number;
+  /** Successful mint only. */
+  accessToken?: string;
+  /** Successful mint only — decoded claims, signature NOT verified. */
+  claims?: Record<string, unknown>;
+  /** Successful mint only — epoch-seconds the token expires at. */
+  expiresAt?: number;
+  /** Failed mint only. */
+  errorCode?: string;
+  errorMessage?: string;
+  /** ISO timestamp the attempt finished at. */
+  finishedAt: string;
+}
+
+/* ------------------------------------------------------------------ */
+/* Pure helpers                                                        */
+/* ------------------------------------------------------------------ */
+
+/** Default scope used by every mode — operators can override per call. */
+const DEFAULT_SCOPE = "https://management.azure.com/.default";
+
+/**
+ * Format a JWT claim value for the per-claim result table. Mirrors the
+ * helper in tricky-login-page.tsx (kept local so this file can stand alone
+ * — it doesn't import from the page).
+ */
+function formatClaimValue(name: string, value: unknown): string {
+  if (value == null) return "(null)";
+  if (typeof value === "string") return value;
+  if (typeof value === "number") {
+    if (name === "iat" || name === "nbf" || name === "exp") {
+      try {
+        const iso = new Date(value * 1000).toISOString();
+        return `${value} (${iso})`;
+      } catch {
+        return String(value);
+      }
+    }
+    return String(value);
+  }
+  if (typeof value === "boolean") return value ? "true" : "false";
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return String(value);
+  }
+}
+
+/**
+ * POST a token request to AAD's v2 endpoint via the dev-server proxy.
+ *
+ * Why the proxy: AAD only sets the `Access-Control-Allow-Origin: *`
+ * header for public-client flows (authorization_code, refresh_token).
+ * Confidential-client grants (client_credentials, jwt-bearer) get NO
+ * CORS allowance, so a direct browser POST fails with a CORS error
+ * BEFORE the response body is readable. The webpack dev server's
+ * /api/auth/proxy-token middleware reads `x-proxy-target` and re-issues
+ * the POST server-side, then streams the body back to the browser. This
+ * is the same plumbing MSAL's customNetworkClient uses (msal-auth.ts
+ * sendPostRequestAsync).
+ *
+ * Returns the parsed JSON body, or throws an Error whose message starts
+ * with `AADSTS…` when AAD rejected.
+ */
+async function postTokenRequest(
+  tenantId: string,
+  body: URLSearchParams,
+): Promise<Record<string, unknown>> {
+  const target = `https://login.microsoftonline.com/${encodeURIComponent(
+    tenantId,
+  )}/oauth2/v2.0/token`;
+  const resp = await fetch("/api/auth/proxy-token", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/x-www-form-urlencoded",
+      "x-proxy-target": target,
+    },
+    body: body.toString(),
+  });
+  let parsed: unknown;
+  try {
+    parsed = await resp.json();
+  } catch (err) {
+    throw new Error(
+      `AAD returned HTTP ${resp.status} with non-JSON body (${
+        err instanceof Error ? err.message : String(err)
+      }).`,
+    );
+  }
+  const data = (parsed ?? {}) as Record<string, unknown>;
+  if (!resp.ok || typeof data.access_token !== "string") {
+    const desc =
+      typeof data.error_description === "string"
+        ? (data.error_description as string)
+        : typeof data.error === "string"
+          ? (data.error as string)
+          : `HTTP ${resp.status}`;
+    throw new Error(desc);
+  }
+  return data;
+}
+
+/* ------------------------------------------------------------------ */
+/* Component                                                           */
+/* ------------------------------------------------------------------ */
+
+export const SpLoginTab: React.FC = () => {
+  const store = useMultiRegionStore();
+
+  /* --- Mount lifecycle (same pattern as the parent page). */
+  const mountedRef = React.useRef(true);
+  React.useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+    };
+  }, []);
+
+  /* --- Mode + form state. */
+  const [mode, setMode] = React.useState<SpMintMode>("secret");
+  // Shared fields across modes.
+  const [tenantId, setTenantId] = React.useState("");
+  const [clientId, setClientId] = React.useState("");
+  const [clientSecret, setClientSecret] = React.useState("");
+  const [scope, setScope] = React.useState(DEFAULT_SCOPE);
+  // OBO-only field — the user access token to swap.
+  const [userAssertion, setUserAssertion] = React.useState("");
+  // Visibility toggles so screen-share-safe by default.
+  const [secretRevealed, setSecretRevealed] = React.useState(false);
+  const [assertionRevealed, setAssertionRevealed] = React.useState(false);
+  const [tokenRevealed, setTokenRevealed] = React.useState(false);
+
+  /* --- Submit state. */
+  const [minting, setMinting] = React.useState(false);
+  const [result, setResult] = React.useState<SpMintResult | null>(null);
+
+  /* --- Form validity per-mode. */
+  const canSubmit = React.useMemo(() => {
+    if (!tenantId.trim() || !clientId.trim() || !scope.trim()) return false;
+    if (mode === "certificate") return false; // explicitly out-of-scope
+    if (mode === "secret") return clientSecret.trim().length > 0;
+    if (mode === "obo")
+      return clientSecret.trim().length > 0 && userAssertion.trim().length > 0;
+    return false;
+  }, [tenantId, clientId, scope, mode, clientSecret, userAssertion]);
+
+  /* --- Submit handler. */
+  const handleSubmit = React.useCallback(async () => {
+    if (!canSubmit) return;
+    const startedAt = performance.now();
+    setMinting(true);
+    setResult(null);
+    setTokenRevealed(false);
+    const tid = tenantId.trim();
+    const cid = clientId.trim();
+    const sc = scope.trim();
+    try {
+      const body = new URLSearchParams();
+      body.set("client_id", cid);
+      body.set("client_secret", clientSecret);
+      body.set("scope", sc);
+      if (mode === "secret") {
+        body.set("grant_type", "client_credentials");
+      } else if (mode === "obo") {
+        body.set("grant_type", "urn:ietf:params:oauth:grant-type:jwt-bearer");
+        body.set("assertion", userAssertion.trim());
+        body.set("requested_token_use", "on_behalf_of");
+      } else {
+        throw new Error("Certificate mode is not supported in the browser.");
+      }
+      const data = await postTokenRequest(tid, body);
+      const accessToken = data.access_token as string;
+      const claims = decodeJwtClaimsUnsafe(accessToken) ?? {};
+      const expiresAt =
+        typeof claims.exp === "number" ? (claims.exp as number) : undefined;
+      const durationMs = Math.round(performance.now() - startedAt);
+      const finalResult: SpMintResult = {
+        status: "success",
+        mode,
+        tenantId: tid,
+        clientId: cid,
+        scope: sc,
+        durationMs,
+        accessToken,
+        claims,
+        expiresAt,
+        finishedAt: new Date().toISOString(),
+      };
+      if (mountedRef.current) {
+        setResult(finalResult);
+      }
+      // Audit: NEVER include the secret or the returned token.
+      auditLog.record({
+        actor: `sp:${cid}`,
+        action: "tricky_login_sp_mint",
+        target: `${tid} / ${sc}`,
+        status: "success",
+        details: {
+          tenantId: tid,
+          clientId: cid,
+          scope: sc,
+          mode,
+          durationMs,
+          tokenAudience:
+            typeof claims.aud === "string" ? (claims.aud as string) : null,
+        },
+      });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      const code = extractAadErrorCode(msg);
+      const durationMs = Math.round(performance.now() - startedAt);
+      const finalResult: SpMintResult = {
+        status: "failure",
+        mode,
+        tenantId: tid,
+        clientId: cid,
+        scope: sc,
+        durationMs,
+        errorCode: code,
+        errorMessage: msg,
+        finishedAt: new Date().toISOString(),
+      };
+      if (mountedRef.current) {
+        setResult(finalResult);
+      }
+      auditLog.record({
+        actor: `sp:${cid}`,
+        action: "tricky_login_sp_mint",
+        target: `${tid} / ${sc}`,
+        status: "failure",
+        error: msg,
+        details: {
+          tenantId: tid,
+          clientId: cid,
+          scope: sc,
+          mode,
+          durationMs,
+          errorCode: code ?? null,
+        },
+      });
+    } finally {
+      if (mountedRef.current) setMinting(false);
+    }
+  }, [
+    canSubmit,
+    tenantId,
+    clientId,
+    clientSecret,
+    scope,
+    userAssertion,
+    mode,
+  ]);
+
+  /* --- Per-result actions. */
+  const handleCopyToken = React.useCallback(async () => {
+    if (!result?.accessToken) return;
+    try {
+      await navigator.clipboard.writeText(result.accessToken);
+      store.addNotification({
+        type: "success",
+        message: "SP access token copied to clipboard.",
+      });
+    } catch {
+      store.addNotification({
+        type: "warning",
+        message:
+          "Could not access clipboard — reveal the token below and copy manually.",
+      });
+    }
+  }, [result, store]);
+
+  const handleImportToVault = React.useCallback(() => {
+    if (!result || result.status !== "success" || !result.accessToken) return;
+    const preview = previewToken(result.accessToken);
+    if (!preview) {
+      store.addNotification({
+        type: "error",
+        message:
+          "Could not decode the new SP token — refusing to import. " +
+          "App-only tokens missing oid/tid can't be vaulted.",
+      });
+      return;
+    }
+    const entry = importToken(preview);
+    store.addNotification({
+      type: "success",
+      message: `Imported ${classifyAudience(preview.rawAudience)} SP token for ${
+        preview.upn ?? preview.oid
+      } → ${preview.tenantId}.`,
+    });
+    auditLog.record({
+      actor: `sp:${result.clientId}`,
+      action: "tricky_login_sp_import_to_vault",
+      target: `${result.tenantId} / ${result.scope}`,
+      status: "success",
+      details: {
+        tenantId: result.tenantId,
+        clientId: result.clientId,
+        scope: result.scope,
+        importedHomeAccountId: entry.homeAccountId,
+      },
+    });
+  }, [result, store]);
+
+  /* ------------------------------------------------------------------ */
+  /* Render                                                              */
+  /* ------------------------------------------------------------------ */
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle className="flex items-center gap-2 text-base">
+          <Lock className="h-4 w-4 text-primary" aria-hidden />
+          Service Principal credential login
+          <InfoTooltip content="Mint a token directly from a Service Principal credential. Use for headless / CI-style identities that don't have a user behind them. No popup, no MSAL — just a raw POST to AAD's token endpoint via the dev-server proxy." />
+        </CardTitle>
+        <CardDescription>
+          Mint tokens for non-interactive identities (CI runners, daemons,
+          background workers). Three sub-modes: client secret, certificate
+          (out-of-scope for browser), and On-Behalf-Of for downstream
+          delegation.
+        </CardDescription>
+      </CardHeader>
+      <CardContent className="flex flex-col gap-4">
+        <Tabs
+          value={mode}
+          onValueChange={(v) => setMode(v as SpMintMode)}
+        >
+          <TabsList>
+            <TabsTrigger value="secret" className="gap-1">
+              <KeyRound className="h-3.5 w-3.5" aria-hidden />
+              Client Secret
+            </TabsTrigger>
+            <TabsTrigger value="certificate" className="gap-1">
+              <ShieldAlert className="h-3.5 w-3.5" aria-hidden />
+              Certificate
+            </TabsTrigger>
+            <TabsTrigger value="obo" className="gap-1">
+              <Sparkles className="h-3.5 w-3.5" aria-hidden />
+              OBO
+            </TabsTrigger>
+          </TabsList>
+
+          {/* Shared field block — tenant id, client id, scope are
+              used by every mode, so we render them once below the
+              tabstrip and let each tab content add its own extras. */}
+          <div className="mt-4 grid gap-3 lg:grid-cols-2">
+            <div className="flex flex-col gap-1">
+              <Label htmlFor="sp-tenant-id" className="text-xs">
+                Tenant id
+              </Label>
+              <Input
+                id="sp-tenant-id"
+                value={tenantId}
+                onChange={(e) => setTenantId(e.target.value)}
+                placeholder="00000000-0000-0000-0000-000000000000"
+                className="font-mono text-xs"
+                spellCheck={false}
+                autoComplete="off"
+              />
+            </div>
+            <div className="flex flex-col gap-1">
+              <Label htmlFor="sp-client-id" className="text-xs">
+                App (client) id
+              </Label>
+              <Input
+                id="sp-client-id"
+                value={clientId}
+                onChange={(e) => setClientId(e.target.value)}
+                placeholder="00000000-0000-0000-0000-000000000000"
+                className="font-mono text-xs"
+                spellCheck={false}
+                autoComplete="off"
+              />
+            </div>
+            <div className="flex flex-col gap-1 lg:col-span-2">
+              <Label htmlFor="sp-scope" className="text-xs">
+                Scope
+              </Label>
+              <Input
+                id="sp-scope"
+                value={scope}
+                onChange={(e) => setScope(e.target.value)}
+                placeholder={DEFAULT_SCOPE}
+                className="font-mono text-xs"
+                spellCheck={false}
+                autoComplete="off"
+              />
+            </div>
+          </div>
+
+          <TabsContent value="secret" className="flex flex-col gap-3">
+            <div className="flex flex-col gap-1">
+              <Label
+                htmlFor="sp-client-secret"
+                className="flex items-center gap-1 text-xs"
+              >
+                Client secret
+                <InfoTooltip content="Pasted plain-text. We never log it or persist it — it's used once for this POST and lives only in component state for the lifetime of this page." />
+              </Label>
+              <div className="flex items-center gap-2">
+                <Input
+                  id="sp-client-secret"
+                  type={secretRevealed ? "text" : "password"}
+                  value={clientSecret}
+                  onChange={(e) => setClientSecret(e.target.value)}
+                  placeholder="paste the SP secret here"
+                  className="flex-1 font-mono text-xs"
+                  spellCheck={false}
+                  autoComplete="off"
+                />
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  type="button"
+                  onClick={() => setSecretRevealed((v) => !v)}
+                  className="gap-1"
+                >
+                  {secretRevealed ? (
+                    <EyeOff className="h-3.5 w-3.5" aria-hidden />
+                  ) : (
+                    <Eye className="h-3.5 w-3.5" aria-hidden />
+                  )}
+                  {secretRevealed ? "Hide" : "Reveal"}
+                </Button>
+              </div>
+            </div>
+            <p className="text-2xs text-muted-foreground">
+              POSTs <code>grant_type=client_credentials</code> with the SP
+              credential. The returned access token is an app-only token —
+              <code className="ml-1">oid</code> = the SP&apos;s object id, no{" "}
+              <code>upn</code>.
+            </p>
+          </TabsContent>
+
+          <TabsContent value="certificate">
+            <Alert variant="info">
+              <ShieldAlert className="h-4 w-4" aria-hidden />
+              <AlertTitle className="text-sm">
+                Certificate flow is out of scope for browser
+              </AlertTitle>
+              <AlertDescription className="text-xs">
+                <p className="m-0">
+                  Certificate-credential mints require building a signed
+                  JWT client assertion using the SP&apos;s private key.
+                  That needs WebCrypto + PKCS#8/PEM parsing and a
+                  thumbprint header — meaningful work that&apos;s also a
+                  security footgun (private keys in a browser tab). Use{" "}
+                  <code>az login --service-principal --certificate</code>{" "}
+                  outside the WebUI, or run the equivalent in your CI
+                  runner, and paste the resulting access token into the
+                  Token Importer page.
+                </p>
+              </AlertDescription>
+            </Alert>
+          </TabsContent>
+
+          <TabsContent value="obo" className="flex flex-col gap-3">
+            <div className="flex flex-col gap-1">
+              <Label
+                htmlFor="sp-obo-secret"
+                className="flex items-center gap-1 text-xs"
+              >
+                Client secret (the middle-tier app&apos;s secret)
+                <InfoTooltip content="The middle-tier confidential client's secret. OBO needs both the user's token AND proof-of-possession from the client app the user delivered the token to." />
+              </Label>
+              <div className="flex items-center gap-2">
+                <Input
+                  id="sp-obo-secret"
+                  type={secretRevealed ? "text" : "password"}
+                  value={clientSecret}
+                  onChange={(e) => setClientSecret(e.target.value)}
+                  placeholder="middle-tier client secret"
+                  className="flex-1 font-mono text-xs"
+                  spellCheck={false}
+                  autoComplete="off"
+                />
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  type="button"
+                  onClick={() => setSecretRevealed((v) => !v)}
+                  className="gap-1"
+                >
+                  {secretRevealed ? (
+                    <EyeOff className="h-3.5 w-3.5" aria-hidden />
+                  ) : (
+                    <Eye className="h-3.5 w-3.5" aria-hidden />
+                  )}
+                  {secretRevealed ? "Hide" : "Reveal"}
+                </Button>
+              </div>
+            </div>
+            <div className="flex flex-col gap-1">
+              <Label
+                htmlFor="sp-obo-assertion"
+                className="flex items-center gap-1 text-xs"
+              >
+                User access token (assertion)
+                <InfoTooltip content="The user-bound access token your middle-tier app received from a downstream call. AAD verifies the user is who they claim and mints a NEW token scoped to the downstream API." />
+              </Label>
+              <div className="flex items-center gap-2">
+                <textarea
+                  id="sp-obo-assertion"
+                  value={userAssertion}
+                  onChange={(e) => setUserAssertion(e.target.value)}
+                  placeholder="paste the user's access token (the assertion)"
+                  className={cn(
+                    "flex h-24 w-full rounded-md border border-input bg-background px-3 py-2 font-mono text-2xs shadow-sm focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring",
+                    !assertionRevealed && "blur-sm",
+                  )}
+                  spellCheck={false}
+                  autoComplete="off"
+                />
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  type="button"
+                  onClick={() => setAssertionRevealed((v) => !v)}
+                  className="gap-1 self-start"
+                >
+                  {assertionRevealed ? (
+                    <EyeOff className="h-3.5 w-3.5" aria-hidden />
+                  ) : (
+                    <Eye className="h-3.5 w-3.5" aria-hidden />
+                  )}
+                  {assertionRevealed ? "Hide" : "Reveal"}
+                </Button>
+              </div>
+            </div>
+            <p className="text-2xs text-muted-foreground">
+              POSTs{" "}
+              <code>
+                grant_type=urn:ietf:params:oauth:grant-type:jwt-bearer
+              </code>{" "}
+              with the assertion and{" "}
+              <code>requested_token_use=on_behalf_of</code>. AAD swaps the
+              user-bound token for a downstream-scoped one — same identity,
+              new audience.
+            </p>
+          </TabsContent>
+        </Tabs>
+
+        <div className="flex flex-wrap items-center gap-3 pt-2">
+          <Button
+            onClick={() => void handleSubmit()}
+            disabled={!canSubmit || minting}
+            loading={minting}
+            className="gap-2"
+          >
+            <Sparkles className="h-4 w-4" aria-hidden />
+            {mode === "secret"
+              ? "Mint app-only token"
+              : mode === "obo"
+                ? "Exchange OBO token"
+                : "Certificate mode unavailable"}
+          </Button>
+          {minting && (
+            <span className="flex items-center gap-1.5 text-2xs text-muted-foreground">
+              <Loader2 className="h-3 w-3 animate-spin" aria-hidden />
+              POSTing /{tenantId || "{tid}"}/oauth2/v2.0/token via proxy…
+            </span>
+          )}
+        </div>
+
+        {/* Result panel — mirrors the user-flow panel but trimmed to
+            what makes sense for an app-only token (no refresh token,
+            no tenant-switch / activate buttons since the SP isn't
+            a member of any operator's MSAL cache). */}
+        {result && (
+          <div
+            className={cn(
+              "flex flex-col gap-3 rounded-md border p-3",
+              result.status === "success"
+                ? "border-success/40 bg-success/5"
+                : "border-destructive/40 bg-destructive/5",
+            )}
+          >
+            <div className="flex flex-wrap items-center gap-2">
+              <span className="text-xs font-semibold">SP mint result</span>
+              {result.status === "success" ? (
+                <Badge variant="success" className="gap-1">
+                  <CheckCircle2 className="h-3 w-3" aria-hidden />
+                  Success
+                </Badge>
+              ) : (
+                <Badge variant="destructive" className="gap-1">
+                  <XCircle className="h-3 w-3" aria-hidden />
+                  Failure
+                </Badge>
+              )}
+              <Badge variant="outline" className="px-1.5 py-0">
+                {result.mode.toUpperCase()}
+              </Badge>
+              <Badge variant="outline">
+                {fmtDuration(result.durationMs / 1000)} elapsed
+              </Badge>
+              {result.status === "success" && result.expiresAt && (
+                <Badge variant="outline">
+                  {formatExpiresIn(result.expiresAt)}
+                </Badge>
+              )}
+              {result.status === "failure" && result.errorCode && (
+                <Badge variant="destructive">{result.errorCode}</Badge>
+              )}
+            </div>
+
+            {result.status === "failure" && (
+              <Alert variant="destructive">
+                <AlertTriangle className="h-4 w-4" aria-hidden />
+                <AlertTitle className="text-sm">
+                  SP mint failed
+                  {result.errorCode ? ` — ${result.errorCode}` : ""}
+                </AlertTitle>
+                <AlertDescription className="text-xs">
+                  <p className="m-0 whitespace-pre-wrap break-all font-mono">
+                    {result.errorMessage}
+                  </p>
+                </AlertDescription>
+              </Alert>
+            )}
+
+            {result.status === "success" && result.claims && (
+              <>
+                <div className="flex flex-col gap-1 rounded-md border bg-card/30 p-3">
+                  <div className="text-2xs font-semibold uppercase tracking-wider text-muted-foreground">
+                    Decoded access-token claims
+                  </div>
+                  <div className="overflow-x-auto">
+                    <table className="w-full text-xs">
+                      <thead className="border-b text-2xs uppercase text-muted-foreground">
+                        <tr>
+                          <th className="w-40 px-3 py-1.5 text-left font-medium">
+                            Claim
+                          </th>
+                          <th className="px-3 py-1.5 text-left font-medium">
+                            Value
+                          </th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {Object.entries(result.claims)
+                          .sort(([a], [b]) => a.localeCompare(b))
+                          .map(([k, v]) => (
+                            <tr
+                              key={k}
+                              className="border-b last:border-b-0 hover:bg-muted/30"
+                            >
+                              <td className="px-3 py-1.5 align-top font-mono text-2xs">
+                                <span className="inline-flex items-center gap-1">
+                                  {k}
+                                  {CLAIM_EXPLAIN[k] && (
+                                    <InfoTooltip
+                                      content={CLAIM_EXPLAIN[k]}
+                                      ariaLabel={`${k} explained`}
+                                      size={12}
+                                    />
+                                  )}
+                                </span>
+                              </td>
+                              <td className="px-3 py-1.5 align-top break-all font-mono text-2xs text-muted-foreground">
+                                {formatClaimValue(k, v)}
+                              </td>
+                            </tr>
+                          ))}
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
+
+                {result.accessToken && (
+                  <div className="flex flex-col gap-2">
+                    <div className="flex flex-wrap items-center gap-2 text-xs">
+                      <Badge variant="success" className="gap-1">
+                        <KeyRound className="h-3 w-3" aria-hidden />
+                        Access token minted
+                      </Badge>
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        onClick={() => setTokenRevealed((v) => !v)}
+                        className="gap-1"
+                      >
+                        {tokenRevealed ? (
+                          <EyeOff className="h-3.5 w-3.5" aria-hidden />
+                        ) : (
+                          <Eye className="h-3.5 w-3.5" aria-hidden />
+                        )}
+                        {tokenRevealed ? "Hide" : "Reveal"}
+                      </Button>
+                      <span className="font-mono text-2xs text-muted-foreground">
+                        {maskToken(result.accessToken)}
+                      </span>
+                    </div>
+                    {tokenRevealed && (
+                      <div className="flex items-center gap-2">
+                        <code className="flex-1 break-all rounded border bg-muted/30 p-2 font-mono text-2xs text-muted-foreground">
+                          {result.accessToken}
+                        </code>
+                        <CopyButton
+                          value={result.accessToken}
+                          alwaysVisible
+                          ariaLabel="Copy SP access token"
+                        />
+                      </div>
+                    )}
+                  </div>
+                )}
+
+                <div className="flex flex-wrap gap-2 pt-1">
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={handleImportToVault}
+                    className="gap-1"
+                  >
+                    <KeyRound className="h-3.5 w-3.5" aria-hidden />
+                    Import to vault
+                  </Button>
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={() => void handleCopyToken()}
+                    className="gap-1"
+                  >
+                    <ClipboardCopy className="h-3.5 w-3.5" aria-hidden />
+                    Copy raw token
+                  </Button>
+                </div>
+              </>
+            )}
+          </div>
+        )}
+      </CardContent>
+    </Card>
+  );
+};

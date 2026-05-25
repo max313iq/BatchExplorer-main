@@ -1,0 +1,32 @@
+/**
+ * Canonical regex matching MSAL / AAD errors that REQUIRE an interactive
+ * popup to recover from. Silent retries are useless against these — the
+ * account's refresh token in MSAL's cache is dead (expired, revoked, or
+ * wiped) and only an interactive sign-in can mint a new one.
+ *
+ * Covers:
+ *   - `interaction_required` (canonical MSAL error code)
+ *   - `invalid_grant` (RT no longer accepted by AAD)
+ *   - "Cached session is no longer valid" (MSAL.js exception message)
+ *   - AADSTS 50173 (FreshTokenNeeded), 50058 (UserInformationNotProvided),
+ *     50076 (UserStrongAuthClientAuthNRequired),
+ *     50079 (StrongAuthEnrollmentRequired), 65001 (DelegationDoesNotExist)
+ *
+ * Single source of truth — both `auth/perform-tenant-switch.ts` and
+ * `auth/use-arm-token.ts` import from here so we no longer need the
+ * "keep these in sync" comments that used to flank duplicated copies.
+ */
+export const REAUTH_REQUIRED_PATTERN =
+  /interaction_required|invalid_grant|Cached session is no longer valid|AADSTS50173|AADSTS50058|AADSTS50076|AADSTS50079|AADSTS65001/i;
+
+/**
+ * Convenience predicate. Accepts any error-like value (Error, string,
+ * unknown) and returns true when the message text triggers
+ * `REAUTH_REQUIRED_PATTERN`.
+ */
+export function isReauthRequiredError(err: unknown): boolean {
+  if (!err) return false;
+  const msg =
+    err instanceof Error ? err.message : typeof err === "string" ? err : String(err);
+  return REAUTH_REQUIRED_PATTERN.test(msg);
+}
