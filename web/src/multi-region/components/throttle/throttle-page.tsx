@@ -21,24 +21,32 @@
  */
 import * as React from "react";
 import {
+  Activity,
+  Bell,
+  BellOff,
   CheckCircle2,
   CircleAlert,
   Clock,
   Filter,
   Gauge,
   History,
+  Keyboard,
   PauseCircle,
   Play,
   RotateCw,
+  Save,
   Search,
   ShieldAlert,
+  Siren,
   Trash2,
   X,
   Zap,
 } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
+import { Checkbox } from "@/components/ui/checkbox";
 import { Input } from "@/components/ui/input";
+import { Kbd } from "@/components/ui/kbd";
 import { Progress } from "@/components/ui/progress";
 import {
   Tooltip,
@@ -197,6 +205,133 @@ function parseKey(key: string): ParsedKey {
     family: key.substring(idx + 2) as EndpointFamily,
   };
 }
+
+// ---------------------------------------------------------------------------
+// Defender-lens: 429 storm correlation
+// ---------------------------------------------------------------------------
+//
+// A *sudden* burst of throttle-opens across many subscriptions is one of the
+// signals red-team tooling (ScoutSuite, Prowler, AzureHound, ROADrecon)
+// reliably emits when it enumerates a tenant: the credential chain in
+// `_analysis_defender_view.md` §1 (DefaultAzureCredential — Environment →
+// MI → SharedTokenCache → VSCredential → AzureCli → InteractiveBrowser)
+// walks `tenants` (defender-view §4), `subscriptions`, `roleAssignments`,
+// `keyVault.secrets`, etc. in fast loops — the ARM and Graph token-buckets
+// drain almost instantly and the breaker pops on many (sub, family) pairs
+// inside a short window. The user-facing UI thus exposes a "storm" banner
+// when:
+//   - >= STORM_MIN_OPENS transitions to `open` land within the rolling
+//     STORM_WINDOW_MS, OR
+//   - those opens span >= STORM_MIN_DISTINCT_SUBS distinct subscriptionIds.
+//
+// Reference (read-only): C:\Users\baimgprodsesa1\Desktop\New folder\
+//   _analysis_defender_view.md:6-19   (DefaultAzureCredential chain)
+//   _analysis_defender_view.md:72-79  (tenants enumeration, single-token
+//                                      multi-tenant pivots)
+//   _analysis_dafthack.md             (GraphRunner / MFASweep — the same
+//                                      enumeration signature on Graph)
+const STORM_WINDOW_MS = 5 * 60_000;
+const STORM_MIN_OPENS = 5;
+const STORM_MIN_DISTINCT_SUBS = 3;
+
+interface StormSignal {
+  active: boolean;
+  opens: number;
+  distinctSubs: number;
+  distinctFamilies: number;
+  windowStart: string | null;
+}
+
+function computeStormSignal(
+  history: readonly ThrottleTransition[],
+  now: number,
+): StormSignal {
+  const cutoff = now - STORM_WINDOW_MS;
+  const subs = new Set<string>();
+  const families = new Set<string>();
+  let opens = 0;
+  let earliest = Infinity;
+  for (const t of history) {
+    if (t.to !== "open") continue;
+    const ts = new Date(t.timestamp).getTime();
+    if (Number.isNaN(ts) || ts < cutoff) continue;
+    opens++;
+    subs.add(t.subscriptionId);
+    families.add(t.family);
+    if (ts < earliest) earliest = ts;
+  }
+  const active =
+    opens >= STORM_MIN_OPENS || subs.size >= STORM_MIN_DISTINCT_SUBS;
+  return {
+    active,
+    opens,
+    distinctSubs: subs.size,
+    distinctFamilies: families.size,
+    windowStart: earliest === Infinity ? null : new Date(earliest).toISOString(),
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Family-roll-up — for the alert-subscription gate and the stacked bar.
+// ---------------------------------------------------------------------------
+
+const FAMILY_CATEGORIES: readonly FamilyCategory[] = [
+  "arm",
+  "graph",
+  "batch",
+  "other",
+] as const;
+
+const FAMILY_CATEGORY_LABEL: Record<FamilyCategory, string> = {
+  arm: "ARM",
+  graph: "Graph",
+  batch: "Batch",
+  other: "Other",
+};
+
+/**
+ * Per-family aggregate stats used by the stacked bar and the alert gate.
+ * `transitionsToOpen` is the count of *→open transitions in the last hour
+ * for that family — the right scale for visualising 429 storm shape.
+ */
+interface FamilyStats {
+  category: FamilyCategory;
+  recentThrottles: number;
+  opensLastHour: number;
+}
+
+function computeFamilyStats(
+  entries: ReadonlyArray<{ family: EndpointFamily; entry: ThrottleStatusEntry }>,
+  history: readonly ThrottleTransition[],
+  now: number,
+): Record<FamilyCategory, FamilyStats> {
+  const acc: Record<FamilyCategory, FamilyStats> = {
+    arm: { category: "arm", recentThrottles: 0, opensLastHour: 0 },
+    graph: { category: "graph", recentThrottles: 0, opensLastHour: 0 },
+    batch: { category: "batch", recentThrottles: 0, opensLastHour: 0 },
+    other: { category: "other", recentThrottles: 0, opensLastHour: 0 },
+  };
+  for (const e of entries) {
+    acc[familyCategory(e.family)].recentThrottles += e.entry.recentThrottles;
+  }
+  const cutoff = now - 60 * 60 * 1000;
+  for (const t of history) {
+    if (t.to !== "open") continue;
+    const ts = new Date(t.timestamp).getTime();
+    if (Number.isNaN(ts) || ts < cutoff) continue;
+    acc[familyCategory(t.family)].opensLastHour++;
+  }
+  return acc;
+}
+
+// Family-category palette for the stacked-bar — uses CSS vars from theme
+// so dark/light modes stay legible without explicit hex codes.
+const FAMILY_BAR_TONE: Record<FamilyCategory, { bg: string; fg: string }> = {
+  arm: { bg: "bg-primary/70", fg: "text-primary" },
+  graph: { bg: "bg-info/70", fg: "text-info" },
+  batch: { bg: "bg-warning/70", fg: "text-warning" },
+  other: { bg: "bg-muted-foreground/50", fg: "text-muted-foreground" },
+};
 
 // ---------------------------------------------------------------------------
 // Filter & sort model
@@ -584,6 +719,95 @@ const TransitionRow: React.FC<{
 };
 
 // ---------------------------------------------------------------------------
+// Stacked bar — 429s by service family
+// ---------------------------------------------------------------------------
+
+interface FamilyStackedBarProps {
+  /** Source data — per-family aggregates. */
+  stats: Record<FamilyCategory, FamilyStats>;
+  /**
+   * Which metric to display. `recentThrottles` is "current pressure",
+   * `opensLastHour` is "storm shape over the last hour". The default is
+   * `recentThrottles` because that's the live signal an operator wants.
+   */
+  metric: "recentThrottles" | "opensLastHour";
+}
+
+/**
+ * Compact horizontal stacked bar that visualises 429 pressure broken down
+ * by service-family category. Pure CSS — no chart-library dependency. The
+ * bar is hidden when total is zero so the page doesn't carry empty chrome.
+ */
+const FamilyStackedBar: React.FC<FamilyStackedBarProps> = ({ stats, metric }) => {
+  const segments = FAMILY_CATEGORIES.map((cat) => ({
+    cat,
+    value: stats[cat][metric],
+  }));
+  const total = segments.reduce((s, x) => s + x.value, 0);
+  if (total === 0) return null;
+  return (
+    <div className="flex flex-col gap-1.5">
+      <div
+        className="relative flex h-3 w-full overflow-hidden rounded-full border border-border bg-card"
+        role="img"
+        aria-label={`429 distribution by service family. ${segments
+          .filter((s) => s.value > 0)
+          .map(
+            (s) =>
+              `${FAMILY_CATEGORY_LABEL[s.cat]}: ${s.value} (${Math.round(
+                (s.value / total) * 100,
+              )}%)`,
+          )
+          .join(", ")}`}
+      >
+        {segments.map(({ cat, value }) => {
+          if (value === 0) return null;
+          const pct = (value / total) * 100;
+          return (
+            <Tooltip key={cat}>
+              <TooltipTrigger asChild>
+                <div
+                  className={cn(
+                    "h-full transition-all duration-200 ease-out motion-reduce:transition-none cursor-help",
+                    FAMILY_BAR_TONE[cat].bg,
+                  )}
+                  style={{ width: `${pct}%` }}
+                />
+              </TooltipTrigger>
+              <TooltipContent side="top">
+                <span className="text-xs">
+                  <strong>{FAMILY_CATEGORY_LABEL[cat]}</strong>: {value} (
+                  {Math.round(pct)}%)
+                </span>
+              </TooltipContent>
+            </Tooltip>
+          );
+        })}
+      </div>
+      <div className="flex flex-wrap gap-x-3 gap-y-0.5 text-2xs text-muted-foreground">
+        {segments
+          .filter((s) => s.value > 0)
+          .map(({ cat, value }) => (
+            <span
+              key={cat}
+              className="inline-flex items-center gap-1 tabular-nums"
+            >
+              <span
+                aria-hidden
+                className={cn("h-2 w-2 rounded-sm", FAMILY_BAR_TONE[cat].bg)}
+              />
+              <span className={FAMILY_BAR_TONE[cat].fg}>
+                {FAMILY_CATEGORY_LABEL[cat]}
+              </span>
+              <span>{value}</span>
+            </span>
+          ))}
+      </div>
+    </div>
+  );
+};
+
+// ---------------------------------------------------------------------------
 // Page
 // ---------------------------------------------------------------------------
 
@@ -672,6 +896,40 @@ export const ThrottlePage: React.FC = () => {
     { version: 1, syncAcrossTabs: true },
   );
 
+  // Operator-calibrated "expected baseline" of avg refill %. Captured at a
+  // known-good moment (a button below grabs the current avg). The page then
+  // alerts when the live avg drifts NEGATIVE by more than DRIFT_BAND_PCT
+  // points from that baseline — catches gradual capacity loss that the
+  // absolute-floor warnAtPct misses (e.g. baseline 95 → drift to 86 is fine
+  // by warnAtPct=80 but is still a 9-point degradation).
+  const [baselinePct, setBaselinePct] = usePersistedState<number | null>(
+    "throttle.baselinePct",
+    null,
+    { version: 1, syncAcrossTabs: true },
+  );
+
+  // Per-family alert subscription set — operators silence "expected" 429
+  // sources (e.g. a noisy Graph polling loop) and keep alerts focused on
+  // the families they care about. The default subscribes to all families
+  // so first-run UX matches today's all-or-nothing behavior.
+  const [alertedFamilies, setAlertedFamilies] = usePersistedState<
+    Record<FamilyCategory, boolean>
+  >(
+    "throttle.alertedFamilies",
+    { arm: true, graph: true, batch: true, other: true },
+    { version: 1, syncAcrossTabs: true },
+  );
+
+  // Which metric the family stacked-bar shows. Persisted so paired ops see
+  // the same panel between reloads.
+  const [familyBarMetric, setFamilyBarMetric] = usePersistedState<
+    "recentThrottles" | "opensLastHour"
+  >("throttle.familyBarMetric", "recentThrottles", {
+    version: 1,
+    syncAcrossTabs: true,
+  });
+
+  const [keyboardHelpOpen, setKeyboardHelpOpen] = React.useState(false);
   const [resetAllOpen, setResetAllOpen] = React.useState(false);
   const [clearHistoryOpen, setClearHistoryOpen] = React.useState(false);
 
@@ -882,6 +1140,121 @@ export const ThrottlePage: React.FC = () => {
     return kpiStats.avgPct < warnAtPct;
   }, [allEntries.length, kpiStats.avgPct, warnAtPct]);
 
+  // Per-family aggregates — feeds the stacked-bar viz and the alert gate.
+  // Re-derives when history (which seeds opens-last-hour) changes or once
+  // a minute as the rolling window slides.
+  const familyStats = React.useMemo(
+    () =>
+      computeFamilyStats(allEntries, stats.history, Date.now()),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [allEntries, stats.history, Math.floor(nowTick / 60)],
+  );
+
+  // Filter the alerting decision by the operator's per-family subscription
+  // mask. A breach on a silenced family doesn't trigger the banner, so the
+  // page stays quiet for "expected" 429 sources. We compute this on top of
+  // the absolute threshold so the existing UX (avgPct vs warnAtPct) is
+  // preserved when all families are subscribed (default state).
+  const alertedFamilyHasBreach = React.useMemo(() => {
+    if (!thresholdBreach) return false;
+    let anySubscribedHasThrottles = false;
+    for (const cat of FAMILY_CATEGORIES) {
+      if (!alertedFamilies[cat]) continue;
+      if (familyStats[cat].recentThrottles > 0 || familyStats[cat].opensLastHour > 0) {
+        anySubscribedHasThrottles = true;
+        break;
+      }
+    }
+    // If the avg dropped but no subscribed family is contributing 429s,
+    // the breach is being driven by a silenced source — suppress it.
+    return anySubscribedHasThrottles;
+  }, [thresholdBreach, alertedFamilies, familyStats]);
+
+  // Defender-lens 429-storm detector — see `_analysis_defender_view.md` §1
+  // (DefaultAzureCredential chain) and §4 (single-token tenant enumeration).
+  // A burst of `*→open` transitions across multiple subscriptions inside
+  // STORM_WINDOW_MS is a strong tell for credential-enumeration / spray
+  // tooling actively recon'ing the tenant. Recompute every 5s as the window
+  // slides; nowTick fires every second so divide by 5.
+  const stormSignal = React.useMemo(
+    () => computeStormSignal(stats.history, Date.now()),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [stats.history, Math.floor(nowTick / 5)],
+  );
+
+  // Filter storm-alert by the per-family subscription mask too — the same
+  // silencing logic applies. The detector spans all families internally, so
+  // we mute the banner if none of the contributing families are subscribed.
+  const stormAlertActive = React.useMemo(() => {
+    if (!stormSignal.active) return false;
+    const cutoff = Date.now() - STORM_WINDOW_MS;
+    for (const t of stats.history) {
+      if (t.to !== "open") continue;
+      const ts = new Date(t.timestamp).getTime();
+      if (Number.isNaN(ts) || ts < cutoff) continue;
+      if (alertedFamilies[familyCategory(t.family)]) return true;
+    }
+    return false;
+  }, [stormSignal.active, stats.history, alertedFamilies]);
+
+  // Baseline-drift check — independent of the absolute floor. Triggers when
+  // the live avg has fallen more than DRIFT_BAND_PCT points below the
+  // operator-saved baseline. Only meaningful when a baseline is set.
+  const DRIFT_BAND_PCT = 10;
+  const baselineDrift = React.useMemo(() => {
+    if (baselinePct == null || allEntries.length === 0) return null;
+    const delta = baselinePct - kpiStats.avgPct;
+    if (delta <= DRIFT_BAND_PCT) return null;
+    return { baseline: baselinePct, current: kpiStats.avgPct, delta };
+  }, [baselinePct, kpiStats.avgPct, allEntries.length]);
+
+  // Ref + edge-trigger so the ARIA-live announcement only fires when the
+  // breach STATE changes (clear → warn or storm-off → storm-on), instead of
+  // re-announcing on every tick. Screen readers otherwise re-read on every
+  // re-render with `aria-live="assertive"`.
+  const [liveAnnouncement, setLiveAnnouncement] = React.useState("");
+  const prevAlertSnapshot = React.useRef<{
+    breach: boolean;
+    storm: boolean;
+    drift: boolean;
+  }>({ breach: false, storm: false, drift: false });
+  React.useEffect(() => {
+    const next = {
+      breach: alertedFamilyHasBreach,
+      storm: stormAlertActive,
+      drift: baselineDrift != null,
+    };
+    const prev = prevAlertSnapshot.current;
+    const msgs: string[] = [];
+    if (next.breach && !prev.breach) {
+      msgs.push(
+        `Throttle alert: average refill ${kpiStats.avgPct} percent, below ${warnAtPct} percent threshold.`,
+      );
+    }
+    if (next.storm && !prev.storm) {
+      msgs.push(
+        `Throttle storm detected: ${stormSignal.opens} circuit opens across ${stormSignal.distinctSubs} subscriptions in the last ${Math.round(
+          STORM_WINDOW_MS / 60_000,
+        )} minutes. Review for credential enumeration.`,
+      );
+    }
+    if (next.drift && !prev.drift && baselineDrift) {
+      msgs.push(
+        `Throttle baseline drift: average refill ${baselineDrift.current} percent is ${baselineDrift.delta} points below saved baseline of ${baselineDrift.baseline} percent.`,
+      );
+    }
+    if (msgs.length > 0) setLiveAnnouncement(msgs.join(" "));
+    prevAlertSnapshot.current = next;
+  }, [
+    alertedFamilyHasBreach,
+    stormAlertActive,
+    baselineDrift,
+    kpiStats.avgPct,
+    warnAtPct,
+    stormSignal.opens,
+    stormSignal.distinctSubs,
+  ]);
+
   // Group transitions into recency buckets for the history log so the
   // reader's eye lands on "what happened in the last hour" first. The
   // bucketing key (`now`) re-evaluates when the wall-clock day rolls over,
@@ -1070,6 +1443,113 @@ export const ThrottlePage: React.FC = () => {
     [setWarnAtPct],
   );
 
+  // Snapshot the current avg refill % as the "expected baseline" — the
+  // drift detector compares live avg against this. Auditable because the
+  // saved value participates in subsequent alerting decisions.
+  const handleCalibrateBaseline = React.useCallback(() => {
+    setBaselinePct(kpiStats.avgPct);
+    auditLog.record({
+      actor: "operator",
+      action: "throttle.calibrate_baseline",
+      target: "throttle.baselinePct",
+      details: { savedAvgPct: kpiStats.avgPct, sampleSize: allEntries.length },
+      status: "success",
+    });
+  }, [kpiStats.avgPct, allEntries.length, setBaselinePct]);
+
+  const handleClearBaseline = React.useCallback(() => {
+    setBaselinePct(null);
+    auditLog.record({
+      actor: "operator",
+      action: "throttle.clear_baseline",
+      target: "throttle.baselinePct",
+      details: {},
+      status: "success",
+    });
+  }, [setBaselinePct]);
+
+  const handleToggleAlertedFamily = React.useCallback(
+    (cat: FamilyCategory) => {
+      setAlertedFamilies({ ...alertedFamilies, [cat]: !alertedFamilies[cat] });
+    },
+    [alertedFamilies, setAlertedFamilies],
+  );
+
+  const handleToggleFamilyBarMetric = React.useCallback(() => {
+    setFamilyBarMetric(
+      familyBarMetric === "recentThrottles" ? "opensLastHour" : "recentThrottles",
+    );
+  }, [familyBarMetric, setFamilyBarMetric]);
+
+  // Page-scoped hotkeys. Ignored when focus is in an input/textarea/select
+  // or any contenteditable so typing in the search box doesn't fire them.
+  //  - `r` Reset visible circuits (confirm dialog)
+  //  - `t` Toggle pause (tail / live-tick freeze)
+  //  - `Esc` Clear filters (only when filters are active)
+  //  - `?` Open keyboard help
+  React.useEffect(() => {
+    function onKeyDown(e: KeyboardEvent) {
+      // Ignore modifier-laden combos so OS / browser shortcuts pass through.
+      if (e.ctrlKey || e.metaKey || e.altKey) return;
+      // While any modal is open, Radix owns the keyboard. Let the dialog's
+      // own onEscapeKeyDown / focus-trap handle the keys.
+      if (keyboardHelpOpen || resetAllOpen || clearHistoryOpen) return;
+      const target = e.target as HTMLElement | null;
+      if (target) {
+        const tag = target.tagName;
+        if (
+          tag === "INPUT" ||
+          tag === "TEXTAREA" ||
+          tag === "SELECT" ||
+          target.isContentEditable
+        ) {
+          // Allow Esc to bubble out of search-clear etc., but only for Esc.
+          if (e.key !== "Escape") return;
+        }
+      }
+      if (e.key === "?" || (e.shiftKey && e.key === "/")) {
+        e.preventDefault();
+        setKeyboardHelpOpen((v) => !v);
+        return;
+      }
+      if (e.key === "r" || e.key === "R") {
+        if (entries.length === 0) return;
+        e.preventDefault();
+        setResetAllOpen(true);
+        return;
+      }
+      if (e.key === "t" || e.key === "T") {
+        e.preventDefault();
+        setPaused((p) => !p);
+        return;
+      }
+      if (e.key === "Escape") {
+        // Only intercept Esc when there's something to clear — otherwise
+        // let it propagate to dialogs / global handlers.
+        if (
+          searchText.length > 0 ||
+          stateFilter !== "all" ||
+          familyFilter !== "all"
+        ) {
+          e.preventDefault();
+          setUrlFilters({ q: "", state: "all", family: "all" });
+        }
+        return;
+      }
+    }
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [
+    entries.length,
+    searchText,
+    stateFilter,
+    familyFilter,
+    setUrlFilters,
+    keyboardHelpOpen,
+    resetAllOpen,
+    clearHistoryOpen,
+  ]);
+
   // Section visibility — distinguish "no traffic" vs "no matches".
   const hasAnyTraffic = totalCounts.total > 0;
   const hasMatches = entries.length > 0;
@@ -1106,12 +1586,31 @@ export const ThrottlePage: React.FC = () => {
                     <PauseCircle className="h-3.5 w-3.5" aria-hidden />
                   )}
                   {paused ? "Resume" : "Pause"}
+                  <Kbd>T</Kbd>
                 </Button>
               </TooltipTrigger>
               <TooltipContent side="bottom" className="max-w-xs">
                 Pauses the 1-second tick that drives countdowns and "X seconds
                 ago" labels. The store still receives live updates — only the
-                wall-clock-driven UI freezes.
+                wall-clock-driven UI freezes. Hotkey: <Kbd>T</Kbd>.
+              </TooltipContent>
+            </Tooltip>
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  onClick={() => setKeyboardHelpOpen(true)}
+                  aria-label="Show keyboard shortcuts"
+                  className="gap-1.5"
+                >
+                  <Keyboard className="h-3.5 w-3.5" aria-hidden />
+                  <Kbd>?</Kbd>
+                </Button>
+              </TooltipTrigger>
+              <TooltipContent side="bottom">
+                Show keyboard shortcuts.
               </TooltipContent>
             </Tooltip>
             <ExportMenu
@@ -1159,12 +1658,14 @@ export const ThrottlePage: React.FC = () => {
                   >
                     <RotateCw className="h-3.5 w-3.5" aria-hidden />
                     Reset visible
+                    <Kbd>R</Kbd>
                   </Button>
                 </span>
               </TooltipTrigger>
               <TooltipContent side="bottom" className="max-w-xs">
                 Clears displayed state for every visible (filtered) circuit.
-                Next request will re-populate from the live guard.
+                Next request will re-populate from the live guard. Hotkey:{" "}
+                <Kbd>R</Kbd>.
               </TooltipContent>
             </Tooltip>
             <Tooltip>
@@ -1304,10 +1805,303 @@ export const ThrottlePage: React.FC = () => {
             }
           />
         </label>
+
+        {/* Operator-calibrated baseline. Drift alert fires when the live avg
+            falls more than 10 points below this saved value. */}
+        <div className="flex items-center gap-2 rounded-lg border bg-card/70 px-3 py-2 text-2xs font-medium uppercase tracking-wider text-muted-foreground">
+          Baseline
+          <span className="tabular-nums text-foreground">
+            {baselinePct == null ? "—" : `${baselinePct}%`}
+          </span>
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <Button
+                type="button"
+                variant="ghost"
+                size="icon-sm"
+                onClick={handleCalibrateBaseline}
+                disabled={allEntries.length === 0}
+                aria-label="Save current average as baseline"
+                className="h-6 w-6"
+              >
+                <Save className="h-3 w-3" aria-hidden />
+              </Button>
+            </TooltipTrigger>
+            <TooltipContent side="bottom" className="max-w-xs">
+              Snapshot the current avg refill % ({kpiStats.avgPct}%) as the
+              expected baseline. The drift alert fires when the live avg
+              falls more than 10 points below this value.
+            </TooltipContent>
+          </Tooltip>
+          {baselinePct != null && (
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="icon-sm"
+                  onClick={handleClearBaseline}
+                  aria-label="Clear baseline"
+                  className="h-6 w-6"
+                >
+                  <X className="h-3 w-3" aria-hidden />
+                </Button>
+              </TooltipTrigger>
+              <TooltipContent side="bottom">
+                Clear the saved baseline.
+              </TooltipContent>
+            </Tooltip>
+          )}
+          <InfoTooltip
+            ariaLabel="Baseline help"
+            content={
+              <span>
+                The baseline is your "known-good" avg refill %. Calibrate it
+                during normal load so the drift detector catches gradual
+                capacity loss that the absolute warn-below floor misses.
+              </span>
+            }
+          />
+        </div>
       </div>
 
+      {/* Family-comparison + alert-subscription panel.
+          Renders only when there is *any* throttle pressure (recent 429s or
+          opens in the last hour). When the page is quiet, the section is
+          omitted so the chrome stays calm. */}
+      {(familyStats.arm.recentThrottles +
+        familyStats.graph.recentThrottles +
+        familyStats.batch.recentThrottles +
+        familyStats.other.recentThrottles +
+        familyStats.arm.opensLastHour +
+        familyStats.graph.opensLastHour +
+        familyStats.batch.opensLastHour +
+        familyStats.other.opensLastHour >
+        0 ||
+        FAMILY_CATEGORIES.some((c) => !alertedFamilies[c])) && (
+        <section
+          className="flex flex-col gap-3 rounded-xl border border-border bg-surface-base/40 p-3"
+          aria-label="Throttle pressure by service family"
+        >
+          <div className="flex flex-wrap items-center gap-2">
+            <Activity
+              className="h-3.5 w-3.5 text-muted-foreground"
+              aria-hidden
+            />
+            <span className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">
+              429s by service family
+            </span>
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  onClick={handleToggleFamilyBarMetric}
+                  className="ml-2 h-7 gap-1.5"
+                  aria-label="Toggle stacked-bar metric"
+                >
+                  <span className="text-2xs">
+                    {familyBarMetric === "recentThrottles"
+                      ? "Recent 429s"
+                      : "Opens · 1h"}
+                  </span>
+                </Button>
+              </TooltipTrigger>
+              <TooltipContent side="bottom" className="max-w-xs">
+                Toggles the stacked-bar metric.{" "}
+                <strong>Recent 429s</strong> = live pressure from the entry
+                snapshot. <strong>Opens · 1h</strong> = circuit opens in the
+                last hour (storm shape).
+              </TooltipContent>
+            </Tooltip>
+            <InfoTooltip
+              ariaLabel="Family panel help"
+              content={
+                <span>
+                  Compares throttle pressure across endpoint-family
+                  categories — useful when one Azure surface (e.g. Graph
+                  enumeration) is the storm source. Per-family alert
+                  checkboxes silence "expected" 429 sources without
+                  disabling the global threshold/drift/storm alerts.
+                </span>
+              }
+            />
+          </div>
+          <FamilyStackedBar stats={familyStats} metric={familyBarMetric} />
+
+          {/* Alert-subscription chips — operator gates which families
+              participate in banner-level alerts. */}
+          <div
+            className="flex flex-wrap items-center gap-3 border-t border-border pt-2"
+            role="group"
+            aria-label="Per-family alert subscriptions"
+          >
+            <span className="inline-flex items-center gap-1 text-2xs font-medium uppercase tracking-wider text-muted-foreground">
+              <Bell className="h-3 w-3" aria-hidden />
+              Alert on
+            </span>
+            {FAMILY_CATEGORIES.map((cat) => {
+              const subscribed = alertedFamilies[cat];
+              const stat = familyStats[cat];
+              return (
+                <Tooltip key={cat}>
+                  <TooltipTrigger asChild>
+                    <label className="inline-flex cursor-pointer items-center gap-1.5 rounded-md border border-border bg-card px-2 py-1 text-xs">
+                      <Checkbox
+                        checked={subscribed}
+                        onCheckedChange={() => handleToggleAlertedFamily(cat)}
+                        aria-label={`Alert on ${FAMILY_CATEGORY_LABEL[cat]} family`}
+                      />
+                      <span
+                        className={cn(
+                          "font-medium",
+                          subscribed
+                            ? FAMILY_BAR_TONE[cat].fg
+                            : "text-muted-foreground/60",
+                        )}
+                      >
+                        {FAMILY_CATEGORY_LABEL[cat]}
+                      </span>
+                      <span className="text-2xs tabular-nums text-muted-foreground">
+                        {stat.recentThrottles}/{stat.opensLastHour}
+                      </span>
+                    </label>
+                  </TooltipTrigger>
+                  <TooltipContent side="top" className="max-w-xs">
+                    {subscribed ? (
+                      <span>
+                        Alerts <strong>enabled</strong> for{" "}
+                        {FAMILY_CATEGORY_LABEL[cat]}. Recent 429s:{" "}
+                        {stat.recentThrottles}; opens in the last hour:{" "}
+                        {stat.opensLastHour}.
+                      </span>
+                    ) : (
+                      <span>
+                        Alerts <strong>silenced</strong> for{" "}
+                        {FAMILY_CATEGORY_LABEL[cat]}. Storm / threshold
+                        banners ignore this family until re-enabled.
+                      </span>
+                    )}
+                  </TooltipContent>
+                </Tooltip>
+              );
+            })}
+            {FAMILY_CATEGORIES.some((c) => !alertedFamilies[c]) && (
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="sm"
+                    className="ml-auto h-7 gap-1.5 text-2xs"
+                    onClick={() =>
+                      setAlertedFamilies({
+                        arm: true,
+                        graph: true,
+                        batch: true,
+                        other: true,
+                      })
+                    }
+                    aria-label="Re-enable alerts for all families"
+                  >
+                    <BellOff className="h-3 w-3" aria-hidden />
+                    Re-enable all
+                  </Button>
+                </TooltipTrigger>
+                <TooltipContent side="bottom">
+                  Subscribe to alerts on every family.
+                </TooltipContent>
+              </Tooltip>
+            )}
+          </div>
+        </section>
+      )}
+
+      {/*
+        Single ARIA-live region for all three alert classes (threshold,
+        storm, drift). Edge-triggered by the effect above so screen readers
+        are notified ONCE per state change, not on every re-render. Visually
+        hidden via inline style so the announcement doesn't double up with
+        the visible banners.
+      */}
+      <div
+        aria-live="assertive"
+        aria-atomic="true"
+        className="sr-only"
+        // sr-only is in our shared stylesheet; the inline width:1px clip is
+        // belt-and-braces in case the class isn't loaded yet during SSR/hot-
+        // reload.
+        style={{
+          position: "absolute",
+          width: 1,
+          height: 1,
+          overflow: "hidden",
+          clip: "rect(0 0 0 0)",
+        }}
+      >
+        {liveAnnouncement}
+      </div>
+
+      {/* Defender-lens storm banner — burst of 429-opens across many subs.
+          See `_analysis_defender_view.md` §1+§4: credential-chain
+          enumeration walks tenants/subscriptions/roleAssignments rapidly
+          and trips many breakers in a short window. */}
+      {stormAlertActive && (
+        <div
+          role="alert"
+          className="flex items-start gap-2 rounded-md border border-destructive/40 bg-destructive/5 p-3 text-xs text-destructive"
+        >
+          <Siren className="mt-0.5 h-4 w-4 shrink-0 animate-pulse motion-reduce:animate-none" aria-hidden />
+          <div className="flex-1">
+            <p className="font-semibold">
+              429 storm detected — {stormSignal.opens} circuit open
+              {stormSignal.opens === 1 ? "" : "s"} across{" "}
+              {stormSignal.distinctSubs} subscription
+              {stormSignal.distinctSubs === 1 ? "" : "s"} in the last{" "}
+              {Math.round(STORM_WINDOW_MS / 60_000)} minutes.
+            </p>
+            <p className="mt-0.5 text-destructive/80">
+              This pattern matches the signature of bulk credential / tenant
+              enumeration (cf. defender-view: DefaultAzureCredential chain
+              walks <code className="text-2xs">tenants</code>,{" "}
+              <code className="text-2xs">subscriptions</code>,{" "}
+              <code className="text-2xs">roleAssignments</code> in fast
+              loops). Review the audit log for privileged-action attempts
+              correlated with this window and, if unexpected, rotate any
+              recently-issued service-principal secrets.
+            </p>
+          </div>
+        </div>
+      )}
+
+      {/* Baseline-drift banner — gradual degradation below the saved good. */}
+      {baselineDrift && (
+        <div
+          role="status"
+          className="flex items-start gap-2 rounded-md border border-info/40 bg-info/5 p-3 text-xs text-info"
+        >
+          <Activity className="mt-0.5 h-4 w-4 shrink-0" aria-hidden />
+          <div className="flex-1">
+            <p className="font-semibold">
+              Refill rate has drifted{" "}
+              <span className="tabular-nums">{baselineDrift.delta}</span>{" "}
+              points below the saved baseline (
+              <span className="tabular-nums">{baselineDrift.baseline}%</span>{" "}
+              → <span className="tabular-nums">{baselineDrift.current}%</span>
+              ).
+            </p>
+            <p className="mt-0.5 text-info/80">
+              Capacity is degrading even though the absolute floor hasn't
+              been hit. Re-calibrate or clear the baseline once the current
+              load is the new normal.
+            </p>
+          </div>
+        </div>
+      )}
+
       {/* Threshold breach banner — only when an operator-set floor is crossed. */}
-      {thresholdBreach && (
+      {alertedFamilyHasBreach && (
         <div
           role="status"
           className="flex items-start gap-2 rounded-md border border-warning/40 bg-warning/5 p-3 text-xs text-warning"
@@ -1381,17 +2175,25 @@ export const ThrottlePage: React.FC = () => {
           </label>
 
           {isFiltered && (
-            <Button
-              type="button"
-              variant="outline"
-              size="sm"
-              onClick={handleClearFilters}
-              className="gap-1.5"
-              aria-label="Clear all filters"
-            >
-              <X className="h-3.5 w-3.5" aria-hidden />
-              Clear filters
-            </Button>
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  onClick={handleClearFilters}
+                  className="gap-1.5"
+                  aria-label="Clear all filters"
+                >
+                  <X className="h-3.5 w-3.5" aria-hidden />
+                  Clear filters
+                  <Kbd>Esc</Kbd>
+                </Button>
+              </TooltipTrigger>
+              <TooltipContent side="bottom">
+                Clear search, state, and family filters. Hotkey: <Kbd>Esc</Kbd>.
+              </TooltipContent>
+            </Tooltip>
           )}
         </div>
 
@@ -1764,6 +2566,43 @@ export const ThrottlePage: React.FC = () => {
         danger
         onConfirm={handleConfirmClearHistory}
         onCancel={handleCancelClearHistory}
+      />
+
+      <ConfirmationDialog
+        hidden={!keyboardHelpOpen}
+        title="Keyboard shortcuts"
+        message={
+          <ul className="m-0 grid list-none grid-cols-[auto_1fr] gap-x-3 gap-y-1.5 p-0 text-xs">
+            <li className="contents">
+              <span>
+                <Kbd>R</Kbd>
+              </span>
+              <span>Reset visible circuits (with confirmation)</span>
+            </li>
+            <li className="contents">
+              <span>
+                <Kbd>T</Kbd>
+              </span>
+              <span>Toggle pause / resume live updates</span>
+            </li>
+            <li className="contents">
+              <span>
+                <Kbd>Esc</Kbd>
+              </span>
+              <span>Clear search and filter chips</span>
+            </li>
+            <li className="contents">
+              <span>
+                <Kbd>?</Kbd>
+              </span>
+              <span>Show / hide this list</span>
+            </li>
+          </ul>
+        }
+        confirmText="Got it"
+        cancelText="Close"
+        onConfirm={() => setKeyboardHelpOpen(false)}
+        onCancel={() => setKeyboardHelpOpen(false)}
       />
     </div>
   );

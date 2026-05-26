@@ -2,6 +2,29 @@
  * Unused Quota page — surfaces accounts with free LP cores and offers
  * bulk auto-create of pools or hand-off to Smart Mode pool creation.
  *
+ * 2026-05-26 wave-2 highlights (corpus-grounded + advanced-UI):
+ *   - Anomaly detection: subscriptions with disproportionate (>=80%)
+ *     unused-quota share trigger a callout banner. Cites the defender
+ *     POV that idle capacity can indicate either over-allocation or an
+ *     attacker pre-reserving capacity for a pivot. See
+ *     `New folder\_analysis_defender_view.md` § "Hunting / Detection
+ *     Indicators".
+ *   - Auto-create attack-surface warning: mass-created pools inherit
+ *     `poolDefaults`. If those defaults carry a privileged start-task
+ *     or a permissive identity, mass-creation amplifies attack surface
+ *     (NetSPI MicroBurst: each new pool node is a fresh IMDS endpoint,
+ *     each fresh-node start-task runs as the pool managed identity).
+ *     See `New folder\_analysis_netspi.md` § I "IMDS Variants" and
+ *     § II "RunAs Certificate Abuse".
+ *   - Bulk auto-create progress bar + ARIA-live per-group announcer.
+ *   - Hotkey `Ctrl+Enter` to commit bulk auto-create from the drawer.
+ *   - Persisted "excluded subscriptions" allowlist that strips matching
+ *     rows from the bulk plan before submit and is surfaced as a chip.
+ *   - In-session sparkline of `totalFreeLpCores` across refresh ticks.
+ *   - Race-guard on submit: only the latest submit controller writes
+ *     `submitResults` / `autoCreateSubmitting`. Previously a re-enter
+ *     could flip the submitting flag mid-flight.
+ *
  * 2026-05-24 rewrite highlights:
  *   - FIX: bulk auto-create now dispatches `create_pools` (plural, the
  *     real action) grouped by `(vmSize, maxLpNodes)`. The previous code
@@ -37,6 +60,8 @@ import * as React from "react";
 import {
   AlertTriangle,
   CheckCircle2,
+  Eye,
+  EyeOff,
   ExternalLink,
   Filter,
   Minus,
@@ -46,7 +71,9 @@ import {
   Rocket,
   Search,
   Server,
+  ShieldAlert,
   Trash2,
+  TrendingUp,
   Users,
   X,
   XCircle,
@@ -200,6 +227,57 @@ function isCapacityShape(value: unknown): value is CapacityShape {
 function portalSubscriptionUrl(subscriptionId: string): string {
   return `https://portal.azure.com/#@/resource/subscriptions/${encodeURIComponent(subscriptionId)}/overview`;
 }
+
+/**
+ * Threshold for the per-subscription idle-capacity anomaly callout.
+ * A subscription is flagged when at least this fraction of its LP
+ * quota is currently free across all of its accounts.
+ *
+ * Rationale — adapted from `_analysis_defender_view.md` § "Hunting /
+ * Detection Indicators":
+ *   - Operators who watch only the *aggregate* free-cores number miss
+ *     the case where one sub is sitting on 95% idle while the rest of
+ *     the fleet runs hot.
+ *   - From an offensive POV, a compromised contributor can quietly
+ *     `Set-AzBatchAccountQuota` (or just leave a pre-provisioned big
+ *     account dormant) and then burn the quota in a single coordinated
+ *     pool burst — same capacity outline as the abnormal-spend pattern
+ *     defenders look for.
+ * 0.80 is intentionally aggressive: with anything less, every
+ * brand-new account would light up the banner.
+ */
+const ANOMALY_FREE_RATIO_THRESHOLD = 0.8;
+/**
+ * Minimum LP-quota size before we consider a sub for the anomaly check.
+ * Tiny accounts (e.g. 24-core test subs sitting at 100% free) are
+ * structurally idle and don't constitute a meaningful "lots of idle
+ * capacity" signal.
+ */
+const ANOMALY_MIN_LP_QUOTA = 96;
+
+interface SubscriptionAnomaly {
+  subscriptionId: string;
+  accountIds: string[];
+  accountCount: number;
+  lpQuota: number;
+  lpFree: number;
+  freeRatio: number;
+  /**
+   * `idle` — most likely benign (operator over-allocated).
+   * `suspicious` — has free dedicated capacity too, AND only one
+   * account holds the bulk of the free quota (classic pre-reserve
+   * shape).
+   */
+  severity: "idle" | "suspicious";
+}
+
+/**
+ * Sliding-window history of total-free-LP-core readings. Kept in a
+ * React ref so it survives re-renders but does not trigger them; the
+ * sparkline reads from a state mirror that's updated only when the
+ * refresh effect picks up a new reading.
+ */
+const FREE_LP_HISTORY_CAP = 24;
 
 interface EnvVar {
   name: string;
@@ -397,6 +475,55 @@ const UnusedQuotaPageInner: React.FC<UnusedQuotaPageProps> = ({
     },
     [capacityShapeSet, setCapacityShape],
   );
+
+  // Persisted "excluded subscriptions" allowlist — operator-curated set
+  // of subscription IDs to strip from the bulk-auto-create plan. Use
+  // case: a sub is on hold (billing freeze, scheduled migration,
+  // capacity-reservation experiment) and the operator does not want
+  // bulk auto-create touching it from any selection. The chip row
+  // below lets the operator add the currently-active filter set or
+  // remove individual entries.
+  //
+  // Stored as a sorted array of strings under
+  // `unused-quota.excluded-subs`. Bump the `version` in the options
+  // bag if the serialized shape ever changes.
+  const [excludedSubsList, setExcludedSubsList] = usePersistedState<string[]>(
+    "unused-quota.excluded-subs",
+    [],
+    {
+      version: 1,
+      deserialize: (raw) => {
+        try {
+          const parsed = JSON.parse(raw) as unknown;
+          if (!Array.isArray(parsed)) return undefined;
+          const cleaned = parsed.filter(
+            (v): v is string => typeof v === "string" && v.length > 0,
+          );
+          return Array.from(new Set(cleaned)).sort();
+        } catch {
+          return undefined;
+        }
+      },
+    },
+  );
+  const excludedSubs = React.useMemo(
+    () => new Set(excludedSubsList),
+    [excludedSubsList],
+  );
+  const toggleExcludedSub = React.useCallback(
+    (subscriptionId: string) => {
+      setExcludedSubsList((prev) => {
+        const set = new Set(prev);
+        if (set.has(subscriptionId)) set.delete(subscriptionId);
+        else set.add(subscriptionId);
+        return Array.from(set).sort();
+      });
+    },
+    [setExcludedSubsList],
+  );
+  const clearExcludedSubs = React.useCallback(() => {
+    setExcludedSubsList([]);
+  }, [setExcludedSubsList]);
 
   // Master live-catalog wire toggle — hydrated from / persisted to user
   // preferences. Shared with Pool Creation; the toggle here is a
@@ -660,6 +787,109 @@ const UnusedQuotaPageInner: React.FC<UnusedQuotaPageProps> = ({
     distinctSubsCount,
     subsWithCapacityCount,
   } = summary;
+  // In-session sparkline history of `totalFreeLpCores`. We don't have a
+  // server-side history, so we accumulate readings each time the
+  // aggregate value changes — typically once per refresh. Stored in
+  // state (not a ref) so the sparkline rerenders. Capped at
+  // FREE_LP_HISTORY_CAP entries; older readings shift out.
+  const [freeLpHistory, setFreeLpHistory] = React.useState<number[]>([]);
+  const lastFreeLpRef = React.useRef<number | null>(null);
+  React.useEffect(() => {
+    // Skip the initial mount when accountInfos hasn't populated yet —
+    // we'd otherwise log a 0 reading before the first refresh resolves.
+    if (allRows.length === 0) return;
+    if (lastFreeLpRef.current === totalFreeLpCores) return;
+    lastFreeLpRef.current = totalFreeLpCores;
+    setFreeLpHistory((prev) => {
+      const next = [...prev, totalFreeLpCores];
+      if (next.length > FREE_LP_HISTORY_CAP) {
+        next.splice(0, next.length - FREE_LP_HISTORY_CAP);
+      }
+      return next;
+    });
+  }, [totalFreeLpCores, allRows.length]);
+
+  // -----------------------------------------------------------------
+  // Subscription-level anomaly detection.
+  //
+  // Aggregate every row by `subscriptionId` and flag subs whose
+  // free-LP-cores ratio crosses `ANOMALY_FREE_RATIO_THRESHOLD`. Cites
+  // `_analysis_defender_view.md` — defenders watch for capacity that
+  // appears "reserved but unused" (a benign over-allocation pattern
+  // AND a pre-attack staging pattern look identical from quota alone).
+  //
+  // `severity` heuristic:
+  //   - `suspicious` when the sub also has free *dedicated* cores
+  //     (over-allocation almost always shows up on LP alone — both
+  //     LP+dedicated idle is more consistent with a deliberate hold)
+  //     AND the free quota is concentrated in a single account.
+  //   - `idle` otherwise.
+  // -----------------------------------------------------------------
+  const subscriptionAnomalies = React.useMemo<SubscriptionAnomaly[]>(() => {
+    type Agg = {
+      subscriptionId: string;
+      accountIds: string[];
+      accountCount: number;
+      lpQuota: number;
+      lpFree: number;
+      dedicatedFree: number;
+      perAccountFree: number[];
+    };
+    const byId = new Map<string, Agg>();
+    for (const r of allRows) {
+      if (!r.subscriptionId) continue;
+      const cur =
+        byId.get(r.subscriptionId) ?? {
+          subscriptionId: r.subscriptionId,
+          accountIds: [],
+          accountCount: 0,
+          lpQuota: 0,
+          lpFree: 0,
+          dedicatedFree: 0,
+          perAccountFree: [],
+        };
+      cur.accountIds.push(r.id);
+      cur.accountCount += 1;
+      cur.lpQuota += r.lpQuota;
+      cur.lpFree += r.lpFree;
+      cur.dedicatedFree += r.dedicatedFree;
+      cur.perAccountFree.push(r.lpFree);
+      byId.set(r.subscriptionId, cur);
+    }
+    const flagged: SubscriptionAnomaly[] = [];
+    for (const agg of byId.values()) {
+      if (agg.lpQuota < ANOMALY_MIN_LP_QUOTA) continue;
+      const ratio = agg.lpQuota > 0 ? agg.lpFree / agg.lpQuota : 0;
+      if (ratio < ANOMALY_FREE_RATIO_THRESHOLD) continue;
+      // Concentration: max single-account free / total sub free.
+      const maxAccount = agg.perAccountFree.reduce(
+        (m, v) => (v > m ? v : m),
+        0,
+      );
+      const concentrated =
+        agg.lpFree > 0 && maxAccount / agg.lpFree >= 0.9;
+      const severity: "idle" | "suspicious" =
+        agg.dedicatedFree > 0 && concentrated ? "suspicious" : "idle";
+      flagged.push({
+        subscriptionId: agg.subscriptionId,
+        accountIds: agg.accountIds,
+        accountCount: agg.accountCount,
+        lpQuota: agg.lpQuota,
+        lpFree: agg.lpFree,
+        freeRatio: ratio,
+        severity,
+      });
+    }
+    // Sort by freeRatio desc so the most idle comes first.
+    flagged.sort((a, b) => b.freeRatio - a.freeRatio);
+    return flagged;
+  }, [allRows]);
+
+  // Hide/show the anomaly banner (state only — not persisted; an
+  // anomaly that goes away on the next refresh shouldn't be hidden
+  // forever).
+  const [anomalyBannerOpen, setAnomalyBannerOpen] = React.useState(true);
+
   // Active filter count drives the "X filters active" badge in the toolbar.
   const activeFilterCount = React.useMemo(() => {
     let n = 0;
@@ -967,20 +1197,92 @@ const UnusedQuotaPageInner: React.FC<UnusedQuotaPageProps> = ({
         const vCpus = getVCpus(ov.vmSize);
         const maxAllowed = vCpus > 0 ? Math.floor(row.lpFree / vCpus) : 0;
         const cappedNodes = Math.max(0, Math.min(ov.nodes, maxAllowed));
+        // Exclude rows whose subscription is on the operator-managed
+        // exclude-list. Surface them as a distinct ineligibility reason
+        // (`excluded`) so the result panel can label them clearly
+        // instead of conflating "you blocked this" with "no fit".
+        const isExcluded =
+          !!row.subscriptionId && excludedSubs.has(row.subscriptionId);
         const eligible =
-          cappedNodes > 0 && ov.vmSize !== "N/A" && !row.isResizing;
+          cappedNodes > 0 &&
+          ov.vmSize !== "N/A" &&
+          !row.isResizing &&
+          !isExcluded;
         return {
           row,
           vmSize: ov.vmSize,
           nodes: cappedNodes,
           maxAllowed,
           eligible,
+          excluded: isExcluded,
         };
       }),
-    [selectedRows, overrides],
+    [selectedRows, overrides, excludedSubs],
   );
 
   const eligibleBulkPlan = bulkPlan.filter((p) => p.eligible);
+
+  // -----------------------------------------------------------------
+  // Auto-create attack-surface analyzer.
+  //
+  // Inherits-from-defaults reasoning, citing `_analysis_netspi.md` §
+  // I (per-node IMDS endpoint) and § II (start-task elevation level).
+  // The flags below are *informational* — the operator may legitimately
+  // run a privileged start-task, but mass-creation amplifies the
+  // surface area to "N new pools × M new nodes" worth of IMDS-reachable
+  // hosts. Surfaced in the drawer as a yellow callout above the submit
+  // button so the operator can pause and double-check before fanning
+  // out.
+  //
+  // A finding is "dangerous" if any of:
+  //   - Start task runs as `autoUser` with `elevationLevel === "admin"`
+  //     and the command line is non-trivial (>= 30 chars or contains
+  //     `curl`/`wget`/`Invoke-WebRequest`/`bash -c`/`sh -c`).
+  //     Each new node executes this with elevated privileges, which is
+  //     exactly the foothold the MicroBurst chain reuses.
+  //   - The defaults declare `enableInterNodeCommunication: true`,
+  //     which removes the per-node isolation defenders depend on.
+  //   - The defaults set `subnetId` to anything but empty — same
+  //     subnet across every pool means a single compromised pool can
+  //     pivot to all the others via the resource-plane.
+  // -----------------------------------------------------------------
+  const attackSurfaceFindings = React.useMemo<string[]>(() => {
+    if (!poolDefaults) return [];
+    const findings: string[] = [];
+    const st = poolDefaults.startTask;
+    if (st && st.commandLine && st.commandLine.trim().length > 0) {
+      const cmd = st.commandLine.toLowerCase();
+      const elev =
+        st.userIdentity?.autoUser?.elevationLevel?.toLowerCase?.() ?? "";
+      if (elev === "admin") {
+        const looksHeavy =
+          cmd.length >= 30 ||
+          cmd.includes("curl") ||
+          cmd.includes("wget") ||
+          cmd.includes("invoke-webrequest") ||
+          cmd.includes("bash -c") ||
+          cmd.includes("sh -c") ||
+          cmd.includes("powershell");
+        if (looksHeavy) {
+          findings.push(
+            "Start task is configured to run as admin and executes a non-trivial command on every new node — each pool you create inherits this. (NetSPI MicroBurst § I: per-node IMDS endpoint is reachable from any process on the node.)",
+          );
+        }
+      }
+    }
+    if (poolDefaults.enableInterNodeCommunication === true) {
+      findings.push(
+        "Defaults enable inter-node communication. Each new pool created here will allow node-to-node traffic — a single compromised task can fan out within the pool. Consider disabling for bulk-created pools.",
+      );
+    }
+    if (poolDefaults.subnetId && poolDefaults.subnetId.trim().length > 0) {
+      findings.push(
+        `All ${eligibleBulkPlan.length} pools will be deployed into the same subnet (${poolDefaults.subnetId.slice(-40)}). Cross-pool lateral movement at the network layer is then trivially possible.`,
+      );
+    }
+    return findings;
+  }, [poolDefaults, eligibleBulkPlan.length]);
+
   const totalCoresToConsume = eligibleBulkPlan.reduce(
     (s, p) => s + p.nodes * getVCpus(p.vmSize),
     0,
@@ -1029,6 +1331,18 @@ const UnusedQuotaPageInner: React.FC<UnusedQuotaPageProps> = ({
     };
   }, []);
 
+  // Live progress state for the bulk submit. `submitProgress` is read
+  // by both the visible progress bar and the screen-reader-only ARIA
+  // live region so assistive tech is announced about each batch
+  // completing — important when the submit can take 10+ seconds.
+  const [submitProgress, setSubmitProgress] = React.useState<{
+    completedGroups: number;
+    totalGroups: number;
+    completedRows: number;
+    totalRows: number;
+    currentGroup: string | null;
+  } | null>(null);
+
   const submitAutoCreate = async () => {
     setShowAutoCreateConfirm(false);
     // Snapshot the plan up front — `bulkPlan` is recomputed on every
@@ -1042,12 +1356,24 @@ const UnusedQuotaPageInner: React.FC<UnusedQuotaPageProps> = ({
     submitAbortRef.current?.abort();
     submitAbortRef.current = submitController;
     setAutoCreateSubmitting(true);
+    const totalGroupsCount = new Set(
+      eligibleSnapshot.map((p) => `${p.vmSize}|${p.nodes}`),
+    ).size;
+    setSubmitProgress({
+      completedGroups: 0,
+      totalGroups: totalGroupsCount,
+      completedRows: 0,
+      totalRows: eligibleSnapshot.length,
+      currentGroup: null,
+    });
     const results: SubmitResult[] = [];
     try {
       const startTask = buildStartTaskConfig();
 
       // Add a "skipped" entry for ineligible rows up front so the result
-      // panel surfaces them.
+      // panel surfaces them. The skip reason differentiates operator-
+      // initiated exclusions (`excluded`) from resize / no-fit
+      // conditions so the audit-log + result panel can attribute them.
       for (const p of planSnapshot) {
         if (!p.eligible) {
           results.push({
@@ -1057,11 +1383,13 @@ const UnusedQuotaPageInner: React.FC<UnusedQuotaPageProps> = ({
             status: "skipped",
             vmSize: p.vmSize,
             nodes: p.nodes,
-            error: p.row.isResizing
-              ? "Pool is resizing"
-              : p.nodes === 0
-                ? "0 nodes (no fit)"
-                : "Invalid VM size",
+            error: p.excluded
+              ? "Subscription on exclude-list"
+              : p.row.isResizing
+                ? "Pool is resizing"
+                : p.nodes === 0
+                  ? "0 nodes (no fit)"
+                  : "Invalid VM size",
           });
         }
       }
@@ -1069,12 +1397,26 @@ const UnusedQuotaPageInner: React.FC<UnusedQuotaPageProps> = ({
       // Group eligible plan entries by their (vmSize, nodes) signature
       // and dispatch one create_pools per group.
       const groups = groupForDispatch(eligibleSnapshot);
+      let groupsDone = 0;
+      let rowsDone = 0;
       for (const [, group] of groups) {
         if (submitController.signal.aborted) break;
         const first = group[0];
         const vmSize = first.vmSize;
         const nodes = first.nodes;
         const accountIds = group.map((g) => g.row.id);
+        // Announce the new in-flight group so the progress bar + ARIA
+        // live region show "Submitting Standard_NC24s_v3 × 4 (group 2
+        // of 3)" — useful when the submit spans 30+ seconds.
+        if (!submitController.signal.aborted) {
+          setSubmitProgress({
+            completedGroups: groupsDone,
+            totalGroups: totalGroupsCount,
+            completedRows: rowsDone,
+            totalRows: eligibleSnapshot.length,
+            currentGroup: `${vmSize} × ${nodes} node${nodes === 1 ? "" : "s"} (${group.length} ${group.length === 1 ? "account" : "accounts"})`,
+          });
+        }
 
         // Build one base poolConfig from the active defaults — every
         // row in this group will use the same shape (the orchestrator
@@ -1162,6 +1504,17 @@ const UnusedQuotaPageInner: React.FC<UnusedQuotaPageProps> = ({
             });
           }
         }
+        groupsDone += 1;
+        rowsDone += group.length;
+        if (!submitController.signal.aborted) {
+          setSubmitProgress({
+            completedGroups: groupsDone,
+            totalGroups: totalGroupsCount,
+            completedRows: rowsDone,
+            totalRows: eligibleSnapshot.length,
+            currentGroup: null,
+          });
+        }
       }
 
       // Notify operator and refresh accountInfos so the "free LP" column
@@ -1217,6 +1570,13 @@ const UnusedQuotaPageInner: React.FC<UnusedQuotaPageProps> = ({
             distinctRegions,
             startedAt,
             withStartTask: startTask !== null,
+            // Attack-surface findings active when the bulk submit ran.
+            // Keeps a defensive trail for "why did we mass-create N
+            // pools with admin start tasks?" reviews. Cites NetSPI
+            // MicroBurst per-node IMDS surface.
+            attackSurfaceFindings: attackSurfaceFindings.length,
+            attackSurfaceDetails: attackSurfaceFindings,
+            excludedSubsCount: excludedSubs.size,
           },
         });
       } catch {
@@ -1234,13 +1594,21 @@ const UnusedQuotaPageInner: React.FC<UnusedQuotaPageProps> = ({
         });
       }
     } finally {
+      // Race-guard: only the latest submit controller is allowed to
+      // mutate the visible state at the end of submitAutoCreate. A
+      // second-click (e.g. via the new Ctrl+Enter hotkey) aborts the
+      // first controller; the first then races into this block and
+      // would clobber the in-flight submit's results / submitting
+      // flag without this check.
+      const isLatest = submitAbortRef.current === submitController;
       if (!submitController.signal.aborted) {
         setSubmitResults(results);
       }
-      if (submitAbortRef.current === submitController) {
+      if (isLatest) {
         submitAbortRef.current = null;
+        setSubmitProgress(null);
+        setAutoCreateSubmitting(false);
       }
-      setAutoCreateSubmitting(false);
     }
   };
 
@@ -1327,6 +1695,17 @@ const UnusedQuotaPageInner: React.FC<UnusedQuotaPageProps> = ({
   setSelectedIdsRef.current = setSelectedIds;
   const handleRefreshRef = React.useRef(handleRefresh);
   handleRefreshRef.current = handleRefresh;
+  // Snapshot the bulk-submit eligibility so the Ctrl+Enter handler can
+  // decide whether to fire without re-binding the global listener on
+  // every selection / override change.
+  const canSubmitRef = React.useRef(false);
+  canSubmitRef.current =
+    drawerOpen &&
+    !autoCreateSubmitting &&
+    !submitResults &&
+    eligibleBulkPlan.length > 0;
+  const requestAutoCreateConfirmRef = React.useRef<() => void>(() => {});
+  requestAutoCreateConfirmRef.current = () => setShowAutoCreateConfirm(true);
   React.useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       // Ignore when typing in form inputs (textarea / input / select / contenteditable).
@@ -1357,6 +1736,22 @@ const UnusedQuotaPageInner: React.FC<UnusedQuotaPageProps> = ({
         if (!drawerOpenRef.current && selectedIdsRef.current.size > 0) {
           setSelectedIdsRef.current(new Set());
         }
+      }
+      // Ctrl+Enter (or Cmd+Enter on macOS) inside the bulk drawer
+      // commits the auto-create. The handler short-circuits when the
+      // drawer is closed, when a submit is already in flight, or when
+      // there's no eligible plan. The form-input guard above is
+      // intentionally bypassed for this combo so the operator can fire
+      // from any focused field inside the drawer (e.g. the env-var
+      // value field) without having to tab out first.
+      if (
+        (e.key === "Enter") &&
+        (e.ctrlKey || e.metaKey) &&
+        canSubmitRef.current
+      ) {
+        e.preventDefault();
+        requestAutoCreateConfirmRef.current();
+        return;
       }
     };
     window.addEventListener("keydown", onKey);
@@ -2058,6 +2453,239 @@ const UnusedQuotaPageInner: React.FC<UnusedQuotaPageProps> = ({
             hint="cores"
             compact
           />
+        </div>
+      )}
+
+      {/*
+        Subscription anomaly banner — flags subs with >=80% of LP quota
+        sitting idle. Two tones:
+          - `idle` (info): operator likely over-allocated; either burn
+            it or release back via Quota Increase.
+          - `suspicious` (warning): one account holds ≥90% of the sub's
+            free quota AND there's free dedicated too — a defender
+            should ask whether something pre-reserved this and is
+            waiting to use it (See `_analysis_defender_view.md`
+            § "Hunting / Detection Indicators": "capacity reserved but
+            unused" pattern).
+        Operator can dismiss for the session via the eye toggle; the
+        banner re-appears on the next refresh that finds a new anomaly.
+      */}
+      {subscriptionAnomalies.length > 0 && anomalyBannerOpen && (
+        <div
+          role="region"
+          aria-label="Subscription quota anomalies"
+          className={cn(
+            "flex flex-col gap-2 rounded-lg border px-3 py-2",
+            subscriptionAnomalies.some((a) => a.severity === "suspicious")
+              ? "border-warning/40 bg-warning/5"
+              : "border-info/30 bg-info/5",
+          )}
+        >
+          <div className="flex items-start justify-between gap-2">
+            <div className="flex items-start gap-2">
+              {subscriptionAnomalies.some(
+                (a) => a.severity === "suspicious",
+              ) ? (
+                <ShieldAlert className="mt-0.5 h-4 w-4 shrink-0 text-warning" />
+              ) : (
+                <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-info" />
+              )}
+              <div className="flex flex-col gap-0.5">
+                <span className="text-sm font-semibold text-foreground">
+                  {subscriptionAnomalies.length}{" "}
+                  {subscriptionAnomalies.length === 1
+                    ? "subscription is"
+                    : "subscriptions are"}{" "}
+                  sitting on ≥{Math.round(ANOMALY_FREE_RATIO_THRESHOLD * 100)}%
+                  unused LP quota
+                </span>
+                <span className="text-2xs text-muted-foreground">
+                  Either over-allocation (release the quota or burn it)
+                  or capacity reserved-but-not-used. See defender
+                  hunting indicators —{" "}
+                  <span className="font-mono text-2xs">
+                    _analysis_defender_view.md
+                  </span>
+                  .
+                </span>
+              </div>
+            </div>
+            <Button
+              type="button"
+              variant="ghost"
+              size="icon-sm"
+              onClick={() => setAnomalyBannerOpen(false)}
+              aria-label="Dismiss anomaly banner for this session"
+              className="text-muted-foreground"
+            >
+              <EyeOff className="h-3.5 w-3.5" />
+            </Button>
+          </div>
+          <ul className="m-0 flex flex-col gap-1 pl-6 text-xs">
+            {subscriptionAnomalies.slice(0, 5).map((a) => (
+              <li key={a.subscriptionId} className="flex items-center gap-2">
+                <span
+                  className={cn(
+                    "inline-flex items-center gap-1 rounded-full px-1.5 py-0.5 text-2xs font-semibold uppercase tracking-wider",
+                    a.severity === "suspicious"
+                      ? "bg-warning/20 text-warning"
+                      : "bg-info/20 text-info",
+                  )}
+                >
+                  {a.severity}
+                </span>
+                <span
+                  className="font-mono text-2xs text-muted-foreground"
+                  title={a.subscriptionId}
+                >
+                  {a.subscriptionId.substring(0, 8)}…
+                </span>
+                <span className="tabular-nums text-foreground">
+                  {formatNumber(a.lpFree)} / {formatNumber(a.lpQuota)} LP cores
+                  free
+                </span>
+                <span className="tabular-nums text-muted-foreground">
+                  ({Math.round(a.freeRatio * 100)}% · {pluralize(a.accountCount, "account")})
+                </span>
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="xs"
+                  onClick={() => {
+                    const next = new Set(selectedIds);
+                    for (const id of a.accountIds) next.add(id);
+                    setSelectedIds(next);
+                  }}
+                  aria-label={`Select accounts in subscription ${a.subscriptionId}`}
+                  className="ml-1 text-2xs"
+                >
+                  <Plus className="h-3 w-3" />
+                  select
+                </Button>
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="xs"
+                  onClick={() => toggleExcludedSub(a.subscriptionId)}
+                  aria-label={`Toggle exclude for subscription ${a.subscriptionId}`}
+                  className="text-2xs"
+                >
+                  <ShieldAlert className="h-3 w-3" />
+                  {excludedSubs.has(a.subscriptionId) ? "un-exclude" : "exclude"}
+                </Button>
+              </li>
+            ))}
+            {subscriptionAnomalies.length > 5 && (
+              <li className="text-2xs italic text-muted-foreground">
+                …and {subscriptionAnomalies.length - 5} more.
+              </li>
+            )}
+          </ul>
+        </div>
+      )}
+      {subscriptionAnomalies.length > 0 && !anomalyBannerOpen && (
+        <button
+          type="button"
+          onClick={() => setAnomalyBannerOpen(true)}
+          className="self-start text-2xs text-muted-foreground underline-offset-2 hover:underline focus-visible:outline-none focus-visible:underline"
+          aria-label="Show subscription anomaly banner"
+        >
+          <Eye className="mr-1 inline-block h-3 w-3" />
+          Show {subscriptionAnomalies.length}{" "}
+          {subscriptionAnomalies.length === 1 ? "anomaly" : "anomalies"}
+        </button>
+      )}
+
+      {/*
+        Free LP cores over time — pure in-session history. We don't
+        persist this across reloads (a 24-point window covers the last
+        ~12 minutes if the operator hits refresh every 30s; longer
+        if they let the data go stale). The sparkline + delta read-out
+        tells the operator whether free capacity is climbing (idle is
+        growing — investigate) or falling (the fleet is consuming it).
+      */}
+      {freeLpHistory.length >= 2 && (
+        <div
+          role="region"
+          aria-label="Free LP cores trend (this session)"
+          className="flex items-center gap-3 rounded-lg border border-border bg-card/60 px-3 py-2 text-xs"
+        >
+          <TrendingUp className="h-3.5 w-3.5 text-muted-foreground" aria-hidden />
+          <span className="text-2xs font-medium uppercase tracking-wider text-muted-foreground">
+            Free LP trend
+          </span>
+          <FreeLpSparkline values={freeLpHistory} />
+          {(() => {
+            const first = freeLpHistory[0];
+            const last = freeLpHistory[freeLpHistory.length - 1];
+            const delta = last - first;
+            const pct = first > 0 ? (delta / first) * 100 : 0;
+            const tone =
+              delta > 0
+                ? "text-warning"
+                : delta < 0
+                  ? "text-success"
+                  : "text-muted-foreground";
+            return (
+              <span className={cn("tabular-nums", tone)}>
+                {delta >= 0 ? "+" : ""}
+                {formatNumber(delta)} cores
+                {first > 0 && (
+                  <span className="ml-1 text-2xs opacity-75">
+                    ({delta >= 0 ? "+" : ""}
+                    {pct.toFixed(1)}%)
+                  </span>
+                )}
+              </span>
+            );
+          })()}
+          <span className="ml-auto text-2xs text-muted-foreground">
+            {pluralize(freeLpHistory.length, "reading")} this session
+          </span>
+        </div>
+      )}
+
+      {/*
+        Excluded-subs chip row. Persisted across reloads. When non-
+        empty, the bulk-auto-create plan strips these subs out and
+        surfaces them in the result panel as "skipped — exclude-list".
+      */}
+      {excludedSubsList.length > 0 && (
+        <div
+          role="region"
+          aria-label="Excluded subscriptions"
+          className="flex flex-wrap items-center gap-2 rounded-lg border border-border bg-muted/20 px-3 py-2 text-xs"
+        >
+          <ShieldAlert
+            className="h-3.5 w-3.5 text-muted-foreground"
+            aria-hidden
+          />
+          <span className="text-2xs font-medium uppercase tracking-wider text-muted-foreground">
+            Bulk-create exclude list
+          </span>
+          {excludedSubsList.map((sub) => (
+            <button
+              key={sub}
+              type="button"
+              onClick={() => toggleExcludedSub(sub)}
+              className="inline-flex items-center gap-1 rounded-full border border-warning/40 bg-warning/10 px-2 py-0.5 text-2xs text-warning hover:bg-warning/20"
+              aria-label={`Remove ${sub} from exclude list`}
+              title={sub}
+            >
+              <span className="font-mono">{sub.substring(0, 8)}…</span>
+              <X className="h-3 w-3" />
+            </button>
+          ))}
+          <Button
+            type="button"
+            variant="ghost"
+            size="xs"
+            onClick={clearExcludedSubs}
+            aria-label="Clear all excluded subscriptions"
+            className="ml-auto"
+          >
+            Clear all
+          </Button>
         </div>
       )}
 
@@ -2850,31 +3478,76 @@ const UnusedQuotaPageInner: React.FC<UnusedQuotaPageProps> = ({
                                   </div>
                                 </TableCell>
                                 <TableCell className="text-right text-xs">
-                                  {p.eligible ? (
-                                    <span className="inline-flex items-center gap-1 text-success">
-                                      <CheckCircle2
-                                        className="h-3 w-3"
-                                        aria-hidden
-                                      />
-                                      Ready
-                                    </span>
-                                  ) : p.row.isResizing ? (
-                                    <span className="inline-flex items-center gap-1 text-warning">
-                                      <AlertTriangle
-                                        className="h-3 w-3"
-                                        aria-hidden
-                                      />
-                                      Resizing
-                                    </span>
-                                  ) : (
-                                    <span className="inline-flex items-center gap-1 text-destructive">
-                                      <XCircle
-                                        className="h-3 w-3"
-                                        aria-hidden
-                                      />
-                                      No fit
-                                    </span>
-                                  )}
+                                  <div className="flex items-center justify-end gap-1.5">
+                                    {p.eligible ? (
+                                      <span className="inline-flex items-center gap-1 text-success">
+                                        <CheckCircle2
+                                          className="h-3 w-3"
+                                          aria-hidden
+                                        />
+                                        Ready
+                                      </span>
+                                    ) : p.excluded ? (
+                                      <span className="inline-flex items-center gap-1 text-warning">
+                                        <ShieldAlert
+                                          className="h-3 w-3"
+                                          aria-hidden
+                                        />
+                                        Excluded
+                                      </span>
+                                    ) : p.row.isResizing ? (
+                                      <span className="inline-flex items-center gap-1 text-warning">
+                                        <AlertTriangle
+                                          className="h-3 w-3"
+                                          aria-hidden
+                                        />
+                                        Resizing
+                                      </span>
+                                    ) : (
+                                      <span className="inline-flex items-center gap-1 text-destructive">
+                                        <XCircle
+                                          className="h-3 w-3"
+                                          aria-hidden
+                                        />
+                                        No fit
+                                      </span>
+                                    )}
+                                    {/* Toggle exclude for the sub this row belongs to. */}
+                                    {p.row.subscriptionId && (
+                                      <Tooltip>
+                                        <TooltipTrigger asChild>
+                                          <Button
+                                            type="button"
+                                            variant="ghost"
+                                            size="icon-sm"
+                                            onClick={() =>
+                                              toggleExcludedSub(p.row.subscriptionId)
+                                            }
+                                            aria-label={
+                                              excludedSubs.has(
+                                                p.row.subscriptionId,
+                                              )
+                                                ? `Remove ${p.row.subscriptionId} from exclude list`
+                                                : `Add ${p.row.subscriptionId} to exclude list`
+                                            }
+                                            className={cn(
+                                              "h-6 w-6",
+                                              excludedSubs.has(p.row.subscriptionId)
+                                                ? "text-warning hover:text-warning"
+                                                : "text-muted-foreground hover:text-warning",
+                                            )}
+                                          >
+                                            <ShieldAlert className="h-3 w-3" />
+                                          </Button>
+                                        </TooltipTrigger>
+                                        <TooltipContent>
+                                          {excludedSubs.has(p.row.subscriptionId)
+                                            ? "Un-exclude this subscription"
+                                            : "Exclude this subscription from bulk auto-create"}
+                                        </TooltipContent>
+                                      </Tooltip>
+                                    )}
+                                  </div>
                                 </TableCell>
                               </TableRow>
                             );
@@ -2888,30 +3561,116 @@ const UnusedQuotaPageInner: React.FC<UnusedQuotaPageProps> = ({
             )}
           </SheetBody>
           {!submitResults && (
-            <SheetFooter>
-              <Button
-                type="button"
-                variant="outline"
-                onClick={closeDrawer}
-                disabled={autoCreateSubmitting}
-                aria-label="Close bulk actions drawer"
-              >
-                Cancel
-              </Button>
-              <Button
-                type="button"
-                variant="default"
-                onClick={requestAutoCreateConfirm}
-                loading={autoCreateSubmitting}
-                disabled={eligibleBulkPlan.length === 0}
-                aria-label="Auto-create pools for selected accounts"
-              >
-                {!autoCreateSubmitting && <Plus />}
-                Auto-Create{" "}
-                {eligibleBulkPlan.length > 0 &&
-                  `${eligibleBulkPlan.length} ${eligibleBulkPlan.length === 1 ? "Pool" : "Pools"}`}
-              </Button>
-            </SheetFooter>
+            <>
+              {/*
+                Attack-surface findings callout. Hidden when none of the
+                heuristics in `attackSurfaceFindings` fire. Inline cite:
+                see `_analysis_netspi.md` — NetSPI MicroBurst Get-AzPasswords
+                / IMDS variant work. Each finding is informational, not
+                blocking; the operator can still hit submit.
+              */}
+              {attackSurfaceFindings.length > 0 && (
+                <section
+                  role="region"
+                  aria-label="Attack surface advisories"
+                  className="mx-4 mb-3 flex flex-col gap-1 rounded-md border border-warning/40 bg-warning/5 px-3 py-2"
+                >
+                  <div className="flex items-center gap-1.5">
+                    <ShieldAlert className="h-3.5 w-3.5 text-warning" aria-hidden />
+                    <span className="text-xs font-semibold text-foreground">
+                      Bulk-creation expands attack surface
+                    </span>
+                    <InfoTooltip
+                      content={
+                        "Each new pool inherits your current poolDefaults. Mass-creation multiplies that footprint. See _analysis_netspi.md (NetSPI MicroBurst) for the per-node IMDS endpoint exposure and start-task elevation chain that defenders watch for."
+                      }
+                      size={11}
+                    />
+                  </div>
+                  <ul className="m-0 flex flex-col gap-0.5 pl-5 text-2xs text-muted-foreground">
+                    {attackSurfaceFindings.map((f, i) => (
+                      <li key={i} className="list-disc">
+                        {f}
+                      </li>
+                    ))}
+                  </ul>
+                </section>
+              )}
+              {/*
+                Live progress bar + ARIA-live announcer for the
+                in-flight bulk submit. `aria-live=polite` so screen
+                readers hear "Submitted group 2 of 3" without
+                interrupting other speech.
+              */}
+              {autoCreateSubmitting && submitProgress && (
+                <section
+                  role="status"
+                  aria-live="polite"
+                  aria-atomic="true"
+                  className="mx-4 mb-3 flex flex-col gap-1 rounded-md border border-info/40 bg-info/5 px-3 py-2"
+                >
+                  <div className="flex items-center justify-between gap-2 text-xs">
+                    <span className="font-medium text-foreground">
+                      Submitting group {submitProgress.completedGroups + 1} of{" "}
+                      {submitProgress.totalGroups}
+                      {submitProgress.currentGroup &&
+                        ` — ${submitProgress.currentGroup}`}
+                    </span>
+                    <span className="text-2xs tabular-nums text-muted-foreground">
+                      {submitProgress.completedRows} / {submitProgress.totalRows}{" "}
+                      accounts
+                    </span>
+                  </div>
+                  <div
+                    className="h-1.5 w-full overflow-hidden rounded-full bg-muted/40"
+                    role="progressbar"
+                    aria-valuemin={0}
+                    aria-valuemax={submitProgress.totalRows || 1}
+                    aria-valuenow={submitProgress.completedRows}
+                    aria-label={`Auto-create progress: ${submitProgress.completedRows} of ${submitProgress.totalRows} accounts complete`}
+                  >
+                    <div
+                      className="h-full bg-info transition-all duration-200 ease-out motion-reduce:transition-none"
+                      style={{
+                        width: `${Math.min(100, submitProgress.totalRows > 0 ? (submitProgress.completedRows / submitProgress.totalRows) * 100 : 0)}%`,
+                      }}
+                    />
+                  </div>
+                </section>
+              )}
+              <SheetFooter>
+                <Button
+                  type="button"
+                  variant="outline"
+                  onClick={closeDrawer}
+                  disabled={autoCreateSubmitting}
+                  aria-label="Close bulk actions drawer"
+                >
+                  Cancel
+                </Button>
+                <Button
+                  type="button"
+                  variant="default"
+                  onClick={requestAutoCreateConfirm}
+                  loading={autoCreateSubmitting}
+                  disabled={eligibleBulkPlan.length === 0}
+                  aria-label="Auto-create pools for selected accounts (Ctrl+Enter)"
+                  title={
+                    eligibleBulkPlan.length === 0
+                      ? "No eligible rows"
+                      : "Ctrl+Enter to submit"
+                  }
+                >
+                  {!autoCreateSubmitting && <Plus />}
+                  Auto-Create{" "}
+                  {eligibleBulkPlan.length > 0 &&
+                    `${eligibleBulkPlan.length} ${eligibleBulkPlan.length === 1 ? "Pool" : "Pools"}`}
+                  <span className="ml-2 hidden text-2xs opacity-60 sm:inline">
+                    ⌃↵
+                  </span>
+                </Button>
+              </SheetFooter>
+            </>
           )}
         </SheetContent>
       </Sheet>
@@ -3041,6 +3800,86 @@ const SummaryStatCard: React.FC<SummaryStatCardProps> = ({
         )}
       </div>
     </div>
+  );
+};
+
+// ---------------------------------------------------------------------------
+// FreeLpSparkline — tiny SVG sparkline of in-session free-LP-core history.
+// Pure-presentational, no deps. Renders a min/max range with a polyline.
+// Width is 120px / 24px tall by default — sized to slot inline next to a
+// label without making the row sticky-tall.
+// ---------------------------------------------------------------------------
+
+interface FreeLpSparklineProps {
+  values: number[];
+  width?: number;
+  height?: number;
+}
+
+const FreeLpSparkline: React.FC<FreeLpSparklineProps> = ({
+  values,
+  width = 120,
+  height = 24,
+}) => {
+  if (values.length < 2) return null;
+  const min = Math.min(...values);
+  const max = Math.max(...values);
+  const range = Math.max(1, max - min);
+  const dx = width / Math.max(1, values.length - 1);
+  // Build the polyline path. We invert Y because SVG origin is top-left.
+  const points = values
+    .map((v, i) => {
+      const x = i * dx;
+      const y = height - ((v - min) / range) * height;
+      return `${x.toFixed(1)},${y.toFixed(1)}`;
+    })
+    .join(" ");
+  const last = values[values.length - 1];
+  const first = values[0];
+  // Tone: rising = warning (idle growing), falling = success (consumed).
+  const tone =
+    last > first ? "stroke-warning" : last < first ? "stroke-success" : "stroke-muted-foreground";
+  // Build a soft area-fill under the line for visual weight.
+  const areaPoints = `0,${height} ${points} ${(values.length - 1) * dx},${height}`;
+  return (
+    <svg
+      role="img"
+      aria-label={`Free LP cores trend, ${values.length} readings, current ${last}`}
+      width={width}
+      height={height}
+      viewBox={`0 0 ${width} ${height}`}
+      className="overflow-visible"
+    >
+      <polygon
+        points={areaPoints}
+        className={cn(
+          "fill-current opacity-10",
+          last > first
+            ? "text-warning"
+            : last < first
+              ? "text-success"
+              : "text-muted-foreground",
+        )}
+      />
+      <polyline
+        points={points}
+        fill="none"
+        strokeWidth={1.5}
+        className={cn(tone, "stroke-current")}
+      />
+      <circle
+        cx={(values.length - 1) * dx}
+        cy={height - ((last - min) / range) * height}
+        r={2}
+        className={cn(
+          last > first
+            ? "fill-warning"
+            : last < first
+              ? "fill-success"
+              : "fill-muted-foreground",
+        )}
+      />
+    </svg>
   );
 };
 

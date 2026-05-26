@@ -117,6 +117,55 @@ const AUTO_LOGIN_PREF_KEY = "user-creator:auto-launch-portal";
 const SHOW_ALL_PW_KEY = "user-creator:show-all-pw";
 const SAVED_TEMPLATES_KEY = "user-creator:saved-templates";
 /**
+ * Operator-defined regex that every UPN prefix must match before the
+ * create call is allowed. Persisted per-browser; empty string disables
+ * the gate (default). Useful when an org standardizes on a UPN shape
+ * like `^[a-z]+\.[a-z]+\.[a-z0-9]{4}$` and wants accidental free-typed
+ * prefixes blocked at the form layer (the server still enforces its
+ * own rules; this is a soft pre-flight gate).
+ */
+const NAMING_CONVENTION_KEY = "user-creator:naming-convention";
+/**
+ * Persisted toggle for the debug JSON-preview panel. Operator hits `d`
+ * (or clicks the chip) to flip this; survives reloads so a power user
+ * who lives in the preview doesn't have to re-enable it each session.
+ */
+const DEBUG_PREVIEW_KEY = "user-creator:debug-preview";
+/**
+ * Persisted column-visibility map for the Created-by-me list. Each key
+ * is a column id, value is `true` for visible. Defaults are inlined at
+ * the read site to keep the storage payload small.
+ */
+const CREATED_COLUMNS_KEY = "user-creator:created-columns";
+/**
+ * Closed-set of toggleable card-sections in the Created-by-me list. Keep
+ * in sync with `DEFAULT_CREATED_COLUMNS` below — usePersistedState reads
+ * the *defaults* for fallback values, this list is the iteration order.
+ */
+type CreatedColumnKey =
+  | "tenant"
+  | "displayName"
+  | "lastUsed"
+  | "sourceBadge"
+  | "password"
+  | "createdAt";
+const CREATED_COLUMN_KEYS: readonly CreatedColumnKey[] = [
+  "tenant",
+  "displayName",
+  "lastUsed",
+  "sourceBadge",
+  "password",
+  "createdAt",
+] as const;
+const DEFAULT_CREATED_COLUMNS: Record<CreatedColumnKey, boolean> = {
+  tenant: true,
+  displayName: true,
+  lastUsed: true,
+  sourceBadge: true,
+  password: true,
+  createdAt: true,
+};
+/**
  * Count threshold above which a bulk quick-mode create requires an explicit
  * confirmation step. Single-user creates skip the dialog (low-risk happy
  * path). Anything bigger triggers a "you are about to provision N users in
@@ -558,6 +607,121 @@ function parseCsvPayload(
     });
   }
   return { rows, errors };
+}
+
+/**
+ * Suspicious-name detection — flags UPN prefixes that match common
+ * "blends-into-normal-admin-activity" naming patterns used to hide
+ * privileged or automation persistence cells.
+ *
+ * Corpus refs:
+ *   - `_bypass_modify_delete.md` §6 (line 623): "Create user" is rated
+ *     ★★★★★ stealth — the audit event itself blends into normal admin
+ *     activity, so the only natural signal the SOC has is the *shape*
+ *     of the name. Service-account / sync-service / helpdesk patterns
+ *     are the canonical "I'm here to stay" persistence-cell signature.
+ *   - `_bypass_role_grant.md` §10 (line 360): `User Admin (limited) →
+ *     create user → backdoor user` is an explicit escalation chain;
+ *     surfacing the deceptive-name shape at create-time is the best
+ *     defender-side counter to that chain.
+ *
+ * Returns the matched category string when the prefix looks like an
+ * automation/service/admin/sync/helpdesk persistence cell, `null`
+ * otherwise. The list is operator-readable so the warning can name
+ * the specific pattern that triggered.
+ */
+const SUSPICIOUS_NAME_PATTERNS: Array<{
+  category: string;
+  re: RegExp;
+  hint: string;
+}> = [
+  {
+    category: "service-account",
+    re: /^(svc|service|sa)[._-]/i,
+    hint: "svc_*/service_*/sa_* — classic long-lived non-interactive credential shape.",
+  },
+  {
+    category: "admin-deception",
+    re: /^(admin|root|sysadmin|superadmin)[._-]/i,
+    hint: "admin_*/root_* — looks like a legitimate admin to a casual SOC review.",
+  },
+  {
+    category: "sync-deception",
+    re: /(^|[._-])(sync|connect|adsync|aadc|aadconnect)([._-]|$)/i,
+    hint: "sync_*/aadsync_* — mimics AAD Connect sync accounts (Gerenios/AADInternals abuse vector).",
+  },
+  {
+    category: "helpdesk-deception",
+    re: /^(helpdesk|help_desk|support|it[._-]?support)[._-]/i,
+    hint: "helpdesk_*/support_* — leverages operator trust in IT-support inboxes.",
+  },
+  {
+    category: "automation",
+    re: /^(bot|automation|robot|noreply|donotreply|do[._-]?not[._-]?reply)[._-]/i,
+    hint: "bot_*/automation_* — automation-creep / persistence-cell shape.",
+  },
+  {
+    category: "hidden-prefix",
+    re: /^_/,
+    hint: "_leading-underscore — common ploy to sort to the top/bottom of a sorted user list.",
+  },
+  {
+    category: "test-deception",
+    re: /^(test|temp|tmp|demo)[._-]/i,
+    hint: "test_*/temp_* — easy to leave behind after a 'temporary' provision and forgotten.",
+  },
+];
+
+interface SuspiciousNameResult {
+  category: string;
+  hint: string;
+}
+
+function detectSuspiciousName(prefix: string): SuspiciousNameResult | null {
+  if (!prefix) return null;
+  for (const p of SUSPICIOUS_NAME_PATTERNS) {
+    if (p.re.test(prefix)) {
+      return { category: p.category, hint: p.hint };
+    }
+  }
+  return null;
+}
+
+/**
+ * Pre-flight summary of the audit-trail surface a bulk create will
+ * produce. Used by the confirmation dialog and the debug JSON preview
+ * to make the *invisible* side-effects (auditLog rows, vault rows) as
+ * loud as the visible one (Graph POST). Corpus ref:
+ * `_bypass_modify_delete.md` §6 — the "Add user" audit event is the
+ * single artifact a defender will see, so it helps to know exactly
+ * how many will be emitted before committing.
+ */
+interface AuditPreview {
+  createUser: number;
+  vaultPut: number;
+  autoLogin: number;
+  forceChangePassword: number;
+  suspiciousNames: number;
+}
+
+function summarizeAuditPreview(
+  rows: QuickUserPayload[],
+  autoLoginAfter: boolean,
+): AuditPreview {
+  let force = 0;
+  let suspicious = 0;
+  for (const r of rows) {
+    if (r.forceChange) force += 1;
+    if (detectSuspiciousName(r.prefix)) suspicious += 1;
+  }
+  return {
+    createUser: rows.length,
+    vaultPut: rows.length,
+    // Auto-login only fires for the single-create happy path right now.
+    autoLogin: autoLoginAfter && rows.length === 1 ? 1 : 0,
+    forceChangePassword: force,
+    suspiciousNames: suspicious,
+  };
 }
 
 function formatRelative(iso: string | null | undefined): string {
@@ -1436,6 +1600,52 @@ const CreateUserForm: React.FC<CreateUserFormProps> = ({
   const [csvText, setCsvText] = React.useState("");
   const [csvError, setCsvError] = React.useState<string | null>(null);
 
+  /**
+   * Operator-defined naming-convention regex. When non-empty, the create
+   * button is blocked unless every UPN prefix matches. Lives in localStorage
+   * because operators tend to keep the same convention across sessions.
+   * Empty string = no gate (default).
+   *
+   * Corpus ref: `_bypass_modify_delete.md` §6 — surfacing UPN shape at
+   * create-time is one of the few defender-side counters to the ★★★★★
+   * stealth of the "Add user" audit event. An operator who locks down a
+   * pattern (e.g. `^[a-z]+\.[a-z]+\.[a-z0-9]{4}$`) catches deceptive-name
+   * persistence attempts before the Graph POST goes out.
+   */
+  const [namingConvention, setNamingConvention] = usePersistedState<string>(
+    NAMING_CONVENTION_KEY,
+    "",
+    { version: 1 },
+  );
+  /**
+   * Compiled regex from the operator's pattern, or `null` if the field is
+   * empty or invalid. We swallow the SyntaxError so a half-typed regex
+   * doesn't blow up the page; the UI surfaces the parse error inline.
+   */
+  const compiledNamingRegex = React.useMemo<{
+    re: RegExp | null;
+    error: string | null;
+  }>(() => {
+    if (!namingConvention.trim()) return { re: null, error: null };
+    try {
+      return { re: new RegExp(namingConvention), error: null };
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      return { re: null, error: msg };
+    }
+  }, [namingConvention]);
+  /**
+   * Debug JSON-preview toggle — shows a sanitized rendition of what
+   * would be POSTed to Graph (passwords redacted). Toggleable via the
+   * `d` hotkey when the form is focused. Persisted so power-users
+   * keep it on across reloads.
+   */
+  const [debugPreview, setDebugPreview] = usePersistedState<boolean>(
+    DEBUG_PREVIEW_KEY,
+    false,
+    { version: 1 },
+  );
+
   const [availability, setAvailability] = React.useState<AvailabilityState>({
     status: "idle",
   });
@@ -1632,10 +1842,34 @@ const CreateUserForm: React.FC<CreateUserFormProps> = ({
       return out;
     }, [validation]);
 
+  /**
+   * Suspicious-name result for the *currently typed* prefix in detailed
+   * mode. Surfaces a non-blocking warning chip near the prefix input. We
+   * never block submission on this — operators occasionally legitimately
+   * create svc_ accounts — but we make the deceptive shape *loud* so the
+   * operator at least has to mouse past it.
+   */
+  const suspiciousPrefix = React.useMemo(
+    () => detectSuspiciousName(prefix),
+    [prefix],
+  );
+
+  /**
+   * Naming-convention pass/fail for the detailed-mode prefix. Empty
+   * regex = pass through. Compiled-with-error = pass through (we don't
+   * want a typo in the regex to block all creates) but we surface the
+   * regex error inline so the operator notices.
+   */
+  const namingConventionOk = React.useMemo(() => {
+    if (!compiledNamingRegex.re) return true;
+    return compiledNamingRegex.re.test(prefix);
+  }, [compiledNamingRegex, prefix]);
+
   const formValid =
     !!account &&
     validation.success &&
-    availability.status === "available";
+    availability.status === "available" &&
+    namingConventionOk;
 
   const handleGeneratePassword = React.useCallback(() => {
     setPassword(generateRandomPassword());
@@ -1731,8 +1965,101 @@ const CreateUserForm: React.FC<CreateUserFormProps> = ({
     }
   }, [csvMode, csvParseErrors]);
 
+  /**
+   * Per-row suspicious-name results for the batch preview. Map keyed by
+   * UPN so the preview list can render a per-row chip without re-running
+   * the regex sweep per render.
+   *
+   * Corpus ref: `_bypass_modify_delete.md` §6 — create_user is ★★★★★
+   * stealth, so the *only* natural defender signal at provisioning time
+   * is the shape of the name. Flagging at the preview stage gives the
+   * operator one last bail-out before N audit events get burned.
+   */
+  const batchSuspicious = React.useMemo<Record<string, SuspiciousNameResult>>(
+    () => {
+      const out: Record<string, SuspiciousNameResult> = {};
+      for (const r of batchPreview) {
+        const s = detectSuspiciousName(r.prefix);
+        if (s) out[r.upn] = s;
+      }
+      return out;
+    },
+    [batchPreview],
+  );
+
+  /**
+   * Per-row naming-convention pass/fail for the batch preview. Empty
+   * regex (the default) flags nothing. Drives the per-row red-line
+   * visual in the preview list AND the gate on `quickValid` below.
+   */
+  const batchNamingFails = React.useMemo<Set<string>>(() => {
+    const out = new Set<string>();
+    if (!compiledNamingRegex.re) return out;
+    for (const r of batchPreview) {
+      if (!compiledNamingRegex.re.test(r.prefix)) out.add(r.upn);
+    }
+    return out;
+  }, [compiledNamingRegex, batchPreview]);
+
+  /**
+   * Audit-event surface for the upcoming submit — count of create_user,
+   * vault_put, webui_auto_login records the run will emit. Surfaced in
+   * the confirm dialog AND the debug JSON preview so the *invisible*
+   * side-effects are as loud as the visible Graph POST.
+   */
+  const auditPreview = React.useMemo<AuditPreview>(
+    () => summarizeAuditPreview(batchPreview, autoLoginEnabled),
+    [batchPreview, autoLoginEnabled],
+  );
+
+  /**
+   * Sanitized JSON preview — what a Graph POST body would look like for
+   * each row, with passwords redacted. Operators in debug mode see this
+   * panel and can sanity-check that the right attributes will flow. We
+   * deliberately DON'T preview temp passwords here — they belong in the
+   * encrypted vault, not in a screenshot-friendly preview pane.
+   */
+  const debugPreviewJson = React.useMemo<string>(() => {
+    if (!debugPreview) return "";
+    const sanitized = batchPreview.map((r) => ({
+      userPrincipalName: r.upn,
+      displayName: r.displayName,
+      mailNickname: r.prefix,
+      passwordProfile: {
+        password: "***REDACTED***",
+        forceChangePasswordNextSignIn: r.forceChange,
+      },
+      accountEnabled: r.accountEnabled,
+      usageLocation: r.usageLocation,
+      givenName: r.givenName,
+      surname: r.surname,
+      jobTitle: r.jobTitle,
+      department: r.department,
+    }));
+    return JSON.stringify(
+      {
+        targetTenant: account?.tenantId ?? "(no account)",
+        actor: account?.username ?? "(no account)",
+        userCount: sanitized.length,
+        auditEvents: {
+          create_user: auditPreview.createUser,
+          vault_put: auditPreview.vaultPut,
+          webui_auto_login: auditPreview.autoLogin,
+        },
+        suspiciousNames: auditPreview.suspiciousNames,
+        users: sanitized,
+      },
+      null,
+      2,
+    );
+  }, [debugPreview, batchPreview, auditPreview, account]);
+
   const quickValid =
-    !!account && quickMode && batchPreview.length > 0 && !bulkSubmitting;
+    !!account &&
+    quickMode &&
+    batchPreview.length > 0 &&
+    !bulkSubmitting &&
+    batchNamingFails.size === 0;
 
   /**
    * Bulk-create everything in `batchPreview`. We call `createUser`
@@ -2035,6 +2362,83 @@ const CreateUserForm: React.FC<CreateUserFormProps> = ({
     autoLoginEnabled,
     store,
     onCreated,
+  ]);
+
+  /**
+   * Hotkey wiring — keeps the form keyboard-first.
+   *   - `Ctrl+Enter` / `Cmd+Enter` → submit (quick-mode bulk or detailed)
+   *   - `Esc`                       → clear in-form errors + close any
+   *                                   open confirm dialog (defensive)
+   *   - `d` (form-focused)          → toggle the debug JSON-preview panel
+   *
+   * Hotkeys are bound at the document level but suppressed when the user
+   * is typing inside a `<textarea>` or a multi-line CSV input. We DON'T
+   * suppress for `<input>` because Ctrl+Enter from an input is the
+   * canonical "submit-from-anywhere" gesture in this form.
+   */
+  React.useEffect(() => {
+    const handler = (ev: KeyboardEvent) => {
+      // Ignore when an interactive control on top of the form is
+      // capturing the keystroke (textarea = CSV paste box).
+      const target = ev.target as HTMLElement | null;
+      const inTextArea = target?.tagName === "TEXTAREA";
+
+      if (ev.key === "Enter" && (ev.ctrlKey || ev.metaKey)) {
+        ev.preventDefault();
+        if (quickMode) {
+          if (!quickValid) return;
+          if (batchPreview.length > BULK_CONFIRM_THRESHOLD) {
+            setBulkConfirmOpen(true);
+          } else {
+            void handleQuickSubmit();
+          }
+        } else {
+          if (!formValid || submitting) return;
+          setSubmitError(null);
+          setConfirmOpen(true);
+        }
+        return;
+      }
+      if (ev.key === "Escape") {
+        // Don't steal Esc from Radix dialogs — they manage their own
+        // close. We only clear inline form errors when no dialog is
+        // open. Radix sets `data-state="open"` on the dialog root and
+        // adds an overlay; sniffing the overlay is the cheapest check.
+        if (document.querySelector('[data-state="open"][role="dialog"]')) {
+          return;
+        }
+        if (submitError) setSubmitError(null);
+        if (csvError) setCsvError(null);
+        return;
+      }
+      if (ev.key === "d" && !ev.ctrlKey && !ev.metaKey && !ev.altKey) {
+        if (inTextArea) return;
+        // Don't fire while typing in any text input — `d` is a legit
+        // letter. Bind to "form focused" by checking the active element
+        // is NOT a text input/textarea/select editing-mode.
+        const tag = target?.tagName;
+        const editable =
+          tag === "INPUT" ||
+          tag === "TEXTAREA" ||
+          tag === "SELECT" ||
+          (target as HTMLElement | null)?.isContentEditable;
+        if (editable) return;
+        ev.preventDefault();
+        setDebugPreview((v) => !v);
+      }
+    };
+    document.addEventListener("keydown", handler);
+    return () => document.removeEventListener("keydown", handler);
+  }, [
+    quickMode,
+    quickValid,
+    formValid,
+    submitting,
+    batchPreview.length,
+    submitError,
+    csvError,
+    handleQuickSubmit,
+    setDebugPreview,
   ]);
 
   const handleConfirm = React.useCallback(async () => {
@@ -2715,12 +3119,164 @@ const CreateUserForm: React.FC<CreateUserFormProps> = ({
                 )}
               </div>
 
+              {/*
+                Naming-convention enforcement — operator-defined regex.
+                When set, every prefix in the batch must match or the
+                create button is disabled. Empty = no gate (default).
+                Corpus ref: `_bypass_modify_delete.md` §6 — the create_user
+                audit event is ★★★★★ stealth, so any defender-side gate on
+                the UPN *shape* before the POST is high-value.
+              */}
+              <div className="flex flex-col gap-1.5 rounded-md border border-border bg-card/60 p-3">
+                <Label
+                  htmlFor="user-creator-naming-convention"
+                  className="flex items-center gap-1.5 text-xs font-medium"
+                >
+                  <ShieldCheck
+                    className="h-3.5 w-3.5 text-primary"
+                    aria-hidden
+                  />
+                  Naming-convention regex (optional)
+                  {namingConvention && (
+                    <Badge
+                      variant={
+                        compiledNamingRegex.error
+                          ? "destructive"
+                          : batchNamingFails.size > 0
+                            ? "warning"
+                            : "success"
+                      }
+                      className="ml-1 text-2xs"
+                    >
+                      {compiledNamingRegex.error
+                        ? "invalid regex"
+                        : batchNamingFails.size > 0
+                          ? `${batchNamingFails.size} fail`
+                          : "all pass"}
+                    </Badge>
+                  )}
+                </Label>
+                <div className="flex gap-1.5">
+                  <Input
+                    id="user-creator-naming-convention"
+                    type="text"
+                    value={namingConvention}
+                    onChange={(ev) => setNamingConvention(ev.target.value)}
+                    placeholder="e.g. ^[a-z]+\.[a-z]+\.[a-z0-9]{4}$"
+                    aria-label="Naming convention regex"
+                    aria-describedby="user-creator-naming-help"
+                    className="h-8 font-mono text-2xs"
+                    disabled={bulkSubmitting}
+                  />
+                  {namingConvention && (
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      size="sm"
+                      onClick={() => setNamingConvention("")}
+                      disabled={bulkSubmitting}
+                      aria-label="Clear naming convention"
+                      title="Disable the naming-convention gate"
+                      className="h-8 px-2"
+                    >
+                      <X />
+                    </Button>
+                  )}
+                </div>
+                <p
+                  id="user-creator-naming-help"
+                  className={cn(
+                    "text-2xs",
+                    compiledNamingRegex.error
+                      ? "text-destructive"
+                      : "text-muted-foreground",
+                  )}
+                >
+                  {compiledNamingRegex.error
+                    ? `Regex parse error: ${compiledNamingRegex.error} — gate disabled.`
+                    : namingConvention
+                      ? `Blocks any UPN prefix that doesn't match. Persisted per-browser.`
+                      : `Empty = no gate. Set a regex like ^[a-z]+\\.[a-z]+\\.[a-z0-9]{4}$ to enforce a UPN shape.`}
+                </p>
+              </div>
+
+              {/*
+                Audit-event surface — what the SOC will see when this batch
+                fires. Corpus ref: `_bypass_modify_delete.md` §6 (line 623)
+                rates `create_user` at ★★★★★ stealth, but the *count* is the
+                second-order signal (a burst of N audit entries from the
+                same actor is more visible than the entries individually).
+                Surfacing the totals before the click pushes operators
+                toward staged batches instead of one giant 50-user push.
+              */}
+              {batchPreview.length > 0 && (
+                <div className="flex flex-wrap items-center gap-2 rounded-md border border-info/30 bg-info/5 px-3 py-2 text-2xs">
+                  <ShieldAlert
+                    className="h-3.5 w-3.5 text-info"
+                    aria-hidden
+                  />
+                  <span className="font-medium text-foreground">
+                    Audit-event preview
+                  </span>
+                  <span className="text-muted-foreground">·</span>
+                  <span>
+                    <strong className="text-foreground tabular-nums">
+                      {auditPreview.createUser}
+                    </strong>{" "}
+                    <code className="font-mono">create_user</code>
+                  </span>
+                  <span>
+                    <strong className="text-foreground tabular-nums">
+                      {auditPreview.vaultPut}
+                    </strong>{" "}
+                    <code className="font-mono">vault_put</code>
+                  </span>
+                  {auditPreview.autoLogin > 0 && (
+                    <span>
+                      <strong className="text-foreground tabular-nums">
+                        {auditPreview.autoLogin}
+                      </strong>{" "}
+                      <code className="font-mono">webui_auto_login</code>
+                    </span>
+                  )}
+                  {auditPreview.forceChangePassword > 0 && (
+                    <span className="text-muted-foreground">
+                      · {auditPreview.forceChangePassword} forced-reset
+                    </span>
+                  )}
+                  {auditPreview.suspiciousNames > 0 && (
+                    <Badge variant="warning" className="ml-auto text-2xs">
+                      {auditPreview.suspiciousNames} deceptive-name
+                    </Badge>
+                  )}
+                  <button
+                    type="button"
+                    onClick={() => setDebugPreview((v) => !v)}
+                    className="ml-auto underline underline-offset-2 hover:no-underline"
+                    aria-label="Toggle debug JSON preview"
+                    title="Hotkey: d"
+                  >
+                    {debugPreview ? "hide" : "show"} JSON (press d)
+                  </button>
+                </div>
+              )}
+
               {/* Live preview of the synthesized batch */}
               <div className="flex flex-col gap-2 rounded-md border border-border bg-card/60 p-3">
                 <div className="flex items-center gap-2 text-xs font-medium">
                   <Sparkles className="h-3.5 w-3.5 text-primary" aria-hidden />
                   Preview ({batchPreview.length}{" "}
                   {batchPreview.length === 1 ? "user" : "users"})
+                  {Object.keys(batchSuspicious).length > 0 && (
+                    <Badge variant="warning" className="text-2xs">
+                      {Object.keys(batchSuspicious).length} deceptive
+                    </Badge>
+                  )}
+                  {batchNamingFails.size > 0 && (
+                    <Badge variant="destructive" className="text-2xs">
+                      {batchNamingFails.size} convention fail
+                    </Badge>
+                  )}
                   <Button
                     type="button"
                     variant="ghost"
@@ -2742,32 +3298,119 @@ const CreateUserForm: React.FC<CreateUserFormProps> = ({
                   </p>
                 ) : (
                   <ul className="flex flex-col gap-1 max-h-64 overflow-auto">
-                    {batchPreview.map((p) => (
-                      <li
-                        key={p.upn}
-                        className="flex flex-wrap items-center gap-2 text-2xs"
-                      >
-                        <BadgeCheck
-                          className="h-3 w-3 text-success"
-                          aria-hidden
-                        />
-                        <code className="font-mono text-foreground">
-                          {p.upn}
-                        </code>
-                        <span className="text-muted-foreground">
-                          · {p.displayName}
-                        </span>
-                        <span className="ml-auto text-muted-foreground">
-                          {p.jobTitle} · {p.department}
-                        </span>
-                      </li>
-                    ))}
+                    {batchPreview.map((p) => {
+                      const suspicious = batchSuspicious[p.upn];
+                      const fails = batchNamingFails.has(p.upn);
+                      return (
+                        <li
+                          key={p.upn}
+                          className={cn(
+                            "flex flex-wrap items-center gap-2 rounded px-1 py-0.5 text-2xs",
+                            fails &&
+                              "border border-destructive/40 bg-destructive/10",
+                            !fails &&
+                              suspicious &&
+                              "border border-warning/40 bg-warning/5",
+                          )}
+                          title={
+                            fails
+                              ? `Does not match naming convention /${namingConvention}/`
+                              : suspicious
+                                ? `Deceptive-name pattern (${suspicious.category}): ${suspicious.hint}`
+                                : undefined
+                          }
+                        >
+                          {fails ? (
+                            <X
+                              className="h-3 w-3 text-destructive"
+                              aria-label="Convention fail"
+                            />
+                          ) : suspicious ? (
+                            <ShieldAlert
+                              className="h-3 w-3 text-warning"
+                              aria-label="Deceptive name pattern"
+                            />
+                          ) : (
+                            <BadgeCheck
+                              className="h-3 w-3 text-success"
+                              aria-hidden
+                            />
+                          )}
+                          <code className="font-mono text-foreground">
+                            {p.upn}
+                          </code>
+                          <span className="text-muted-foreground">
+                            · {p.displayName}
+                          </span>
+                          {suspicious && !fails && (
+                            <Badge variant="warning" className="text-2xs">
+                              {suspicious.category}
+                            </Badge>
+                          )}
+                          <span className="ml-auto text-muted-foreground">
+                            {p.jobTitle} · {p.department}
+                          </span>
+                        </li>
+                      );
+                    })}
                   </ul>
                 )}
               </div>
 
+              {/*
+                Sanitized JSON-preview panel — what the Graph POST body
+                would look like for each row. Passwords redacted. Operators
+                in debug mode use this to confirm the right attributes
+                will flow before clicking Create. Hotkey: `d`.
+              */}
+              {debugPreview && batchPreview.length > 0 && (
+                <div className="flex flex-col gap-1 rounded-md border border-primary/30 bg-primary/5 p-3">
+                  <div className="flex items-center gap-1.5 text-xs font-medium">
+                    <FileJson
+                      className="h-3.5 w-3.5 text-primary"
+                      aria-hidden
+                    />
+                    Debug JSON preview
+                    <span className="text-2xs text-muted-foreground">
+                      (sanitized — passwords redacted)
+                    </span>
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      size="sm"
+                      className="ml-auto"
+                      onClick={async () => {
+                        const ok = await tryWriteClipboard(debugPreviewJson);
+                        store.addNotification({
+                          type: ok ? "info" : "error",
+                          message: ok
+                            ? "Debug JSON copied to clipboard."
+                            : "Clipboard blocked by the browser.",
+                        });
+                      }}
+                      aria-label="Copy debug JSON"
+                    >
+                      <Copy />
+                      Copy
+                    </Button>
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      size="sm"
+                      onClick={() => setDebugPreview(false)}
+                      aria-label="Hide debug preview"
+                    >
+                      <X />
+                    </Button>
+                  </div>
+                  <pre className="max-h-72 overflow-auto rounded bg-background px-2 py-1.5 font-mono text-2xs text-foreground">
+                    {debugPreviewJson}
+                  </pre>
+                </div>
+              )}
+
               {bulkProgress && (
-                <Alert>
+                <Alert role="status" aria-live="polite" aria-atomic="true">
                   <Loader2 className="h-4 w-4 animate-spin" />
                   <AlertDescription>
                     Creating {bulkProgress.done + 1} of {bulkProgress.total}
@@ -2777,7 +3420,22 @@ const CreateUserForm: React.FC<CreateUserFormProps> = ({
                 </Alert>
               )}
 
-              <div className="flex justify-end">
+              <div className="flex items-center justify-end gap-2">
+                <span className="text-2xs text-muted-foreground">
+                  Hotkeys:{" "}
+                  <kbd className="rounded border border-border bg-card px-1 font-mono">
+                    Ctrl+Enter
+                  </kbd>{" "}
+                  submit ·{" "}
+                  <kbd className="rounded border border-border bg-card px-1 font-mono">
+                    Esc
+                  </kbd>{" "}
+                  clear errors ·{" "}
+                  <kbd className="rounded border border-border bg-card px-1 font-mono">
+                    d
+                  </kbd>{" "}
+                  toggle JSON
+                </span>
                 <Button
                   type="button"
                   variant="default"
@@ -2792,7 +3450,12 @@ const CreateUserForm: React.FC<CreateUserFormProps> = ({
                     }
                   }}
                   disabled={!quickValid}
-                  aria-label={`Create ${batchPreview.length || count} user${(batchPreview.length || count) === 1 ? "" : "s"}`}
+                  aria-label={`Create ${batchPreview.length || count} user${(batchPreview.length || count) === 1 ? "" : "s"} (Ctrl+Enter)`}
+                  title={
+                    batchNamingFails.size > 0
+                      ? `${batchNamingFails.size} row${batchNamingFails.size === 1 ? "" : "s"} fail the naming-convention regex — fix or clear the regex.`
+                      : "Ctrl+Enter to submit"
+                  }
                 >
                   {bulkSubmitting ? (
                     <Loader2 className="animate-spin" />
@@ -3016,6 +3679,46 @@ const CreateUserForm: React.FC<CreateUserFormProps> = ({
                             ? `Full UPN: ${upn}`
                             : "Letters, numbers, dot, dash, or underscore. Max 40 characters."}
               </p>
+              {/*
+                Inline indicators — fire on top of the standard availability
+                line when the operator's prefix matches a deceptive pattern,
+                or when the operator-defined naming convention rejects it.
+                Both are non-blocking *advisory* in detailed mode (the
+                convention DOES block submit; the suspicious flag is loud
+                but doesn't gate). Corpus refs: `_bypass_modify_delete.md`
+                §6 (line 623) and `_bypass_role_grant.md` §10 (line 360).
+              */}
+              {prefix.length > 0 && suspiciousPrefix && (
+                <p
+                  className="flex items-start gap-1.5 text-2xs text-warning"
+                  role="status"
+                >
+                  <ShieldAlert
+                    className="mt-0.5 h-3 w-3 shrink-0"
+                    aria-hidden
+                  />
+                  <span>
+                    Deceptive-name pattern (
+                    <strong>{suspiciousPrefix.category}</strong>):{" "}
+                    {suspiciousPrefix.hint} Not blocked — but the SOC will
+                    see a generic <code className="font-mono">Add user</code>{" "}
+                    audit event with the shape you typed.
+                  </span>
+                </p>
+              )}
+              {prefix.length > 0 && !namingConventionOk && (
+                <p
+                  className="flex items-start gap-1.5 text-2xs text-destructive"
+                  role="status"
+                >
+                  <X className="mt-0.5 h-3 w-3 shrink-0" aria-hidden />
+                  <span>
+                    Does not match naming convention{" "}
+                    <code className="font-mono">/{namingConvention}/</code>{" "}
+                    (set in Quick mode &gt; Naming-convention regex).
+                  </span>
+                </p>
+              )}
             </div>
 
             <div className="flex flex-col gap-1.5">
@@ -3240,7 +3943,12 @@ const CreateUserForm: React.FC<CreateUserFormProps> = ({
           </>)}
 
           {submitError && (
-            <Alert variant="destructive">
+            <Alert
+              variant="destructive"
+              role="alert"
+              aria-live="assertive"
+              aria-atomic="true"
+            >
               <AlertCircle className="h-4 w-4" />
               <AlertDescription>{submitError}</AlertDescription>
             </Alert>
@@ -3257,6 +3965,8 @@ const CreateUserForm: React.FC<CreateUserFormProps> = ({
             <div
               role="status"
               aria-live="polite"
+              aria-atomic="true"
+              aria-label={`User ${lastCreated.upn} created successfully in tenant ${account.tenantId}.${lastCreated.mustChangePassword ? " Must change password on first sign-in." : ""}`}
               className="flex flex-col gap-2 rounded-md border border-success/40 bg-success/10 p-4 transition-colors duration-200 ease-out motion-reduce:transition-none"
             >
               <div className="flex items-center gap-2 text-sm font-semibold text-success">
@@ -3578,7 +4288,22 @@ const CreateUserForm: React.FC<CreateUserFormProps> = ({
           )}
 
           {!quickMode && (
-            <div className="flex justify-end">
+            <div className="flex items-center justify-end gap-2">
+              <span className="text-2xs text-muted-foreground">
+                Hotkeys:{" "}
+                <kbd className="rounded border border-border bg-card px-1 font-mono">
+                  Ctrl+Enter
+                </kbd>{" "}
+                submit ·{" "}
+                <kbd className="rounded border border-border bg-card px-1 font-mono">
+                  Esc
+                </kbd>{" "}
+                clear errors ·{" "}
+                <kbd className="rounded border border-border bg-card px-1 font-mono">
+                  d
+                </kbd>{" "}
+                toggle JSON
+              </span>
               <TooltipProvider delayDuration={150}>
                 <Tooltip>
                   <TooltipTrigger asChild>
@@ -3588,7 +4313,8 @@ const CreateUserForm: React.FC<CreateUserFormProps> = ({
                         variant="default"
                         onClick={handleSubmitClick}
                         disabled={!formValid || submitting}
-                        aria-label="Create user"
+                        aria-label="Create user (Ctrl+Enter)"
+                        title="Ctrl+Enter to submit"
                         className="transition-all duration-200 ease-out motion-reduce:transition-none"
                       >
                         <UserPlus />
@@ -3608,9 +4334,11 @@ const CreateUserForm: React.FC<CreateUserFormProps> = ({
                               ? "Could not verify UPN availability."
                               : availability.status !== "available"
                                 ? "Pick a UPN prefix and wait for availability."
-                                : !validation.success
-                                  ? "Resolve form errors to continue."
-                                  : "Form not yet valid."}
+                                : !namingConventionOk
+                                  ? `UPN prefix doesn't match /${namingConvention}/.`
+                                  : !validation.success
+                                    ? "Resolve form errors to continue."
+                                    : "Form not yet valid."}
                     </TooltipContent>
                   )}
                 </Tooltip>
@@ -3640,20 +4368,48 @@ const CreateUserForm: React.FC<CreateUserFormProps> = ({
       <ConfirmationDialog
         hidden={!bulkConfirmOpen}
         title={`Create ${batchPreview.length} users`}
-        danger={batchPreview.length >= 10}
+        danger={
+          batchPreview.length >= 10 || auditPreview.suspiciousNames > 0
+        }
         message={
-          <span>
-            About to provision <strong>{batchPreview.length}</strong> users in
-            tenant{" "}
-            <code className="font-mono text-xs">{account.tenantId}</code>{" "}
-            (preset{" "}
-            <strong>{activePresetForQuick.label}</strong>
-            {csvMode ? ", from pasted CSV" : ""}). Each user will receive a
-            randomly-generated password{" "}
-            {activePresetForQuick.forceChangePassword
-              ? "and be forced to change it on first sign-in"
-              : "with no forced reset"}
-            . Continue?
+          <span className="flex flex-col gap-2">
+            <span>
+              About to provision <strong>{batchPreview.length}</strong> users
+              in tenant{" "}
+              <code className="font-mono text-xs">{account.tenantId}</code>{" "}
+              (preset <strong>{activePresetForQuick.label}</strong>
+              {csvMode ? ", from pasted CSV" : ""}). Each user will receive a
+              randomly-generated password{" "}
+              {activePresetForQuick.forceChangePassword
+                ? "and be forced to change it on first sign-in"
+                : "with no forced reset"}
+              .
+            </span>
+            <span className="rounded border border-info/30 bg-info/5 px-2 py-1 text-2xs">
+              <strong>Audit trail:</strong>{" "}
+              {auditPreview.createUser}× <code>create_user</code>,{" "}
+              {auditPreview.vaultPut}× <code>vault_put</code>
+              {auditPreview.autoLogin > 0 && (
+                <>
+                  , {auditPreview.autoLogin}×{" "}
+                  <code>webui_auto_login</code>
+                </>
+              )}
+              . Each <code>create_user</code> shows in the Entra audit log as{" "}
+              <code>Add user</code>.
+            </span>
+            {auditPreview.suspiciousNames > 0 && (
+              <span className="rounded border border-warning/40 bg-warning/10 px-2 py-1 text-2xs">
+                <strong>
+                  {auditPreview.suspiciousNames} deceptive-name pattern
+                  {auditPreview.suspiciousNames === 1 ? "" : "s"}
+                </strong>{" "}
+                detected (svc_*/admin_*/sync_*/etc.). These names blend into
+                normal admin activity and are classic persistence-cell
+                shapes — confirm the operator-intent before continuing.
+              </span>
+            )}
+            <span>Continue?</span>
           </span>
         }
         confirmText={`Create ${batchPreview.length} users`}
@@ -3822,6 +4578,38 @@ const CreatedByMeTab: React.FC<CreatedByMeTabProps> = ({ account, store }) => {
       /* ignore */
     }
   }, [showAllPasswords]);
+
+  /**
+   * Persisted column-visibility for the created-users list. Each "column"
+   * here is really a card-section toggle (tenant ID, display name, last
+   * used, source badge, etc.) — operators who churn through dozens of
+   * created accounts in a session can hide the chrome they don't read.
+   *
+   * Defaults are module-level so the reference is stable across renders;
+   * usePersistedState only reads the initial value on first mount but a
+   * stable reference is friendlier to React DevTools diffing.
+   */
+  const [columnVisibility, setColumnVisibility] = usePersistedState<
+    Record<CreatedColumnKey, boolean>
+  >(CREATED_COLUMNS_KEY, DEFAULT_CREATED_COLUMNS, { version: 1 });
+  const setColumnVisible = React.useCallback(
+    (key: CreatedColumnKey, visible: boolean) => {
+      setColumnVisibility((prev) => ({ ...prev, [key]: visible }));
+    },
+    [setColumnVisibility],
+  );
+  /**
+   * Count of *hidden* columns — surfaced in the toolbar so a confused
+   * operator who can't find their password column has an obvious hint
+   * ("3 columns hidden — click to restore").
+   */
+  const hiddenColumnCount = React.useMemo(() => {
+    let n = 0;
+    for (const k of CREATED_COLUMN_KEYS) {
+      if (columnVisibility[k] === false) n += 1;
+    }
+    return n;
+  }, [columnVisibility]);
 
   const markBusy = React.useCallback((key: string) => {
     setBusyKeys((prev) => {
@@ -4597,6 +5385,67 @@ const CreatedByMeTab: React.FC<CreatedByMeTabProps> = ({ account, store }) => {
                 </Button>
               </div>
             </div>
+            {/*
+              Persisted column-visibility — each chip toggles whether the
+              corresponding card section renders. Hidden columns are
+              counted in the chip label so a confused operator knows why
+              their password row disappeared. Stored per-browser.
+            */}
+            <details className="rounded-md border border-border bg-card/40 px-2 py-1.5 text-2xs">
+              <summary className="flex cursor-pointer items-center gap-1.5 select-none">
+                <Filter
+                  className="h-3 w-3 text-muted-foreground"
+                  aria-hidden
+                />
+                <span className="font-medium">Columns</span>
+                {hiddenColumnCount > 0 ? (
+                  <Badge variant="warning" className="text-2xs">
+                    {hiddenColumnCount} hidden
+                  </Badge>
+                ) : (
+                  <span className="text-muted-foreground">(all visible)</span>
+                )}
+                {hiddenColumnCount > 0 && (
+                  <button
+                    type="button"
+                    onClick={(ev) => {
+                      ev.preventDefault();
+                      setColumnVisibility(DEFAULT_CREATED_COLUMNS);
+                    }}
+                    className="ml-auto underline underline-offset-2 hover:no-underline"
+                    aria-label="Restore all columns"
+                  >
+                    restore all
+                  </button>
+                )}
+              </summary>
+              <div className="mt-1.5 flex flex-wrap items-center gap-2">
+                {(
+                  [
+                    { k: "sourceBadge", label: "Source badge" },
+                    { k: "createdAt", label: "Created date" },
+                    { k: "tenant", label: "Tenant ID" },
+                    { k: "displayName", label: "Display name" },
+                    { k: "lastUsed", label: "Last used" },
+                    { k: "password", label: "Password" },
+                  ] as Array<{ k: CreatedColumnKey; label: string }>
+                ).map(({ k, label }) => (
+                  <label
+                    key={k}
+                    className="flex cursor-pointer items-center gap-1 rounded border border-border bg-card px-1.5 py-0.5"
+                  >
+                    <Checkbox
+                      checked={columnVisibility[k] !== false}
+                      onCheckedChange={(v) =>
+                        setColumnVisible(k, Boolean(v))
+                      }
+                      aria-label={`Toggle ${label} column`}
+                    />
+                    <span>{label}</span>
+                  </label>
+                ))}
+              </div>
+            </details>
             {/* Status filter chips */}
             <div
               role="radiogroup"
@@ -4860,62 +5709,79 @@ const CreatedByMeTab: React.FC<CreatedByMeTabProps> = ({ account, store }) => {
                     })
                   }
                 />
-                {e.source === "create" && (
-                  <Badge variant="info" className="text-2xs">
-                    created
-                  </Badge>
-                )}
-                {e.source === "reset" && (
-                  <Badge variant="secondary" className="text-2xs">
-                    reset
-                  </Badge>
-                )}
+                {columnVisibility.sourceBadge !== false &&
+                  e.source === "create" && (
+                    <Badge variant="info" className="text-2xs">
+                      created
+                    </Badge>
+                  )}
+                {columnVisibility.sourceBadge !== false &&
+                  e.source === "reset" && (
+                    <Badge variant="secondary" className="text-2xs">
+                      reset
+                    </Badge>
+                  )}
                 {e.mustChangePassword && (
                   <Badge variant="warning" className="text-2xs">
                     must change
                   </Badge>
                 )}
-                <span
-                  className="ml-auto text-2xs text-muted-foreground tabular-nums"
-                  title={
-                    e.createdAt ? new Date(e.createdAt).toISOString() : undefined
-                  }
-                >
-                  {e.createdAt
-                    ? formatRelative(e.createdAt)
-                    : "unknown date"}
-                </span>
-              </div>
-              <div className="flex flex-wrap items-center gap-2 text-2xs text-muted-foreground">
-                <span>
-                  tenant{" "}
-                  <code className="font-mono">{truncateMiddle(e.tenantId)}</code>
-                </span>
-                <CopyChip
-                  value={e.tenantId}
-                  label="tenant ID"
-                  onCopied={() =>
-                    store.addNotification({
-                      type: "info",
-                      message: "Tenant ID copied.",
-                    })
-                  }
-                  onCopyFailed={() =>
-                    store.addNotification({
-                      type: "error",
-                      message: "Clipboard blocked by the browser.",
-                    })
-                  }
-                />
-                {e.displayName && (
-                  <span>· {e.displayName}</span>
-                )}
-                {e.lastUsedAt && (
-                  <span title={new Date(e.lastUsedAt).toISOString()}>
-                    · last used {formatRelative(e.lastUsedAt)}
+                {columnVisibility.createdAt !== false && (
+                  <span
+                    className="ml-auto text-2xs text-muted-foreground tabular-nums"
+                    title={
+                      e.createdAt
+                        ? new Date(e.createdAt).toISOString()
+                        : undefined
+                    }
+                  >
+                    {e.createdAt
+                      ? formatRelative(e.createdAt)
+                      : "unknown date"}
                   </span>
                 )}
               </div>
+              {(columnVisibility.tenant !== false ||
+                columnVisibility.displayName !== false ||
+                columnVisibility.lastUsed !== false) && (
+                <div className="flex flex-wrap items-center gap-2 text-2xs text-muted-foreground">
+                  {columnVisibility.tenant !== false && (
+                    <>
+                      <span>
+                        tenant{" "}
+                        <code className="font-mono">
+                          {truncateMiddle(e.tenantId)}
+                        </code>
+                      </span>
+                      <CopyChip
+                        value={e.tenantId}
+                        label="tenant ID"
+                        onCopied={() =>
+                          store.addNotification({
+                            type: "info",
+                            message: "Tenant ID copied.",
+                          })
+                        }
+                        onCopyFailed={() =>
+                          store.addNotification({
+                            type: "error",
+                            message: "Clipboard blocked by the browser.",
+                          })
+                        }
+                      />
+                    </>
+                  )}
+                  {columnVisibility.displayName !== false && e.displayName && (
+                    <span>· {e.displayName}</span>
+                  )}
+                  {columnVisibility.lastUsed !== false && e.lastUsedAt && (
+                    <span title={new Date(e.lastUsedAt).toISOString()}>
+                      · last used {formatRelative(e.lastUsedAt)}
+                    </span>
+                  )}
+                </div>
+              )}
+              {columnVisibility.password !== false && (
               <div className="flex flex-wrap items-center gap-1.5">
                 <code className="rounded bg-background px-2 py-1 font-mono text-2xs">
                   {revealed ? e.password : "••••••••••••"}
@@ -4941,6 +5807,7 @@ const CreatedByMeTab: React.FC<CreatedByMeTabProps> = ({ account, store }) => {
                   <Copy />
                 </Button>
               </div>
+              )}
               <div className="flex flex-wrap items-center gap-1.5">
                 {/*
                   PRIMARY: Full-auto WebUI sign-in via Playwright. Opens a

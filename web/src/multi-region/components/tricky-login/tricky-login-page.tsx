@@ -37,6 +37,8 @@ import * as React from "react";
 import {
   AlertTriangle,
   Award,
+  BookOpen,
+  Braces,
   CheckCircle2,
   ChevronDown,
   ClipboardCopy,
@@ -50,9 +52,12 @@ import {
   KeyRound,
   Loader2,
   Lock,
+  Maximize2,
+  Minimize2,
   RefreshCcw,
   Repeat2,
   Shield,
+  ShieldAlert,
   ShieldCheck,
   Sparkles,
   Star,
@@ -159,6 +164,13 @@ import {
   type TrickyLoginMintResult,
 } from "./tricky-login-helpers";
 import { SpLoginTab } from "./sp-login-tab";
+import {
+  computeOperatorAdvisories,
+  type AdvisoryMintMeta,
+  type OperatorAdvisory,
+  type RealmProbeSummary,
+} from "./corpus-advisories";
+import { FlowEducationWizard } from "./flow-education-wizard";
 
 /* ---------------------------------------------------------------------- */
 /* Small render helpers — kept inline (no JSX dependency to surface).      */
@@ -624,6 +636,61 @@ export const TrickyLoginPage: React.FC = () => {
   );
 
   /* ----------------------------------------------------------------
+   * D.2. Compact view toggle (persisted)
+   *
+   * Operators on smaller laptops (or those triaging multiple Tricky
+   * Login mints back-to-back) asked for a denser layout that hides
+   * the "About this page" footer, collapses the long claims table to
+   * a single-line summary, and tightens the result-panel padding.
+   *
+   * Boolean only — safe to persist to localStorage. Verified: no
+   * code path reads or writes token material to this key.
+   * ---------------------------------------------------------------- */
+  const [compactView, setCompactView] = usePersistedState<boolean>(
+    "tricky-login:compact-view:v1",
+    false,
+    { version: 1 },
+  );
+
+  /* ----------------------------------------------------------------
+   * D.3. JSON-preview reveal toggle (NOT persisted)
+   *
+   * When ON, the claims block in the result panel renders a
+   * pretty-printed JSON preview alongside the human-readable table.
+   * The JSON value is built from `result.claims` after a defensive
+   * JWT-shape screen — any claim value that LOOKS like a JWT is
+   * replaced with `<jwt-redacted>` so a malformed claims map can't
+   * accidentally render a token. NOT persisted — operators choose
+   * per-mint whether they want the raw JSON.
+   * ---------------------------------------------------------------- */
+  const [showClaimsJson, setShowClaimsJson] = React.useState<boolean>(false);
+
+  /* ----------------------------------------------------------------
+   * D.4. Flow-education wizard open state (NOT persisted)
+   * ---------------------------------------------------------------- */
+  const [wizardOpen, setWizardOpen] = React.useState<boolean>(false);
+
+  /* ----------------------------------------------------------------
+   * D.5. ARIA-live announcement region (NOT persisted)
+   *
+   * A small string that screen readers announce on auth-state
+   * transitions: minting start, success, failure, advisory surfaced,
+   * realm probe complete. Plain-text only — NEVER token material.
+   * Stored as state so updates trigger an aria-live re-announce.
+   * ---------------------------------------------------------------- */
+  const [ariaAnnouncement, setAriaAnnouncement] = React.useState<string>("");
+  // Setter helper that also clears after a short delay so repeated
+  // identical announcements still re-fire (some screen readers
+  // de-dupe back-to-back identical aria-live updates).
+  const announcePolite = React.useCallback((msg: string) => {
+    setAriaAnnouncement(msg);
+    // Clear after 4s so repeated identical events still announce.
+    window.setTimeout(() => {
+      setAriaAnnouncement((prev) => (prev === msg ? "" : prev));
+    }, 4000);
+  }, []);
+
+  /* ----------------------------------------------------------------
    * E. History (session-scoped, capped at 20)
    * ---------------------------------------------------------------- */
   const [history, setHistory] = React.useState<TrickyLoginHistoryRow[]>(() =>
@@ -683,6 +750,12 @@ export const TrickyLoginPage: React.FC = () => {
   );
   const [realmLoading, setRealmLoading] = React.useState(false);
   const [realmError, setRealmError] = React.useState<string | null>(null);
+  // Operator-side cancel controller — bound to the currently-in-flight
+  // probe so Esc can abort it. Distinct from the useAbortableEffect's
+  // internal signal (which aborts on unmount / dep-change only). The
+  // ref holds the controller so the Esc hotkey handler below can call
+  // .abort() without re-rendering.
+  const realmProbeAbortRef = React.useRef<AbortController | null>(null);
   // useAbortableEffect: the realm-discovery fetch gets a signal tied to
   // the effect's lifetime. Unmount or dep-change aborts the in-flight
   // request so the response never updates a stale component.
@@ -701,22 +774,37 @@ export const TrickyLoginPage: React.FC = () => {
         return;
       }
       setRealmLoading(true);
+      // Combine the effect's auto-signal with an operator-controlled
+      // controller so Esc can abort an in-flight probe. We pass the
+      // local controller's signal to fetch and listen on the parent
+      // signal to forward unmount/dep-change cancellations.
+      const localCtrl = new AbortController();
+      realmProbeAbortRef.current = localCtrl;
+      const onParentAbort = () => {
+        try {
+          localCtrl.abort();
+        } catch {
+          /* no-op */
+        }
+      };
+      signal.addEventListener("abort", onParentAbort, { once: true });
       const url = `https://login.microsoftonline.com/getuserrealm.srf?login=${encodeURIComponent(
         upn,
       )}&xml=1`;
       try {
         // Cheap CORS-permissive endpoint. Passing the abort signal means
         // unmount / dep change cancels the fetch (no more orphan promise
-        // landing in setRealmProbe after the page is gone).
+        // landing in setRealmProbe after the page is gone). Esc-cancel
+        // is forwarded via localCtrl above.
         const resp = await fetch(url, {
           method: "GET",
           credentials: "omit",
-          signal,
+          signal: localCtrl.signal,
         });
-        if (signal.aborted) return;
+        if (signal.aborted || localCtrl.signal.aborted) return;
         if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
         const xml = await resp.text();
-        if (signal.aborted) return;
+        if (signal.aborted || localCtrl.signal.aborted) return;
         // Tag-extraction via regex — DOMParser would be cleaner but the
         // realm-discovery XML is tiny, well-formed, and we only need a
         // handful of leaf elements. Keeping it regex-based avoids
@@ -739,21 +827,43 @@ export const TrickyLoginPage: React.FC = () => {
           domainName: tag("DomainName"),
         };
         realmCacheRef.current.set(cacheKey, result);
-        if (signal.aborted || !mountedRef.current) return;
+        if (
+          signal.aborted ||
+          localCtrl.signal.aborted ||
+          !mountedRef.current
+        ) {
+          return;
+        }
         setRealmProbe(result);
         setRealmLoading(false);
+        // ARIA-live announce realm completion. Plain status text only.
+        announcePolite(
+          `Federation realm probe complete: ${result.status}${
+            result.domainName ? ` for domain ${result.domainName}` : ""
+          }.`,
+        );
       } catch (err) {
-        // AbortError is the planned outcome of an unmount/dep-change —
-        // swallow it silently.
+        // AbortError is the planned outcome of an unmount/dep-change
+        // OR an operator-triggered Esc cancel. Swallow silently in
+        // both cases; the Esc handler announces the cancellation
+        // separately.
         if (
           (err as { name?: string } | null)?.name === "AbortError" ||
-          signal.aborted
+          signal.aborted ||
+          localCtrl.signal.aborted
         ) {
           return;
         }
         if (!mountedRef.current) return;
         setRealmError(err instanceof Error ? err.message : String(err));
         setRealmLoading(false);
+      } finally {
+        // Clear the operator-controlled ref if it still points at THIS
+        // controller — a newer effect run may have replaced it already.
+        if (realmProbeAbortRef.current === localCtrl) {
+          realmProbeAbortRef.current = null;
+        }
+        signal.removeEventListener("abort", onParentAbort);
       }
     },
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -947,6 +1057,13 @@ export const TrickyLoginPage: React.FC = () => {
       setTokenRevealed(false);
       setRtRevealed(false);
       setAutoAttempts([]);
+      // ARIA-live announce mint start — plain text, no token material.
+      announcePolite(
+        `Minting token via ${overrideMethod ?? method} for ${findTenantLabel(
+          tenantChoices,
+          targetTenantId,
+        )}…`,
+      );
       // Recompute audience + scope locally — when overrideAudience is
       // supplied we ignore the `audienceId` state value entirely
       // (this is the batch-mint path; ignoring state lets us run the
@@ -1205,6 +1322,7 @@ export const TrickyLoginPage: React.FC = () => {
       tenantChoices,
       rememberMethod,
       pushHistory,
+      announcePolite,
     ],
   );
 
@@ -2029,14 +2147,212 @@ export const TrickyLoginPage: React.FC = () => {
    * Render guards
    * ---------------------------------------------------------------- */
 
+  /* ----------------------------------------------------------------
+   * H. Corpus-grounded operator advisories
+   *
+   * Computed off the LAST SUCCESSFUL result + the realm probe. Pure
+   * function lives in corpus-advisories.ts; this memo only adapts
+   * the page-local types to the advisory engine's metadata-only
+   * shape. HARD: only the claim payload (already in memory) and
+   * realm metadata are passed — never the access token.
+   * ---------------------------------------------------------------- */
+  const operatorAdvisories: OperatorAdvisory[] = React.useMemo(() => {
+    if (!result || result.status !== "success" || !result.claims) return [];
+    const meta: AdvisoryMintMeta = {
+      methodUsed: result.methodUsed,
+      extendedAudience: result.extendedAudience,
+      targetTenantId: result.targetTenantId,
+      sourceHomeTenantId: sourceAccount?.tenantId,
+      claims: result.claims,
+    };
+    const realmSummary: RealmProbeSummary | null = realmProbe
+      ? {
+          status: realmProbe.status,
+          stsUrl: realmProbe.stsUrl,
+          federationProtocol: realmProbe.federationProtocol,
+          authUrl: realmProbe.authUrl,
+          domainName: realmProbe.domainName,
+        }
+      : null;
+    return computeOperatorAdvisories(
+      meta,
+      realmSummary,
+      sourceAccount?.username,
+    );
+  }, [result, realmProbe, sourceAccount]);
+
+  /* ----------------------------------------------------------------
+   * H.2. ARIA-live announcements on result transitions
+   * ---------------------------------------------------------------- */
+  // We track the last announced result fingerprint so we don't repeat
+  // announcements on re-renders that don't change the result.
+  const lastAnnouncedResultRef = React.useRef<string | null>(null);
+  React.useEffect(() => {
+    if (!result) return;
+    const fp = result.finishedAt ?? null;
+    if (!fp || lastAnnouncedResultRef.current === fp) return;
+    lastAnnouncedResultRef.current = fp;
+    if (result.status === "success") {
+      announcePolite(
+        `Mint succeeded via ${result.methodUsed} for tenant ${result.targetTenantLabel}. ${
+          operatorAdvisories.length > 0
+            ? `${operatorAdvisories.length} operator advisory${operatorAdvisories.length === 1 ? "" : "s"} surfaced — review below.`
+            : "No operator advisories surfaced."
+        }`,
+      );
+    } else {
+      announcePolite(
+        `Mint failed${result.errorCode ? ` — ${result.errorCode}` : ""}. See result panel for details.`,
+      );
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [result, operatorAdvisories.length]);
+
+  /* ----------------------------------------------------------------
+   * H.3. Sanitized JSON-claims preview
+   *
+   * Builds a stringified JSON view of the result's claims with two
+   * layers of defense against accidental token leakage:
+   *   1. Any claim VALUE that is a string matching the JWT-shape
+   *      regex (>120 chars, 3 base64url segments) is replaced with
+   *      "<jwt-redacted>".
+   *   2. The whole blob is JSON.stringify'd with a fixed indent, so
+   *      no embedded HTML and no React-tree rendering.
+   *
+   * The string is never persisted, never audited — it's a render-
+   * only convenience. Compute lazily so opening the toggle is cheap.
+   * ---------------------------------------------------------------- */
+  const sanitizedClaimsJson: string = React.useMemo(() => {
+    if (!result?.claims) return "";
+    const safe: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(result.claims)) {
+      if (typeof v === "string" && looksLikeJwt(v)) {
+        safe[k] = "<jwt-redacted>";
+      } else if (Array.isArray(v)) {
+        safe[k] = v.map((item) =>
+          typeof item === "string" && looksLikeJwt(item)
+            ? "<jwt-redacted>"
+            : item,
+        );
+      } else {
+        safe[k] = v;
+      }
+    }
+    try {
+      return JSON.stringify(safe, null, 2);
+    } catch {
+      return "(could not serialise claims)";
+    }
+  }, [result, looksLikeJwt]);
+
+  /* ----------------------------------------------------------------
+   * H.4. Copy sanitized JSON claims (no raw token material)
+   * ---------------------------------------------------------------- */
+  const handleCopyClaimsJson = React.useCallback(async () => {
+    if (!sanitizedClaimsJson) return;
+    try {
+      await navigator.clipboard.writeText(sanitizedClaimsJson);
+      store.addNotification({
+        type: "success",
+        message: "Sanitized claims JSON copied (JWT-shaped values redacted).",
+      });
+    } catch {
+      store.addNotification({
+        type: "warning",
+        message: "Clipboard unavailable — reveal the JSON below and copy manually.",
+      });
+    }
+  }, [sanitizedClaimsJson, store]);
+
+  /* ----------------------------------------------------------------
+   * H.5. Hotkeys
+   *
+   * - Esc: cancel any in-flight realm probe (operator-controlled
+   *   abort signal). We deliberately do NOT cancel an in-flight
+   *   mint via Esc — the mint is wrapped around external calls
+   *   (msal-auth.ts, foci-exchange) we don't own AbortController
+   *   plumbing for, and partial cancellation could leave imported
+   *   RTs in a half-rotated state. The probe is a single GET we
+   *   own end-to-end, so it's safe.
+   * - Enter: commit the focused flow when (a) focus is inside this
+   *   page's container, (b) target tenant is set, (c) we're not
+   *   already minting / batch minting. Skipped when focus is on a
+   *   textarea / contenteditable / open dialog so typing isn't
+   *   hijacked.
+   *
+   * Bound at document level so they work from anywhere on the page.
+   * Cleaned up on unmount.
+   * ---------------------------------------------------------------- */
+  // Ref to the doMint function so the hotkey handler doesn't need to
+  // be re-bound every time doMint's deps change.
+  const doMintRef = React.useRef<typeof doMint | null>(null);
+  React.useEffect(() => {
+    doMintRef.current = doMint;
+  }, [doMint]);
+  React.useEffect(() => {
+    const handler = (e: KeyboardEvent) => {
+      // Ignore key events from inside dialogs (Radix portals into body).
+      const targetEl = e.target as HTMLElement | null;
+      const insideDialog =
+        !!targetEl?.closest?.('[role="dialog"]');
+      if (insideDialog) return;
+      if (e.key === "Escape") {
+        // Cancel an in-flight realm probe if any.
+        const ctrl = realmProbeAbortRef.current;
+        if (ctrl) {
+          try {
+            ctrl.abort();
+            realmProbeAbortRef.current = null;
+            setRealmLoading(false);
+            announcePolite("Federation realm probe cancelled by operator.");
+          } catch {
+            /* no-op */
+          }
+        }
+      } else if (e.key === "Enter") {
+        // Avoid hijacking typing inside form controls.
+        const tag = (targetEl?.tagName ?? "").toLowerCase();
+        const isFormControl =
+          tag === "input" ||
+          tag === "textarea" ||
+          tag === "select" ||
+          !!targetEl?.isContentEditable;
+        if (isFormControl) return;
+        // Only commit if a tenant is selected and we're idle.
+        if (!sourceAccount || !targetTenantId) return;
+        if (minting || batchMinting) return;
+        if (targetIsActiveRef.current) return;
+        e.preventDefault();
+        const fn = doMintRef.current;
+        if (fn) {
+          announcePolite("Submitting mint via Enter hotkey.");
+          void fn();
+        }
+      }
+    };
+    document.addEventListener("keydown", handler);
+    return () => document.removeEventListener("keydown", handler);
+    // We deliberately omit `doMint` from deps — we use the ref above
+    // so deps changes don't re-attach the listener every render.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [sourceAccount, targetTenantId, minting, batchMinting, announcePolite]);
+
   const noAccounts = azureAccounts.length === 0;
   const noTargetTenant = !targetTenantId;
   // Target tenant matches active tenant — surface it as a no-op so the
-  // operator doesn't waste a click.
-  const targetIsActive =
+  // operator doesn't waste a click. Computed here so the hotkey effect
+  // above (Enter to commit) can read it from the same closure.
+  const targetIsActiveValue =
     !!activeTenantId &&
     !!targetTenantId &&
     activeTenantId.toLowerCase() === targetTenantId.toLowerCase();
+  // Track in a ref so the document keydown handler reads the freshest
+  // value without re-binding every render.
+  const targetIsActiveRef = React.useRef<boolean>(false);
+  React.useEffect(() => {
+    targetIsActiveRef.current = targetIsActiveValue;
+  }, [targetIsActiveValue]);
+  const targetIsActive = targetIsActiveValue;
 
   const canMint =
     !!sourceAccount && !noTargetTenant && !targetIsActive && !minting;
@@ -2046,7 +2362,30 @@ export const TrickyLoginPage: React.FC = () => {
    * ---------------------------------------------------------------- */
 
   return (
-    <div className="flex flex-col gap-6">
+    <div className={cn("flex flex-col", compactView ? "gap-3" : "gap-6")}>
+      {/* ARIA-live region for auth state changes. role=status +
+          aria-live=polite means screen readers announce transitions
+          (mint start / success / failure / advisory surfaced / realm
+          probe complete) without interrupting the operator. The
+          visually-hidden class keeps it off-screen but accessible. */}
+      <div
+        role="status"
+        aria-live="polite"
+        aria-atomic="true"
+        className="sr-only"
+      >
+        {ariaAnnouncement}
+      </div>
+
+      {/* Flow-education wizard — opens on demand from the method
+          card. Mounted at the top of the tree so it portals from a
+          stable root. */}
+      <FlowEducationWizard
+        open={wizardOpen}
+        onOpenChange={setWizardOpen}
+        initialMethod={method}
+      />
+
       {/* ─── Page header ──────────────────────────────────────────── */}
       <PageHeader
         title="Tricky Login"
@@ -2068,6 +2407,41 @@ export const TrickyLoginPage: React.FC = () => {
             })
           }
         />
+        {/* Compact view toggle — persisted via usePersistedState. Trims
+            page padding and collapses the long claims table to a JSON
+            summary. Operator-only — no token surface touched. */}
+        <Button
+          variant="ghost"
+          size="sm"
+          onClick={() => setCompactView((v) => !v)}
+          aria-pressed={compactView}
+          title={
+            compactView
+              ? "Switch to comfortable view"
+              : "Switch to compact view (denser layout)"
+          }
+          className="gap-1"
+        >
+          {compactView ? (
+            <Maximize2 className="h-3.5 w-3.5" aria-hidden />
+          ) : (
+            <Minimize2 className="h-3.5 w-3.5" aria-hidden />
+          )}
+          {compactView ? "Comfortable" : "Compact"}
+        </Button>
+        {/* "Why are you using this flow?" — opens the flow-education
+            wizard. Operator education tool; no side effects. */}
+        <Button
+          variant="ghost"
+          size="sm"
+          onClick={() => setWizardOpen(true)}
+          title="Open the per-flow education wizard (what each method does + corpus references)"
+          aria-label="Open flow-education wizard"
+          className="gap-1"
+        >
+          <BookOpen className="h-3.5 w-3.5" aria-hidden />
+          Why this flow?
+        </Button>
       </PageHeader>
 
       {/* ─── No-accounts empty state ──────────────────────────────── */}
@@ -2444,9 +2818,22 @@ export const TrickyLoginPage: React.FC = () => {
               </ul>
 
               <div className="flex flex-col gap-2">
-                <Label className="text-xs uppercase tracking-wider text-muted-foreground">
-                  Method
-                </Label>
+                <div className="flex items-center gap-2">
+                  <Label className="text-xs uppercase tracking-wider text-muted-foreground">
+                    Method
+                  </Label>
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    onClick={() => setWizardOpen(true)}
+                    className="h-6 gap-1 px-2 text-2xs"
+                    title="Open the per-flow education wizard — what each method does, when to use it, and the corpus playbook reference."
+                    aria-label="Open flow-education wizard"
+                  >
+                    <BookOpen className="h-3 w-3" aria-hidden />
+                    Why this flow?
+                  </Button>
+                </div>
                 <div
                   className="flex flex-wrap gap-2"
                   role="radiogroup"
@@ -3129,6 +3516,72 @@ export const TrickyLoginPage: React.FC = () => {
                       );
                     })()}
 
+                    {/* ─── Corpus-grounded operator advisories ─────
+                        Computed from the result's claims + the realm
+                        probe. Each advisory cites the authoritative
+                        playbook in the master corpus. These are
+                        defensive-side warnings (federation backdoor
+                        suspect, device-code RT detected, sovereign-
+                        cloud issuer mismatch). Renders nothing when
+                        no advisories fire (the normal case).
+
+                        SECURITY: the advisory engine in
+                        corpus-advisories.ts is typed to accept
+                        metadata only — accidental token-string
+                        passing is a compile-time error. The bodies
+                        run quoted strings through a JWT-shape screen
+                        before rendering. */}
+                    {operatorAdvisories.length > 0 && (
+                      <div
+                        className="flex flex-col gap-2"
+                        role="region"
+                        aria-label="Operator advisories"
+                      >
+                        <div className="flex items-center gap-2 text-2xs font-semibold uppercase tracking-wider text-muted-foreground">
+                          <ShieldAlert className="h-3 w-3" aria-hidden />
+                          Operator advisories ({operatorAdvisories.length})
+                          <InfoTooltip
+                            content="Corpus-grounded defensive advisories computed from the minted token's claims + the realm probe. Each entry cites the source playbook in the master research corpus."
+                          />
+                        </div>
+                        {operatorAdvisories.map((adv) => (
+                          <Alert
+                            key={adv.id}
+                            variant={
+                              adv.severity === "danger"
+                                ? "destructive"
+                                : adv.severity === "warning"
+                                  ? "warning"
+                                  : "info"
+                            }
+                          >
+                            {adv.severity === "danger" ? (
+                              <ShieldAlert className="h-4 w-4" aria-hidden />
+                            ) : adv.severity === "warning" ? (
+                              <AlertTriangle className="h-4 w-4" aria-hidden />
+                            ) : (
+                              <Info className="h-4 w-4" aria-hidden />
+                            )}
+                            <AlertTitle className="text-sm">
+                              {adv.title}
+                            </AlertTitle>
+                            <AlertDescription className="text-xs">
+                              <p className="m-0 whitespace-pre-wrap">
+                                {adv.body}
+                              </p>
+                              <p className="m-0 mt-2 text-2xs">
+                                <strong>Action: </strong>
+                                {adv.action}
+                              </p>
+                              <p className="m-0 mt-1 text-3xs italic opacity-80">
+                                Corpus: <code className="font-mono">{adv.corpusRef}</code>
+                              </p>
+                            </AlertDescription>
+                          </Alert>
+                        ))}
+                      </div>
+                    )}
+
                     {/* Authority URL preview — shows the exact
                         /oauth2/v2.0/token endpoint a FOCI exchange
                         would POST to for this (target tenant). Useful
@@ -3164,7 +3617,59 @@ export const TrickyLoginPage: React.FC = () => {
                         <ChevronDown className="h-3.5 w-3.5" aria-hidden />
                         Decoded access-token claims
                         <InfoTooltip content="Signature NOT verified — these are read straight off the JWT body. The remote resource server is the one that will accept or reject the token." />
+                        {/* JSON view toggle. Renders a sanitized
+                            pretty-printed JSON view alongside (or in
+                            place of, when compact view is on) the
+                            human-readable table. JWT-shaped values
+                            are replaced with <jwt-redacted>. */}
+                        <Button
+                          variant="ghost"
+                          size="sm"
+                          onClick={() => setShowClaimsJson((v) => !v)}
+                          aria-pressed={showClaimsJson}
+                          className="ml-auto h-6 gap-1 px-2 text-2xs"
+                          title="Toggle a sanitized JSON view of the claim payload (JWT-shaped values redacted)."
+                          aria-label="Toggle JSON view of claims"
+                        >
+                          <Braces className="h-3 w-3" aria-hidden />
+                          {showClaimsJson ? "Hide JSON" : "JSON"}
+                        </Button>
                       </div>
+                      {/* Sanitized JSON preview. Renders BEFORE the
+                          table in compact view (and replaces it),
+                          AFTER the table in comfortable view (and
+                          augments it). Both modes pass the same
+                          screened blob.
+                          SECURITY: sanitizedClaimsJson goes through
+                          the JWT-shape screen in the memo above —
+                          token-shaped string values are replaced
+                          with the literal "<jwt-redacted>". */}
+                      {showClaimsJson && (
+                        <div className="flex flex-col gap-1 rounded-md border bg-muted/20 p-2">
+                          <div className="flex items-center justify-between gap-2 text-2xs uppercase tracking-wider text-muted-foreground">
+                            <span>
+                              Sanitized claims JSON
+                              <span className="ml-1 text-3xs italic opacity-70">
+                                (JWT-shaped values → &lt;jwt-redacted&gt;)
+                              </span>
+                            </span>
+                            <Button
+                              variant="ghost"
+                              size="sm"
+                              onClick={() => void handleCopyClaimsJson()}
+                              className="h-6 gap-1 px-2 text-2xs"
+                              aria-label="Copy sanitized claims JSON"
+                            >
+                              <ClipboardCopy className="h-3 w-3" aria-hidden />
+                              Copy
+                            </Button>
+                          </div>
+                          <pre className="m-0 max-h-72 overflow-auto whitespace-pre-wrap break-all rounded border bg-card/40 p-2 font-mono text-2xs leading-snug text-muted-foreground">
+                            {sanitizedClaimsJson}
+                          </pre>
+                        </div>
+                      )}
+                      {!compactView && (
                       <div className="rounded-md border bg-card/50">
                         <table className="w-full text-xs">
                           <thead className="border-b text-2xs uppercase text-muted-foreground">
@@ -3205,6 +3710,13 @@ export const TrickyLoginPage: React.FC = () => {
                           </tbody>
                         </table>
                       </div>
+                      )}
+                      {compactView && !showClaimsJson && (
+                        <p className="m-0 text-2xs italic text-muted-foreground">
+                          Claims table hidden in compact view. Click "JSON"
+                          above to inspect the sanitized payload.
+                        </p>
+                      )}
                     </div>
 
                     {/* Refresh-token presence indicator */}
@@ -3527,7 +4039,10 @@ export const TrickyLoginPage: React.FC = () => {
             </CardContent>
           </Card>
 
-          {/* ─── About footer ─────────────────────────────────────── */}
+          {/* ─── About footer ───────────────────────────────────────
+              Hidden in compact view — operators using compact mode are
+              power users who already know what the page does. */}
+          {!compactView && (
           <Card>
             <CardHeader className="pb-2">
               <CardTitle className="flex items-center gap-2 text-base">
@@ -3617,6 +4132,7 @@ export const TrickyLoginPage: React.FC = () => {
               </dl>
             </CardContent>
           </Card>
+          )}
             </TabsContent>
 
             <TabsContent value="sp" className="flex flex-col gap-6">

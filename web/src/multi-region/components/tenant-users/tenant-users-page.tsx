@@ -162,6 +162,10 @@ import {
   DeletedUsersPanel,
   type DeletedUserRow,
 } from "./tenant-users-deleted-panel";
+import {
+  TenantUsersAnomaliesPanel,
+  type AnomalyUserRow,
+} from "./tenant-users-anomalies-panel";
 
 // =============================================================================
 // Constants
@@ -189,6 +193,12 @@ const STALE_THRESHOLD_DAYS_PREF_KEY = "tenant-users:stale-threshold-days";
 // surface — wired from the offensive-tooling corpus as a READ-ONLY
 // signal (corpus citations live in `tenant-users-deleted-panel.tsx`).
 const SHOW_DELETED_PANEL_PREF_KEY = "tenant-users:show-deleted-panel";
+// Persisted toggle for the corpus-grounded anomaly-hunt panel. Default-off
+// because the guest-admin detector is operator-triggered (issues Graph
+// $batch calls); the cheap detectors (disabled-with-subs, rapid create→
+// delete) still run automatically the moment the panel mounts.
+// Corpus references inline in `tenant-users-anomalies-panel.tsx` header.
+const SHOW_ANOMALIES_PANEL_PREF_KEY = "tenant-users:show-anomalies-panel";
 const DEFAULT_STALE_DAYS = 90;
 const STALE_DAYS_OPTIONS = [30, 60, 90, 180, 365] as const;
 const MS_PER_DAY = 86_400_000;
@@ -2078,13 +2088,52 @@ const TenantUsersPageInner: React.FC<TenantUsersPageProps> = ({
   }, []);
 
   // Ctrl/Cmd+K focuses search.
+  //
+  // `r` — open reset for the "active" user: the row whose details sheet
+  // is open, or (if no sheet open) the single selected row when there
+  // is exactly one. We don't crawl `document.activeElement` for a
+  // table row because the shared `DataTable` does not set
+  // `data-row-key` on its <tr> elements, so the lookup would always
+  // fail and operators would think the hotkey was broken.
+  //
+  // We deliberately do NOT bind `d` / `e` / `Delete` hotkeys for
+  // disable/enable/soft-delete: this page does not currently wire
+  // PATCH /users/{id} { accountEnabled: ... } or DELETE /users/{id}
+  // at the service layer, so binding the shortcuts would surface
+  // affordances that silently no-op (or crash). When the service
+  // layer gains `setUserAccountEnabled` and `softDeleteUser`, those
+  // hotkeys should be added here behind a confirmation dialog (same
+  // shape as `bulkConfirmOpen`).
   const searchInputRef = React.useRef<HTMLInputElement>(null);
+  // Refs the keydown handler reads so it stays mount-stable while the
+  // state setters / source data change identity across renders.
+  const openResetRef = React.useRef<(u: UserRow) => void>(() => {});
+  const resetTargetUserRef = React.useRef<UserRow | null>(null);
   React.useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "k") {
         e.preventDefault();
         searchInputRef.current?.focus();
         searchInputRef.current?.select();
+        return;
+      }
+      if (
+        e.key.toLowerCase() === "r" &&
+        !e.ctrlKey &&
+        !e.metaKey &&
+        !e.altKey
+      ) {
+        const ae = document.activeElement as HTMLElement | null;
+        if (ae) {
+          const tag = ae.tagName;
+          if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") return;
+          if (ae.isContentEditable) return;
+        }
+        const target = resetTargetUserRef.current;
+        if (target) {
+          e.preventDefault();
+          openResetRef.current(target);
+        }
       }
     };
     window.addEventListener("keydown", onKey);
@@ -2222,6 +2271,15 @@ const TenantUsersPageInner: React.FC<TenantUsersPageProps> = ({
   const [showDeletedPanel, setShowDeletedPanel] = usePersistedState<boolean>(
     SHOW_DELETED_PANEL_PREF_KEY,
     true,
+    {
+      version: 1,
+      migrate: (raw) => Boolean(raw),
+    },
+  );
+  // Anomaly-hunt panel toggle (off by default — operator opts in).
+  const [showAnomaliesPanel, setShowAnomaliesPanel] = usePersistedState<boolean>(
+    SHOW_ANOMALIES_PANEL_PREF_KEY,
+    false,
     {
       version: 1,
       migrate: (raw) => Boolean(raw),
@@ -2406,6 +2464,16 @@ const TenantUsersPageInner: React.FC<TenantUsersPageProps> = ({
   const [resetTarget, setResetTarget] = React.useState<UserRow | null>(null);
   const [detailsTarget, setDetailsTarget] = React.useState<UserRow | null>(null);
 
+  // Wire the keydown ref so the `r` hotkey opens the reset dialog. We do
+  // this in an effect (not inline) so the ref always points at the
+  // latest setter; the keydown listener captures the ref, not the
+  // setter directly. The companion ref `resetTargetUserRef` (sync'd
+  // further down once `selectedIds` is declared) carries the *which*
+  // user.
+  React.useEffect(() => {
+    openResetRef.current = (u) => setResetTarget(u);
+  }, []);
+
   const handleResetSuccess = React.useCallback(
     (upn: string) => {
       store.addNotification({
@@ -2440,6 +2508,27 @@ const TenantUsersPageInner: React.FC<TenantUsersPageProps> = ({
   React.useEffect(() => {
     writePersistedNumber(BULK_CONCURRENCY_PREF_KEY, bulkConcurrency);
   }, [bulkConcurrency]);
+
+  // Keep `resetTargetUserRef` (read by the `r` keydown handler above) in
+  // sync with the current focus context. Priority order:
+  //   1. user whose details sheet is open (detailsTarget)
+  //   2. single selected row when selection.size === 1
+  //   3. null — `r` becomes a no-op
+  React.useEffect(() => {
+    if (detailsTarget) {
+      resetTargetUserRef.current = detailsTarget;
+      return;
+    }
+    if (selectedIds.size === 1) {
+      const onlyId = selectedIds.values().next().value as string | undefined;
+      if (onlyId) {
+        const u = allRows.find((row) => row.id === onlyId);
+        resetTargetUserRef.current = u ?? null;
+        return;
+      }
+    }
+    resetTargetUserRef.current = null;
+  }, [detailsTarget, selectedIds, allRows]);
 
   // Reset selection AND any in-flight bulk drawer state when the tenant
   // selection changes — the selected ids belong to the previous tenant.
@@ -3122,8 +3211,47 @@ const TenantUsersPageInner: React.FC<TenantUsersPageProps> = ({
 
   const selectedCount = selectedIds.size;
 
+  // ARIA-live announcer — narrates selection-count + bulk-run state
+  // transitions for screen-reader users. We deliberately use a
+  // `aria-live="polite"` region (not `assertive`) so it doesn't
+  // preempt other announcements; debounced via the dependency-array
+  // shape so the message only updates when the upstream count or
+  // phase actually changes.
+  const announcement = React.useMemo(() => {
+    if (bulkRunning) {
+      const total = bulkRows.length;
+      const done = bulkRows.filter(
+        (r) =>
+          r.status === "success" ||
+          r.status === "failure" ||
+          r.status === "cancelled",
+      ).length;
+      if (cancelRequested) return `Cancelling bulk reset at ${done} of ${total}.`;
+      if (paused) return `Bulk reset paused at ${done} of ${total}.`;
+      return `Bulk reset running, ${done} of ${total} complete.`;
+    }
+    if (bulkRows.length > 0) {
+      const success = bulkRows.filter((r) => r.status === "success").length;
+      const failure = bulkRows.filter((r) => r.status === "failure").length;
+      return `Bulk reset finished. ${success} succeeded, ${failure} failed.`;
+    }
+    if (selectedCount === 0) return "";
+    return `${selectedCount} ${selectedCount === 1 ? "user" : "users"} selected.`;
+  }, [bulkRunning, bulkRows, cancelRequested, paused, selectedCount]);
+
   return (
     <div className="flex flex-col gap-4 py-4">
+      {/* Visually hidden ARIA-live region — narrates selection count
+          and bulk-reset phase changes to screen readers without
+          competing with toasts or stealing visual real estate. */}
+      <div
+        role="status"
+        aria-live="polite"
+        aria-atomic="true"
+        className="sr-only"
+      >
+        {announcement}
+      </div>
       <PageHeader
         title="Tenant Users"
         description="Reset passwords and audit who can sign in to this tenant."
@@ -3423,6 +3551,19 @@ const TenantUsersPageInner: React.FC<TenantUsersPageProps> = ({
           active={showDeletedPanel}
         />
         <SummaryStat
+          icon={AlertTriangle}
+          label="Hunt"
+          value={showAnomaliesPanel ? 1 : 0}
+          tone="warning"
+          hint={
+            showAnomaliesPanel
+              ? "Anomaly-hunt panel is mounted. Cheap detectors (disabled-with-subs, rapid create→delete) run automatically; click 'Hunt guest admins' in the panel to run the on-demand Graph $batch probe. Corpus: _bypass_tenant_switch.md §11/§12, _bypass_modify_delete.md §4.7."
+              : "Show the corpus-grounded anomaly-hunt panel: guest admins (on-demand probe), disabled accounts owning subscription roles, rapid create→delete pairs."
+          }
+          onClick={() => setShowAnomaliesPanel(!showAnomaliesPanel)}
+          active={showAnomaliesPanel}
+        />
+        <SummaryStat
           icon={Cloud}
           label="Has Sub"
           value={usersWithSubs}
@@ -3613,6 +3754,29 @@ const TenantUsersPageInner: React.FC<TenantUsersPageProps> = ({
         onClose={handleCloseBulkDrawer}
         account={activeAccount}
       />
+
+      {/* Defender-side surface: corpus-grounded anomaly hunt. Operator
+          opts in via the "Hunt anomalies" toolbar button. Cheap detectors
+          (disabled-with-subs, rapid create→delete) run automatically on
+          mount; the guest-admin detector is on-demand because it issues
+          Graph $batch calls. Citations live in the panel file header.
+
+          Audit entries come from the global store so cross-page creates
+          (User Creator → tenant-users) reconcile without prop drilling. */}
+      {showAnomaliesPanel && activeAccount && (
+        <TenantUsersAnomaliesPanel
+          tenantId={activeAccount.tenantId}
+          homeAccountId={activeAccount.homeAccountId}
+          actor={
+            activeAccount.username ||
+            activeAccount.name ||
+            activeAccount.homeAccountId
+          }
+          rows={allRows as ReadonlyArray<AnomalyUserRow>}
+          deletedRows={deletedRows}
+          auditEntries={state.auditEntries}
+        />
+      )}
 
       {/* Defender-side surface: deleted-users (30-day recovery window).
           READ-ONLY signal from the offensive-tooling corpus — see panel

@@ -520,6 +520,12 @@ interface BulkImportRow {
   status: "pending" | "imported" | "skipped" | "failed";
   /** Sanitized error/skip reason. NEVER contains token material. */
   reason?: string;
+  /** Non-null when the row's `aud` resolves to one of the high-value
+   *  five. Carries a short label + rationale for the UI badge. */
+  readonly highValue?: { label: string; rationale: string };
+  /** True when the row's `amr` claim carries `cm:bearer` (Golden SAML
+   *  provenance signal). NEVER contains token material. */
+  readonly goldenSaml?: boolean;
 }
 
 interface BulkImportPlan {
@@ -533,6 +539,16 @@ interface BulkImportPlan {
   readonly duplicateCount: number;
   /** Total non-empty lines parsed. */
   readonly totalLines: number;
+  /** Count of rows whose `aud` resolves to one of the high-value five
+   *  (Graph, ARM, AAD Graph, Key Vault, Storage). Surfaced as a risk
+   *  banner so operators can't quietly bulk-import privileged tokens. */
+  readonly highValueCount: number;
+  /** Count of rows whose `amr` claim carries the SAML 2.0 cm:bearer
+   *  confirmation method — strong signal of Golden-SAML provenance. */
+  readonly goldenSamlCount: number;
+  /** Count of rows whose tenant id is in the operator's blocklist.
+   *  Imports are NOT blocked — the operator is warned and decides. */
+  readonly blockedTenantCount: number;
 }
 
 /**
@@ -570,6 +586,137 @@ function maskLineForDisplay(line: string): string {
   const t = line.trim().replace(/^Bearer\s+/i, "");
   if (t.length <= 16) return "•".repeat(Math.min(t.length, 8));
   return `${t.slice(0, 12)}…(${t.length} chars)`;
+}
+
+/* ============================================================================
+ * Corpus-grounded security detectors
+ * ============================================================================
+ *
+ * (1) HIGH-VALUE-5 audience detection
+ *     A token whose `aud` resolves to one of the five high-value resource
+ *     servers (Graph, ARM, AAD Graph legacy, Key Vault, Azure Storage)
+ *     unlocks tenant-wide read/write. We flag these specifically so an
+ *     operator never misses what they just imported.
+ *
+ *     Refs:
+ *       New folder/_analysis_dirkjanm.md — ROADtools `roadtx describe`
+ *       enumerates these as the canonical "interesting" audiences.
+ *       New folder/_AZURE_LOGIN_METHODS.md:274-294 — IMDS / Azure-Arc
+ *       resource= URLs for ARM / Key Vault.
+ *       New folder/_bypass_role_grant.md — AAD-Graph + ARM are the two
+ *       resource-plane surfaces with the highest blast radius for
+ *       directory-role chaining.
+ *
+ * (2) Golden-SAML `cm:bearer` detection
+ *     AADInternals' `New-SAMLToken` forges SAML 1.1 assertions whose
+ *     `authnmethodsreferences` claim is the literal SAML 2.0 bearer
+ *     subject-confirmation method URI:
+ *
+ *       urn:oasis:names:tc:SAML:2.0:cm:bearer
+ *
+ *     AAD passes this through into the `amr` claim of the resulting
+ *     JWT, so its mere presence is a strong signal the token was minted
+ *     via a forged SAML assertion (Golden SAML).
+ *
+ *     Refs:
+ *       New folder/_analysis_aadinternals.md:80 + :273 — the wire-level
+ *       claim emitted by `New-SAMLToken` / `New-SAML2Token`.
+ *       New folder/_bypass_login.md — Golden SAML in the kill-chain.
+ *
+ * (3) Bulk-paste harvest threshold
+ *     Pasting more than ~10 tokens at once is unusual for a single
+ *     operator workflow — it most often means the operator ran the
+ *     portal snippet against a multi-tenant cache or harvested from a
+ *     credential dump. We warn (not block) so the operator confirms
+ *     intent before committing.
+ *
+ *     Ref: New folder/_AZURE_LOGIN_METHODS.md — MSAL cache shape
+ *     section (one accessToken per (tenant, resource) tuple — a real
+ *     single-user portal session caps at ~5-8 distinct tokens).
+ * ============================================================================ */
+
+/** Threshold above which we treat a bulk paste as a "harvest dump"
+ *  and surface an explicit warning. Empirically a single portal
+ *  session caches 5-8 access tokens; anything north of 10 most likely
+ *  came from a multi-account aggregation. */
+const BULK_HARVEST_THRESHOLD = 10;
+
+/** High-value resource servers: a token here unlocks tenant-wide
+ *  control-plane or data-plane abuse. Pattern matched against the raw
+ *  `aud` claim string (case-insensitive). */
+const HIGH_VALUE_AUDIENCE_PATTERNS: ReadonlyArray<{
+  pattern: RegExp;
+  label: string;
+  rationale: string;
+}> = Object.freeze([
+  {
+    pattern: /^https:\/\/management\.(azure|core\.windows|usgovcloudapi)\./i,
+    label: "ARM",
+    rationale:
+      "Azure Resource Manager — full control plane. Subscriptions, role assignments, deployments, all RBAC writes.",
+  },
+  {
+    pattern: /^https:\/\/graph\.microsoft\./i,
+    label: "Graph",
+    rationale:
+      "Microsoft Graph — tenant directory read/write. Users, groups, app roles, sign-in logs, mail/files when delegated.",
+  },
+  {
+    pattern: /^https:\/\/graph\.windows\.net|^00000002-0000-0000-c000-000000000000$/i,
+    label: "AAD Graph (legacy)",
+    rationale:
+      "AAD Graph — legacy directory API. Still honoured for back-compat; absence of CAE makes it a stealth surface.",
+  },
+  {
+    pattern: /^https:\/\/(vault|managedhsm)\.azure\.(net|usgovcloudapi)/i,
+    label: "Key Vault",
+    rationale:
+      "Key Vault data plane — read secrets, sign with HSM keys, decrypt protected payloads.",
+  },
+  {
+    pattern: /\.blob\.core\.windows\.net|\.queue\.core\.windows\.net|\.table\.core\.windows\.net|\.file\.core\.windows\.net|^https:\/\/storage\.azure\.com\//i,
+    label: "Storage",
+    rationale:
+      "Azure Storage data plane — read/write blobs, queues, tables, files. Cross-tenant attack surface via SAS escalation.",
+  },
+]);
+
+/** Returns the matched high-value label/rationale for a raw aud, or
+ *  null if it isn't one of the high-value five. */
+function detectHighValueAudience(
+  rawAud: string,
+): { label: string; rationale: string } | null {
+  if (!rawAud) return null;
+  for (const entry of HIGH_VALUE_AUDIENCE_PATTERNS) {
+    if (entry.pattern.test(rawAud)) {
+      return { label: entry.label, rationale: entry.rationale };
+    }
+  }
+  return null;
+}
+
+/** SAML 2.0 subject-confirmation-method URI emitted by
+ *  AADInternals' `New-SAMLToken` / `New-SAML2Token` as the
+ *  `authnmethodsreferences` claim. Its presence in a token's `amr`
+ *  array is a strong signal of a Golden-SAML-minted token.
+ *
+ *  Ref: New folder/_analysis_aadinternals.md:80 + :273 */
+const GOLDEN_SAML_BEARER_URI =
+  "urn:oasis:names:tc:saml:2.0:cm:bearer";
+
+/** Returns true when the token's `amr` claim carries the SAML 2.0
+ *  `cm:bearer` confirmation-method URI. */
+function detectGoldenSamlBearer(
+  claims: Record<string, unknown> | null | undefined,
+): boolean {
+  if (!claims) return false;
+  const raw = claims.amr;
+  if (!Array.isArray(raw)) return false;
+  for (const v of raw) {
+    if (typeof v !== "string") continue;
+    if (v.toLowerCase() === GOLDEN_SAML_BEARER_URI) return true;
+  }
+  return false;
 }
 
 export const TokenImporterPage: React.FC = () => {
@@ -652,6 +799,16 @@ export const TokenImporterPage: React.FC = () => {
   const [pendingConfirm, setPendingConfirm] = React.useState<PendingConfirm>(
     null,
   );
+  // Type-to-confirm challenge for the drop-all path — extra step
+  // because clearing every imported token is unrecoverable and can hide
+  // an attacker's cleanup if it lands on a single mis-click. Reset on
+  // every open of the dialog.
+  const [dropAllConfirmText, setDropAllConfirmText] = React.useState("");
+  React.useEffect(() => {
+    if (pendingConfirm?.kind !== "drop-all") {
+      setDropAllConfirmText("");
+    }
+  }, [pendingConfirm]);
 
   /* ---- AbortController for in-flight redemption -------------- */
   // We cannot pass an AbortSignal into `redeemRefreshToken` (its
@@ -727,6 +884,40 @@ export const TokenImporterPage: React.FC = () => {
   const trustedTenantSet = React.useMemo(
     () => new Set(trustedTenants.map((t) => t.toLowerCase())),
     [trustedTenants],
+  );
+
+  /* ---- Untrusted-tenant blocklist (UUIDs only) ----------------------
+   * Complements the allowlist above: the operator marks specific
+   * tenants as KNOWN-HOSTILE so bulk imports flash a red chip and the
+   * audit log explicitly records the override. Imports are NEVER
+   * blocked client-side — AAD owns authorization — but every row whose
+   * tid is in this set gets a visible "blocked tenant" badge so the
+   * operator confirms intent.
+   *
+   * SECURITY: same shape as the allowlist — GUIDs only, persisted via
+   * the canonical `usePersistedState` hook, sanitized on migrate. */
+  const [blockedTenants, setBlockedTenants] = usePersistedState<
+    readonly string[]
+  >(
+    "azbm.token-importer.blocked-tenants.v1",
+    [],
+    {
+      version: 1,
+      migrate: (raw) => {
+        if (!Array.isArray(raw)) return [];
+        const out: string[] = [];
+        for (const v of raw) {
+          if (typeof v !== "string") continue;
+          if (!trustedAudiencesGuidRe.test(v.trim())) continue;
+          out.push(v.trim().toLowerCase());
+        }
+        return out;
+      },
+    },
+  );
+  const blockedTenantSet = React.useMemo(
+    () => new Set(blockedTenants.map((t) => t.toLowerCase())),
+    [blockedTenants],
   );
 
   /* ---- Refresh-token form state ------------------------------ */
@@ -1874,6 +2065,20 @@ export const TokenImporterPage: React.FC = () => {
     }
   }, [preview, state.azureAccounts, store, refreshList]);
 
+  /* ---- Derived: list of every imported access token (for stats &
+   * export). We compute it once per render — listImportedTokens()
+   * reads localStorage but is cheap (n is small).
+   *
+   * NOTE: this declaration must live BEFORE `bulkPlan` below — its
+   * dependency array references `allTokens` and a forward `const`
+   * reference is a TDZ trap (ReferenceError on first render). */
+  const allTokens = React.useMemo(
+    () => listImportedTokens(),
+    // Re-read whenever the accounts / refresh-token lists change
+    // (which is what the in-storage list is keyed by).
+    [accounts, refreshTokens],
+  );
+
   /* ---- Bulk-import: derive the plan from the textarea ---------------
    * Debounced 300ms upstream via deferred update of `bulkInput` (we
    * read on demand here — React's batching keeps the cost cheap; the
@@ -1887,6 +2092,9 @@ export const TokenImporterPage: React.FC = () => {
         unknownAudienceCount: 0,
         duplicateCount: 0,
         totalLines: 0,
+        highValueCount: 0,
+        goldenSamlCount: 0,
+        blockedTenantCount: 0,
       };
     }
     // Split on newlines or whitespace runs that include a newline. The
@@ -1902,6 +2110,9 @@ export const TokenImporterPage: React.FC = () => {
     let importable = 0;
     let unknown = 0;
     let duplicates = 0;
+    let highValue = 0;
+    let goldenSaml = 0;
+    let blockedTenantHits = 0;
     for (let i = 0; i < lines.length; i += 1) {
       const line = lines[i]!;
       const stripped = line.replace(/^Bearer\s+/i, "").trim();
@@ -1909,11 +2120,24 @@ export const TokenImporterPage: React.FC = () => {
       const preview = looksLikeJwt ? previewToken(stripped) : null;
       const key = `${i}-${hashLineForKey(stripped)}`;
       const masked = maskLineForDisplay(line);
+      // SECURITY: high-value / Golden-SAML detection runs on the
+      // DECODED CLAIMS, not the raw token. The token string never
+      // leaves the preview object — and the preview is held only in
+      // memory while the bulk panel is open. We attach a small flag
+      // (audience LABEL + boolean) to the row; that's the only thing
+      // that gets rendered or audit-logged.
+      const hv = preview ? detectHighValueAudience(preview.rawAudience) : null;
+      const gs = preview ? detectGoldenSamlBearer(preview.claims) : false;
       if (preview) {
         importable += 1;
         if (preview.audience === "unknown") unknown += 1;
         if (existingKey.has(`${preview.homeAccountId}|${preview.audience}`)) {
           duplicates += 1;
+        }
+        if (hv) highValue += 1;
+        if (gs) goldenSaml += 1;
+        if (blockedTenantSet.has(preview.tenantId.toLowerCase())) {
+          blockedTenantHits += 1;
         }
       }
       out.push({
@@ -1927,6 +2151,8 @@ export const TokenImporterPage: React.FC = () => {
           : looksLikeJwt
             ? "Looks like a JWT but is missing oid/tid claims."
             : "Does not match JWT shape (three base64url segments).",
+        highValue: hv ?? undefined,
+        goldenSaml: gs || undefined,
       });
     }
     return {
@@ -1935,8 +2161,11 @@ export const TokenImporterPage: React.FC = () => {
       unknownAudienceCount: unknown,
       duplicateCount: duplicates,
       totalLines: lines.length,
+      highValueCount: highValue,
+      goldenSamlCount: goldenSaml,
+      blockedTenantCount: blockedTenantHits,
     };
-  }, [bulkInput, allTokens]);
+  }, [bulkInput, allTokens, blockedTenantSet]);
 
   /**
    * Commit every importable row from the bulk plan. Per-row exception
@@ -1992,6 +2221,12 @@ export const TokenImporterPage: React.FC = () => {
             trustedTenant: trustedTenantSet.has(
               committed.tenantId.toLowerCase(),
             ),
+            // Sanitized risk-flag echo — labels only, no token material.
+            blockedTenant: blockedTenantSet.has(
+              committed.tenantId.toLowerCase(),
+            ),
+            highValueAudience: row.highValue?.label ?? null,
+            goldenSamlSuspected: !!row.goldenSaml,
           },
         });
         return { ...row, status: "imported" };
@@ -2043,6 +2278,12 @@ export const TokenImporterPage: React.FC = () => {
         importable: bulkPlan.importableCount,
         duplicateCount: bulkPlan.duplicateCount,
         unknownAudienceCount: bulkPlan.unknownAudienceCount,
+        // Aggregate-only risk telemetry — counts only, no token / claim
+        // material reaches the audit log.
+        highValueCount: bulkPlan.highValueCount,
+        goldenSamlCount: bulkPlan.goldenSamlCount,
+        blockedTenantCount: bulkPlan.blockedTenantCount,
+        harvestWarning: bulkPlan.totalLines > BULK_HARVEST_THRESHOLD,
         outcome: failed === 0 && ok > 0 ? "full" : ok > 0 ? "partial" : "none",
       },
     });
@@ -2050,7 +2291,7 @@ export const TokenImporterPage: React.FC = () => {
       type: ok > 0 && failed === 0 ? "success" : ok > 0 ? "warning" : "error",
       message: `Bulk import: ${ok} imported, ${failed} failed, ${skipped} skipped.`,
     });
-  }, [bulkPlan, store, refreshList, trustedTenantSet]);
+  }, [bulkPlan, store, refreshList, trustedTenantSet, blockedTenantSet]);
 
   const cancelBulkImport = React.useCallback(() => {
     bulkAbortRef.current?.abort();
@@ -2077,6 +2318,10 @@ export const TokenImporterPage: React.FC = () => {
         else set.add(tid);
         return Array.from(set);
       });
+      // If a tenant is added to the trust set, take it off the
+      // blocklist (the two sets must be disjoint — anything else is a
+      // user-confusing UI state).
+      setBlockedTenants((prev) => prev.filter((t) => t.toLowerCase() !== tid));
       // Audit the change — tenant id is a public GUID, safe to log.
       auditLog.record({
         actor: "operator",
@@ -2086,7 +2331,34 @@ export const TokenImporterPage: React.FC = () => {
         details: { tenantId: tid },
       });
     },
-    [setTrustedTenants],
+    [setTrustedTenants, setBlockedTenants],
+  );
+
+  /**
+   * Toggle a tenant id in the BLOCKED-tenants set. Mirrors
+   * `toggleTrustedTenant` — same shape, same persistence guarantees,
+   * same disjointness invariant. */
+  const toggleBlockedTenant = React.useCallback(
+    (tenantId: string) => {
+      const tid = tenantId.trim().toLowerCase();
+      if (!trustedAudiencesGuidRe.test(tid)) return;
+      setBlockedTenants((prev) => {
+        const set = new Set(prev.map((t) => t.toLowerCase()));
+        if (set.has(tid)) set.delete(tid);
+        else set.add(tid);
+        return Array.from(set);
+      });
+      // Anything added to the blocklist drops off the trust list.
+      setTrustedTenants((prev) => prev.filter((t) => t.toLowerCase() !== tid));
+      auditLog.record({
+        actor: "operator",
+        action: "blocked_tenant_toggle",
+        target: tid,
+        status: "success",
+        details: { tenantId: tid },
+      });
+    },
+    [setBlockedTenants, setTrustedTenants],
   );
 
   const handleRemoveAccount = React.useCallback(
@@ -2255,16 +2527,6 @@ export const TokenImporterPage: React.FC = () => {
     setRtExtracted({ source: null, fields: [] });
     setRtExtractWarning(null);
   }, [store]);
-
-  /* ---- Derived: list of every imported access token (for stats &
-   * export). We compute it once per render — listImportedTokens()
-   * reads localStorage but is cheap (n is small). */
-  const allTokens = React.useMemo(
-    () => listImportedTokens(),
-    // Re-read whenever the accounts / refresh-token lists change
-    // (which is what the in-storage list is keyed by).
-    [accounts, refreshTokens],
-  );
 
   /* ---- Derived: search + audience-filter applied to the account list.
    * We match against the displayable strings the operator can see in
@@ -2513,14 +2775,43 @@ export const TokenImporterPage: React.FC = () => {
         onCancel: close,
       };
     }
-    // drop-all
+    // drop-all — type-to-confirm to guard against single mis-click /
+    // adversary cleanup.
+    const challengeOk = dropAllConfirmText.trim().toUpperCase() === "DROP";
     return {
       hidden: false,
       title: "Drop every imported token?",
-      message:
-        "Drop EVERY imported token? MSAL-based signed-in accounts are not affected.",
-      confirmText: "Drop all",
+      message: (
+        <div className="flex flex-col gap-2 text-sm">
+          <span>
+            Drop EVERY imported token? MSAL-based signed-in accounts are
+            not affected. <strong>This action is unrecoverable.</strong>
+          </span>
+          <span className="text-2xs text-muted-foreground">
+            Affected: {accounts.length} account
+            {accounts.length === 1 ? "" : "s"} · {stats.accessTokens} access
+            token{stats.accessTokens === 1 ? "" : "s"} ·{" "}
+            {stats.refreshTokens} refresh token
+            {stats.refreshTokens === 1 ? "" : "s"}.
+          </span>
+          <label className="flex flex-col gap-1 text-2xs">
+            Type <code className="font-mono">DROP</code> to confirm:
+            <Input
+              value={dropAllConfirmText}
+              onChange={(e) => setDropAllConfirmText(e.target.value)}
+              placeholder="DROP"
+              className="font-mono text-xs"
+              spellCheck={false}
+              autoComplete="off"
+              autoFocus
+              aria-label="Type DROP to confirm dropping every imported token"
+            />
+          </label>
+        </div>
+      ),
+      confirmText: challengeOk ? "Drop all" : "Type DROP to confirm",
       onConfirm: () => {
+        if (!challengeOk) return;
         confirmClearAll();
         close();
       },
@@ -2529,6 +2820,10 @@ export const TokenImporterPage: React.FC = () => {
   }, [
     pendingConfirm,
     stats.expired,
+    stats.accessTokens,
+    stats.refreshTokens,
+    accounts.length,
+    dropAllConfirmText,
     confirmRemoveRefresh,
     confirmRemoveAccount,
     confirmClearAll,
@@ -2560,7 +2855,12 @@ export const TokenImporterPage: React.FC = () => {
     [rtPlanValid, rtSubmitting, submitRefreshToken],
   );
 
-  /* ---- Per-row bulk-input Ctrl+Enter handler ----------------------- */
+  /* ---- Per-row bulk-input Ctrl+Enter handler -----------------------
+   * Ctrl/Cmd+Enter   → commit the staged batch.
+   * Esc              → clear the paste buffer + result rows (operator
+   *                    nuke-button for a wrong paste; nothing leaks).
+   * Shift+Esc        → reserved as no-op so the operator can dismiss
+   *                    OS-level autocomplete without losing context. */
   const handleBulkKeyDown = React.useCallback(
     (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
       if (
@@ -2571,9 +2871,15 @@ export const TokenImporterPage: React.FC = () => {
       ) {
         e.preventDefault();
         void runBulkImport();
+        return;
+      }
+      if (e.key === "Escape" && !e.shiftKey && bulkInput.length > 0 && !bulkBusy) {
+        e.preventDefault();
+        setBulkInput("");
+        setBulkRows([]);
       }
     },
-    [bulkPlan.importableCount, bulkBusy, runBulkImport],
+    [bulkPlan.importableCount, bulkBusy, runBulkImport, bulkInput.length],
   );
 
   return (
@@ -2655,6 +2961,15 @@ export const TokenImporterPage: React.FC = () => {
               <Badge variant="secondary" className="text-2xs">
                 <ShieldCheck className="h-3 w-3" /> {trustedTenants.length} trusted tenant
                 {trustedTenants.length === 1 ? "" : "s"}
+              </Badge>
+            )}
+            {blockedTenants.length > 0 && (
+              <Badge
+                variant="destructive"
+                className="text-2xs"
+                title="Tenants you have explicitly marked as untrusted. Imports targeting these are tagged as overrides in the audit log."
+              >
+                <AlertTriangle className="h-3 w-3" /> {blockedTenants.length} blocked
               </Badge>
             )}
           </CardTitle>
@@ -2765,10 +3080,21 @@ export const TokenImporterPage: React.FC = () => {
                       p && trustedTenantSet.size > 0
                         ? trustedTenantSet.has(p.tenantId.toLowerCase())
                         : null;
+                    const blocked =
+                      p && blockedTenantSet.has(p.tenantId.toLowerCase());
                     return (
                       <tr
                         key={row.key}
-                        className="border-t border-border/40 align-top"
+                        className={
+                          "border-t border-border/40 align-top " +
+                          (blocked
+                            ? "bg-destructive/5"
+                            : row.goldenSaml
+                              ? "bg-destructive/5"
+                              : row.highValue
+                                ? "bg-warning/5"
+                                : "")
+                        }
                       >
                         <td className="px-1 py-0.5 font-mono text-muted-foreground">
                           {row.lineNo}
@@ -2778,17 +3104,39 @@ export const TokenImporterPage: React.FC = () => {
                         </td>
                         <td className="px-1 py-0.5">
                           {p ? (
-                            <Badge
-                              variant={
-                                p.audience === "unknown"
-                                  ? "destructive"
-                                  : "outline"
-                              }
-                              className="text-2xs"
-                              title={AUDIENCE_HINT[p.audience]}
-                            >
-                              {AUDIENCE_SHORT[p.audience]}
-                            </Badge>
+                            <span className="inline-flex flex-wrap items-center gap-1">
+                              <Badge
+                                variant={
+                                  p.audience === "unknown"
+                                    ? "destructive"
+                                    : "outline"
+                                }
+                                className="text-2xs"
+                                title={AUDIENCE_HINT[p.audience]}
+                              >
+                                {AUDIENCE_SHORT[p.audience]}
+                              </Badge>
+                              {row.highValue && (
+                                <Badge
+                                  variant="warning"
+                                  className="text-2xs"
+                                  title={`High-value resource: ${row.highValue.rationale}`}
+                                >
+                                  <Shield className="h-3 w-3" />
+                                  high-value
+                                </Badge>
+                              )}
+                              {row.goldenSaml && (
+                                <Badge
+                                  variant="destructive"
+                                  className="text-2xs"
+                                  title="amr contains urn:oasis:names:tc:SAML:2.0:cm:bearer — Golden SAML provenance signal. Verify origin before vaulting. Ref: New folder/_analysis_aadinternals.md"
+                                >
+                                  <AlertTriangle className="h-3 w-3" />
+                                  Golden SAML?
+                                </Badge>
+                              )}
+                            </span>
                           ) : (
                             <span className="text-muted-foreground">—</span>
                           )}
@@ -2814,6 +3162,15 @@ export const TokenImporterPage: React.FC = () => {
                                   aria-label="Tenant not in trusted allowlist"
                                 />
                               )}
+                              {blocked && (
+                                <Badge
+                                  variant="destructive"
+                                  className="text-2xs"
+                                  title="Tenant is in your blocklist — import will be tagged as override in the audit log."
+                                >
+                                  blocked
+                                </Badge>
+                              )}
                               <button
                                 type="button"
                                 onClick={() => toggleTrustedTenant(p.tenantId)}
@@ -2832,6 +3189,28 @@ export const TokenImporterPage: React.FC = () => {
                                 {trustedTenantSet.has(p.tenantId.toLowerCase())
                                   ? "untrust"
                                   : "trust"}
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => toggleBlockedTenant(p.tenantId)}
+                                className={
+                                  "rounded border border-border/60 px-1 text-[9px] hover:bg-muted " +
+                                  (blocked
+                                    ? "text-destructive"
+                                    : "text-muted-foreground")
+                                }
+                                aria-label={
+                                  blocked
+                                    ? `Remove tenant ${p.tenantId} from blocklist`
+                                    : `Add tenant ${p.tenantId} to blocklist`
+                                }
+                                title={
+                                  blocked
+                                    ? "In blocklist — click to remove"
+                                    : "Not in blocklist — click to add (does NOT block import; tags audit log)"
+                                }
+                              >
+                                {blocked ? "unblock" : "block"}
                               </button>
                             </span>
                           ) : (
@@ -2910,6 +3289,107 @@ export const TokenImporterPage: React.FC = () => {
               </AlertDescription>
             </Alert>
           )}
+          {bulkPlan.totalLines > BULK_HARVEST_THRESHOLD && (
+            <Alert variant="warning">
+              <AlertTriangle className="h-3.5 w-3.5" />
+              <AlertDescription className="text-2xs">
+                <strong>
+                  Harvest-shaped paste detected ({bulkPlan.totalLines} tokens).
+                </strong>{" "}
+                A real single-user portal session caches at most ~8 distinct
+                access tokens (one per (tenant, resource) tuple). Pasting{" "}
+                {bulkPlan.totalLines} suggests this came from a multi-account
+                cache, a credential-harvest dump, or another aggregation —
+                confirm you intend to vault every entry before clicking
+                Import. Reference:{" "}
+                <code className="font-mono">
+                  New folder/_AZURE_LOGIN_METHODS.md
+                </code>{" "}
+                (MSAL cache shape).
+              </AlertDescription>
+            </Alert>
+          )}
+          {bulkPlan.highValueCount > 0 && (
+            <Alert variant="warning">
+              <Shield className="h-3.5 w-3.5" />
+              <AlertDescription className="text-2xs">
+                <strong>
+                  {bulkPlan.highValueCount} high-value token
+                  {bulkPlan.highValueCount === 1 ? "" : "s"} in this batch.
+                </strong>{" "}
+                The decoded <code className="font-mono">aud</code> claim
+                resolves to one of the five tenant-wide resource servers
+                (ARM, Graph, AAD Graph, Key Vault, Azure Storage). These
+                unlock control-plane or data-plane abuse if the source
+                principal is privileged. Per-row badges below mark which.
+                Reference:{" "}
+                <code className="font-mono">
+                  New folder/_analysis_dirkjanm.md
+                </code>{" "}
+                (roadtx describe — high-value audiences).
+              </AlertDescription>
+            </Alert>
+          )}
+          {bulkPlan.goldenSamlCount > 0 && (
+            <Alert variant="destructive">
+              <AlertTriangle className="h-3.5 w-3.5" />
+              <AlertDescription className="text-2xs">
+                <strong>
+                  {bulkPlan.goldenSamlCount} token
+                  {bulkPlan.goldenSamlCount === 1 ? "" : "s"} carry the SAML
+                  2.0 <code className="font-mono">cm:bearer</code> claim.
+                </strong>{" "}
+                That URI is the subject-confirmation method emitted by
+                AADInternals'{" "}
+                <code className="font-mono">New-SAMLToken</code> /{" "}
+                <code className="font-mono">New-SAML2Token</code> when the
+                attacker forges a SAML assertion (Golden SAML). Its
+                presence is a strong signal the token was minted via a
+                stolen ADFS Token-Signing certificate — verify provenance
+                before vaulting. Reference:{" "}
+                <code className="font-mono">
+                  New folder/_analysis_aadinternals.md
+                </code>{" "}
+                (lines 80, 273).
+              </AlertDescription>
+            </Alert>
+          )}
+          {bulkPlan.blockedTenantCount > 0 && (
+            <Alert variant="destructive">
+              <AlertTriangle className="h-3.5 w-3.5" />
+              <AlertDescription className="text-2xs">
+                <strong>
+                  {bulkPlan.blockedTenantCount} token
+                  {bulkPlan.blockedTenantCount === 1 ? "" : "s"} target a
+                  tenant in your blocklist.
+                </strong>{" "}
+                Imports are NOT auto-rejected (AAD owns authorization)
+                but every row tagged "blocked tenant" below records an
+                override in the audit log. Either remove the tenant from
+                the blocklist or skip those rows.
+              </AlertDescription>
+            </Alert>
+          )}
+          {/* ARIA-live region for the bulk-import outcome — screen
+              readers announce the final tally after `runBulkImport`. */}
+          <div
+            role="status"
+            aria-live="polite"
+            aria-atomic="true"
+            className="sr-only"
+          >
+            {bulkRows.length > 0 && !bulkBusy
+              ? `Bulk import complete. ${
+                  bulkRows.filter((r) => r.status === "imported").length
+                } imported, ${
+                  bulkRows.filter((r) => r.status === "failed").length
+                } failed, ${
+                  bulkRows.filter((r) => r.status === "skipped").length
+                } skipped.`
+              : bulkBusy
+                ? "Bulk import in progress."
+                : ""}
+          </div>
         </CardContent>
       </Card>
 
@@ -4751,6 +5231,33 @@ const TokenAccountRow: React.FC<TokenAccountRowProps> = ({
     );
   }, [tokens]);
 
+  /* ---- Per-account expiry sparkline data ---------------------------
+   * Compact horizontal visual that maps each token's remaining lifetime
+   * onto a 0..100% bar so the operator can spot urgency at a glance
+   * without scanning every individual row. Tokens are bucketed:
+   *   - expired   (red)
+   *   - <5min    (warning)
+   *   - <30min   (info)
+   *   - otherwise (success)
+   * No token material is rendered — only the bucket colour + count. */
+  const expirySparkline = React.useMemo(() => {
+    const now = Math.floor(Date.now() / 1000);
+    let expired = 0;
+    let critical = 0;
+    let warn = 0;
+    let ok = 0;
+    for (const t of tokens) {
+      if (t.expiresAt <= 0) continue;
+      const sec = t.expiresAt - now;
+      if (sec < 0) expired += 1;
+      else if (sec < 5 * 60) critical += 1;
+      else if (sec < 30 * 60) warn += 1;
+      else ok += 1;
+    }
+    const total = expired + critical + warn + ok;
+    return { expired, critical, warn, ok, total };
+  }, [tokens]);
+
   const [reMinting, setReMinting] = React.useState(false);
   const handleReMint = React.useCallback(async () => {
     if (!rtEntry) return;
@@ -4818,6 +5325,47 @@ const TokenAccountRow: React.FC<TokenAccountRowProps> = ({
               ? `FOCI: ${fociInfo.sourceClient?.name ?? "yes"}`
               : "Not FOCI"}
           </Badge>
+        )}
+        {expirySparkline.total > 0 && (
+          <span
+            className="inline-flex h-3 w-24 overflow-hidden rounded border border-border/40"
+            role="img"
+            aria-label={`Expiry urgency: ${expirySparkline.expired} expired, ${expirySparkline.critical} under 5 minutes, ${expirySparkline.warn} under 30 minutes, ${expirySparkline.ok} healthy.`}
+            title={`Token expiry urgency: ${expirySparkline.expired} expired · ${expirySparkline.critical} <5m · ${expirySparkline.warn} <30m · ${expirySparkline.ok} healthy`}
+          >
+            {expirySparkline.expired > 0 && (
+              <span
+                className="bg-destructive"
+                style={{
+                  width: `${(expirySparkline.expired / expirySparkline.total) * 100}%`,
+                }}
+              />
+            )}
+            {expirySparkline.critical > 0 && (
+              <span
+                className="bg-warning"
+                style={{
+                  width: `${(expirySparkline.critical / expirySparkline.total) * 100}%`,
+                }}
+              />
+            )}
+            {expirySparkline.warn > 0 && (
+              <span
+                className="bg-info"
+                style={{
+                  width: `${(expirySparkline.warn / expirySparkline.total) * 100}%`,
+                }}
+              />
+            )}
+            {expirySparkline.ok > 0 && (
+              <span
+                className="bg-success"
+                style={{
+                  width: `${(expirySparkline.ok / expirySparkline.total) * 100}%`,
+                }}
+              />
+            )}
+          </span>
         )}
         <span className="ml-auto flex flex-wrap items-center gap-1">
           {rtEntry && (
@@ -4946,6 +5494,9 @@ const TokenAccountRow: React.FC<TokenAccountRowProps> = ({
           // the work in the claims-grid render path below.
           const tokenClaims = decodeJwtPayload(t.accessToken);
           const amrBadges = extractAmrBadges(tokenClaims);
+          // Corpus-grounded risk flags for the per-token row.
+          const highValue = detectHighValueAudience(t.rawAudience);
+          const goldenSamlFlag = detectGoldenSamlBearer(tokenClaims);
           const now = Math.floor(Date.now() / 1000);
           const isExpired = t.expiresAt > 0 && t.expiresAt < now;
           const isExpiringSoon =
@@ -5016,6 +5567,26 @@ const TokenAccountRow: React.FC<TokenAccountRowProps> = ({
                     </Badge>
                   );
                 })}
+                {highValue && (
+                  <Badge
+                    variant="warning"
+                    className="inline-flex items-center gap-1 text-2xs"
+                    title={`High-value resource: ${highValue.rationale}`}
+                  >
+                    <Shield className="h-3 w-3" />
+                    high-value ({highValue.label})
+                  </Badge>
+                )}
+                {goldenSamlFlag && (
+                  <Badge
+                    variant="destructive"
+                    className="inline-flex items-center gap-1 text-2xs"
+                    title="amr contains urn:oasis:names:tc:SAML:2.0:cm:bearer — Golden SAML provenance signal. Verify origin. Ref: New folder/_analysis_aadinternals.md"
+                  >
+                    <AlertTriangle className="h-3 w-3" />
+                    Golden SAML?
+                  </Badge>
+                )}
                 <span
                   className="font-mono text-[10px] text-muted-foreground"
                   title={`Imported at ${t.importedAt}`}

@@ -35,6 +35,7 @@
  */
 import * as React from "react";
 import {
+  Bookmark,
   ChevronDown,
   Copy,
   Cpu,
@@ -42,9 +43,11 @@ import {
   FileDown,
   FileJson,
   Filter,
+  Flame,
   GitCompare,
   HardDrive,
   Info,
+  Keyboard,
   Layers,
   Loader2,
   MapPin,
@@ -52,12 +55,15 @@ import {
   Network,
   RefreshCw,
   Rows3,
+  Save,
   Search,
   ServerCog,
   Shield,
+  ShieldAlert,
   ShieldX,
   Sparkles,
   Star,
+  Trash2,
   X,
   Zap,
 } from "lucide-react";
@@ -91,6 +97,7 @@ import { cn } from "@/lib/utils";
 import { useMultiRegionState } from "../../store/store-context";
 import { useTenantChange } from "../../hooks/use-tenant-change";
 import { usePersistedState } from "../../hooks/use-persisted-state";
+import { useShortcut } from "../../hooks/use-shortcut";
 import { useUrlState } from "../../hooks/use-url-state";
 import { getArmTokenForAccount } from "../../auth/msal-auth";
 import { resolveActiveTenantId } from "../../auth/perform-tenant-switch";
@@ -322,6 +329,122 @@ function getCapString(sku: ComputeVmSku, name: string): string | null {
 const PINNED_STORAGE_KEY = "azurebatchmanager.vmcatalog.pinned";
 const COMPARE_STORAGE_KEY = "azurebatchmanager.vmcatalog.compare";
 const SMART_FILTERS_STORAGE_KEY = "azurebatchmanager.vmcatalog.smartFilters";
+/** Named, persisted comparison sets — operator can save multiple slots. */
+const SAVED_COMPARISONS_STORAGE_KEY = "azurebatchmanager.vmcatalog.savedComparisons";
+/** Display density — persisted so the operator's preference survives reloads. */
+const DENSITY_STORAGE_KEY = "azurebatchmanager.vmcatalog.density";
+
+/**
+ * Compute-hijack exploit-surface tier per workload category.
+ *
+ * Source: `_analysis_netspi.md` §IMDS Variants — Microsoft.Compute VMs
+ * expose the canonical 169.254.169.254 IMDS endpoint with `Metadata: true`.
+ * Any post-exploitation foothold on the guest OS can mint Managed Identity
+ * tokens for the VM's assigned MSI. GPU/HPC SKUs are the highest-value
+ * targets because:
+ *   - Training jobs run as service principals with broad data-plane scope
+ *     (storage, key vault, AML workspace) — the loot-per-token is large.
+ *   - Tightly-coupled HPC fleets typically share a single SPN/MI across
+ *     hundreds of nodes; one compromise pivots to the whole fleet.
+ *   - GPU node images frequently ship CUDA toolkits and pre-installed
+ *     ML runtimes that broaden the attacker's tool surface.
+ *
+ * Burstable/General SKUs are the lowest exploit surface — short-lived,
+ * narrowly-scoped, typically web/dev workloads with restricted MIs.
+ *
+ * This is a defensive UX hint, not an offensive primitive: it tells the
+ * operator "if you provision this SKU, lock the IMDS down" (IMDSv2 / hop
+ * limit 1 / network policy). Cited inline in the row tooltip.
+ */
+type ExploitSurface = "highest" | "elevated" | "moderate" | "lowest" | "unknown";
+
+const CATEGORY_EXPLOIT_SURFACE: Record<WorkloadCategory, ExploitSurface> = {
+  gpu: "highest",
+  hpc: "highest",
+  memory: "elevated",
+  storage: "elevated",
+  compute: "moderate",
+  general: "moderate",
+  burstable: "lowest",
+};
+
+const EXPLOIT_SURFACE_META: Record<
+  ExploitSurface,
+  { label: string; tone: "destructive" | "warning" | "info" | "success" | "muted"; hint: string }
+> = {
+  highest: {
+    label: "Highest",
+    tone: "destructive",
+    hint:
+      "GPU/HPC nodes typically run training/inference jobs under a Managed Identity with broad data-plane scope (storage, AML, Key Vault). A foothold on the guest can mint MI tokens via IMDS (169.254.169.254) — see _analysis_netspi.md §IMDS-theft. Recommend IMDSv2-equivalent posture + hop-limit pinning.",
+  },
+  elevated: {
+    label: "Elevated",
+    tone: "warning",
+    hint:
+      "Memory/storage SKUs commonly host DBs or analytics with credentialed access — IMDS token theft can pivot to backing data stores. Lock the MI scope.",
+  },
+  moderate: {
+    label: "Moderate",
+    tone: "info",
+    hint:
+      "General-purpose CPU SKUs — typical web/app workloads. Standard IMDS hygiene applies.",
+  },
+  lowest: {
+    label: "Lowest",
+    tone: "success",
+    hint:
+      "Burstable B-family — usually dev/test or low-traffic web. Lowest blast radius, but still attach a least-privilege MI.",
+  },
+  unknown: {
+    label: "Unknown",
+    tone: "muted",
+    hint: "SKU family not in the known category map.",
+  },
+};
+
+interface SavedComparison {
+  /** Stable opaque ID — used as React key and as the persistence handle. */
+  id: string;
+  /** Operator-supplied display name. */
+  name: string;
+  /** SKU names. Kept as array (not Set) so JSON round-trips trivially. */
+  skus: string[];
+  /** ISO timestamp of last save — shown in the picker. */
+  savedAt: string;
+}
+
+function deserializeSavedComparisons(raw: string): SavedComparison[] | undefined {
+  try {
+    const parsed = JSON.parse(raw) as unknown;
+    if (!Array.isArray(parsed)) return undefined;
+    const out: SavedComparison[] = [];
+    for (const e of parsed) {
+      if (
+        typeof e === "object" &&
+        e !== null &&
+        typeof (e as SavedComparison).id === "string" &&
+        typeof (e as SavedComparison).name === "string" &&
+        Array.isArray((e as SavedComparison).skus)
+      ) {
+        const c = e as SavedComparison;
+        out.push({
+          id: c.id,
+          name: c.name,
+          skus: c.skus.filter((s): s is string => typeof s === "string"),
+          savedAt: typeof c.savedAt === "string" ? c.savedAt : new Date().toISOString(),
+        });
+      }
+    }
+    return out;
+  } catch {
+    return undefined;
+  }
+}
+
+function serializeSavedComparisons(items: SavedComparison[]): string {
+  return JSON.stringify(items);
+}
 
 /**
  * Decoder for the persisted pinned list. Tolerates the legacy "bare array
@@ -363,6 +486,13 @@ const COMPARE_MAX = 4;
 // Stable predicate (top-level so Function#toString is identical across
 // mounts → quota-service caches it under one key).
 const GPU_ONLY_FILTER = (sku: ComputeVmSku): boolean => isGpuSkuName(sku.name);
+
+/**
+ * Shared empty Map used as the per-row supportedRegionMap fallback. Module-
+ * scope so React.memo's identity check stays stable when a row has no probe
+ * data (which is the common case while probes are still in flight).
+ */
+const EMPTY_REGION_MAP: ReadonlyMap<string, boolean> = new Map();
 
 // ---------------------------------------------------------------------------
 // Hook: progressive catalog loader
@@ -1010,19 +1140,29 @@ const CapBadge: React.FC<{
 interface VmRowProps {
   row: VmRow;
   batchSupportedAnyRegion: boolean;
-  batchSupportedByRegion: Map<string, boolean>;
+  batchSupportedByRegion: ReadonlyMap<string, boolean>;
+  /** Stable per-page handler — receives the SKU name. */
   onUseVm: (vmName: string) => void;
   /** Display density toggle — "tight" hides secondary metadata. */
   density?: "comfortable" | "tight";
   pinned: boolean;
-  onTogglePin: () => void;
+  /** Stable per-page handler — receives the SKU name. */
+  onTogglePin: (vmName: string) => void;
   inCompare: boolean;
   compareDisabled: boolean;
-  onToggleCompare: () => void;
-  onCopyName: () => void;
+  /** Stable per-page handler — receives the SKU name. */
+  onToggleCompare: (vmName: string) => void;
+  /** Stable per-page handler — receives the SKU name. */
+  onCopyName: (vmName: string) => void;
+  /** True when this row is the keyboard-focus target. */
+  focused: boolean;
+  /** Notify parent when the row receives DOM focus (clicked or tabbed-to). */
+  onFocus: (vmName: string) => void;
+  /** Computed once at parent scope — IMDS / hijack exploit surface. */
+  exploitSurface: ExploitSurface;
 }
 
-const VmRowCard: React.FC<VmRowProps> = ({
+const VmRowCardImpl: React.FC<VmRowProps> = ({
   row,
   batchSupportedAnyRegion,
   batchSupportedByRegion,
@@ -1034,21 +1174,32 @@ const VmRowCard: React.FC<VmRowProps> = ({
   compareDisabled,
   onToggleCompare,
   onCopyName,
+  focused,
+  onFocus,
+  exploitSurface,
 }) => {
   const [open, setOpen] = React.useState(false);
   const [copied, setCopied] = React.useState(false);
   const { sku } = row;
   const tier = row.gpuType ? GPU_TIER[row.gpuType] : "muted";
   const tierClasses = TIER_CLASSES[tier];
+  const exploit = EXPLOIT_SURFACE_META[exploitSurface];
+  // High-value compute-hijack target = highest exploit-surface tier *and* a
+  // SKU family the operator has flagged interest in (GPU/HPC). The badge is
+  // intentionally separate from the generic exploit-surface tooltip so the
+  // "this is a credential-theft magnet" signal is visually distinct.
+  const isHighValueHijackTarget =
+    exploitSurface === "highest" &&
+    (row.category === "gpu" || row.category === "hpc");
 
   const copy = React.useCallback(
     (e: React.MouseEvent) => {
       e.stopPropagation();
-      onCopyName();
+      onCopyName(sku.name);
       setCopied(true);
       setTimeout(() => setCopied(false), 1400);
     },
-    [onCopyName],
+    [onCopyName, sku.name],
   );
 
   return (
@@ -1060,7 +1211,10 @@ const VmRowCard: React.FC<VmRowProps> = ({
           : "border-border hover:border-foreground/20",
         "hover:shadow-elev-1",
         inCompare && "ring-2 ring-accent/50",
+        focused && "ring-2 ring-ring/70 ring-offset-1 ring-offset-background",
       )}
+      data-vm-row={sku.name}
+      onFocusCapture={() => onFocus(sku.name)}
     >
       <button
         type="button"
@@ -1148,6 +1302,64 @@ const VmRowCard: React.FC<VmRowProps> = ({
                 </TooltipContent>
               </Tooltip>
             )}
+            {/* Compute-hijack target badge — only on highest-tier GPU/HPC
+                SKUs. Visual cue that the operator should harden the IMDS
+                posture before provisioning (IMDSv2-equivalent / hop-limit 1
+                / NSG block of 169.254.169.254 from non-host workloads).
+                Cite: _analysis_netspi.md §IMDS Variants. */}
+            {isHighValueHijackTarget && (
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <span className="inline-flex items-center gap-1 rounded-full bg-destructive/10 px-2 py-0.5 text-2xs font-semibold text-destructive ring-1 ring-destructive/30">
+                    <ShieldAlert className="h-3 w-3" />
+                    Hijack target
+                  </span>
+                </TooltipTrigger>
+                <TooltipContent side="top" className="max-w-xs">
+                  <div className="font-medium">High-value compute-hijack target</div>
+                  <div className="mt-0.5 text-2xs opacity-80">
+                    {row.category === "gpu" ? "GPU" : "HPC"} nodes commonly
+                    carry a Managed Identity with broad data-plane scope
+                    (storage, AML, Key Vault). A foothold on the guest can
+                    mint MI tokens via{" "}
+                    <span className="font-mono">169.254.169.254</span> IMDS.
+                    Recommend IMDSv2-equivalent hardening (hop-limit 1, NSG
+                    block, per-job MI) — see <span className="font-mono">_analysis_netspi.md</span> §IMDS Variants.
+                  </div>
+                </TooltipContent>
+              </Tooltip>
+            )}
+            {/* Exploit-surface advisory — coarse per-family tier so every
+                row carries the defensive context without needing to expand
+                details. Cite: _analysis_netspi.md §IMDS-theft. */}
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <span
+                  className={cn(
+                    "inline-flex items-center gap-1 rounded-full px-1.5 py-0.5 text-2xs font-medium ring-1",
+                    exploit.tone === "destructive" &&
+                      "bg-destructive/10 text-destructive ring-destructive/30",
+                    exploit.tone === "warning" &&
+                      "bg-warning/10 text-warning ring-warning/30",
+                    exploit.tone === "info" &&
+                      "bg-info/10 text-info ring-info/30",
+                    exploit.tone === "success" &&
+                      "bg-success/10 text-success ring-success/30",
+                    exploit.tone === "muted" &&
+                      "bg-muted/40 text-muted-foreground ring-border",
+                  )}
+                >
+                  <Flame className="h-2.5 w-2.5" />
+                  {exploit.label}
+                </span>
+              </TooltipTrigger>
+              <TooltipContent side="top" className="max-w-xs">
+                <div className="font-medium">
+                  Exploit surface: {exploit.label.toLowerCase()}
+                </div>
+                <div className="mt-0.5 text-2xs opacity-80">{exploit.hint}</div>
+              </TooltipContent>
+            </Tooltip>
             {batchSupportedAnyRegion ? (
               <Tooltip>
                 <TooltipTrigger asChild>
@@ -1265,7 +1477,7 @@ const VmRowCard: React.FC<VmRowProps> = ({
                 type="button"
                 onClick={(e) => {
                   e.stopPropagation();
-                  onTogglePin();
+                  onTogglePin(sku.name);
                 }}
                 className={cn(
                   "rounded p-1 transition-colors",
@@ -1274,7 +1486,7 @@ const VmRowCard: React.FC<VmRowProps> = ({
                     : "text-muted-foreground/60 hover:bg-muted/40 hover:text-foreground",
                 )}
                 aria-pressed={pinned}
-                aria-label={pinned ? "Unpin SKU" : "Pin SKU"}
+                aria-label={pinned ? "Unpin SKU (p)" : "Pin SKU (p)"}
               >
                 <Star
                   className={cn(
@@ -1319,7 +1531,7 @@ const VmRowCard: React.FC<VmRowProps> = ({
                 onClick={(e) => {
                   e.stopPropagation();
                   if (compareDisabled && !inCompare) return;
-                  onToggleCompare();
+                  onToggleCompare(sku.name);
                 }}
                 className={cn(
                   "rounded p-1 transition-colors",
@@ -1331,7 +1543,7 @@ const VmRowCard: React.FC<VmRowProps> = ({
                 )}
                 aria-pressed={inCompare}
                 aria-label={
-                  inCompare ? "Remove from comparison" : "Add to comparison"
+                  inCompare ? "Remove from comparison (c)" : "Add to comparison (c)"
                 }
                 disabled={compareDisabled && !inCompare}
               >
@@ -1463,6 +1675,34 @@ const VmRowCard: React.FC<VmRowProps> = ({
   );
 };
 
+/**
+ * Memoized row card. The catalog often re-renders the parent (Batch probes
+ * landing, filter toggles) without changing most rows; `React.memo` with the
+ * stable per-page callbacks keeps each card identity-stable across those
+ * incidental renders. The `batchSupportedByRegion` Map is rebuilt at parent
+ * scope so identity changes propagate when a region's probe lands — that's
+ * the intentional re-render path. Everything else gates on row data.
+ */
+const VmRowCard = React.memo(VmRowCardImpl, (prev, next) => {
+  if (prev.row !== next.row) return false;
+  if (prev.batchSupportedAnyRegion !== next.batchSupportedAnyRegion) return false;
+  if (prev.batchSupportedByRegion !== next.batchSupportedByRegion) return false;
+  if (prev.density !== next.density) return false;
+  if (prev.pinned !== next.pinned) return false;
+  if (prev.inCompare !== next.inCompare) return false;
+  if (prev.compareDisabled !== next.compareDisabled) return false;
+  if (prev.focused !== next.focused) return false;
+  if (prev.exploitSurface !== next.exploitSurface) return false;
+  // Callbacks are stable per-page (useCallback) so identity is enough.
+  if (prev.onUseVm !== next.onUseVm) return false;
+  if (prev.onTogglePin !== next.onTogglePin) return false;
+  if (prev.onToggleCompare !== next.onToggleCompare) return false;
+  if (prev.onCopyName !== next.onCopyName) return false;
+  if (prev.onFocus !== next.onFocus) return false;
+  return true;
+});
+VmRowCard.displayName = "VmRowCard";
+
 // ---------------------------------------------------------------------------
 // Page
 // ---------------------------------------------------------------------------
@@ -1546,10 +1786,27 @@ export const VmCatalogPage: React.FC = () => {
   /**
    * Display density. "comfortable" shows full row metadata; "tight" hides
    * the secondary line so 2x more rows fit on screen — useful when the
-   * operator is scanning a long catalog. Lives in component state, not
-   * filters, because it doesn't affect what data is shown.
+   * operator is scanning a long catalog. Persisted across reloads — once
+   * an operator has chosen tight, they almost always want it again.
    */
-  const [density, setDensity] = React.useState<"comfortable" | "tight">("comfortable");
+  const [density, setDensity] = usePersistedState<"comfortable" | "tight">(
+    DENSITY_STORAGE_KEY,
+    "comfortable",
+    {
+      // Tiny string-only adapter — usePersistedState defaults to JSON
+      // round-trip; supplying these mirrors the existing keys in this file.
+      serialize: (v) => JSON.stringify(v),
+      deserialize: (raw) => {
+        try {
+          const parsed = JSON.parse(raw) as unknown;
+          if (parsed === "comfortable" || parsed === "tight") return parsed;
+        } catch {
+          /* fall through */
+        }
+        return undefined;
+      },
+    },
+  );
 
   // Pinned SKUs — persisted across reloads via the shared `usePersistedState`
   // hook (single localStorage adapter; see hooks/use-persisted-state.ts).
@@ -1607,6 +1864,72 @@ export const VmCatalogPage: React.FC = () => {
     [setCompareSet],
   );
 
+  // Saved-comparisons — persisted, named slot list. Lets the operator
+  // stash multiple "what if I picked these 4?" sets and recall them
+  // later. Distinct from the live compareSet (which is the current
+  // working tray). Each slot is { id, name, skus, savedAt }.
+  const [savedComparisons, setSavedComparisons] = usePersistedState<
+    SavedComparison[]
+  >(SAVED_COMPARISONS_STORAGE_KEY, [], {
+    serialize: serializeSavedComparisons,
+    deserialize: deserializeSavedComparisons,
+  });
+  const [savePromptOpen, setSavePromptOpen] = React.useState(false);
+  const [savePromptName, setSavePromptName] = React.useState("");
+  const saveCurrentComparison = React.useCallback(
+    (name: string) => {
+      const trimmed = name.trim();
+      if (!trimmed || compareSet.size === 0) return;
+      // Use crypto.randomUUID when available; fall back to a Math.random
+      // shim for stale browsers / tests. Either way the id is opaque.
+      const id =
+        typeof crypto !== "undefined" && "randomUUID" in crypto
+          ? crypto.randomUUID()
+          : `cmp_${Date.now()}_${Math.random().toString(36).slice(2)}`;
+      // Cap at 12 slots — keeps the dropdown scannable and localStorage
+      // footprint trivial. When full, drop the oldest entry.
+      const SAVED_SLOTS_CAP = 12;
+      setSavedComparisons((prev) => {
+        const next = [
+          ...prev,
+          {
+            id,
+            name: trimmed,
+            skus: Array.from(compareSet),
+            savedAt: new Date().toISOString(),
+          },
+        ];
+        return next.length > SAVED_SLOTS_CAP
+          ? next.slice(next.length - SAVED_SLOTS_CAP)
+          : next;
+      });
+      auditLog.record({
+        actor: "self",
+        action: "vm_catalog_save_comparison",
+        target: `comparison:${trimmed}`,
+        status: "success",
+        details: { skuCount: compareSet.size },
+      });
+    },
+    [compareSet, setSavedComparisons],
+  );
+  const loadComparison = React.useCallback(
+    (id: string) => {
+      const slot = savedComparisons.find((s) => s.id === id);
+      if (!slot) return;
+      // Cap at COMPARE_MAX in case the slot was saved before the cap was
+      // tightened (defensive — the type still allows old data through).
+      setCompareSet(new Set(slot.skus.slice(0, COMPARE_MAX)));
+    },
+    [savedComparisons, setCompareSet],
+  );
+  const deleteComparison = React.useCallback(
+    (id: string) => {
+      setSavedComparisons((prev) => prev.filter((s) => s.id !== id));
+    },
+    [setSavedComparisons],
+  );
+
   // Smart-filter preference: "best $/cpu in current region" chip.
   // No live pricing wire today — this is a UI affordance that, when ON,
   // hoists Burstable + General SKUs (high vCPU-per-dollar families) to the
@@ -1632,23 +1955,21 @@ export const VmCatalogPage: React.FC = () => {
 
   // Search keyboard shortcut: `/` to focus, Esc to clear (while focused).
   const searchInputRef = React.useRef<HTMLInputElement>(null);
-  React.useEffect(() => {
-    const onKey = (e: KeyboardEvent) => {
-      // Don't hijack when the user is typing in any input/textarea or
-      // when a modifier key is pressed.
-      const target = e.target as HTMLElement | null;
-      const inEditable =
-        target instanceof HTMLInputElement ||
-        target instanceof HTMLTextAreaElement ||
-        (target?.isContentEditable ?? false);
-      if (e.key === "/" && !inEditable && !e.ctrlKey && !e.metaKey) {
-        e.preventDefault();
-        searchInputRef.current?.focus();
-      }
-    };
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
+
+  // Focused-row tracking — drives the `p` / `c` / `Enter` row-targeted
+  // hotkeys plus a visual ring on the active row. Lives in state so the
+  // ring re-renders, but most renders won't change it.
+  const [focusedRow, setFocusedRow] = React.useState<string | null>(null);
+  const onRowFocus = React.useCallback((vmName: string) => {
+    setFocusedRow(vmName);
   }, []);
+
+  // `/` focuses the search input from anywhere in the page (unless the user
+  // is typing in another input). Lifted to useShortcut so the dependency on
+  // window event listener is centralised — see hooks/use-shortcut.ts.
+  useShortcut("/", () => {
+    searchInputRef.current?.focus();
+  });
 
   // Account regions for this sub — the "Your accounts" shortcut populates from this.
   const accountRegions = React.useMemo(() => {
@@ -1993,6 +2314,38 @@ export const VmCatalogPage: React.FC = () => {
     };
   }, [filteredRows, regionsToProbe, catalog.batchSupported]);
 
+  // Visible window cap — same 200-row ceiling as before, but extracted into
+  // a memo so the slice isn't re-allocated on every render.
+  const visibleRows = React.useMemo(
+    () => filteredRows.slice(0, 200),
+    [filteredRows],
+  );
+
+  // Per-row Batch-support map, pre-computed once per (visibleRows ×
+  // batchSupported × regionsToProbe) change. This was previously inline in
+  // the JSX map callback, allocating a fresh Map on every render even when
+  // only filters changed. Lifting it here lets React.memo on VmRowCard
+  // short-circuit when neither the row nor its support data changed.
+  const rowComputeMap = React.useMemo(() => {
+    const map = new Map<
+      string,
+      { supportedRegionMap: Map<string, boolean>; anySupported: boolean }
+    >();
+    for (const row of visibleRows) {
+      const supportedRegionMap = new Map<string, boolean>();
+      let anySupported = false;
+      for (const r of regionsToProbe) {
+        const supported = catalog.batchSupported.has(
+          `${row.sku.name.toLowerCase()}::${r}`,
+        );
+        supportedRegionMap.set(r, supported);
+        if (supported) anySupported = true;
+      }
+      map.set(row.sku.name, { supportedRegionMap, anySupported });
+    }
+    return map;
+  }, [visibleRows, regionsToProbe, catalog.batchSupported]);
+
   const onUseVm = React.useCallback(
     (vmName: string) => {
       try {
@@ -2012,6 +2365,26 @@ export const VmCatalogPage: React.FC = () => {
     },
     [navigateToPage],
   );
+
+  // Row-targeted hotkeys: `p` pins / unpins the focused row, `c` toggles
+  // it in compare, `Enter` hands it off to pool creation. The focused row
+  // is tracked via onFocusCapture on each <VmRowCard /> so tab navigation
+  // through the list naturally moves the target. We snapshot focusedRow in
+  // the handlers so each chord acts on the most-recent focus state.
+  //
+  // Note: useShortcut by default blocks while focus is inside an input —
+  // exactly what we want here so typing search queries doesn't trigger
+  // these. The Enter handler additionally guards against the catalog being
+  // empty (no SKU to navigate to).
+  useShortcut("p", () => {
+    if (focusedRow) togglePin(focusedRow);
+  });
+  useShortcut("c", () => {
+    if (focusedRow) toggleCompare(focusedRow);
+  });
+  useShortcut("Enter", () => {
+    if (focusedRow) onUseVm(focusedRow);
+  });
 
   const setFilter = React.useCallback(
     <K extends keyof Filters>(key: K, value: Filters[K]) => {
@@ -2416,6 +2789,25 @@ export const VmCatalogPage: React.FC = () => {
           </Button>
         )}
 
+        {/* Saved comparisons — picker for previously-saved named slots.
+            When the current tray has SKUs, the "Save" button stashes them
+            as a new slot. Limited to a sensible 12-slot ceiling enforced
+            in `saveCurrentComparison`. */}
+        <SavedComparisonsControl
+          items={savedComparisons}
+          onLoad={(id) => {
+            loadComparison(id);
+            setCompareOpen(true);
+          }}
+          onDelete={deleteComparison}
+          onPromptSave={() => {
+            setSavePromptName("");
+            setSavePromptOpen(true);
+          }}
+          canSave={compareSet.size > 0}
+          currentSize={compareSet.size}
+        />
+
         {filtersActive && (
           <Button
             type="button"
@@ -2735,27 +3127,25 @@ export const VmCatalogPage: React.FC = () => {
 
       <div
         className="flex flex-col gap-2"
+        // ARIA-grid would be ideal here, but every row's primary interaction
+        // is a collapsible card with multiple controls — pure `grid` /
+        // `gridcell` would force keyboard handling we don't want. We keep
+        // `role="list"` with explicit `listitem` children so screen readers
+        // count the catalog correctly, and rely on the per-row buttons for
+        // semantics (each has its own aria-label and aria-pressed).
         role="list"
         aria-label="VM catalog rows"
+        aria-rowcount={filteredRows.length}
       >
-        {filteredRows.slice(0, 200).map((row) => {
-          // Per-row Map build is cheap (regionsToProbe is typically <= 10);
-          // we don't memoize across rows because the catalog.batchSupported
-          // Set identity changes as Batch probes land and we want the row
-          // to re-render at that point anyway. The previous Array.from()
-          // copy is replaced with an in-loop boolean accumulator (saves a
-          // GC churn per row on a 200-row render).
-          const supportedRegionMap = new Map<string, boolean>();
-          let anySupported = false;
-          for (const r of regionsToProbe) {
-            const supported = catalog.batchSupported.has(
-              `${row.sku.name.toLowerCase()}::${r}`,
-            );
-            supportedRegionMap.set(r, supported);
-            if (supported) anySupported = true;
-          }
+        {visibleRows.map((row) => {
+          const data = rowComputeMap.get(row.sku.name);
+          const supportedRegionMap = data?.supportedRegionMap ?? EMPTY_REGION_MAP;
+          const anySupported = data?.anySupported ?? false;
           const isPinned = pinned.has(row.sku.name);
           const inCompare = compareSet.has(row.sku.name);
+          const exploitSurface: ExploitSurface = row.category
+            ? CATEGORY_EXPLOIT_SURFACE[row.category]
+            : "unknown";
           return (
             <div role="listitem" key={row.sku.name}>
               <VmRowCard
@@ -2765,13 +3155,16 @@ export const VmCatalogPage: React.FC = () => {
                 onUseVm={onUseVm}
                 density={density}
                 pinned={isPinned}
-                onTogglePin={() => togglePin(row.sku.name)}
+                onTogglePin={togglePin}
                 inCompare={inCompare}
                 compareDisabled={
                   !inCompare && compareSet.size >= COMPARE_MAX
                 }
-                onToggleCompare={() => toggleCompare(row.sku.name)}
-                onCopyName={() => copyToName(row.sku.name)}
+                onToggleCompare={toggleCompare}
+                onCopyName={copyToName}
+                focused={focusedRow === row.sku.name}
+                onFocus={onRowFocus}
+                exploitSurface={exploitSurface}
               />
             </div>
           );
@@ -2939,7 +3332,98 @@ export const VmCatalogPage: React.FC = () => {
         onToggleDiffOnly={setCompareDiffOnly}
         regionsToProbe={regionsToProbe}
         batchSupported={catalog.batchSupported}
+        onSaveAs={() => {
+          setSavePromptName("");
+          setSavePromptOpen(true);
+        }}
+        canSave={compareSet.size > 0}
       />
+
+      {/* Save-comparison prompt — tiny modal that asks for a slot name
+          before persisting the current compareSet. Auto-suggests a default
+          like "ND H100 vs ND A100" from the current SKU names so the user
+          rarely has to type anything. */}
+      <Dialog open={savePromptOpen} onOpenChange={setSavePromptOpen}>
+        <DialogContent className="max-w-md">
+          <DialogHeader>
+            <DialogTitle className="flex items-center gap-2">
+              <Save className="h-4 w-4 text-primary" />
+              Save comparison
+            </DialogTitle>
+            <DialogDescription>
+              Name this set of {compareSet.size} SKU
+              {compareSet.size === 1 ? "" : "s"} so you can load it back
+              later. Saved per-browser.
+            </DialogDescription>
+          </DialogHeader>
+          <div className="px-1 pb-2">
+            <Input
+              autoFocus
+              placeholder={
+                Array.from(compareSet)
+                  .map((n) => n.replace(/^Standard_/, ""))
+                  .slice(0, 2)
+                  .join(" vs ") || "My comparison"
+              }
+              value={savePromptName}
+              onChange={(e) => setSavePromptName(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") {
+                  e.preventDefault();
+                  const name =
+                    savePromptName.trim() ||
+                    Array.from(compareSet)
+                      .map((n) => n.replace(/^Standard_/, ""))
+                      .slice(0, 2)
+                      .join(" vs ") ||
+                    "Comparison";
+                  saveCurrentComparison(name);
+                  setSavePromptOpen(false);
+                }
+              }}
+              className="h-9"
+            />
+            <div className="mt-1 text-2xs text-muted-foreground">
+              Press Enter to save · Esc to cancel
+            </div>
+          </div>
+          <div className="flex items-center justify-end gap-2 border-t border-border px-4 py-3">
+            <Button
+              type="button"
+              variant="ghost"
+              size="sm"
+              onClick={() => setSavePromptOpen(false)}
+            >
+              Cancel
+            </Button>
+            <Button
+              type="button"
+              variant="default"
+              size="sm"
+              disabled={compareSet.size === 0}
+              onClick={() => {
+                const name =
+                  savePromptName.trim() ||
+                  Array.from(compareSet)
+                    .map((n) => n.replace(/^Standard_/, ""))
+                    .slice(0, 2)
+                    .join(" vs ") ||
+                  "Comparison";
+                saveCurrentComparison(name);
+                setSavePromptOpen(false);
+              }}
+              className="gap-1.5"
+            >
+              <Save className="h-3.5 w-3.5" />
+              Save
+            </Button>
+          </div>
+        </DialogContent>
+      </Dialog>
+
+      {/* Hotkey help cheatsheet — floating bottom-left so the operator can
+          discover row-targeted shortcuts without leaving the page. */}
+      <HotkeyHelpFooter />
     </div>
   );
 };
@@ -3083,6 +3567,10 @@ interface CompareDialogProps {
   onToggleDiffOnly: (v: boolean) => void;
   regionsToProbe: string[];
   batchSupported: Set<string>;
+  /** Open the "save as" prompt dialog at the page level. */
+  onSaveAs: () => void;
+  /** Disable the Save button when the tray is empty. */
+  canSave: boolean;
 }
 
 const CompareDialog: React.FC<CompareDialogProps> = ({
@@ -3096,6 +3584,8 @@ const CompareDialog: React.FC<CompareDialogProps> = ({
   onToggleDiffOnly,
   regionsToProbe,
   batchSupported,
+  onSaveAs,
+  canSave,
 }) => {
   const selected = React.useMemo(
     () => skuNames.map((n) => allRows.find((r) => r.sku.name === n)).filter(
@@ -3199,6 +3689,18 @@ const CompareDialog: React.FC<CompareDialogProps> = ({
               <X className="h-3 w-3" />
               Clear all
             </Button>
+            <Button
+              type="button"
+              size="xs"
+              variant="outline"
+              disabled={!canSave}
+              onClick={onSaveAs}
+              className="gap-1"
+              title="Save this comparison as a named slot you can recall later"
+            >
+              <Save className="h-3 w-3" />
+              Save as…
+            </Button>
           </DialogDescription>
         </DialogHeader>
         {selected.length === 0 ? (
@@ -3300,5 +3802,215 @@ const CompareDialog: React.FC<CompareDialogProps> = ({
         )}
       </DialogContent>
     </Dialog>
+  );
+};
+
+// ---------------------------------------------------------------------------
+// Saved-comparisons control — toolbar pop-out that lists previously-saved
+// named comparison slots and lets the operator load / delete them, plus a
+// "Save current" affordance that promotes the live tray to a new slot.
+//
+// Implemented as a controlled details/summary popout so we don't pull in a
+// dropdown library — keeps the page source-only and dependency-free, per
+// CLAUDE.md.
+// ---------------------------------------------------------------------------
+
+interface SavedComparisonsControlProps {
+  items: SavedComparison[];
+  onLoad: (id: string) => void;
+  onDelete: (id: string) => void;
+  onPromptSave: () => void;
+  canSave: boolean;
+  currentSize: number;
+}
+
+const SavedComparisonsControl: React.FC<SavedComparisonsControlProps> = ({
+  items,
+  onLoad,
+  onDelete,
+  onPromptSave,
+  canSave,
+  currentSize,
+}) => {
+  const [open, setOpen] = React.useState(false);
+  const ref = React.useRef<HTMLDivElement>(null);
+
+  // Close on outside-click — small DOM-level handler since we're not pulling
+  // in a popover primitive. Keyed on `open` so the listener is only attached
+  // when the menu is visible.
+  React.useEffect(() => {
+    if (!open) return;
+    const onDoc = (e: MouseEvent) => {
+      if (ref.current && !ref.current.contains(e.target as Node)) {
+        setOpen(false);
+      }
+    };
+    window.addEventListener("mousedown", onDoc);
+    return () => window.removeEventListener("mousedown", onDoc);
+  }, [open]);
+
+  if (items.length === 0 && !canSave) return null;
+
+  return (
+    <div ref={ref} className="relative">
+      <Button
+        type="button"
+        variant="outline"
+        size="sm"
+        onClick={() => setOpen((v) => !v)}
+        className="gap-1.5"
+        aria-haspopup="menu"
+        aria-expanded={open}
+        title={
+          items.length > 0
+            ? `${items.length} saved comparison${items.length === 1 ? "" : "s"}`
+            : "Save the current comparison tray as a named slot"
+        }
+      >
+        <Bookmark className="h-3.5 w-3.5" />
+        Saved
+        {items.length > 0 && (
+          <span className="ml-0.5 rounded-full bg-muted/40 px-1.5 py-px text-2xs tabular-nums">
+            {items.length}
+          </span>
+        )}
+      </Button>
+      {open && (
+        <div
+          role="menu"
+          className="absolute right-0 top-full z-30 mt-1 w-80 overflow-hidden rounded-md border border-border bg-card shadow-elev-2 animate-fade-in"
+        >
+          <div className="flex items-center justify-between border-b border-border bg-muted/30 px-3 py-2">
+            <span className="text-2xs font-semibold uppercase tracking-wider text-muted-foreground">
+              Saved comparisons ({items.length})
+            </span>
+            <Button
+              type="button"
+              size="xs"
+              variant="ghost"
+              disabled={!canSave}
+              onClick={() => {
+                setOpen(false);
+                onPromptSave();
+              }}
+              className="gap-1"
+              title={
+                canSave
+                  ? `Save the current tray (${currentSize} SKUs) as a new slot`
+                  : "Add at least one SKU to the compare tray first"
+              }
+            >
+              <Save className="h-3 w-3" />
+              Save current
+            </Button>
+          </div>
+          {items.length === 0 ? (
+            <div className="px-3 py-3 text-center text-2xs text-muted-foreground">
+              No saved comparisons yet. Add SKUs to the tray and click{" "}
+              <span className="font-medium">Save current</span> to stash a
+              named slot.
+            </div>
+          ) : (
+            <ul className="max-h-64 overflow-y-auto">
+              {items.map((s) => (
+                <li
+                  key={s.id}
+                  className="group flex items-center gap-2 border-b border-border/40 px-3 py-2 last:border-b-0 hover:bg-muted/30"
+                >
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setOpen(false);
+                      onLoad(s.id);
+                    }}
+                    className="min-w-0 flex-1 text-left"
+                    role="menuitem"
+                  >
+                    <div className="truncate text-xs font-medium text-foreground">
+                      {s.name}
+                    </div>
+                    <div className="mt-0.5 truncate text-2xs text-muted-foreground">
+                      {s.skus.length} SKU{s.skus.length === 1 ? "" : "s"} ·{" "}
+                      {new Date(s.savedAt).toLocaleDateString()}
+                    </div>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      onDelete(s.id);
+                    }}
+                    className="rounded p-1 text-muted-foreground/60 opacity-0 transition-opacity hover:bg-destructive/10 hover:text-destructive group-hover:opacity-100"
+                    aria-label={`Delete saved comparison ${s.name}`}
+                    title="Delete this slot"
+                  >
+                    <Trash2 className="h-3 w-3" />
+                  </button>
+                </li>
+              ))}
+            </ul>
+          )}
+        </div>
+      )}
+    </div>
+  );
+};
+
+// ---------------------------------------------------------------------------
+// Hotkey help footer — floating bottom-left cheatsheet so the operator can
+// discover the row-targeted shortcuts (p / c / Enter / /) without leaving
+// the page. Collapses to a single key icon when not hovered.
+// ---------------------------------------------------------------------------
+
+const HOTKEYS: ReadonlyArray<{ key: string; label: string }> = [
+  { key: "/", label: "focus search" },
+  { key: "p", label: "pin focused row" },
+  { key: "c", label: "compare focused row" },
+  { key: "Enter", label: "use focused VM in pool" },
+  { key: "Esc", label: "clear search" },
+];
+
+const HotkeyHelpFooter: React.FC = () => {
+  const [open, setOpen] = React.useState(false);
+  return (
+    <div className="pointer-events-none fixed bottom-4 left-4 z-30">
+      <div className="pointer-events-auto">
+        {open ? (
+          <div className="flex flex-col gap-1 rounded-md border border-border bg-card/95 p-3 shadow-elev-2 backdrop-blur animate-fade-in">
+            <div className="mb-1 flex items-center justify-between gap-3">
+              <span className="text-2xs font-semibold uppercase tracking-wider text-muted-foreground">
+                Hotkeys
+              </span>
+              <button
+                type="button"
+                onClick={() => setOpen(false)}
+                className="rounded p-0.5 text-muted-foreground/60 hover:bg-muted/40 hover:text-foreground"
+                aria-label="Close hotkey help"
+              >
+                <X className="h-3 w-3" />
+              </button>
+            </div>
+            {HOTKEYS.map((hk) => (
+              <div key={hk.key} className="flex items-center gap-2 text-2xs">
+                <kbd className="inline-flex h-5 min-w-[1.4rem] items-center justify-center rounded border border-border bg-muted/40 px-1 font-mono text-2xs text-foreground">
+                  {hk.key}
+                </kbd>
+                <span className="text-muted-foreground">{hk.label}</span>
+              </div>
+            ))}
+          </div>
+        ) : (
+          <button
+            type="button"
+            onClick={() => setOpen(true)}
+            className="flex items-center gap-1.5 rounded-full border border-border bg-card/80 px-2.5 py-1 text-2xs text-muted-foreground shadow-elev-1 backdrop-blur transition-colors hover:bg-card hover:text-foreground"
+            aria-label="Show keyboard shortcuts"
+          >
+            <Keyboard className="h-3 w-3" />
+            ?
+          </button>
+        )}
+      </div>
+    </div>
   );
 };
