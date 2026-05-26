@@ -28,12 +28,38 @@ export type BaselineSeverity =
   | "critical"
   | "unknown";
 
-/** Stable identifier for each of the six tenant-baseline checks. */
+/** Stable identifier for each tenant-baseline check.
+ *
+ * Two corpus-derived defender signals extend the original six checks:
+ *
+ *   - "federation-backdoor-drift": per-federated-domain detector that
+ *     surfaces issuer URI + signing certificate + recent-modification
+ *     posture. Critical when a *new* federated domain appears since the
+ *     saved baseline (the canonical AADInternals `ConvertTo-Backdoor`
+ *     persistence technique). Detection inspired by:
+ *       New folder/_AZURE_BYPASS_PLAYBOOK.md "Critical Defender Audit
+ *         Surface" item 1 (`Set domain authentication` audit event) and
+ *         "Top 30 Techniques" #30 (Federated domain backdoor).
+ *       New folder/_analysis_aadinternals.md §2.4 "The Federation Backdoor
+ *         (`ConvertTo-Backdoor`)".
+ *       New folder/_bypass_tenant_switch.md "12 chains" #6 (External-IdP
+ *         federation backdoor).
+ *
+ *   - "ca-policy-drift": per-policy CA enumeration that surfaces state,
+ *     exclusion-set size, role-exclusion-for-Global-Admin, and the
+ *     last-modified timestamp. Detection inspired by:
+ *       New folder/_AZURE_BYPASS_PLAYBOOK.md "Critical Defender Audit
+ *         Surface" item 2 (`Update conditional access policy` audit event).
+ *       New folder/_analysis_dirkjanm.md (ROADrecon CA enumeration —
+ *         `/identity/conditionalAccess/policies`).
+ */
 export type BaselineCheckId =
   | "security-defaults"
   | "guest-invite-policy"
   | "default-user-permissions"
   | "domains-federation"
+  | "federation-backdoor-drift"
+  | "ca-policy-drift"
   | "onprem-sync"
   | "password-protection";
 
@@ -654,6 +680,48 @@ export interface DomainRaw {
 }
 
 /**
+ * `internalDomainFederation` resource shape returned by
+ * `GET /domains/{id}/federationConfiguration`.
+ *
+ * Field names mirror Microsoft Graph's published schema; not every tenant
+ * returns every field, hence everything is optional.
+ *
+ * Detection inspired by:
+ *   New folder/_analysis_aadinternals.md §2.4 — `ConvertTo-Backdoor` sets
+ *     `issuerUri` + signing key on a freshly-added federated domain.
+ */
+export interface FederationConfigRaw {
+  id?: string;
+  displayName?: string | null;
+  issuerUri?: string | null;
+  metadataExchangeUri?: string | null;
+  passiveSignInUri?: string | null;
+  preferredAuthenticationProtocol?: string | null;
+  signingCertificate?: string | null;
+  /** "Primary" | "Secondary" */
+  signingCertificateUpdateStatus?:
+    | {
+        certificateUpdateResult?: string | null;
+        lastRunDateTime?: string | null;
+      }
+    | null;
+  /** When the federation config was last modified. ISO timestamp. */
+  modifiedDateTime?: string | null;
+}
+
+/** Result of per-domain federation enrichment used by Signal A. */
+export interface FederatedDomainEntry {
+  /** The domain name itself (`/domains/{id}` is the verified DNS suffix). */
+  domain: string;
+  /** Whether this is the tenant's `isDefault` domain. */
+  isDefault: boolean;
+  /** Per-domain federationConfiguration payload, when retrievable. */
+  config: FederationConfigRaw | null;
+  /** Set when the federationConfiguration probe failed. */
+  configError: string | null;
+}
+
+/**
  * Domain federation — any federated non-Managed domain is flagged. Some
  * tenants legitimately federate (e.g. ADFS-backed customers), so this is
  * "High, please review" not "Critical".
@@ -704,6 +772,422 @@ export function scoreDomainsFederation(
     whyItMatters: why,
     remediation,
     raw: domains,
+  };
+}
+
+/**
+ * Signal A — Federation backdoor detector.
+ *
+ * Defenders need a per-domain view that surfaces:
+ *   - which domains are Federated (vs Managed)
+ *   - their declared issuer URI (a fresh `https://attacker.tld/sts` is the
+ *     loudest possible signal of `ConvertTo-Backdoor`)
+ *   - whether the federation config was modified recently (last 30 days)
+ *   - presence of a signing certificate (any federated domain MUST have
+ *     one — its absence is itself suspicious)
+ *
+ * Severity framing (per corpus risk model):
+ *   - critical: federation config was modified in the last 30 days. The
+ *     `Set domain authentication` audit event is the #1 defender alert in
+ *     `_AZURE_BYPASS_PLAYBOOK.md` "Critical Defender Audit Surface".
+ *   - high:    federated domain present but config modification is older
+ *     (still warrants verification — the IdP could have been backdoored
+ *     long before).
+ *   - medium:  configuration not retrievable (permissions gap); fall-through
+ *     to the legacy domain-federation finding.
+ *   - ok:      no federated domains in the tenant.
+ *
+ * Detection inspired by:
+ *   New folder/_AZURE_BYPASS_PLAYBOOK.md "Critical Defender Audit Surface"
+ *     item 1 ("`Set domain authentication` audit event").
+ *   New folder/_analysis_aadinternals.md §2.4 "The Federation Backdoor
+ *     (`ConvertTo-Backdoor`)".
+ */
+export interface ScoreFederationBackdoorInput {
+  /** Per-federated-domain enrichment entries (config + errors). */
+  entries: FederatedDomainEntry[];
+  /** Wall clock — injectable for unit-tests. */
+  now?: Date;
+  /** Threshold for treating a federation change as "recent". */
+  recentChangeWindowDays?: number;
+}
+
+export const FEDERATION_RECENT_CHANGE_WINDOW_DAYS = 30;
+
+export function scoreFederationBackdoorDrift(
+  input: ScoreFederationBackdoorInput,
+): BaselineFinding {
+  const base = "Federation backdoor drift";
+  const why =
+    "An attacker with Global Administrator can add a *new* federated domain pointing at their own IdP " +
+    "(`Set-AADIntFederationSettings` / `ConvertTo-Backdoor`). Any subsequent SAML token the attacker " +
+    "mints with `ImmutableID=<existing-user-guid>` is accepted as that user — no password, no MFA. " +
+    "This is the canonical AADInternals persistence technique and survives password resets, MFA " +
+    "resets, and role revocations. Detect at the federation-config edge: any new federated domain or " +
+    "any recent change to issuer URI / signing cert on an existing one is a critical lead.";
+  const remediation =
+    "Triage: Microsoft Entra admin center → Domains → click each federated domain → Federation tab.\n" +
+    "Confirm `issuerUri` matches your authoritative IdP (typically `http://yourorg.com/adfs/services/trust`).\n" +
+    "Confirm `signingCertificate` thumbprint matches your ADFS Token-Signing certificate (Get-AdfsCertificate).\n" +
+    "If either does not match, treat as a Global Admin compromise: rotate ALL credentials, then\n" +
+    "  PATCH https://graph.microsoft.com/v1.0/domains/{domain} with {\"authenticationType\": \"Managed\"}\n" +
+    "and remove the rogue domain via DELETE /domains/{domain}.\n" +
+    "Wire-level audit: Microsoft 365 Unified Audit Log → `Set federation settings on domain`.";
+
+  const now = input.now ?? new Date();
+  const windowDays =
+    input.recentChangeWindowDays ?? FEDERATION_RECENT_CHANGE_WINDOW_DAYS;
+  const windowMs = windowDays * 24 * 60 * 60 * 1000;
+
+  const fed = input.entries;
+  if (fed.length === 0) {
+    return {
+      id: "federation-backdoor-drift",
+      name: base,
+      severity: "ok",
+      summary: "No federated domains detected — federation backdoor surface absent",
+      whyItMatters: why,
+      remediation,
+      raw: { entries: [] },
+    };
+  }
+
+  // Gather permission errors (likely 403 Domain.Read.All).
+  const errorEntries = fed.filter((e) => e.configError !== null);
+  const recentlyChanged: { domain: string; modifiedDateTime: string }[] = [];
+  const missingSigningCert: string[] = [];
+  for (const e of fed) {
+    const m = e.config?.modifiedDateTime ?? null;
+    if (m) {
+      const t = Date.parse(m);
+      if (Number.isFinite(t) && now.getTime() - t < windowMs) {
+        recentlyChanged.push({ domain: e.domain, modifiedDateTime: m });
+      }
+    }
+    if (e.config !== null && !e.config.signingCertificate) {
+      missingSigningCert.push(e.domain);
+    }
+  }
+
+  if (recentlyChanged.length > 0) {
+    const list = recentlyChanged
+      .map(
+        (r) =>
+          `${r.domain} (modified ${Math.round((now.getTime() - Date.parse(r.modifiedDateTime)) / (1000 * 60 * 60 * 24))}d ago)`,
+      )
+      .join(", ");
+    return {
+      id: "federation-backdoor-drift",
+      name: base,
+      severity: "critical",
+      summary: `Federation config modified in last ${windowDays}d on: ${list}`,
+      whyItMatters: why,
+      remediation,
+      raw: { entries: fed, recentlyChanged, missingSigningCert },
+    };
+  }
+  if (missingSigningCert.length > 0) {
+    return {
+      id: "federation-backdoor-drift",
+      name: base,
+      severity: "high",
+      summary: `Federated domain(s) without a signing certificate: ${missingSigningCert.join(", ")} — config is incomplete or unreadable`,
+      whyItMatters: why,
+      remediation,
+      raw: { entries: fed, recentlyChanged, missingSigningCert },
+    };
+  }
+  if (errorEntries.length === fed.length) {
+    return {
+      id: "federation-backdoor-drift",
+      name: base,
+      severity: "unknown",
+      summary:
+        "Federated domain(s) present but their federationConfiguration could not be read — needs Domain.Read.All / Policy.Read.All",
+      whyItMatters: why,
+      remediation,
+      raw: { entries: fed },
+      error: errorEntries[0]!.configError ?? undefined,
+    };
+  }
+  return {
+    id: "federation-backdoor-drift",
+    name: base,
+    severity: "high",
+    summary: `${fed.length} federated domain${fed.length === 1 ? "" : "s"} — manually verify issuer URI + signing certificate ownership`,
+    whyItMatters: why,
+    remediation,
+    raw: { entries: fed },
+  };
+}
+
+/**
+ * Signal B — Conditional Access policy drift detector.
+ *
+ * Per-policy enumeration of `/identity/conditionalAccess/policies`. We pull
+ * out the small set of fields a defender actually cares about:
+ *
+ *   - `state` (enabled / disabled / reportOnly): a recently flipped-to-
+ *     disabled policy is one of the loudest attack signals (the canonical
+ *     `Update conditional access policy` audit event in the playbook).
+ *   - `conditions.users.excludeUsers/excludeGroups/excludeRoles`: an
+ *     attacker who can edit CA policies typically adds themselves (or a
+ *     planted group) to an exclusion list. A policy that excludes
+ *     `Global Administrator` is the classic attacker bypass — the
+ *     legitimate "break-glass account" exclusion is normally pinned to
+ *     specific user IDs, not the role.
+ *   - `modifiedDateTime`: any policy modified inside the change window
+ *     warrants attention.
+ *
+ * Severity framing (per corpus risk model):
+ *   - critical: a policy excludes the Global Administrator role
+ *     (`62e90394-69f5-4237-9190-012177145e10`) — the most common attacker
+ *     bypass shape, per `_AZURE_BYPASS_PLAYBOOK.md` and `_bypass_login.md`.
+ *   - high:    a policy in `enabledForReportingButNotEnforced` whose name
+ *     looks like a primary MFA policy (likely silently disabled), or any
+ *     policy modified in the change window.
+ *   - medium:  many disabled policies — broad weakening of posture.
+ *   - ok:      everything enabled, no recent edits, no role exclusions.
+ *   - unknown: enumeration failed (permissions gap).
+ *
+ * Detection inspired by:
+ *   New folder/_AZURE_BYPASS_PLAYBOOK.md "Critical Defender Audit Surface"
+ *     item 2 (`Update conditional access policy` audit event).
+ *   New folder/_analysis_dirkjanm.md (ROADrecon enumerates the same
+ *     endpoint via `/identity/conditionalAccess/policies`).
+ */
+
+/**
+ * Subset of `/identity/conditionalAccess/policies` we consume.
+ *
+ * Graph returns more nested structure; we only project what the scorer
+ * needs to surface signal. The page also persists this projection — keeping
+ * it narrow keeps the snapshot envelope small.
+ */
+export interface ConditionalAccessPolicyRaw {
+  id?: string;
+  displayName?: string | null;
+  /** "enabled" | "disabled" | "enabledForReportingButNotEnforced" */
+  state?: string | null;
+  createdDateTime?: string | null;
+  modifiedDateTime?: string | null;
+  conditions?: {
+    users?: {
+      excludeUsers?: string[] | null;
+      excludeGroups?: string[] | null;
+      excludeRoles?: string[] | null;
+    } | null;
+  } | null;
+}
+
+export interface ScoreCaPolicyDriftInput {
+  policies: ConditionalAccessPolicyRaw[] | null;
+  policiesError: string | null;
+  /** Wall clock — injectable for unit-tests. */
+  now?: Date;
+  /** Treat policy modifications inside this window as "recent". */
+  recentChangeWindowDays?: number;
+}
+
+export const CA_POLICY_RECENT_CHANGE_WINDOW_DAYS = 14;
+
+export function scoreCaPolicyDrift(
+  input: ScoreCaPolicyDriftInput,
+): BaselineFinding {
+  const base = "Conditional Access policy drift";
+  const why =
+    "A common AADInternals/GraphRunner privilege chain is: get into a high-priv role for a moment, " +
+    "*flip* a critical CA policy off (or add yourself to its exclusion list), then sign in without " +
+    "MFA. Both modifications surface here at the `/identity/conditionalAccess/policies` edge: state " +
+    "changes and exclusion-list edits.";
+  const remediation =
+    "Microsoft Entra admin center → Protection → Conditional Access — review every policy listed in the raw response.\n" +
+    "For each policy in 'disabled' or 'enabledForReportingButNotEnforced', verify intentional.\n" +
+    "Inspect `conditions.users.excludeRoles`: legitimate break-glass exclusions should target specific user object ids, NOT the role guid.\n" +
+    "Wire-level audit: Microsoft Entra Audit log → `Update conditional access policy` events from the last 30 days.";
+
+  if (input.policiesError) {
+    return {
+      id: "ca-policy-drift",
+      name: base,
+      severity: "unknown",
+      summary: `Could not enumerate Conditional Access policies: ${input.policiesError}`,
+      whyItMatters: why,
+      remediation,
+      raw: { error: input.policiesError },
+      error: input.policiesError,
+    };
+  }
+  const policies = input.policies;
+  if (!policies) {
+    return {
+      id: "ca-policy-drift",
+      name: base,
+      severity: "unknown",
+      summary: "Conditional Access policies not retrieved",
+      whyItMatters: why,
+      remediation,
+      raw: null,
+    };
+  }
+  if (policies.length === 0) {
+    return {
+      id: "ca-policy-drift",
+      name: base,
+      severity: "high",
+      summary:
+        "Tenant has zero Conditional Access policies — MFA / device / location enforcement is absent",
+      whyItMatters: why,
+      remediation,
+      raw: { policies },
+    };
+  }
+
+  const now = input.now ?? new Date();
+  const windowDays =
+    input.recentChangeWindowDays ?? CA_POLICY_RECENT_CHANGE_WINDOW_DAYS;
+  const windowMs = windowDays * 24 * 60 * 60 * 1000;
+
+  // Global Admin role template id — surfaced for "policy excludes GA role".
+  const GA_ROLE_TEMPLATE_ID = "62e90394-69f5-4237-9190-012177145e10";
+
+  let disabledCount = 0;
+  let reportOnlyCount = 0;
+  let enabledCount = 0;
+  const recentlyModified: { name: string; modifiedDateTime: string }[] = [];
+  const policiesExcludingGA: string[] = [];
+  let totalExclusions = 0;
+
+  for (const p of policies) {
+    const state = (p.state ?? "").toLowerCase();
+    if (state === "disabled") disabledCount += 1;
+    else if (state === "enabledforreportingbutnotenforced") reportOnlyCount += 1;
+    else if (state === "enabled") enabledCount += 1;
+
+    const excludeRoles = p.conditions?.users?.excludeRoles ?? [];
+    const excludeUsers = p.conditions?.users?.excludeUsers ?? [];
+    const excludeGroups = p.conditions?.users?.excludeGroups ?? [];
+    totalExclusions +=
+      (excludeRoles?.length ?? 0) +
+      (excludeUsers?.length ?? 0) +
+      (excludeGroups?.length ?? 0);
+    if (
+      Array.isArray(excludeRoles) &&
+      excludeRoles.includes(GA_ROLE_TEMPLATE_ID)
+    ) {
+      policiesExcludingGA.push(p.displayName ?? p.id ?? "(unnamed policy)");
+    }
+
+    const mod = p.modifiedDateTime ?? null;
+    if (mod) {
+      const t = Date.parse(mod);
+      if (Number.isFinite(t) && now.getTime() - t < windowMs) {
+        recentlyModified.push({
+          name: p.displayName ?? p.id ?? "(unnamed policy)",
+          modifiedDateTime: mod,
+        });
+      }
+    }
+  }
+
+  if (policiesExcludingGA.length > 0) {
+    return {
+      id: "ca-policy-drift",
+      name: base,
+      severity: "critical",
+      summary: `Policies excluding the Global Administrator role: ${policiesExcludingGA.join(", ")} — attacker-classic exclusion shape`,
+      whyItMatters: why,
+      remediation,
+      raw: {
+        policies,
+        disabledCount,
+        reportOnlyCount,
+        enabledCount,
+        totalExclusions,
+        recentlyModified,
+        policiesExcludingGA,
+      },
+    };
+  }
+  if (recentlyModified.length > 0) {
+    const list = recentlyModified
+      .map(
+        (r) =>
+          `${r.name} (${Math.round((now.getTime() - Date.parse(r.modifiedDateTime)) / (1000 * 60 * 60 * 24))}d ago)`,
+      )
+      .join(", ");
+    return {
+      id: "ca-policy-drift",
+      name: base,
+      severity: "high",
+      summary: `${recentlyModified.length} policy/policies modified in last ${windowDays}d: ${list}`,
+      whyItMatters: why,
+      remediation,
+      raw: {
+        policies,
+        disabledCount,
+        reportOnlyCount,
+        enabledCount,
+        totalExclusions,
+        recentlyModified,
+        policiesExcludingGA,
+      },
+    };
+  }
+  if (disabledCount + reportOnlyCount > enabledCount && enabledCount === 0) {
+    return {
+      id: "ca-policy-drift",
+      name: base,
+      severity: "high",
+      summary: `${policies.length} CA policies but NONE are in the enabled state (${disabledCount} disabled, ${reportOnlyCount} report-only)`,
+      whyItMatters: why,
+      remediation,
+      raw: {
+        policies,
+        disabledCount,
+        reportOnlyCount,
+        enabledCount,
+        totalExclusions,
+        recentlyModified,
+        policiesExcludingGA,
+      },
+    };
+  }
+  if (disabledCount + reportOnlyCount >= enabledCount && enabledCount > 0) {
+    return {
+      id: "ca-policy-drift",
+      name: base,
+      severity: "medium",
+      summary: `${enabledCount} enabled, ${disabledCount} disabled, ${reportOnlyCount} report-only — confirm disabled/report-only policies are intentional`,
+      whyItMatters: why,
+      remediation,
+      raw: {
+        policies,
+        disabledCount,
+        reportOnlyCount,
+        enabledCount,
+        totalExclusions,
+        recentlyModified,
+        policiesExcludingGA,
+      },
+    };
+  }
+  return {
+    id: "ca-policy-drift",
+    name: base,
+    severity: "ok",
+    summary: `${enabledCount} enabled CA policies, ${disabledCount} disabled, ${reportOnlyCount} report-only — no recent edits, no GA-role exclusions`,
+    whyItMatters: why,
+    remediation,
+    raw: {
+      policies,
+      disabledCount,
+      reportOnlyCount,
+      enabledCount,
+      totalExclusions,
+      recentlyModified,
+      policiesExcludingGA,
+    },
   };
 }
 
@@ -1021,6 +1505,8 @@ export function buildSnapshot(
     "guest-invite-policy": { severity: "unknown", summary: "" },
     "default-user-permissions": { severity: "unknown", summary: "" },
     "domains-federation": { severity: "unknown", summary: "" },
+    "federation-backdoor-drift": { severity: "unknown", summary: "" },
+    "ca-policy-drift": { severity: "unknown", summary: "" },
     "onprem-sync": { severity: "unknown", summary: "" },
     "password-protection": { severity: "unknown", summary: "" },
   };
@@ -1071,6 +1557,18 @@ export function portalLinkForFinding(
         href: `https://entra.microsoft.com/${t}/#view/Microsoft_AAD_IAM/DomainsList.ReactView`,
         label: "Open Domains",
       };
+    case "federation-backdoor-drift":
+      // Same Domains blade — operator clicks through to the federated
+      // domain's "Federation" tab to inspect issuer + signing cert.
+      return {
+        href: `https://entra.microsoft.com/${t}/#view/Microsoft_AAD_IAM/DomainsList.ReactView`,
+        label: "Open Domains → click federated domain → Federation tab",
+      };
+    case "ca-policy-drift":
+      return {
+        href: `https://entra.microsoft.com/${t}/#view/Microsoft_AAD_ConditionalAccess/ConditionalAccessBlade/~/Policies`,
+        label: "Open Conditional Access → Policies",
+      };
     case "onprem-sync":
       return {
         href: `https://entra.microsoft.com/${t}/#view/Microsoft_AAD_IAM/EntraConnectMenuBlade/~/Overview`,
@@ -1100,4 +1598,122 @@ export function portalLinkForServicePrincipal(
     href: `https://entra.microsoft.com/${t}/#view/Microsoft_AAD_IAM/ManagedAppMenuBlade/~/Credentials/objectId//appId/${a}`,
     label: "Open in Entra portal (Enterprise applications)",
   };
+}
+
+// ---------------------------------------------------------------------------
+// Signal C — Sovereign cloud sentinel
+// ---------------------------------------------------------------------------
+
+/**
+ * The Microsoft cloud environment a token / endpoint belongs to.
+ *
+ * Detection inspired by:
+ *   New folder/_AZURE_BYPASS_PLAYBOOK.md Phase 4 ("Cross-cloud: probe
+ *     `login.microsoftonline.us` (Gov) and `login.partner.microsoftonline.cn`
+ *     (China) for the same identity").
+ *   New folder/_bypass_tenant_switch.md §8 "Sovereign / Cross-Cloud Pivots"
+ *     (endpoint catalog + §8.2 "Commercial → Gov pivot" — defenders rarely
+ *     correlate sign-in logs across clouds).
+ */
+export type AzureCloudEnvironment =
+  | "AzureCommercial"
+  | "AzureUSGovernment"
+  | "AzureChina"
+  | "AzureGermany"
+  | "Unknown";
+
+export interface CloudEnvironmentInfo {
+  environment: AzureCloudEnvironment;
+  /** Human-readable label for the banner. */
+  label: string;
+  /** Issuer URI from the token, when parseable. */
+  issuer: string | null;
+  /** Best-effort raw `aud` / `appid` if we want to surface them. */
+  audience: string | null;
+}
+
+/**
+ * Decode the JWT body (no signature verification — purely presentational)
+ * and infer which Microsoft cloud the token was issued in based on the
+ * `iss` claim. Returns `Unknown` if the token cannot be parsed.
+ *
+ * Mapping comes from `_bypass_tenant_switch.md` §8.1 endpoint catalog —
+ * the same hostnames Microsoft documents for cross-cloud routing.
+ */
+export function detectCloudEnvironmentFromToken(
+  token: string,
+): CloudEnvironmentInfo {
+  const fallback: CloudEnvironmentInfo = {
+    environment: "Unknown",
+    label: "Unknown cloud",
+    issuer: null,
+    audience: null,
+  };
+  const parts = token.split(".");
+  if (parts.length < 2) return fallback;
+  try {
+    const payload = parts[1]!.replace(/-/g, "+").replace(/_/g, "/");
+    const pad = payload.length % 4;
+    const padded = pad ? payload + "=".repeat(4 - pad) : payload;
+    const decoded =
+      typeof atob === "function"
+        ? atob(padded)
+        : Buffer.from(padded, "base64").toString("utf8");
+    const json = JSON.parse(decoded) as {
+      iss?: string;
+      aud?: string;
+    };
+    const iss = typeof json.iss === "string" ? json.iss : null;
+    const aud = typeof json.aud === "string" ? json.aud : null;
+    return {
+      ...classifyIssuer(iss),
+      issuer: iss,
+      audience: aud,
+    };
+  } catch {
+    return fallback;
+  }
+}
+
+/**
+ * Map an issuer URI / hostname to a Microsoft cloud environment.
+ *
+ * Exported so unit tests + the page banner can share the same mapping.
+ */
+export function classifyIssuer(
+  issuer: string | null | undefined,
+): { environment: AzureCloudEnvironment; label: string } {
+  if (!issuer) {
+    return { environment: "Unknown", label: "Unknown cloud" };
+  }
+  const lower = issuer.toLowerCase();
+  if (
+    lower.includes("login.microsoftonline.us") ||
+    lower.includes("sts.windows-ppe.us") ||
+    lower.includes("sts.windows.us")
+  ) {
+    return {
+      environment: "AzureUSGovernment",
+      label: "Azure US Government (sovereign)",
+    };
+  }
+  if (
+    lower.includes("login.partner.microsoftonline.cn") ||
+    lower.includes("login.chinacloudapi.cn")
+  ) {
+    return { environment: "AzureChina", label: "Azure China 21Vianet (sovereign)" };
+  }
+  if (
+    lower.includes("login.microsoftonline.de") ||
+    lower.includes("microsoftazure.de")
+  ) {
+    return { environment: "AzureGermany", label: "Azure Germany (legacy)" };
+  }
+  if (
+    lower.includes("login.microsoftonline.com") ||
+    lower.includes("sts.windows.net")
+  ) {
+    return { environment: "AzureCommercial", label: "Azure Commercial" };
+  }
+  return { environment: "Unknown", label: "Unknown cloud" };
 }

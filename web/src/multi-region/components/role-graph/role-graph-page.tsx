@@ -103,22 +103,34 @@ import { TokenExpiryBadge } from "../shared/token-expiry-badge";
 import type { PageKey } from "../shared/sidebar-nav";
 
 import {
+  ADMIN_TIER_GRAPH_APP_ROLES,
   applyFilters,
+  auditRoleAssignableGroups,
   classifyRoleTier,
   classifyScopeLevel,
+  computeDefenderSignalScore,
   computeStats,
   describeScope,
+  detectAppAdminEscalation,
+  detectCustomRoleWritePrivesc,
   groupByPrincipal,
   PRIVILEGE_TIER_META,
+  summarizeCredentialSurface,
+  type AppAdminEscalationFinding,
+  type CredentialSurfaceFinding,
+  type CustomRolePrivescFinding,
   type EscalationCategory,
   type EscalationFinding,
   type PrincipalAssignment,
   type PrincipalSummary,
   type PrivilegeTier,
   type ResolvedGroupMember,
+  type RoleAssignableGroupFinding,
   type RoleDefinitionForTier,
   type RoleGraphFilters,
+  type SpCredentialSummary,
 } from "./role-graph-helpers";
+import { DefenderSignalsPanel } from "./defender-signals-panel";
 
 const ARM_BASE = "https://management.azure.com";
 const GRAPH_BASE = "https://graph.microsoft.com/v1.0";
@@ -299,6 +311,470 @@ async function fetchGroupTransitiveMembers(
   return out;
 }
 
+// ---------------------------------------------------------------------------
+// Supplementary defender-signal Graph fetchers
+//
+// These power Signals B, C, D from the corpus (`_bypass_role_grant.md` §5,
+// §3.5, §4.x). They are LOAD-ON-DEMAND — the operator clicks the panel's
+// "Enumerate" button to trigger them, so a normal probe doesn't pay the
+// extra Graph cost when the user only wants role-graph results.
+//
+// COORDINATOR: these endpoints aren't in the existing graph-service helper
+// surface. Rather than expand the shared service in this scoped edit, we
+// inline the fetchers here. If a future change adds them to graph-service,
+// re-route these calls through the service.
+// ---------------------------------------------------------------------------
+
+/**
+ * Enumerate role-assignable groups + their owners (Signal B).
+ *
+ * Corpus: `_bypass_role_grant.md` §5.1 + §5.3 — these groups can hold Entra
+ * directory roles, and the OWNERS inherit the group's role with no
+ * role-grant audit event firing. The detector ranks severity based on
+ * whether the group holds a Tier-0 role AND has non-Tier-0 owners.
+ */
+async function fetchRoleAssignableGroupsWithOwners(
+  graphToken: string,
+  signal?: AbortSignal,
+): Promise<
+  Array<{
+    id: string;
+    displayName: string;
+    owners: Array<{
+      id: string;
+      displayName: string;
+      type: string;
+      signInName?: string;
+    }>;
+  }>
+> {
+  const initialUrl =
+    `${GRAPH_BASE}/groups` +
+    `?$filter=isAssignableToRole eq true` +
+    `&$select=id,displayName,isAssignableToRoleEnabled`;
+  const groups: Array<{ id: string; displayName: string }> = [];
+  let next: string | undefined = initialUrl;
+  // Step 1: enumerate role-assignable groups.
+  while (next) {
+    if (signal?.aborted) throw new Error("Aborted");
+    const resp: Response = await fetch(next, {
+      headers: {
+        Authorization: `Bearer ${graphToken}`,
+        Accept: "application/json",
+      },
+      ...(signal ? { signal } : {}),
+    });
+    if (!resp.ok) {
+      const errBody = (await resp.json().catch(() => ({}))) as {
+        error?: { message?: string };
+      };
+      throw new Error(
+        errBody?.error?.message ??
+          `Graph role-assignable groups failed: ${resp.status}`,
+      );
+    }
+    const body = (await resp.json()) as {
+      value?: Array<{ id?: string; displayName?: string }>;
+      ["@odata.nextLink"]?: string;
+    };
+    for (const g of body.value ?? []) {
+      if (!g.id) continue;
+      groups.push({ id: g.id, displayName: g.displayName ?? g.id });
+    }
+    next = body["@odata.nextLink"];
+  }
+  // Step 2: for each group, fetch owners. We cap concurrency by walking
+  // sequentially — group-counts are usually small (single digits) and we
+  // want predictable throttling behaviour.
+  const out: Array<{
+    id: string;
+    displayName: string;
+    owners: Array<{
+      id: string;
+      displayName: string;
+      type: string;
+      signInName?: string;
+    }>;
+  }> = [];
+  for (const g of groups) {
+    if (signal?.aborted) break;
+    const ownersUrl =
+      `${GRAPH_BASE}/groups/${encodeURIComponent(g.id)}/owners` +
+      `?$select=id,displayName,userPrincipalName,mail`;
+    const owners: Array<{
+      id: string;
+      displayName: string;
+      type: string;
+      signInName?: string;
+    }> = [];
+    try {
+      const resp = await fetch(ownersUrl, {
+        headers: {
+          Authorization: `Bearer ${graphToken}`,
+          Accept: "application/json",
+        },
+        ...(signal ? { signal } : {}),
+      });
+      if (resp.ok) {
+        const body = (await resp.json()) as {
+          value?: Array<Record<string, unknown>>;
+        };
+        for (const o of body.value ?? []) {
+          const id = String(o.id ?? "");
+          if (!id) continue;
+          const odata = String(o["@odata.type"] ?? "").toLowerCase();
+          const type = odata.includes("user")
+            ? "User"
+            : odata.includes("serviceprincipal")
+              ? "ServicePrincipal"
+              : odata.includes("group")
+                ? "Group"
+                : "Unknown";
+          owners.push({
+            id,
+            displayName:
+              (o.displayName as string | undefined) ??
+              (o.userPrincipalName as string | undefined) ??
+              id,
+            type,
+            signInName:
+              (o.userPrincipalName as string | undefined) ??
+              (o.mail as string | undefined),
+          });
+        }
+      }
+      // Soft-fail on per-group permission errors so the panel still
+      // renders for the groups we CAN see.
+    } catch {
+      /* soft-fail per group */
+    }
+    out.push({ id: g.id, displayName: g.displayName, owners });
+  }
+  return out;
+}
+
+/**
+ * Enumerate Application Administrator + Cloud Application Administrator
+ * holders AND service principals that hold admin-tier Graph permissions
+ * (Signal C).
+ *
+ * Corpus: `_bypass_role_grant.md` §3.5 — App Admin can `addKey` to ANY app
+ * including apps already granted high-tier Graph scopes
+ * (`RoleManagement.ReadWrite.Directory` et al). Detecting this combo is
+ * the canonical stealth-GA chain detection.
+ *
+ * Endpoints used (read-only):
+ *   GET /v1.0/directoryRoles
+ *   GET /v1.0/directoryRoles/{id}/members
+ *   GET /v1.0/servicePrincipals?$filter=appId eq '00000003-0000-0000-c000-000000000046'
+ *     (the Microsoft Graph SP — whose appRoles[] is the canonical scope list)
+ *   GET /v1.0/servicePrincipals/{ms-graph-id}/appRoleAssignedTo
+ */
+async function fetchAppAdminEscalationData(
+  graphToken: string,
+  signal?: AbortSignal,
+): Promise<{
+  appAdminPrincipals: Array<{
+    id: string;
+    displayName: string;
+    type: string;
+    signInName?: string;
+    roleName: string;
+  }>;
+  highPrivSps: Array<{
+    id: string;
+    displayName: string;
+    appRoles: string[];
+  }>;
+}> {
+  // The two directoryRole ids we care about. These are well-known and
+  // STABLE across all Entra tenants (commercial + sovereign).
+  const APP_ADMIN_TEMPLATE = "9b895d92-2cd3-44c7-9d02-a6ac2d5ea5c3";
+  const CLOUD_APP_ADMIN_TEMPLATE = "158c047a-c907-4556-b7ef-446551a6b5f7";
+
+  // 1) GET /directoryRoles — filter client-side to App-Admin variants.
+  const rolesResp = await fetch(
+    `${GRAPH_BASE}/directoryRoles` +
+      `?$select=id,displayName,roleTemplateId`,
+    {
+      headers: {
+        Authorization: `Bearer ${graphToken}`,
+        Accept: "application/json",
+      },
+      ...(signal ? { signal } : {}),
+    },
+  );
+  if (!rolesResp.ok) {
+    throw new Error(`Graph directoryRoles failed: ${rolesResp.status}`);
+  }
+  const rolesBody = (await rolesResp.json()) as {
+    value?: Array<{
+      id?: string;
+      displayName?: string;
+      roleTemplateId?: string;
+    }>;
+  };
+  const targetRoles = (rolesBody.value ?? []).filter(
+    (r) =>
+      (r.roleTemplateId ?? "").toLowerCase() ===
+        APP_ADMIN_TEMPLATE.toLowerCase() ||
+      (r.roleTemplateId ?? "").toLowerCase() ===
+        CLOUD_APP_ADMIN_TEMPLATE.toLowerCase(),
+  );
+
+  const appAdminPrincipals: Array<{
+    id: string;
+    displayName: string;
+    type: string;
+    signInName?: string;
+    roleName: string;
+  }> = [];
+
+  // 2) For each target role, enumerate members.
+  for (const role of targetRoles) {
+    if (signal?.aborted) break;
+    if (!role.id) continue;
+    try {
+      const membersResp = await fetch(
+        `${GRAPH_BASE}/directoryRoles/${encodeURIComponent(role.id)}/members` +
+          `?$select=id,displayName,userPrincipalName,mail`,
+        {
+          headers: {
+            Authorization: `Bearer ${graphToken}`,
+            Accept: "application/json",
+          },
+          ...(signal ? { signal } : {}),
+        },
+      );
+      if (!membersResp.ok) continue;
+      const membersBody = (await membersResp.json()) as {
+        value?: Array<Record<string, unknown>>;
+      };
+      for (const m of membersBody.value ?? []) {
+        const id = String(m.id ?? "");
+        if (!id) continue;
+        const odata = String(m["@odata.type"] ?? "").toLowerCase();
+        const type = odata.includes("user")
+          ? "User"
+          : odata.includes("serviceprincipal")
+            ? "ServicePrincipal"
+            : odata.includes("group")
+              ? "Group"
+              : "Unknown";
+        appAdminPrincipals.push({
+          id,
+          displayName:
+            (m.displayName as string | undefined) ??
+            (m.userPrincipalName as string | undefined) ??
+            id,
+          type,
+          signInName:
+            (m.userPrincipalName as string | undefined) ??
+            (m.mail as string | undefined),
+          roleName: role.displayName ?? "Application Administrator",
+        });
+      }
+    } catch {
+      /* soft-fail per role */
+    }
+  }
+
+  // 3) Enumerate high-priv SPs via Microsoft Graph SP's `appRoleAssignedTo`.
+  const highPrivSps: Array<{
+    id: string;
+    displayName: string;
+    appRoles: string[];
+  }> = [];
+  try {
+    const msGraphAppId = "00000003-0000-0000-c000-000000000046";
+    const spResp = await fetch(
+      `${GRAPH_BASE}/servicePrincipals` +
+        `?$filter=appId eq '${msGraphAppId}'` +
+        `&$select=id,appRoles`,
+      {
+        headers: {
+          Authorization: `Bearer ${graphToken}`,
+          Accept: "application/json",
+        },
+        ...(signal ? { signal } : {}),
+      },
+    );
+    if (spResp.ok) {
+      const spBody = (await spResp.json()) as {
+        value?: Array<{
+          id?: string;
+          appRoles?: Array<{ id?: string; value?: string }>;
+        }>;
+      };
+      const msGraphSp = spBody.value?.[0];
+      if (msGraphSp?.id) {
+        // Build appRoleId -> scope-value map (the actual permission string).
+        const roleValueById = new Map<string, string>();
+        for (const r of msGraphSp.appRoles ?? []) {
+          if (r.id && r.value) roleValueById.set(r.id, r.value);
+        }
+        // Enumerate every SP that has been granted one of these appRoles.
+        let next: string | undefined =
+          `${GRAPH_BASE}/servicePrincipals/${encodeURIComponent(msGraphSp.id)}` +
+          `/appRoleAssignedTo` +
+          `?$select=id,appRoleId,principalId,principalDisplayName,principalType`;
+        // We aggregate roles per principal.
+        const byPrincipal = new Map<
+          string,
+          { displayName: string; appRoles: Set<string> }
+        >();
+        while (next) {
+          if (signal?.aborted) break;
+          const r: Response = await fetch(next, {
+            headers: {
+              Authorization: `Bearer ${graphToken}`,
+              Accept: "application/json",
+            },
+            ...(signal ? { signal } : {}),
+          });
+          if (!r.ok) break;
+          const body = (await r.json()) as {
+            value?: Array<{
+              appRoleId?: string;
+              principalId?: string;
+              principalDisplayName?: string;
+              principalType?: string;
+            }>;
+            ["@odata.nextLink"]?: string;
+          };
+          for (const ar of body.value ?? []) {
+            const scope = ar.appRoleId
+              ? roleValueById.get(ar.appRoleId)
+              : undefined;
+            if (!scope || !ADMIN_TIER_GRAPH_APP_ROLES.has(scope)) continue;
+            const pid = ar.principalId;
+            if (!pid) continue;
+            const entry = byPrincipal.get(pid) ?? {
+              displayName: ar.principalDisplayName ?? pid,
+              appRoles: new Set<string>(),
+            };
+            entry.appRoles.add(scope);
+            byPrincipal.set(pid, entry);
+          }
+          next = body["@odata.nextLink"];
+        }
+        for (const [pid, v] of byPrincipal.entries()) {
+          highPrivSps.push({
+            id: pid,
+            displayName: v.displayName,
+            appRoles: Array.from(v.appRoles),
+          });
+        }
+      }
+    }
+  } catch {
+    /* soft-fail */
+  }
+
+  return { appAdminPrincipals, highPrivSps };
+}
+
+/**
+ * Enumerate credential metadata for the union of:
+ *   - SPs we already discovered as role-assignment principals.
+ *   - SPs known to be high-priv (Signal C result, if available).
+ *
+ * Corpus: `_bypass_role_grant.md` §4.1, §4.2 (the addPassword / addKey
+ * persistence primitives). We surface `passwordCredentials.length`,
+ * `keyCredentials.length`, and the newest `startDateTime` so the page
+ * can flag credentials minted inside the recency window.
+ *
+ * COORDINATOR: needs baseline snapshot to diff — without one, the page can
+ * only show within-window recency. A future baseline service would
+ * unlock proper CHANGE detection matching corpus item 5 more closely.
+ */
+async function fetchSpCredentialSurface(
+  graphToken: string,
+  spIds: ReadonlyArray<string>,
+  highPrivSpIds: ReadonlySet<string>,
+  signal?: AbortSignal,
+): Promise<SpCredentialSummary[]> {
+  // De-dupe + cap to keep the page responsive — defensive surface, not
+  // exhaustive inventory.
+  const unique = Array.from(new Set(spIds.filter(Boolean))).slice(0, 200);
+  const out: SpCredentialSummary[] = [];
+  for (const id of unique) {
+    if (signal?.aborted) break;
+    try {
+      // Try servicePrincipals first (the most common case for our probe
+      // input — RBAC assignments name servicePrincipal object ids, not app
+      // ids). Fall back to applications if it 404s.
+      let resp = await fetch(
+        `${GRAPH_BASE}/servicePrincipals/${encodeURIComponent(id)}` +
+          `?$select=id,displayName,passwordCredentials,keyCredentials`,
+        {
+          headers: {
+            Authorization: `Bearer ${graphToken}`,
+            Accept: "application/json",
+          },
+          ...(signal ? { signal } : {}),
+        },
+      );
+      if (resp.status === 404) {
+        resp = await fetch(
+          `${GRAPH_BASE}/applications/${encodeURIComponent(id)}` +
+            `?$select=id,displayName,passwordCredentials,keyCredentials`,
+          {
+            headers: {
+              Authorization: `Bearer ${graphToken}`,
+              Accept: "application/json",
+            },
+            ...(signal ? { signal } : {}),
+          },
+        );
+      }
+      if (!resp.ok) continue;
+      const body = (await resp.json()) as {
+        id?: string;
+        displayName?: string;
+        passwordCredentials?: Array<{
+          startDateTime?: string;
+          endDateTime?: string;
+        }>;
+        keyCredentials?: Array<{
+          startDateTime?: string;
+          endDateTime?: string;
+        }>;
+      };
+      const pwd = body.passwordCredentials ?? [];
+      const keys = body.keyCredentials ?? [];
+      const newestPwdEnd = pwd
+        .map((c) => c.endDateTime)
+        .filter((x): x is string => !!x)
+        .sort()
+        .pop();
+      const newestKeyEnd = keys
+        .map((c) => c.endDateTime)
+        .filter((x): x is string => !!x)
+        .sort()
+        .pop();
+      const newestStart = [...pwd, ...keys]
+        .map((c) => c.startDateTime)
+        .filter((x): x is string => !!x)
+        .sort()
+        .pop();
+      out.push({
+        spId: id,
+        displayName: body.displayName ?? id,
+        passwordCredentialCount: pwd.length,
+        keyCredentialCount: keys.length,
+        newestPasswordEnd: newestPwdEnd,
+        newestKeyEnd: newestKeyEnd,
+        newestCredentialStart: newestStart,
+        isHighPriv: highPrivSpIds.has(id),
+      });
+    } catch {
+      /* soft-fail per SP */
+    }
+  }
+  return out;
+}
+
 /**
  * One probe target. We loop over these so the operator can audit
  * multiple subs in a single click.
@@ -392,7 +868,11 @@ const PrincipalNode: React.FC<{
   onToggle: () => void;
   /** True when this principal matches the path-finder focus (hide-other when filter active). */
   isPathHighlight?: boolean;
-}> = ({ summary, expanded, onToggle, isPathHighlight }) => {
+  /** Optional credential-surface finding for this principal (Signal D).
+   *  Renders an inline credential-recency badge when present.
+   *  Citation: _bypass_role_grant.md §4.1, §4.2. */
+  credentialFinding?: CredentialSurfaceFinding;
+}> = ({ summary, expanded, onToggle, isPathHighlight, credentialFinding }) => {
   const Icon = principalIcon(summary.principalType);
   const meta = PRIVILEGE_TIER_META[summary.highestTier];
   const accentTint = isPathHighlight
@@ -462,6 +942,33 @@ const PrincipalNode: React.FC<{
             {summary.assignmentCount}{" "}
             {summary.assignmentCount === 1 ? "role" : "roles"}
           </Badge>
+          {/* Signal D inline: addPassword/addKey credential surface badge.
+              Citation: _bypass_role_grant.md §4.1, §4.2 (the canonical
+              SP-persistence APIs). Recent-credential badge fires when newest
+              credential is within the recency window. */}
+          {credentialFinding && (
+            <Badge
+              variant={
+                credentialFinding.isRecent && credentialFinding.isHighPriv
+                  ? "destructive"
+                  : credentialFinding.isRecent
+                    ? "warning"
+                    : "outline"
+              }
+              className="text-2xs"
+              title={
+                credentialFinding.isRecent
+                  ? `Newest credential minted ${credentialFinding.daysSinceNewestCredential ?? "?"} day(s) ago — within recency window.`
+                  : `${credentialFinding.passwordCredentialCount} pwd / ${credentialFinding.keyCredentialCount} key credentials.`
+              }
+            >
+              <Key className="mr-1 h-3 w-3" aria-hidden />
+              {credentialFinding.passwordCredentialCount +
+                credentialFinding.keyCredentialCount}{" "}
+              cred
+              {credentialFinding.isRecent && " · recent"}
+            </Badge>
+          )}
           <TierBadge tier={summary.highestTier} />
           <span className="sr-only">
             highest tier: {meta.label} ({meta.description})
@@ -1294,6 +1801,267 @@ export const RoleGraphPage: React.FC<RoleGraphPageProps> = ({ onNavigate }) => {
     [filteredSummaries],
   );
 
+  // -------- Defender-signal data sources (Signals A/B/C/D) --------
+  //
+  // Signal A (custom-role privesc) is purely derived from existing probe data
+  // and re-computes on every change. Signals B/C/D require supplementary
+  // Graph reads — load-on-demand to avoid paying that cost on every probe.
+  //
+  // Citations:
+  //   _bypass_role_grant.md §8.1 (A), §5.1/§5.3 (B), §3.5 (C), §4.1/§4.2 (D)
+  //   _AZURE_BYPASS_PLAYBOOK.md Top-30 items 23-26 + Defender Audit 4-5
+  const principalLookup = React.useMemo(() => {
+    const m = new Map<
+      string,
+      { displayName: string; type: string; signInName?: string }
+    >();
+    for (const r of subResults) {
+      for (const p of r.principals) {
+        if (!m.has(p.id)) {
+          m.set(p.id, {
+            displayName: p.displayName,
+            type: p.type,
+            signInName: p.signInName,
+          });
+        }
+      }
+    }
+    return m;
+  }, [subResults]);
+
+  // ----- Signal A: derived synchronously from probe data -----
+  const customRoleFindings: CustomRolePrivescFinding[] = React.useMemo(() => {
+    if (subResults.length === 0) return [];
+    return detectCustomRoleWritePrivesc({
+      subResults: subResults.map((r) => ({
+        subscriptionId: r.subscriptionId,
+        displayName: r.displayName,
+        roleDefs: r.roleDefs,
+        assignments: r.assignments.map((a) => ({
+          id: a.id,
+          principalId: a.principalId,
+          principalType: a.principalType,
+          roleDefinitionId: a.roleDefinitionId,
+          scope: a.scope,
+        })),
+      })),
+      principalLookup,
+    });
+  }, [subResults, principalLookup]);
+
+  // ----- Signal B: role-assignable groups + owners (load-on-demand) -----
+  const [roleAssignableGroupFindings, setRoleAssignableGroupFindings] =
+    React.useState<RoleAssignableGroupFinding[] | null>(null);
+  const [roleAssignableGroupsLoading, setRoleAssignableGroupsLoading] =
+    React.useState(false);
+  const [roleAssignableGroupsWarning, setRoleAssignableGroupsWarning] =
+    React.useState<string | null>(null);
+  const signalsAbortRef = React.useRef<AbortController | null>(null);
+
+  const loadRoleAssignableGroups = React.useCallback(async () => {
+    if (!account || subResults.length === 0) return;
+    const firstTenant = subResults[0]?.tenantId;
+    if (!firstTenant) return;
+    signalsAbortRef.current?.abort();
+    const ctrl = new AbortController();
+    signalsAbortRef.current = ctrl;
+    setRoleAssignableGroupsLoading(true);
+    setRoleAssignableGroupsWarning(null);
+    try {
+      const graphToken = await getGraphTokenForAccount(
+        account.homeAccountId,
+        firstTenant,
+      );
+      const groups = await fetchRoleAssignableGroupsWithOwners(
+        graphToken,
+        ctrl.signal,
+      );
+      if (ctrl.signal.aborted) return;
+      const findings = auditRoleAssignableGroups({ groups, summaries });
+      setRoleAssignableGroupFindings(findings);
+    } catch (err) {
+      if (ctrl.signal.aborted) return;
+      setRoleAssignableGroupFindings([]);
+      setRoleAssignableGroupsWarning(
+        err instanceof Error ? err.message : String(err),
+      );
+    } finally {
+      if (!ctrl.signal.aborted) setRoleAssignableGroupsLoading(false);
+    }
+  }, [account, subResults, summaries]);
+
+  // ----- Signal C: App Admin escalation paths (load-on-demand) -----
+  const [appAdminFindings, setAppAdminFindings] = React.useState<
+    AppAdminEscalationFinding[] | null
+  >(null);
+  const [appAdminLoading, setAppAdminLoading] = React.useState(false);
+  const [appAdminWarning, setAppAdminWarning] = React.useState<string | null>(
+    null,
+  );
+  // Cache high-priv SP id set so Signal D can re-use it without refetching.
+  const [highPrivSpIds, setHighPrivSpIds] = React.useState<Set<string>>(
+    () => new Set(),
+  );
+
+  const loadAppAdmin = React.useCallback(async () => {
+    if (!account || subResults.length === 0) return;
+    const firstTenant = subResults[0]?.tenantId;
+    if (!firstTenant) return;
+    signalsAbortRef.current?.abort();
+    const ctrl = new AbortController();
+    signalsAbortRef.current = ctrl;
+    setAppAdminLoading(true);
+    setAppAdminWarning(null);
+    try {
+      const graphToken = await getGraphTokenForAccount(
+        account.homeAccountId,
+        firstTenant,
+      );
+      const data = await fetchAppAdminEscalationData(graphToken, ctrl.signal);
+      if (ctrl.signal.aborted) return;
+      setHighPrivSpIds(new Set(data.highPrivSps.map((s) => s.id)));
+      const findings = detectAppAdminEscalation({
+        appAdminPrincipals: data.appAdminPrincipals,
+        highPrivSps: data.highPrivSps,
+      });
+      setAppAdminFindings(findings);
+    } catch (err) {
+      if (ctrl.signal.aborted) return;
+      setAppAdminFindings([]);
+      setAppAdminWarning(err instanceof Error ? err.message : String(err));
+    } finally {
+      if (!ctrl.signal.aborted) setAppAdminLoading(false);
+    }
+  }, [account, subResults]);
+
+  // ----- Signal D: SP credential surface (load-on-demand) -----
+  const [credentialSurfaceFindings, setCredentialSurfaceFindings] =
+    React.useState<CredentialSurfaceFinding[] | null>(null);
+  const [credentialSurfaceLoading, setCredentialSurfaceLoading] =
+    React.useState(false);
+  const [credentialSurfaceWarning, setCredentialSurfaceWarning] = React.useState<
+    string | null
+  >(null);
+
+  const loadCredentialSurface = React.useCallback(async () => {
+    if (!account || subResults.length === 0) return;
+    const firstTenant = subResults[0]?.tenantId;
+    if (!firstTenant) return;
+    signalsAbortRef.current?.abort();
+    const ctrl = new AbortController();
+    signalsAbortRef.current = ctrl;
+    setCredentialSurfaceLoading(true);
+    setCredentialSurfaceWarning(null);
+    try {
+      const graphToken = await getGraphTokenForAccount(
+        account.homeAccountId,
+        firstTenant,
+      );
+      // Collect SP-typed principals from the existing probe (RBAC role
+      // holders) AND any high-priv SP ids we already cached from Signal C.
+      const spIds = new Set<string>();
+      for (const r of subResults) {
+        for (const p of r.principals) {
+          if (
+            p.type === "ServicePrincipal" ||
+            p.type === "Application"
+          ) {
+            spIds.add(p.id);
+          }
+        }
+      }
+      for (const id of highPrivSpIds) spIds.add(id);
+      const summary = await fetchSpCredentialSurface(
+        graphToken,
+        Array.from(spIds),
+        highPrivSpIds,
+        ctrl.signal,
+      );
+      if (ctrl.signal.aborted) return;
+      const findings = summarizeCredentialSurface(summary);
+      setCredentialSurfaceFindings(findings);
+    } catch (err) {
+      if (ctrl.signal.aborted) return;
+      setCredentialSurfaceFindings([]);
+      setCredentialSurfaceWarning(
+        err instanceof Error ? err.message : String(err),
+      );
+    } finally {
+      if (!ctrl.signal.aborted) setCredentialSurfaceLoading(false);
+    }
+  }, [account, subResults, highPrivSpIds]);
+
+  // Cancel in-flight signal fetches when the page unmounts or the probe
+  // restarts (we explicitly clear stale findings on a fresh probe).
+  React.useEffect(() => {
+    return () => {
+      signalsAbortRef.current?.abort();
+    };
+  }, []);
+
+  // Reset signal findings whenever the probe restarts — stale rows from
+  // the previous probe would confuse the operator.
+  React.useEffect(() => {
+    setRoleAssignableGroupFindings(null);
+    setRoleAssignableGroupsWarning(null);
+    setAppAdminFindings(null);
+    setAppAdminWarning(null);
+    setHighPrivSpIds(new Set());
+    setCredentialSurfaceFindings(null);
+    setCredentialSurfaceWarning(null);
+  }, [subResults]);
+
+  // ----- Aggregate defender-signal counts + risk score -----
+  const defenderCounts = React.useMemo(() => {
+    const countBy = (
+      arr: ReadonlyArray<{ severity: string }> | null,
+      sev: string,
+    ): number => (arr ? arr.filter((f) => f.severity === sev).length : 0);
+    return {
+      customRolePrivescCritical: countBy(customRoleFindings, "critical"),
+      customRolePrivescHigh: countBy(customRoleFindings, "high"),
+      roleAssignableGroupCritical: countBy(
+        roleAssignableGroupFindings,
+        "critical",
+      ),
+      roleAssignableGroupHigh: countBy(roleAssignableGroupFindings, "high"),
+      appAdminEscalationCritical: countBy(appAdminFindings, "critical"),
+      appAdminEscalationHigh: countBy(appAdminFindings, "high"),
+      credentialSurfaceCritical: countBy(
+        credentialSurfaceFindings,
+        "critical",
+      ),
+      credentialSurfaceHigh: countBy(credentialSurfaceFindings, "high"),
+    };
+  }, [
+    customRoleFindings,
+    roleAssignableGroupFindings,
+    appAdminFindings,
+    credentialSurfaceFindings,
+  ]);
+  const defenderScore = React.useMemo(
+    () => computeDefenderSignalScore(defenderCounts),
+    [defenderCounts],
+  );
+
+  // Per-principal credential lookup powers the inline "cred / recent" badge
+  // on each PrincipalNode header. Keyed by lowercased principal id to be
+  // robust against ARM/Graph's mixed-case GUID return values.
+  // Citation: _bypass_role_grant.md §4.1, §4.2.
+  const credentialFindingsByPrincipalId = React.useMemo(() => {
+    const m = new Map<string, CredentialSurfaceFinding>();
+    for (const f of credentialSurfaceFindings ?? []) {
+      m.set(f.spId.toLowerCase(), f);
+    }
+    // Return a wrapper that also looks up by un-lowered id for callers that
+    // pass the principal id verbatim (PrincipalNode does).
+    return {
+      get(id: string): CredentialSurfaceFinding | undefined {
+        return m.get(id.toLowerCase());
+      },
+    };
+  }, [credentialSurfaceFindings]);
+
   // -------- Export columns --------
   const exportRows = React.useMemo(() => {
     type Row = {
@@ -1965,6 +2733,28 @@ export const RoleGraphPage: React.FC<RoleGraphPageProps> = ({ onNavigate }) => {
         />
       )}
 
+      {/* Defender signals (corpus-wired) — visible whenever the probe ran. */}
+      {probedAt && summaries.length > 0 && (
+        <DefenderSignalsPanel
+          customRoleFindings={customRoleFindings}
+          roleAssignableGroupFindings={roleAssignableGroupFindings}
+          roleAssignableGroupsLoading={roleAssignableGroupsLoading}
+          onLoadRoleAssignableGroups={() => void loadRoleAssignableGroups()}
+          roleAssignableGroupsWarning={roleAssignableGroupsWarning}
+          appAdminFindings={appAdminFindings}
+          appAdminLoading={appAdminLoading}
+          onLoadAppAdmin={() => void loadAppAdmin()}
+          appAdminWarning={appAdminWarning}
+          credentialSurfaceFindings={credentialSurfaceFindings}
+          credentialSurfaceLoading={credentialSurfaceLoading}
+          onLoadCredentialSurface={() => void loadCredentialSurface()}
+          credentialSurfaceWarning={credentialSurfaceWarning}
+          counts={defenderCounts}
+          score={defenderScore.score}
+          scoreLabel={defenderScore.label}
+        />
+      )}
+
       {/* Tree of principals */}
       {filteredSummaries.length > 0 && (
         <div className="flex flex-col gap-2">
@@ -2005,6 +2795,9 @@ export const RoleGraphPage: React.FC<RoleGraphPageProps> = ({ onNavigate }) => {
                 expanded={expanded.has(s.principalId)}
                 onToggle={() => toggleExpanded(s.principalId)}
                 isPathHighlight={pathHighlightIds.has(s.principalId)}
+                credentialFinding={credentialFindingsByPrincipalId.get(
+                  s.principalId,
+                )}
               />
             ))}
           </div>

@@ -75,6 +75,7 @@ import {
   CheckCircle2,
   ChevronDown,
   ChevronRight,
+  Cloud,
   ExternalLink,
   GitCompare,
   Globe,
@@ -136,7 +137,11 @@ import {
   type BaselineFinding,
   type BaselineSeverity,
   type BaselineSnapshot,
+  type CloudEnvironmentInfo,
+  type ConditionalAccessPolicyRaw,
   type DomainRaw,
+  type FederatedDomainEntry,
+  type FederationConfigRaw,
   type FindingDrift,
   type GraphServicePrincipalRaw,
   type OrganizationRaw,
@@ -148,11 +153,14 @@ import {
   buildSnapshot,
   compareIsoDates,
   compareSeverityDesc,
+  detectCloudEnvironmentFromToken,
   diffAgainstSnapshot,
   portalLinkForFinding,
   portalLinkForServicePrincipal,
+  scoreCaPolicyDrift,
   scoreDefaultUserPermissions,
   scoreDomainsFederation,
+  scoreFederationBackdoorDrift,
   scoreGuestInvitePolicy,
   scoreOnPremSync,
   scorePasswordProtection,
@@ -359,6 +367,60 @@ const DriftPill: React.FC<{ drift: FindingDrift }> = ({ drift }) => {
         </TooltipContent>
       </Tooltip>
     </TooltipProvider>
+  );
+};
+
+/**
+ * Sovereign-cloud sentinel banner (Signal C).
+ *
+ * Pure presentational. Reads the cloud env we already inferred from the
+ * Graph token's `iss` claim and renders a one-line read-only banner. We
+ * never probe other clouds.
+ *
+ * Detection inspired by:
+ *   New folder/_AZURE_BYPASS_PLAYBOOK.md Phase 4 ("Cross-cloud: probe
+ *     login.microsoftonline.us and login.partner.microsoftonline.cn").
+ *   New folder/_bypass_tenant_switch.md §8.2 — defenders rarely correlate
+ *     sign-in logs across clouds; cross-cloud guests are a documented
+ *     pivot path.
+ */
+const SovereignCloudBanner: React.FC<{ cloudInfo: CloudEnvironmentInfo }> = ({
+  cloudInfo,
+}) => {
+  // Sovereign clouds use a warning-tinted banner; commercial uses a
+  // neutral / muted shade. Unknown also gets the warning shade because
+  // an unidentifiable issuer is itself a signal.
+  const isSovereign: boolean =
+    cloudInfo.environment === "AzureUSGovernment" ||
+    cloudInfo.environment === "AzureChina" ||
+    cloudInfo.environment === "AzureGermany";
+  const isUnknown: boolean = cloudInfo.environment === "Unknown";
+  return (
+    <div
+      role="status"
+      aria-label={`Active Microsoft cloud environment: ${cloudInfo.label}`}
+      className={cn(
+        "flex flex-wrap items-center gap-2 rounded-md border px-2.5 py-1.5 text-xs",
+        isSovereign
+          ? "border-warning/50 bg-warning/10 text-foreground"
+          : isUnknown
+            ? "border-warning/40 bg-muted/40 text-foreground"
+            : "border-border bg-muted/30 text-muted-foreground",
+      )}
+    >
+      <Cloud className="h-3.5 w-3.5" aria-hidden />
+      <span className="font-semibold">{cloudInfo.label}</span>
+      <span className="text-2xs text-muted-foreground">
+        — posture in this view reflects ONLY this cloud. Identities also
+        present in other Microsoft clouds (Commercial / US Gov / China)
+        must be audited separately.
+      </span>
+      {cloudInfo.issuer && (
+        <span className="ml-auto font-mono text-3xs text-muted-foreground">
+          iss: {cloudInfo.issuer}
+        </span>
+      )}
+    </div>
   );
 };
 
@@ -609,6 +671,16 @@ const BaselineTab: React.FC<BaselineTabProps> = ({
         tenantId,
       ),
       "domains-federation": portalLinkForFinding("domains-federation", tenantId),
+      // Detection inspired by: New folder/_AZURE_BYPASS_PLAYBOOK.md
+      // "Critical Defender Audit Surface" item 1; corresponds to the
+      // federation-backdoor-drift baseline finding.
+      "federation-backdoor-drift": portalLinkForFinding(
+        "federation-backdoor-drift",
+        tenantId,
+      ),
+      // Detection inspired by: New folder/_AZURE_BYPASS_PLAYBOOK.md
+      // "Critical Defender Audit Surface" item 2.
+      "ca-policy-drift": portalLinkForFinding("ca-policy-drift", tenantId),
       "onprem-sync": portalLinkForFinding("onprem-sync", tenantId),
       "password-protection": portalLinkForFinding("password-protection", tenantId),
     };
@@ -1464,9 +1536,18 @@ async function probeBaseline(
   const permissionWarnings: string[] = [];
 
   // Run six probes in parallel; each captures its own failure.
+  //
+  // The CA probe is the per-policy "drift" enumeration used by Signal B
+  // (`scoreCaPolicyDrift`). We request the fields the scorer cares about
+  // up front so the snapshot envelope stays small.
+  // Detection inspired by: New folder/_AZURE_BYPASS_PLAYBOOK.md
+  // "Critical Defender Audit Surface" item 2 (`Update conditional access
+  // policy` audit event).
+  const CA_POLICY_SELECT =
+    "id,displayName,state,createdDateTime,modifiedDateTime,conditions";
   const [
     secDefaultsRes,
-    caCountRes,
+    caPoliciesRes,
     authPolicyRes,
     orgRes,
     domainsRes,
@@ -1477,12 +1558,10 @@ async function probeBaseline(
       token,
       { signal },
     ),
-    // CA policies: `/identity/conditionalAccess/policies?$top=1` — we only
-    // need to know whether there's at least one. If this 403s, leave the
-    // count as "null" so the security-defaults scorer treats it as
-    // "unknown" rather than "definitely none".
-    graphList<{ id?: string }>(
-      "/identity/conditionalAccess/policies?$select=id&$top=10",
+    // Full CA enumeration — both for the "any CA exists?" boolean the
+    // security-defaults scorer needs AND for the per-policy drift scorer.
+    graphList<ConditionalAccessPolicyRaw>(
+      `/identity/conditionalAccess/policies?$select=${CA_POLICY_SELECT}&$top=100`,
       token,
       { signal },
     ),
@@ -1518,15 +1597,19 @@ async function probeBaseline(
   // --- Security defaults -------------------------------------------------
   let secDefaultsFinding: BaselineFinding;
   let hasAnyCA: boolean | null;
-  if (caCountRes.status === "fulfilled") {
-    hasAnyCA = caCountRes.value.length > 0;
+  let caPolicies: ConditionalAccessPolicyRaw[] | null = null;
+  let caPoliciesError: string | null = null;
+  if (caPoliciesRes.status === "fulfilled") {
+    caPolicies = caPoliciesRes.value;
+    hasAnyCA = caPolicies.length > 0;
   } else {
     hasAnyCA = null;
     const msg = String(
-      caCountRes.reason instanceof Error
-        ? caCountRes.reason.message
-        : caCountRes.reason,
+      caPoliciesRes.reason instanceof Error
+        ? caPoliciesRes.reason.message
+        : caPoliciesRes.reason,
     );
+    caPoliciesError = msg;
     if (msg.includes("403")) {
       permissionWarnings.push(
         "Could not enumerate Conditional Access policies — needs Policy.Read.All",
@@ -1598,8 +1681,55 @@ async function probeBaseline(
 
   // --- Domains -----------------------------------------------------------
   let domainsFinding: BaselineFinding;
+  let federatedEntries: FederatedDomainEntry[] = [];
   if (domainsRes.status === "fulfilled") {
     domainsFinding = scoreDomainsFederation(domainsRes.value);
+    // Per-domain federation enrichment for Signal A (federation-backdoor).
+    // Detection inspired by: New folder/_analysis_aadinternals.md §2.4
+    // "The Federation Backdoor (`ConvertTo-Backdoor`)" — every federated
+    // domain has a corresponding `internalDomainFederation` config object
+    // that records `issuerUri`, `signingCertificate`, and modification
+    // metadata. A *fresh* config on a *new* domain is the textbook signal.
+    const fedDomains = domainsRes.value.filter(
+      (d) => (d.authenticationType ?? "").toLowerCase() === "federated",
+    );
+    federatedEntries = await Promise.all(
+      fedDomains.map(async (d): Promise<FederatedDomainEntry> => {
+        const domain = (d.id ?? "") as string;
+        try {
+          const cfg = await graphGet<{
+            value?: FederationConfigRaw[];
+          }>(
+            `/domains/${encodeURIComponent(domain)}/federationConfiguration`,
+            token,
+            { signal },
+          );
+          // The endpoint returns a collection; defenders typically have a
+          // single primary config per domain. Surface the first record but
+          // keep the rest in raw if anyone needs them.
+          const primary = cfg.value?.[0] ?? null;
+          return {
+            domain,
+            isDefault: d.isDefault === true,
+            config: primary,
+            configError: null,
+          };
+        } catch (err) {
+          const m = err instanceof Error ? err.message : String(err);
+          if (m.includes("403")) {
+            permissionWarnings.push(
+              "Could not read /domains/{id}/federationConfiguration — needs Domain.Read.All",
+            );
+          }
+          return {
+            domain,
+            isDefault: d.isDefault === true,
+            config: null,
+            configError: m,
+          };
+        }
+      }),
+    );
   } else {
     const errMsg = String(
       domainsRes.reason instanceof Error
@@ -1615,7 +1745,30 @@ async function probeBaseline(
       ...scoreDomainsFederation(null),
       error: errMsg,
     };
+    federatedEntries = [];
   }
+
+  // --- Signal A — Federation backdoor drift ------------------------------
+  // Detection inspired by: New folder/_AZURE_BYPASS_PLAYBOOK.md "Critical
+  // Defender Audit Surface" item 1 (`Set domain authentication`); New
+  // folder/_analysis_aadinternals.md §2.4 (`ConvertTo-Backdoor`).
+  const federationBackdoorFinding = scoreFederationBackdoorDrift({
+    entries: federatedEntries,
+  });
+  // Inherit any blanket domain-enumeration error so the operator sees it
+  // attached to *both* federation cards.
+  if (domainsRes.status === "rejected") {
+    federationBackdoorFinding.error =
+      federationBackdoorFinding.error ?? domainsFinding.error;
+  }
+
+  // --- Signal B — Conditional Access policy drift ------------------------
+  // Detection inspired by: New folder/_AZURE_BYPASS_PLAYBOOK.md "Critical
+  // Defender Audit Surface" item 2 (`Update conditional access policy`).
+  const caDriftFinding = scoreCaPolicyDrift({
+    policies: caPolicies,
+    policiesError: caPoliciesError,
+  });
 
   // --- Password protection ----------------------------------------------
   let pwdFinding: BaselineFinding;
@@ -1646,9 +1799,17 @@ async function probeBaseline(
   return {
     findings: [
       secDefaultsFinding,
+      // Signal B sits next to security-defaults because they answer
+      // adjacent questions ("is anything enforcing MFA at all?" → "is
+      // anything weakening the enforcement we have?").
+      caDriftFinding,
       guestFinding,
       defaultPermsFinding,
       domainsFinding,
+      // Signal A sits immediately after the legacy domain-federation
+      // card so an operator scrolling through the matrix reads them as a
+      // pair (count of federated domains → per-domain backdoor posture).
+      federationBackdoorFinding,
       onPremFinding,
       pwdFinding,
     ],
@@ -1775,6 +1936,20 @@ export const TenantBaselinePage: React.FC = () => {
     number | null
   >(null);
 
+  // Signal C — Sovereign-cloud sentinel.
+  //
+  // We derive the active cloud environment from the `iss` claim of the
+  // most-recent Graph token. Pure presentational — we never probe other
+  // clouds.
+  //
+  // Detection inspired by:
+  //   New folder/_AZURE_BYPASS_PLAYBOOK.md Phase 4 (Cross-cloud pivots).
+  //   New folder/_bypass_tenant_switch.md §8 "Sovereign / Cross-Cloud
+  //     Pivots" — defenders rarely correlate sign-in logs across clouds.
+  const [cloudInfo, setCloudInfo] = React.useState<CloudEnvironmentInfo | null>(
+    null,
+  );
+
   // Tab state.
   const [baselineState, setBaselineState] = React.useState<BaselineState>({
     loading: false,
@@ -1836,6 +2011,10 @@ export const TenantBaselinePage: React.FC = () => {
       );
       if (seq !== baselineSeqRef.current) return;
       setTokenExpiresInSec(tokenSecondsUntilExpiry(token));
+      // Signal C — derive active cloud environment from the token's
+      // `iss` claim. Read-only enumeration of OUR own token; we do not
+      // probe sovereign endpoints.
+      setCloudInfo(detectCloudEnvironmentFromToken(token));
       const { findings, permissionWarnings } = await probeBaseline(
         token,
         controller.signal,
@@ -1893,6 +2072,10 @@ export const TenantBaselinePage: React.FC = () => {
       );
       if (seq !== spSeqRef.current) return;
       setTokenExpiresInSec(tokenSecondsUntilExpiry(token));
+      // Signal C — derive active cloud environment from the token's
+      // `iss` claim. Read-only enumeration of OUR own token; we do not
+      // probe sovereign endpoints.
+      setCloudInfo(detectCloudEnvironmentFromToken(token));
       const { rows, roleEnumerationFailed } = await probeServicePrincipals(
         token,
         controller.signal,
@@ -2106,6 +2289,23 @@ export const TenantBaselinePage: React.FC = () => {
           )}
         </div>
       </header>
+
+      {/*
+        Signal C — Sovereign-cloud sentinel banner.
+
+        Read-only banner showing which Microsoft cloud the active Graph
+        token was issued in. Defenders frequently *only* watch Commercial
+        sign-in logs; a token issued by Gov or China endpoints means
+        posture for THIS view does not cover the other clouds.
+
+        Detection inspired by:
+          New folder/_AZURE_BYPASS_PLAYBOOK.md Phase 4 (Cross-cloud pivots).
+          New folder/_bypass_tenant_switch.md §8 (Sovereign / Cross-Cloud
+            Pivots — endpoint catalog + §8.2 Commercial→Gov pivot).
+      */}
+      {cloudInfo && (
+        <SovereignCloudBanner cloudInfo={cloudInfo} />
+      )}
 
       <Tabs defaultValue="baseline" onValueChange={handleTabChange}>
         <TabsList>

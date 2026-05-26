@@ -28,13 +28,17 @@
  */
 import * as React from "react";
 import {
+  Activity,
   AlertTriangle,
   CheckCircle2,
   Clock,
+  CreditCard,
   ExternalLink,
   FileText,
   Filter as FilterIcon,
+  FolderOpen,
   KeyRound,
+  Layers,
   Loader2,
   RefreshCw,
   Search,
@@ -108,6 +112,16 @@ import {
   StorageAccountResource,
   summarizeFindings,
 } from "./security-audit-helpers";
+import {
+  DiagnosticSettingResource,
+  evaluateDiagnosticSettings,
+  evaluateIdleResourceGroups,
+  evaluateSubscriptionStates,
+  isCorpusFinding,
+  ResourceGroupSummary,
+  riskScoreFor,
+  SubscriptionListEntry,
+} from "./security-audit-corpus-signals";
 
 // --------------------------------------------------------------------------
 // ARM constants
@@ -116,11 +130,34 @@ import {
 const ARM_BASE = "https://management.azure.com";
 const STORAGE_API_VERSION = "2023-05-01";
 const KEYVAULT_API_VERSION = "2023-07-01";
+// Diagnostic settings on a resource — used by Signal A.
+// citation: New folder\_bypass_modify_delete.md:599 (matching DELETE)
+const DIAGNOSTIC_SETTINGS_API_VERSION = "2021-05-01-preview";
+// Tenant subscriptions enumeration — used by Signal B.
+// Same api-version the DELETE in §5.11 cites, so the state shape we
+// match against is the one ARM exposes alongside the cancellation.
+const SUBSCRIPTIONS_API_VERSION = "2020-01-01";
+// Resource-group + resource enumeration — used by Signal D.
+const RESOURCEGROUPS_API_VERSION = "2021-04-01";
+const RESOURCES_API_VERSION = "2021-04-01";
 // Max pages we'll follow on one provider/sub probe — defensive guard
 // against a runaway nextLink loop. 50 pages * 100 results per page =
 // 5,000 resources per sub per provider is enough for every real
 // tenant we've seen.
 const PAGE_FOLLOW_CAP = 50;
+// Tags that hint at temporary / non-production lifecycle. Matched
+// case-insensitively on tag KEY or VALUE. Used by Signal D to bump
+// idle-RG severity from medium to high.
+const TEMP_TAG_HINTS: readonly string[] = [
+  "temp",
+  "temporary",
+  "ephemeral",
+  "scratch",
+  "dev",
+  "development",
+  "sandbox",
+  "test",
+];
 
 interface ScopeSubscription {
   subscriptionId: string;
@@ -228,6 +265,39 @@ function listKeyVaultsUrl(subscriptionId: string): string {
   return `${ARM_BASE}/subscriptions/${subscriptionId}/providers/Microsoft.KeyVault/vaults?api-version=${KEYVAULT_API_VERSION}`;
 }
 
+// Diagnostic-settings list on a specific resource. Used by Signal A.
+// citation: New folder\_bypass_modify_delete.md §5.14
+function listDiagnosticSettingsUrl(resourceArmId: string): string {
+  const trimmed = resourceArmId.startsWith("/")
+    ? resourceArmId
+    : `/${resourceArmId}`;
+  return `${ARM_BASE}${trimmed}/providers/microsoft.insights/diagnosticSettings?api-version=${DIAGNOSTIC_SETTINGS_API_VERSION}`;
+}
+
+// Subscriptions list (defensive Signal B). Tenant-wide; one token is
+// sufficient. citation: New folder\_bypass_modify_delete.md §5.11.
+function listSubscriptionsUrl(): string {
+  return `${ARM_BASE}/subscriptions?api-version=${SUBSCRIPTIONS_API_VERSION}`;
+}
+
+// Resource groups in a subscription (Signal D — idle / empty RG).
+function listResourceGroupsUrl(subscriptionId: string): string {
+  return `${ARM_BASE}/subscriptions/${subscriptionId}/resourceGroups?api-version=${RESOURCEGROUPS_API_VERSION}`;
+}
+
+// All resources in an RG with $expand=changedTime,createdTime — we
+// derive the RG's last-modified from the max of these timestamps.
+// citation: posture surface used by Azucar / ScoutSuite to detect
+// orphaned RGs (see _analysis_defender_view.md §1).
+function listResourcesInGroupUrl(
+  subscriptionId: string,
+  resourceGroupName: string,
+): string {
+  return `${ARM_BASE}/subscriptions/${subscriptionId}/resourceGroups/${encodeURIComponent(
+    resourceGroupName,
+  )}/resources?api-version=${RESOURCES_API_VERSION}&$expand=changedTime,createdTime`;
+}
+
 // --------------------------------------------------------------------------
 // Scan orchestration
 // --------------------------------------------------------------------------
@@ -245,10 +315,21 @@ interface ScanSubscriptionArgs {
  * 403 / 404 / 429 are caught and surfaced via the `error` field on
  * SubScanResult so the page can render a warning row instead of
  * blowing up the whole scan.
+ *
+ * Corpus signals layered on top:
+ *   - Signal A: per Tier-0 resource diagnostic-settings probe (Key
+ *     Vaults always counted Tier-0; storage accounts marked tier-1
+ *     by default). citation: New folder\_AZURE_BYPASS_PLAYBOOK.md
+ *     item 8 + _bypass_modify_delete.md §5.14
+ *   - Signal D: resource-group enumeration with $expand=changedTime
+ *     to detect idle / empty RGs. citation: New folder
+ *     \_analysis_defender_view.md §1 (Azucar / ScoutSuite findings
+ *     model — orphan / idle infra posture failures).
  */
 async function scanSubscription(
   args: ScanSubscriptionArgs,
   subscriptionName: string,
+  opts: { idleThresholdDays: number },
 ): Promise<SubScanResult> {
   const { sub, token, signal } = args;
   const result: SubScanResult = {
@@ -259,7 +340,7 @@ async function scanSubscription(
     findings: [],
   };
   try {
-    const [storage, vaults] = await Promise.all([
+    const [storage, vaults, rgs] = await Promise.all([
       fetchArmPaged<StorageAccountResource>(
         listStorageAccountsUrl(sub.subscriptionId),
         token,
@@ -285,10 +366,27 @@ async function scanSubscription(
         }
         throw err;
       }),
+      // Signal D probe — resource groups for idle / empty RG detection.
+      // Tolerated to fail same as storage/vaults so a 403 on RG list
+      // doesn't kill the whole sub scan.
+      fetchArmPaged<ArmResourceGroup>(
+        listResourceGroupsUrl(sub.subscriptionId),
+        token,
+        signal,
+      ).catch((err: Error & { status?: number }) => {
+        if (err.status === 403 || err.status === 401) {
+          return { __forbidden: true, message: err.message } as unknown as
+            | ArmResourceGroup[]
+            | { __forbidden: true; message: string };
+        }
+        // RG enumeration failure is non-fatal — log but continue.
+        return [] as ArmResourceGroup[];
+      }),
     ]);
 
     const storageList = Array.isArray(storage) ? storage : [];
     const vaultList = Array.isArray(vaults) ? vaults : [];
+    const rgList = Array.isArray(rgs) ? rgs : [];
 
     // Track per-provider 403s so the warning row makes sense even
     // when one provider succeeded and the other didn't.
@@ -299,6 +397,9 @@ async function scanSubscription(
     if (!Array.isArray(vaults)) {
       partialErrors.push("key vaults (403)");
     }
+    if (!Array.isArray(rgs)) {
+      partialErrors.push("resource groups (403)");
+    }
 
     result.storageCount = storageList.length;
     result.vaultCount = vaultList.length;
@@ -308,6 +409,78 @@ async function scanSubscription(
     for (const kv of vaultList) {
       result.findings.push(...evaluateKeyVault(kv, subscriptionName));
     }
+
+    // --- Signal A: diagnostic settings ---
+    // Probe each storage account + key vault for its diagnostic
+    // settings. We bound concurrency to 5 so a sub with hundreds of
+    // resources doesn't burst the ARM throttle. citation: New folder
+    // \_bypass_modify_delete.md §5.14 (DELETE on this exact ARM path).
+    const diagnosticTargets: Array<{
+      armId: string;
+      name: string;
+      rg: string;
+      region: string;
+      tierZero: boolean;
+    }> = [];
+    for (const sa of storageList) {
+      const p = parseArmId(sa.id);
+      diagnosticTargets.push({
+        armId: sa.id,
+        name: sa.name,
+        rg: p.resourceGroup,
+        region: sa.location,
+        tierZero: false,
+      });
+    }
+    for (const kv of vaultList) {
+      const p = parseArmId(kv.id);
+      diagnosticTargets.push({
+        armId: kv.id,
+        name: kv.name,
+        rg: p.resourceGroup,
+        region: kv.location,
+        tierZero: true,
+      });
+    }
+    const diagFindings = await probeDiagnosticSettings(
+      diagnosticTargets,
+      token,
+      subscriptionName,
+      sub.subscriptionId,
+      signal,
+    );
+    result.findings.push(...diagFindings);
+
+    // --- Signal D: idle / empty resource groups ---
+    if (rgList.length > 0) {
+      const summaries = await buildResourceGroupSummaries(
+        rgList,
+        sub.subscriptionId,
+        token,
+        signal,
+      );
+      result.findings.push(
+        ...evaluateIdleResourceGroups(summaries, {
+          subscriptionId: sub.subscriptionId,
+          subscriptionName,
+          idleThresholdDays: opts.idleThresholdDays,
+        }),
+      );
+    }
+
+    // --- Signal C: public-access containers ---
+    // COORDINATOR: a ListBlobContainers ARM call
+    //   GET /subscriptions/{sub}/resourceGroups/{rg}/providers/
+    //       Microsoft.Storage/storageAccounts/{name}/blobServices/
+    //       default/containers?api-version=2023-05-01
+    // would let `evaluatePublicContainers()` from
+    // security-audit-corpus-signals.ts emit findings. We deliberately
+    // do NOT add that endpoint here per the per-page edit boundary
+    // (it belongs in the storage service layer, not in this page).
+    // When it lands, wire it like the diagnostics probe above:
+    //   const containers = await fetchArmPaged<ArmContainer>(...);
+    //   result.findings.push(...evaluatePublicContainers(...));
+
     if (partialErrors.length > 0) {
       result.error = `Insufficient permissions on: ${partialErrors.join(", ")}. Partial results shown.`;
     }
@@ -323,22 +496,251 @@ async function scanSubscription(
 }
 
 // --------------------------------------------------------------------------
+// Signal A — diagnostic-settings probe (bounded concurrency)
+// --------------------------------------------------------------------------
+
+interface DiagnosticTarget {
+  armId: string;
+  name: string;
+  rg: string;
+  region: string;
+  tierZero: boolean;
+}
+
+/**
+ * Fetch diagnostic settings for every target with a small worker
+ * pool. Each per-resource fetch tolerates 404 (no settings) /
+ * 403 (no permission) — translating to an empty list so the
+ * evaluator can still emit the "diag.absent" finding for the
+ * 404 case (the most important defender signal).
+ */
+async function probeDiagnosticSettings(
+  targets: readonly DiagnosticTarget[],
+  token: string,
+  subscriptionName: string,
+  subscriptionId: string,
+  signal: AbortSignal | undefined,
+): Promise<Finding[]> {
+  const CONCURRENCY = 5;
+  const findings: Finding[] = [];
+  let i = 0;
+  async function worker(): Promise<void> {
+    while (true) {
+      if (signal?.aborted) return;
+      const idx = i++;
+      if (idx >= targets.length) return;
+      const t = targets[idx]!;
+      try {
+        const settings = await fetchArmPaged<DiagnosticSettingResource>(
+          listDiagnosticSettingsUrl(t.armId),
+          token,
+          signal,
+        );
+        findings.push(
+          ...evaluateDiagnosticSettings(
+            {
+              resourceId: t.armId,
+              resourceName: t.name,
+              resourceGroup: t.rg,
+              region: t.region,
+              tierZero: t.tierZero,
+              settings,
+            },
+            { subscriptionId, subscriptionName },
+          ),
+        );
+      } catch (err) {
+        const e = err as Error & { status?: number };
+        if (e.status === 404) {
+          // 404 here actually means "no diagnostic settings exist
+          // for this resource" — which IS the finding we care about.
+          findings.push(
+            ...evaluateDiagnosticSettings(
+              {
+                resourceId: t.armId,
+                resourceName: t.name,
+                resourceGroup: t.rg,
+                region: t.region,
+                tierZero: t.tierZero,
+                settings: [],
+              },
+              { subscriptionId, subscriptionName },
+            ),
+          );
+        }
+        // 403 / 401 / other — silently skip this resource. We can't
+        // tell "no setting" from "no permission" so we err on the
+        // side of not crying wolf.
+      }
+    }
+  }
+  const workers: Promise<void>[] = [];
+  for (let w = 0; w < CONCURRENCY; w++) workers.push(worker());
+  await Promise.all(workers);
+  return findings;
+}
+
+// --------------------------------------------------------------------------
+// Signal D — resource-group summary builder
+// --------------------------------------------------------------------------
+
+interface ArmResourceGroup {
+  id: string;
+  name: string;
+  location: string;
+  tags?: Record<string, string>;
+}
+
+interface ArmResource {
+  id: string;
+  name: string;
+  type: string;
+  changedTime?: string;
+  createdTime?: string;
+  tags?: Record<string, string>;
+}
+
+function hasTempLifecycleTag(tags: Record<string, string> | undefined): boolean {
+  if (!tags) return false;
+  for (const [key, val] of Object.entries(tags)) {
+    const k = key.toLowerCase();
+    const v = (val ?? "").toLowerCase();
+    for (const hint of TEMP_TAG_HINTS) {
+      if (k === hint || v === hint) return true;
+      if (k.includes(hint) || v.includes(hint)) return true;
+    }
+  }
+  return false;
+}
+
+async function buildResourceGroupSummaries(
+  rgs: readonly ArmResourceGroup[],
+  subscriptionId: string,
+  token: string,
+  signal: AbortSignal | undefined,
+): Promise<ResourceGroupSummary[]> {
+  // Bounded concurrency — one in-flight RG resource-list call per
+  // worker. Larger pools just hit ARM throttles.
+  const CONCURRENCY = 4;
+  const out: ResourceGroupSummary[] = [];
+  let i = 0;
+  async function worker(): Promise<void> {
+    while (true) {
+      if (signal?.aborted) return;
+      const idx = i++;
+      if (idx >= rgs.length) return;
+      const rg = rgs[idx]!;
+      let resources: ArmResource[] = [];
+      try {
+        resources = await fetchArmPaged<ArmResource>(
+          listResourcesInGroupUrl(subscriptionId, rg.name),
+          token,
+          signal,
+        );
+      } catch (err) {
+        const e = err as Error & { status?: number };
+        if (e.status !== 403 && e.status !== 401) {
+          // Non-permission errors leave us with 0 resources for the
+          // RG — we still record the summary so the operator sees
+          // the RG exists (just without an idle calculation).
+        }
+      }
+      // Compute the freshest timestamp across changedTime/createdTime.
+      let maxTs: number | null = null;
+      let hasTempTag = hasTempLifecycleTag(rg.tags);
+      for (const r of resources) {
+        const ct = r.changedTime ? Date.parse(r.changedTime) : NaN;
+        const cr = r.createdTime ? Date.parse(r.createdTime) : NaN;
+        for (const t of [ct, cr]) {
+          if (Number.isFinite(t)) {
+            maxTs = maxTs == null ? t : Math.max(maxTs, t);
+          }
+        }
+        if (!hasTempTag && hasTempLifecycleTag(r.tags)) hasTempTag = true;
+      }
+      out.push({
+        id: rg.id,
+        name: rg.name,
+        location: rg.location,
+        tags: rg.tags ?? {},
+        resourceCount: resources.length,
+        lastChangedIso:
+          maxTs != null ? new Date(maxTs).toISOString() : null,
+        hasTempTag,
+      });
+    }
+  }
+  const workers: Promise<void>[] = [];
+  for (let w = 0; w < CONCURRENCY; w++) workers.push(worker());
+  await Promise.all(workers);
+  return out;
+}
+
+// --------------------------------------------------------------------------
 // Filters / display state
 // --------------------------------------------------------------------------
 
 const ALL_SEVERITIES: Severity[] = ["critical", "high", "medium", "info"];
-const ALL_RESOURCE_TYPES: ResourceType[] = ["storage", "keyvault"];
+const ALL_RESOURCE_TYPES: ResourceType[] = [
+  "storage",
+  "keyvault",
+  // Corpus signals — kept on the right so the original storage/kv
+  // chips stay in the same screen position for muscle memory.
+  "diagnostic-setting",
+  "subscription",
+  "storage-container",
+  "resource-group",
+];
 // Findings older than this are considered "stale / unfixed". 30 days
 // is the typical SLA window in MicroBurst / Prowler default policies
 // (NIST 800-53 SI-2 "Flaw Remediation" timing target).
 const STALE_THRESHOLD_MS = 30 * 24 * 60 * 60 * 1000;
 
+// Default idle-RG threshold (Signal D). 90 days matches the Azucar /
+// ScoutSuite default — the corpus tools' authors picked it because
+// 90 days is one full sprint quarter; an RG that hasn't changed for
+// a quarter is almost certainly forgotten.
+// citation: New folder\_analysis_defender_view.md §1
+const IDLE_RG_DEFAULT_DAYS = 90;
+const IDLE_RG_MIN_DAYS = 7;
+const IDLE_RG_MAX_DAYS = 365;
+
 function resourceTypeLabel(t: ResourceType): string {
-  return t === "storage" ? "Storage Account" : "Key Vault";
+  switch (t) {
+    case "storage":
+      return "Storage Account";
+    case "keyvault":
+      return "Key Vault";
+    case "diagnostic-setting":
+      return "Diagnostic Setting";
+    case "subscription":
+      return "Subscription";
+    case "storage-container":
+      return "Storage Container";
+    case "resource-group":
+      return "Resource Group";
+    default:
+      return t;
+  }
 }
 
 function resourceTypeIcon(t: ResourceType): React.FC<{ className?: string }> {
-  return t === "storage" ? FileText : KeyRound;
+  switch (t) {
+    case "storage":
+      return FileText;
+    case "keyvault":
+      return KeyRound;
+    case "diagnostic-setting":
+      return Activity;
+    case "subscription":
+      return CreditCard;
+    case "storage-container":
+      return FolderOpen;
+    case "resource-group":
+      return Layers;
+    default:
+      return FileText;
+  }
 }
 
 // --------------------------------------------------------------------------
@@ -471,6 +873,25 @@ const SecurityAuditPageInner: React.FC = () => {
   // hits Run Audit again — last click wins.
   const abortRef = React.useRef<AbortController | null>(null);
 
+  // Idle-RG threshold for Signal D — persisted so the operator's
+  // chosen sensitivity (e.g. 30 days for a hot environment, 180 for
+  // a stable one) survives reloads. Bounded to [7, 365].
+  // citation: New folder\_analysis_defender_view.md §1 — Azucar /
+  // ScoutSuite default is 90 days.
+  const [idleThresholdDays, setIdleThresholdDays] = usePersistedState<number>(
+    "security-audit:idle-rg-threshold-days-v1",
+    () => IDLE_RG_DEFAULT_DAYS,
+    {
+      version: 1,
+      migrate: (raw): number => {
+        if (typeof raw !== "number" || !Number.isFinite(raw)) {
+          return IDLE_RG_DEFAULT_DAYS;
+        }
+        return Math.min(IDLE_RG_MAX_DAYS, Math.max(IDLE_RG_MIN_DAYS, raw));
+      },
+    },
+  );
+
   const runAudit = React.useCallback(async () => {
     if (selectedSubIds.size === 0) return;
     // Resolve the picked subs back to full scope entries (with the
@@ -500,6 +921,59 @@ const SecurityAuditPageInner: React.FC = () => {
       // MSAL into the page bundle unless the operator actually runs a
       // scan (cheap defer; first-click latency is negligible).
       const { getArmTokenForAccount } = await import("../../auth/msal-auth");
+
+      // --- Signal B: subscription-state probe (tenant-wide) ---
+      // Run ONCE per scan, using the first token we can acquire from
+      // an in-scope account. ARM's /subscriptions endpoint returns the
+      // full set of subs the caller can see — so the same call covers
+      // every selected sub in one shot. Tier-0 flag is set based on
+      // whether the operator picked the sub for scanning (i.e. they
+      // care about it). citation: New folder\_AZURE_BYPASS_PLAYBOOK.md
+      // §"Critical Defender Audit Surface" item 10.
+      const subProbeAccount = accountsById.get(
+        targets[0]!.homeAccountId,
+      );
+      if (subProbeAccount) {
+        try {
+          const probeToken = await getArmTokenForAccount(
+            subProbeAccount.homeAccountId,
+            subProbeAccount.tenantId,
+          );
+          if (probeToken && !ctrl.signal.aborted) {
+            try {
+              const subList = await fetchArmPaged<SubscriptionListEntry>(
+                listSubscriptionsUrl(),
+                probeToken,
+                ctrl.signal,
+              );
+              const selectedIdSet = new Set(
+                targets.map((t) => t.subscriptionId),
+              );
+              const decorated: SubscriptionListEntry[] = subList.map((s) => ({
+                ...s,
+                isTierZero: selectedIdSet.has(s.subscriptionId),
+              }));
+              aggFindings.push(...evaluateSubscriptionStates(decorated));
+            } catch (probeErr) {
+              const e = probeErr as Error & { status?: number };
+              // 403 on /subscriptions is rare (any signed-in identity
+              // can read it) — but treat gracefully as a warning row.
+              if (!ctrl.signal.aborted) {
+                aggWarnings.push({
+                  kind: "warning",
+                  id: `warn::sub-state-probe::${e.status ?? "err"}`,
+                  subscriptionId: "(tenant)",
+                  subscriptionName: "Subscription-state probe (Signal B)",
+                  message: `Could not list subscriptions for cancel-state check: ${e.message ?? String(e)}`,
+                });
+              }
+            }
+          }
+        } catch {
+          // Token acquisition failure already surfaces below in the
+          // per-sub loop; no duplicate warning here.
+        }
+      }
 
       // Sequential per-sub to be a polite ARM citizen — parallelizing
       // tends to trip per-tenant rate limits when the operator has 20+
@@ -555,6 +1029,7 @@ const SecurityAuditPageInner: React.FC = () => {
         const result = await scanSubscription(
           { sub, token, signal: ctrl.signal },
           sub.displayName,
+          { idleThresholdDays },
         );
         aggFindings.push(...result.findings);
         aggCounts.storage += result.storageCount;
@@ -601,8 +1076,20 @@ const SecurityAuditPageInner: React.FC = () => {
 
       // Audit log — success path. One entry per scan, with aggregate
       // counts so the audit-log page shows the scan dimensions
-      // without us having to log per-finding spam.
+      // without us having to log per-finding spam. Corpus signal
+      // counts are broken out so the defender's dashboard can chart
+      // Signal A/B/C/D trends over time.
       const summary = summarizeFindings(aggFindings, aggCounts);
+      let signalACount = 0;
+      let signalBCount = 0;
+      let signalCCount = 0;
+      let signalDCount = 0;
+      for (const f of aggFindings) {
+        if (f.ruleId.startsWith("diag.")) signalACount += 1;
+        else if (f.ruleId.startsWith("sub.state.")) signalBCount += 1;
+        else if (f.ruleId.startsWith("container.public")) signalCCount += 1;
+        else if (f.ruleId.startsWith("rg.")) signalDCount += 1;
+      }
       auditLog.record({
         actor: primaryAccount?.username ?? "(unknown)",
         action: "security_audit_scan",
@@ -616,6 +1103,13 @@ const SecurityAuditPageInner: React.FC = () => {
           criticalCount: summary.critical,
           highCount: summary.high,
           warnings: aggWarnings.length,
+          corpusSignals: {
+            diagAbsent: signalACount,
+            subscriptionState: signalBCount,
+            publicContainer: signalCCount,
+            idleResourceGroup: signalDCount,
+          },
+          idleThresholdDays,
         },
       });
     } catch (err) {
@@ -637,7 +1131,13 @@ const SecurityAuditPageInner: React.FC = () => {
       // (another scan may have raced in and replaced it).
       if (abortRef.current === ctrl) abortRef.current = null;
     }
-  }, [accountsById, allSubscriptions, primaryAccount, selectedSubIds]);
+  }, [
+    accountsById,
+    allSubscriptions,
+    primaryAccount,
+    selectedSubIds,
+    idleThresholdDays,
+  ]);
 
   // Cancel any in-flight scan when the component unmounts.
   React.useEffect(
@@ -663,6 +1163,10 @@ const SecurityAuditPageInner: React.FC = () => {
       q: "",
       crit: "",
       stale: "",
+      // corpus-only chip — "1" shows only Signal-A/B/C/D findings
+      // (defender-side detection signals). Off by default so the
+      // existing storage/keyvault findings still surface.
+      corpus: "",
     }),
     [],
   );
@@ -704,6 +1208,9 @@ const SecurityAuditPageInner: React.FC = () => {
   const showStaleOnly =
     (typeof urlState.stale === "string" && urlState.stale === "1") ||
     (Array.isArray(urlState.stale) && urlState.stale[0] === "1");
+  const showCorpusOnly =
+    (typeof urlState.corpus === "string" && urlState.corpus === "1") ||
+    (Array.isArray(urlState.corpus) && urlState.corpus[0] === "1");
 
   // Audit-log helper — fires once per *change* (not per render). We only
   // record human-driven filter mutations so the audit-log page isn't
@@ -761,6 +1268,13 @@ const SecurityAuditPageInner: React.FC = () => {
     },
     [setUrlState, recordFilterChange],
   );
+  const setShowCorpusOnly = React.useCallback(
+    (v: boolean) => {
+      setUrlState({ corpus: v ? "1" : "" });
+      recordFilterChange("corpus-only", v);
+    },
+    [setUrlState, recordFilterChange],
+  );
 
   // ----------------- Finding "first seen" tracking -----------------
   // Persist when each finding-id was first observed so the "older than
@@ -798,6 +1312,7 @@ const SecurityAuditPageInner: React.FC = () => {
         const firstSeen = firstSeenAt[f.id];
         if (firstSeen == null || firstSeen > staleThreshold) return false;
       }
+      if (showCorpusOnly && !isCorpusFinding(f)) return false;
       if (!q) return true;
       const hay = [
         f.resourceName,
@@ -818,6 +1333,7 @@ const SecurityAuditPageInner: React.FC = () => {
     searchText,
     criticalHighOnly,
     showStaleOnly,
+    showCorpusOnly,
     firstSeenAt,
     staleThreshold,
   ]);
@@ -854,14 +1370,25 @@ const SecurityAuditPageInner: React.FC = () => {
         return c !== 0 ? c : a.resourceName.localeCompare(b.resourceName);
       }
       // severity:
-      //   - flip primary by direction (desc shows critical-first, asc shows
-      //     none-first);
-      //   - tie-break by name ASC regardless of direction so within-severity
-      //     rows stay alphabetically predictable.
-      const sevDiff =
+      //   - primary key is `riskScoreFor` (severity weight + small
+      //     bonus for corpus sentinel rules) so a critical Signal-B
+      //     "subscription Warned" outranks a critical storage-public
+      //     finding by 0.5 — the operator sees the imminent
+      //     destructive op first;
+      //   - flip primary by direction (desc shows worst-first, asc
+      //     shows none-first);
+      //   - tie-break by name ASC regardless of direction so
+      //     within-severity rows stay alphabetically predictable.
+      const riskA = riskScoreFor(a);
+      const riskB = riskScoreFor(b);
+      const sevDiff = (riskB - riskA) * (sortDir === "desc" ? 1 : -1);
+      if (sevDiff !== 0) return sevDiff > 0 ? 1 : -1;
+      // Stable secondary — keep the severity-weight fallback so a
+      // tie on score still respects the canonical bucket order.
+      const wDiff =
         (SEVERITY_WEIGHT[b.severity] - SEVERITY_WEIGHT[a.severity]) *
         (sortDir === "desc" ? 1 : -1);
-      if (sevDiff !== 0) return sevDiff;
+      if (wDiff !== 0) return wDiff;
       return a.resourceName.localeCompare(b.resourceName);
     });
     return findOnly;
@@ -935,6 +1462,15 @@ const SecurityAuditPageInner: React.FC = () => {
   const exportColumns = React.useMemo(
     () => [
       { header: "Severity", accessor: (f: Finding) => SEVERITY_LABEL[f.severity] },
+      // Risk score = severity weight + small bonus for corpus
+      // sentinel rules (A/B/C). Lets exports be sorted-by-risk
+      // outside the UI.
+      { header: "Risk Score", accessor: (f: Finding) => riskScoreFor(f).toFixed(2) },
+      {
+        header: "Signal Class",
+        accessor: (f: Finding) =>
+          isCorpusFinding(f) ? "corpus-defender" : "microburst-style",
+      },
       { header: "Resource Type", accessor: (f: Finding) => resourceTypeLabel(f.resourceType) },
       { header: "Resource Name", accessor: (f: Finding) => f.resourceName },
       { header: "Resource Group", accessor: (f: Finding) => f.resourceGroup },
@@ -965,7 +1501,9 @@ const SecurityAuditPageInner: React.FC = () => {
         searchText: searchText.trim(),
         criticalHighOnly,
         showStaleOnly,
+        showCorpusOnly,
         staleThresholdDays: 30,
+        idleResourceGroupThresholdDays: idleThresholdDays,
       },
       scanned: scanCounts,
       summary,
@@ -978,6 +1516,8 @@ const SecurityAuditPageInner: React.FC = () => {
       searchText,
       criticalHighOnly,
       showStaleOnly,
+      showCorpusOnly,
+      idleThresholdDays,
       scanCounts,
       summary,
     ],
@@ -988,6 +1528,8 @@ const SecurityAuditPageInner: React.FC = () => {
   const searchId = React.useId();
   const critOnlyId = React.useId();
   const staleOnlyId = React.useId();
+  const corpusOnlyId = React.useId();
+  const idleThresholdId = React.useId();
 
   // Count of findings older than 30 days (for the chip badge) — pulled
   // from the unfiltered list so the number reflects reality even when
@@ -1001,6 +1543,17 @@ const SecurityAuditPageInner: React.FC = () => {
     return n;
   }, [findings, firstSeenAt, staleThreshold]);
 
+  // Count of corpus-derived findings — surfaces in the chip badge so
+  // the operator can tell at a glance how much of the total comes from
+  // the four defender signals (A: diag, B: sub-state, C: container,
+  // D: idle-RG). Pulled from the unfiltered list for the same reason
+  // as staleCount above.
+  const corpusFindingCount = React.useMemo(() => {
+    let n = 0;
+    for (const f of findings) if (isCorpusFinding(f)) n += 1;
+    return n;
+  }, [findings]);
+
   const clearFilters = React.useCallback(() => {
     setUrlState({
       sev: ALL_SEVERITIES as readonly string[] as string[],
@@ -1008,6 +1561,7 @@ const SecurityAuditPageInner: React.FC = () => {
       q: "",
       crit: "",
       stale: "",
+      corpus: "",
     });
     recordFilterChange("clear-filters", null);
   }, [setUrlState, recordFilterChange]);
@@ -1310,11 +1864,76 @@ const SecurityAuditPageInner: React.FC = () => {
             </span>
           </Label>
         </div>
+        <span className="h-4 w-px bg-border" aria-hidden />
+        {/* "Corpus signals only" chip — restrict the table to the
+            defender-side detection signals derived from the corpus
+            (Signal A / B / C / D). Off by default so the existing
+            MicroBurst-style storage + Key Vault findings still
+            surface. citation: see security-audit-corpus-signals.ts. */}
+        <div className="flex items-center gap-1.5">
+          <Switch
+            id={corpusOnlyId}
+            checked={showCorpusOnly}
+            onCheckedChange={(v) => setShowCorpusOnly(Boolean(v))}
+            aria-label="Show only corpus-derived defender signals (diag / sub-state / public-container / idle-RG)"
+          />
+          <Label
+            htmlFor={corpusOnlyId}
+            className="inline-flex cursor-pointer items-center gap-1 text-2xs"
+            title="Restrict to corpus-derived signals: diagnostic-setting absence, subscription cancellation states, public storage containers, and idle resource groups."
+          >
+            <ShieldAlert className="h-3 w-3" aria-hidden />
+            Corpus signals only
+            <span
+              className="tabular-nums text-muted-foreground"
+              aria-label={`${corpusFindingCount} corpus finding${corpusFindingCount === 1 ? "" : "s"}`}
+            >
+              ({corpusFindingCount})
+            </span>
+          </Label>
+        </div>
+        <span className="h-4 w-px bg-border" aria-hidden />
+        {/* Idle-RG threshold input (Signal D). Bounded [7, 365], default 90.
+            citation: New folder\_analysis_defender_view.md §1 — 90d matches
+            the Azucar / ScoutSuite default. */}
+        <div className="flex items-center gap-1.5">
+          <Label
+            htmlFor={idleThresholdId}
+            className="inline-flex cursor-pointer items-center gap-1 text-2xs"
+            title="Resource groups with no resource changes in this many days are flagged as idle (Signal D)."
+          >
+            <Layers className="h-3 w-3" aria-hidden />
+            Idle RG threshold
+          </Label>
+          <Input
+            id={idleThresholdId}
+            type="number"
+            inputMode="numeric"
+            min={IDLE_RG_MIN_DAYS}
+            max={IDLE_RG_MAX_DAYS}
+            step={1}
+            value={idleThresholdDays}
+            onChange={(e) => {
+              const n = Number.parseInt(e.target.value, 10);
+              if (Number.isFinite(n)) {
+                const clamped = Math.min(
+                  IDLE_RG_MAX_DAYS,
+                  Math.max(IDLE_RG_MIN_DAYS, n),
+                );
+                setIdleThresholdDays(clamped);
+              }
+            }}
+            className="h-7 w-16 text-2xs tabular-nums"
+            aria-label="Idle resource-group threshold in days"
+          />
+          <span className="text-2xs text-muted-foreground">days</span>
+        </div>
         {(activeSeverities.size < ALL_SEVERITIES.length ||
           activeResourceTypes.size < ALL_RESOURCE_TYPES.length ||
           searchText.trim() ||
           criticalHighOnly ||
-          showStaleOnly) && (
+          showStaleOnly ||
+          showCorpusOnly) && (
           <Button
             type="button"
             variant="ghost"

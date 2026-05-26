@@ -51,6 +51,7 @@ import {
   Check,
   Clock,
   Copy,
+  Eye,
   KeyRound,
   Layers,
   LayoutGrid,
@@ -110,6 +111,7 @@ import {
 } from "../../auth/msal-auth";
 import { resolveActiveTenantId } from "../../auth/perform-tenant-switch";
 import { useArmToken } from "../../auth/use-arm-token";
+import { usePersistedState } from "../../hooks/use-persisted-state";
 import { useTenantChange } from "../../hooks/use-tenant-change";
 import { useUrlState } from "../../hooks/use-url-state";
 import { auditLog } from "../../services/audit-log";
@@ -150,6 +152,15 @@ import {
   type MintSuccess,
   type RowKind,
 } from "./audience-matrix-helpers";
+import {
+  clientIdIsFoci,
+  DEFENDER_BANNER_COPY,
+  FOCI_BANNER_DISMISS_KEY,
+  fociClientName,
+  getAudienceRisk,
+  tierShort,
+  tierTextClass,
+} from "./audience-matrix-corpus";
 
 // ---------------------------------------------------------------------------
 //  Local types
@@ -319,6 +330,33 @@ export const AudienceMatrixPage: React.FC = () => {
 
   // ----- Export panel: include-token-material gate -----
   const [includeTokens, setIncludeTokens] = React.useState(false);
+
+  // ----- Signal C — Defender awareness banner -----
+  // Persisted across reloads so operators don't see the FOCI primer every
+  // session; the dismiss action emits a single audit entry so we can
+  // attribute "did the operator acknowledge the defender context before
+  // minting".  See `audience-matrix-corpus.ts` for the citation chain.
+  const [bannerDismissed, setBannerDismissed] = usePersistedState<boolean>(
+    FOCI_BANNER_DISMISS_KEY,
+    false,
+  );
+  const dismissBanner = React.useCallback(() => {
+    setBannerDismissed(true);
+    auditLog.record({
+      actor: "operator",
+      action: "audience_matrix_dismiss_foci_banner",
+      target: "audience-matrix",
+      status: "success",
+      details: {
+        bannerKey: FOCI_BANNER_DISMISS_KEY,
+        corpus: [
+          "_AZURE_LOGIN_METHODS.md",
+          "_analysis_defender_view.md",
+          "dirkjanm/family-of-client-ids-research/README.md",
+        ],
+      },
+    });
+  }, [setBannerDismissed]);
 
   // ----- Cleanup all in-flight controllers on unmount -----
   // Using `controllersRef` (not the `cells` map) so the cleanup sees every
@@ -950,6 +988,50 @@ export const AudienceMatrixPage: React.FC = () => {
           </Button>
         </PageHeader>
 
+        {/*
+          Signal C — Defender awareness banner.
+          Cites the corpus paths driving the FOCI signal (`_AZURE_LOGIN_METHODS.md`,
+          `_analysis_defender_view.md`, `dirkjanm/family-of-client-ids-research`).
+          Dismiss state persists via `usePersistedState` under
+          `FOCI_BANNER_DISMISS_KEY`. Dismissal emits an audit entry so the page
+          stays consistent with the rest of the matrix (every operator-visible
+          mutation is audited).
+        */}
+        {!bannerDismissed && (
+          <Alert variant="info" role="region" aria-label="FOCI defender context">
+            <Eye className="h-4 w-4" aria-hidden />
+            <AlertTitle className="flex items-center justify-between gap-2 text-sm">
+              <span>{DEFENDER_BANNER_COPY.title}</span>
+              <Button
+                type="button"
+                size="sm"
+                variant="ghost"
+                onClick={dismissBanner}
+                aria-label="Dismiss FOCI defender banner"
+              >
+                <X className="h-3 w-3" aria-hidden />
+                Dismiss
+              </Button>
+            </AlertTitle>
+            <AlertDescription className="space-y-2 text-xs">
+              <p className="m-0">{DEFENDER_BANNER_COPY.body}</p>
+              <p className="m-0 text-2xs text-muted-foreground">
+                Corpus:{" "}
+                {DEFENDER_BANNER_COPY.citationLines.map((line, idx) => (
+                  <React.Fragment key={line}>
+                    <code className="rounded bg-muted/60 px-1 py-0.5 font-mono text-3xs">
+                      {line}
+                    </code>
+                    {idx < DEFENDER_BANNER_COPY.citationLines.length - 1
+                      ? " · "
+                      : ""}
+                  </React.Fragment>
+                ))}
+              </p>
+            </AlertDescription>
+          </Alert>
+        )}
+
         {/* Section B — Row source selector */}
         <Card>
           <CardContent className="flex flex-wrap items-center gap-2 p-3">
@@ -1168,13 +1250,48 @@ export const AudienceMatrixPage: React.FC = () => {
                       >
                         Identity ({visibleRows.length})
                       </th>
-                      {AUDIENCE_COLUMNS.map((aud) => (
+                      {AUDIENCE_COLUMNS.map((aud) => {
+                        // Signal B — risk tier per audience column. The
+                        // tier + rationale live in audience-matrix-corpus.ts;
+                        // see that module's header for the citation chain.
+                        const risk = getAudienceRisk(aud.key);
+                        return (
                         <th
                           key={aud.key}
                           scope="col"
+                          data-audience-risk={risk.tier}
                           className="border-b px-2 py-2 text-center text-2xs font-semibold uppercase tracking-wider text-muted-foreground"
                         >
                           <div className="flex flex-col items-center gap-1">
+                            <Tooltip>
+                              <TooltipTrigger asChild>
+                                <span
+                                  className={`inline-flex h-4 items-center rounded px-1 font-mono text-3xs leading-none ${tierTextClass(risk.tier)} bg-muted/40`}
+                                  aria-label={`Risk tier: ${risk.tier}`}
+                                >
+                                  {tierShort(risk.tier)}
+                                </span>
+                              </TooltipTrigger>
+                              <TooltipContent>
+                                <p className="m-0 max-w-xs text-xs">
+                                  <span className="font-semibold">
+                                    {risk.tier.toUpperCase()} risk
+                                  </span>{" "}
+                                  — {risk.rationale}
+                                </p>
+                                <p className="m-0 mt-1 text-3xs text-muted-foreground">
+                                  Calibrated against{" "}
+                                  <code className="font-mono">
+                                    dafthack/azure-ad-first-party-apps-permissions
+                                  </code>{" "}
+                                  +{" "}
+                                  <code className="font-mono">
+                                    _analysis_dirkjanm.md
+                                  </code>
+                                  .
+                                </p>
+                              </TooltipContent>
+                            </Tooltip>
                             <span className="inline-flex items-center gap-1">
                               {aud.short}
                               <InfoTooltip
@@ -1218,7 +1335,8 @@ export const AudienceMatrixPage: React.FC = () => {
                             </Tooltip>
                           </div>
                         </th>
-                      ))}
+                        );
+                      })}
                       <th
                         scope="col"
                         className="border-b px-2 py-2 text-center text-2xs font-semibold uppercase tracking-wider text-muted-foreground"
@@ -1428,6 +1546,13 @@ export const AudienceMatrixPage: React.FC = () => {
 
 const RowIdentifierCell: React.FC<{ row: MintRow }> = ({ row }) => {
   if (row.kind === "rt") {
+    // Signal A — FOCI family detection.
+    // Source: `dirkjanm/family-of-client-ids-research/known-foci-clients.csv`
+    // — if the source client_id is on the published list, this RT is a
+    // family refresh token (FRT) and can be redeemed for any other family
+    // member's audience scopes. See `audience-matrix-corpus.ts`.
+    const isFoci = clientIdIsFoci(row.clientId);
+    const fociName = fociClientName(row.clientId);
     return (
       <div className="flex flex-col gap-0.5">
         <span className="inline-flex items-center gap-1.5">
@@ -1436,6 +1561,38 @@ const RowIdentifierCell: React.FC<{ row: MintRow }> = ({ row }) => {
           <Badge variant="info" className="text-3xs">
             RT
           </Badge>
+          {isFoci && (
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <Badge
+                  variant="warning"
+                  className="text-3xs"
+                  aria-label="FOCI family refresh token"
+                >
+                  FOCI
+                </Badge>
+              </TooltipTrigger>
+              <TooltipContent>
+                <p className="m-0 max-w-xs text-xs">
+                  <span className="font-semibold">Family of Client IDs.</span>{" "}
+                  This RT was minted by{" "}
+                  <code className="font-mono">{fociName ?? "a known FOCI client"}</code>
+                  . AAD will redeem it for an access_token as any other family
+                  member, with that member's pre-consented scopes — no
+                  re-authentication required.
+                </p>
+                <p className="m-0 mt-1 text-3xs text-muted-foreground">
+                  Reference:{" "}
+                  <code className="font-mono">
+                    dirkjanm/family-of-client-ids-research
+                  </code>
+                  ,{" "}
+                  <code className="font-mono">_AZURE_LOGIN_METHODS.md §FOCI</code>
+                  .
+                </p>
+              </TooltipContent>
+            </Tooltip>
+          )}
         </span>
         {row.upn && (
           <span className="text-3xs text-muted-foreground">{row.upn}</span>
@@ -1446,6 +1603,9 @@ const RowIdentifierCell: React.FC<{ row: MintRow }> = ({ row }) => {
         {row.clientId && (
           <span className="font-mono text-3xs text-muted-foreground">
             client {row.clientId.slice(0, 8)}…
+            {isFoci && fociName && (
+              <span className="ml-1 text-3xs text-warning">({fociName})</span>
+            )}
           </span>
         )}
       </div>

@@ -59,6 +59,7 @@ import {
   RotateCw,
   Search,
   ShieldCheck,
+  Trash2,
   UserCheck,
   UserCog,
   Users,
@@ -157,6 +158,11 @@ import { PageHeader } from "../shared/page-header";
 import { PortalLoginButton } from "../shared/portal-login-button";
 import { type PageKey } from "../shared/sidebar-nav";
 
+import {
+  DeletedUsersPanel,
+  type DeletedUserRow,
+} from "./tenant-users-deleted-panel";
+
 // =============================================================================
 // Constants
 // =============================================================================
@@ -179,6 +185,10 @@ const DEFAULT_BULK_CONCURRENCY = 3;
 // The threshold is configurable via the persisted "stale-threshold-days" pref
 // so an operator can tighten/loosen the heuristic without code changes.
 const STALE_THRESHOLD_DAYS_PREF_KEY = "tenant-users:stale-threshold-days";
+// Persisted toggle for the defender-side "Deleted users (last 30 days)"
+// surface — wired from the offensive-tooling corpus as a READ-ONLY
+// signal (corpus citations live in `tenant-users-deleted-panel.tsx`).
+const SHOW_DELETED_PANEL_PREF_KEY = "tenant-users:show-deleted-panel";
 const DEFAULT_STALE_DAYS = 90;
 const STALE_DAYS_OPTIONS = [30, 60, 90, 180, 365] as const;
 const MS_PER_DAY = 86_400_000;
@@ -2183,6 +2193,110 @@ const TenantUsersPageInner: React.FC<TenantUsersPageProps> = ({
     },
   );
 
+  // ---- Defender-side: deleted-users surface ------------------------------
+  // Corpus-derived READ-ONLY signal: users sitting in the 30-day soft-delete
+  // recovery window (`/directory/deletedItems/microsoft.graph.user`). See
+  // `tenant-users-deleted-panel.tsx` header for the full citation set —
+  // primary refs are `_AZURE_BYPASS_PLAYBOOK.md` item 9 ("Hard delete user"
+  // is one of the top-10 defender-audit signals) and
+  // `_bypass_modify_delete.md` §4.7/4.9.
+  //
+  // The probe must NEVER invoke hard-delete or restore — those are
+  // state-changing primitives the offensive playbook documents but this
+  // defensive WebUI deliberately does not expose. The panel surfaces the
+  // trail and provides a portal deep-link for any remediation; the
+  // operator performs the actual restore in the audited Entra Portal UI.
+  //
+  // COORDINATOR: tenant-users needs graph-service.listDeletedUsers()
+  // returning DeletedUserRow[] (see `tenant-users-deleted-panel.tsx`).
+  // Suggested wire shape:
+  //   GET /v1.0/directory/deletedItems/microsoft.graph.user
+  //     ?$select=id,displayName,userPrincipalName,mail,deletedDateTime,
+  //              accountEnabled
+  //     &$orderby=deletedDateTime desc
+  //     &$top=100
+  // Requires Directory.AccessAsUser.All (delegated) or User.Read.All
+  // (app-only). Until that lands, this page stubs the data path with an
+  // empty array + a "Permission required" hint when the operator's
+  // capability is unknown (no directory role discovery probed this).
+  const [showDeletedPanel, setShowDeletedPanel] = usePersistedState<boolean>(
+    SHOW_DELETED_PANEL_PREF_KEY,
+    true,
+    {
+      version: 1,
+      migrate: (raw) => Boolean(raw),
+    },
+  );
+  const [deletedRows, setDeletedRows] = React.useState<DeletedUserRow[]>([]);
+  const [deletedLoading, setDeletedLoading] = React.useState(false);
+  const [deletedError, setDeletedError] = React.useState<string | null>(null);
+  // Capability flag — once `graph-service.listDeletedUsers` exists this can
+  // flip to true after a successful probe. Until then we default to false
+  // so the panel renders the "Permission required" hint instead of an
+  // empty-state that would lie about the state of the tenant.
+  const [deletedPermissionGranted, setDeletedPermissionGranted] =
+    React.useState(false);
+  const deletedSeqRef = React.useRef(0);
+
+  const refreshDeletedUsers = React.useCallback(async () => {
+    if (!activeAccount) {
+      setDeletedRows([]);
+      setDeletedPermissionGranted(false);
+      return;
+    }
+    const seq = ++deletedSeqRef.current;
+    setDeletedLoading(true);
+    setDeletedError(null);
+    try {
+      // COORDINATOR: replace this stub with
+      //   const token = await getGraphTokenForAccount(...);
+      //   const rows = await listDeletedUsers(activeAccount.tenantId, token);
+      // and set deletedPermissionGranted from the resulting 200 / 403.
+      const rows: DeletedUserRow[] = [];
+      if (seq !== deletedSeqRef.current) return;
+      setDeletedRows(rows);
+      // Until the service method exists, we cannot prove the operator
+      // has the right scope, so we leave the permission flag false to
+      // surface the "Permission required" hint (instead of pretending
+      // the tenant truly has zero deletions).
+      setDeletedPermissionGranted(false);
+    } catch (e: unknown) {
+      if (seq !== deletedSeqRef.current) return;
+      const msg = e instanceof Error ? e.message : String(e);
+      setDeletedError(msg);
+      setDeletedRows([]);
+      setDeletedPermissionGranted(false);
+    } finally {
+      if (seq === deletedSeqRef.current) {
+        setDeletedLoading(false);
+      }
+    }
+  }, [activeAccount]);
+
+  // Probe the deleted-users surface when the account or the toggle changes.
+  // `useAbortableEffect`'s AbortSignal guards us if the operator switches
+  // accounts mid-flight; the seq guard inside `refreshDeletedUsers` is
+  // belt-and-braces for the post-await state writes.
+  useAbortableEffect(
+    async (signal) => {
+      if (!activeAccount || !showDeletedPanel) {
+        setDeletedRows([]);
+        setDeletedError(null);
+        setDeletedPermissionGranted(false);
+        return;
+      }
+      await refreshDeletedUsers();
+      if (signal.aborted) return;
+    },
+    [activeAccount, showDeletedPanel, refreshDeletedUsers],
+  );
+
+  // KPI tile value: how many deletions sit inside the 30-day window. We
+  // count `deletedRows` directly (the corpus signal is "anything in the
+  // bucket is a tracking surface") rather than filtering by age, because
+  // the Graph endpoint itself only returns the last 30 days.
+  const deletedCount = deletedRows.length;
+
   // Per-row enrichment: derive isGuest / appearsOnPremSynced / isStale once.
   // We snapshot Date.now() into the memo so a single tenant load uses one
   // reference time across all rows; the memo refreshes whenever the source
@@ -3296,6 +3410,19 @@ const TenantUsersPageInner: React.FC<TenantUsersPageProps> = ({
           active={quickFilter === "stale"}
         />
         <SummaryStat
+          icon={Trash2}
+          label="Deleted 30d"
+          value={deletedCount}
+          tone="warning"
+          hint={
+            deletedPermissionGranted
+              ? "Users sitting in the 30-day soft-delete recovery window (defender-side audit surface — corpus: _AZURE_BYPASS_PLAYBOOK.md item 9, _bypass_modify_delete.md §4.7/4.9)."
+              : "Permission required (Directory.AccessAsUser.All / User.Read.All). Toggle the deleted-users panel below to see the hint."
+          }
+          onClick={() => setShowDeletedPanel(!showDeletedPanel)}
+          active={showDeletedPanel}
+        />
+        <SummaryStat
           icon={Cloud}
           label="Has Sub"
           value={usersWithSubs}
@@ -3486,6 +3613,29 @@ const TenantUsersPageInner: React.FC<TenantUsersPageProps> = ({
         onClose={handleCloseBulkDrawer}
         account={activeAccount}
       />
+
+      {/* Defender-side surface: deleted-users (30-day recovery window).
+          READ-ONLY signal from the offensive-tooling corpus — see panel
+          file header for full citation (`_AZURE_BYPASS_PLAYBOOK.md`
+          item 9 + `_bypass_modify_delete.md` §4.7/4.9). Toggleable
+          via the "Deleted 30d" KPI tile above; default-open so an
+          operator running this against their own tenant sees the
+          signal immediately. */}
+      {showDeletedPanel && activeAccount && (
+        <DeletedUsersPanel
+          tenantId={activeAccount.tenantId}
+          actor={
+            activeAccount.username ||
+            activeAccount.name ||
+            activeAccount.homeAccountId
+          }
+          rows={deletedRows}
+          permissionGranted={deletedPermissionGranted}
+          loading={deletedLoading}
+          error={deletedError}
+          onRefresh={() => void refreshDeletedUsers()}
+        />
+      )}
     </div>
   );
 };

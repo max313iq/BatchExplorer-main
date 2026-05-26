@@ -35,18 +35,21 @@
 import * as React from "react";
 import {
   AlertTriangle,
+  Bomb,
   ChevronDown,
   ChevronRight,
   Clock,
   EyeOff,
   ExternalLink,
   Filter as FilterIcon,
+  GitBranch,
   KeyRound,
   RefreshCw,
   Search,
   ShieldAlert,
   ShieldCheck,
   Sparkles,
+  Ticket,
   Users,
 } from "lucide-react";
 
@@ -95,27 +98,44 @@ import { TokenExpiryBadge } from "../shared/token-expiry-badge";
 
 import {
   ASSIGNMENT_PATH_META,
+  HIGH_PRIV_GRAPH_APP_ROLES,
+  MICROSOFT_GRAPH_APP_ID,
+  RECENT_CREDENTIAL_WINDOW_MS,
+  RECENT_TAP_WINDOW_MS,
+  SEVERITY_META,
+  SIGNAL_RISK_WEIGHTS,
   STALE_THRESHOLD_MS,
   TIER_META,
   classifyRole,
-  compareByRiskScore,
+  compareByRiskScoreWithSignals,
   compareByTierThenName,
+  gradeFederatedCredential,
+  gradeHighPrivGraphPermission,
+  gradePimEligibility,
+  gradeTapIssuance,
   hasShadowAdminPath,
   highestTier,
   isExternalUpn,
   isHighBlastRadiusGroup,
   isPrivilegedRoleAdmin,
+  isPublicFederationIssuer,
   isStalePrincipal,
   portalDeepLink,
   riskScore,
   roleDeepLink,
   type AssignmentDetail,
   type AssignmentPath,
+  type FederatedCredentialFinding,
+  type FindingSeverity,
+  type HighPrivGraphPermissionFinding,
+  type PimEligibilityFinding,
+  type PimExpirationKind,
   type PrincipalType,
   type PrivilegedGroup,
   type PrivilegedPrincipal,
   type RoleTier,
   type ShadowAdminPath,
+  type TapIssuanceFinding,
 } from "./privileged-audit-helpers";
 
 // ===========================================================================
@@ -164,6 +184,18 @@ interface PrivilegedAuditDataset {
   warnings: ProbeWarning[];
   /** Activated directory roles found in the tenant, for context. */
   activatedRoleCount: number;
+  /** Signal A — SPs holding high-priv Graph permissions. Corpus:
+   *  `_bypass_role_grant.md` §3.1 + `_AZURE_BYPASS_PLAYBOOK.md` Top-30 #23. */
+  highPrivGraphPermissions: HighPrivGraphPermissionFinding[];
+  /** Signal B — Federated identity credentials on privileged SPs. Corpus:
+   *  `_bypass_role_grant.md` §6 + `_AZURE_BYPASS_PLAYBOOK.md` Top-30 #17. */
+  federatedCredentials: FederatedCredentialFinding[];
+  /** Signal C — PIM eligibility with `noExpiration` on privileged roles.
+   *  Corpus: `_bypass_staged_pim.md` §5.1 + Top-30 #27. */
+  pimEligibilities: PimEligibilityFinding[];
+  /** Signal D — TAP issuances to privileged users. Corpus:
+   *  `_AZURE_BYPASS_PLAYBOOK.md` "Critical Defender Audit Surface" #3 + Top-30 #13. */
+  tapIssuances: TapIssuanceFinding[];
 }
 
 const EMPTY_DATASET: PrivilegedAuditDataset = {
@@ -173,6 +205,10 @@ const EMPTY_DATASET: PrivilegedAuditDataset = {
   servicePrincipals: [],
   warnings: [],
   activatedRoleCount: 0,
+  highPrivGraphPermissions: [],
+  federatedCredentials: [],
+  pimEligibilities: [],
+  tapIssuances: [],
 };
 
 interface DirectoryRoleSummary {
@@ -633,6 +669,542 @@ async function probeTenant(
     .filter((p) => p.type === "ServicePrincipal")
     .map((p) => ({ ...p, createdDateTime: createdById.get(p.id) }));
 
+  // =========================================================================
+  // Corpus-derived detection signals (read-only enumeration).
+  //
+  // The four signals A/B/C/D are all reads against the operator's OWN tenant.
+  // No POST / PATCH / DELETE is issued — the page never invokes addKey /
+  // addPassword / federated-cred / role-grant / TAP-issue / PIM-create.
+  //
+  // Master reference: `_AZURE_BYPASS_PLAYBOOK.md` §"Critical Defender
+  //                   Audit Surface" items 3, 4, 5, 6, 7.
+  //
+  // COORDINATOR: privileged-audit invokes several Graph endpoints not yet
+  // exposed by services/graph-service. If/when graph-service grows wrappers
+  // for these we should route through them (matches the existing pattern
+  // for `directoryRoles/.../members` which we also fetch direct here):
+  //   - GET /servicePrincipals/{graphSpObjectId}/appRoleAssignedTo
+  //   - GET /servicePrincipals/{id} (passwordCredentials,keyCredentials,...)
+  //   - GET /applications?$filter=appId eq '{appId}'
+  //   - GET /applications/{id}/federatedIdentityCredentials
+  //   - GET /roleManagement/directory/roleEligibilityScheduleRequests
+  //   - GET /users/{id}/authentication/temporaryAccessPassMethods
+  // =========================================================================
+
+  // ---- Signal A — High-privilege Graph permissions on SPs ----------------
+  //
+  // Citation:
+  //   `_bypass_role_grant.md` §3.1 (Application.ReadWrite.All → addKey on
+  //     Microsoft Graph SP → app-only with RoleManagement.ReadWrite.Directory
+  //     → self-assign Global Administrator)
+  //   `_AZURE_BYPASS_PLAYBOOK.md` Top-30 #23
+  //
+  // Detection wire-up:
+  //   1. Resolve Microsoft Graph SP object id.
+  //   2. GET /servicePrincipals/{graphId}/appRoleAssignedTo — every SP
+  //      Microsoft Graph has granted an app-role TO.
+  //   3. Filter on the well-known appRoleIds in HIGH_PRIV_GRAPH_APP_ROLES.
+  //   4. For each principal: fetch passwordCredentials + keyCredentials to
+  //      score the "recent credential" companion signal (audit item #5 in
+  //      the master playbook: addKey / addPassword detection).
+  let highPrivGraphPermissions: HighPrivGraphPermissionFinding[] = [];
+  try {
+    // Resolve the Microsoft Graph SP object id by appId.
+    const graphLookup = await fetchAllPages<Record<string, unknown>>(
+      `${GRAPH_BASE}/servicePrincipals?` +
+        `$filter=appId eq '${MICROSOFT_GRAPH_APP_ID}'&$select=id`,
+      token,
+      signal,
+    );
+    const graphSpObjectId = graphLookup.length
+      ? String(graphLookup[0]?.id ?? "")
+      : "";
+    if (!graphSpObjectId) {
+      warnings.push({
+        id: "signal-a:no-graph-sp",
+        message:
+          "Microsoft Graph service principal not resolvable — Signal A " +
+          "(high-privilege Graph permissions) is empty until that completes.",
+      });
+    } else {
+      const assignedTo = await fetchAllPages<Record<string, unknown>>(
+        `${GRAPH_BASE}/servicePrincipals/${encodeURIComponent(graphSpObjectId)}` +
+          `/appRoleAssignedTo?$select=id,principalId,principalDisplayName,principalType,appRoleId,createdDateTime` +
+          `&$top=999`,
+        token,
+        signal,
+      );
+      // Group by principalId; we only care about SP principals here.
+      const perPrincipal = new Map<
+        string,
+        Array<{
+          assignmentId: string;
+          appRoleId: string;
+          permissionName: string;
+          createdDateTime?: string;
+          principalDisplayName: string;
+        }>
+      >();
+      for (const row of assignedTo) {
+        const appRoleId = String(row.appRoleId ?? "");
+        const permName = HIGH_PRIV_GRAPH_APP_ROLES.get(appRoleId);
+        if (!permName) continue;
+        const principalType = String(row.principalType ?? "");
+        if (principalType !== "ServicePrincipal") continue;
+        const principalId = String(row.principalId ?? "");
+        if (!principalId) continue;
+        const list = perPrincipal.get(principalId) ?? [];
+        list.push({
+          assignmentId: String(row.id ?? ""),
+          appRoleId,
+          permissionName: permName,
+          createdDateTime:
+            (row.createdDateTime as string | undefined) ?? undefined,
+          principalDisplayName: String(row.principalDisplayName ?? ""),
+        });
+        perPrincipal.set(principalId, list);
+      }
+      // Hydrate each SP with name/appId/credential counts.
+      const now = Date.now();
+      const findings: HighPrivGraphPermissionFinding[] = [];
+      await Promise.allSettled(
+        Array.from(perPrincipal.entries()).map(async ([spId, perms]) => {
+          let spName = perms[0]?.principalDisplayName ?? spId;
+          let appId: string | undefined;
+          let signInAudience: string | undefined;
+          let createdDateTime: string | undefined;
+          let pwdCount = 0;
+          let keyCount = 0;
+          let mostRecent: number | null = null;
+          try {
+            const url =
+              `${GRAPH_BASE}/servicePrincipals/${encodeURIComponent(spId)}` +
+              `?$select=id,displayName,appId,signInAudience,createdDateTime,passwordCredentials,keyCredentials`;
+            const r = await fetch(url, {
+              headers: graphHeaders(token),
+              ...(signal ? { signal } : {}),
+            });
+            if (r.ok) {
+              const d = (await r.json()) as {
+                displayName?: string;
+                appId?: string;
+                signInAudience?: string;
+                createdDateTime?: string;
+                passwordCredentials?: Array<{ startDateTime?: string }>;
+                keyCredentials?: Array<{ startDateTime?: string }>;
+              };
+              if (d.displayName) spName = d.displayName;
+              appId = d.appId;
+              signInAudience = d.signInAudience;
+              createdDateTime = d.createdDateTime;
+              const pwds = d.passwordCredentials ?? [];
+              const keys = d.keyCredentials ?? [];
+              pwdCount = pwds.length;
+              keyCount = keys.length;
+              for (const c of [...pwds, ...keys]) {
+                if (!c.startDateTime) continue;
+                const ts = new Date(c.startDateTime).getTime();
+                if (!Number.isFinite(ts)) continue;
+                if (mostRecent === null || ts > mostRecent) mostRecent = ts;
+              }
+            }
+          } catch {
+            /* swallow — SP detail is optional context for the finding */
+          }
+          const hasRecent =
+            mostRecent !== null && now - mostRecent <= RECENT_CREDENTIAL_WINDOW_MS;
+          findings.push({
+            id: `sigA:${spId}`,
+            servicePrincipalId: spId,
+            servicePrincipalDisplayName: spName,
+            appId,
+            signInAudience,
+            servicePrincipalCreatedDateTime: createdDateTime,
+            permissions: perms.map((p) => ({
+              assignmentId: p.assignmentId,
+              appRoleId: p.appRoleId,
+              permissionName: p.permissionName,
+              createdDateTime: p.createdDateTime,
+            })),
+            passwordCredentialCount: pwdCount,
+            keyCredentialCount: keyCount,
+            hasRecentCredential: hasRecent,
+            mostRecentCredentialAt:
+              mostRecent !== null
+                ? new Date(mostRecent).toISOString()
+                : undefined,
+          });
+        }),
+      );
+      // Sort: criticals first (recent cred + canonical perm), then perm count.
+      findings.sort((a, b) => {
+        const sa =
+          gradeHighPrivGraphPermission(a) === "critical"
+            ? 0
+            : gradeHighPrivGraphPermission(a) === "high"
+              ? 1
+              : 2;
+        const sb =
+          gradeHighPrivGraphPermission(b) === "critical"
+            ? 0
+            : gradeHighPrivGraphPermission(b) === "high"
+              ? 1
+              : 2;
+        if (sa !== sb) return sa - sb;
+        return b.permissions.length - a.permissions.length;
+      });
+      highPrivGraphPermissions = findings;
+    }
+  } catch (err) {
+    warnings.push({
+      id: "signal-a:failed",
+      message:
+        `Signal A (high-privilege Graph permissions) probe failed: ${
+          (err as Error).message
+        }. Needs Application.Read.All / Directory.Read.All on Microsoft Graph.`,
+    });
+  }
+
+  // ---- Signal B — Federated identity credentials on privileged SPs --------
+  //
+  // Citation:
+  //   `_bypass_role_grant.md` §6 (WIF federated credential = role-grant bypass)
+  //   `_AZURE_BYPASS_PLAYBOOK.md` Top-30 #17 + audit item #6
+  //
+  // Detection wire-up:
+  //   - For every SP that surfaced in Signal A (highest-leverage SPs in the
+  //     tenant), resolve its parent application object, then enumerate
+  //     /applications/{appObjectId}/federatedIdentityCredentials.
+  //   - Flag any federated credential whose issuer host matches the
+  //     curated PUBLIC_FEDERATION_ISSUER_HOSTS list.
+  let federatedCredentials: FederatedCredentialFinding[] = [];
+  try {
+    const findings: FederatedCredentialFinding[] = [];
+    const targets = highPrivGraphPermissions.map((f) => ({
+      spId: f.servicePrincipalId,
+      spName: f.servicePrincipalDisplayName,
+      appId: f.appId,
+    }));
+    await Promise.allSettled(
+      targets.map(async (t) => {
+        if (!t.appId) return;
+        // Resolve parent application object id (federated creds live on
+        // /applications, not /servicePrincipals).
+        let appObjectId: string | undefined;
+        try {
+          const u =
+            `${GRAPH_BASE}/applications?` +
+            `$filter=appId eq '${encodeURIComponent(t.appId)}'&$select=id`;
+          const r = await fetch(u, {
+            headers: graphHeaders(token),
+            ...(signal ? { signal } : {}),
+          });
+          if (r.ok) {
+            const d = (await r.json()) as {
+              value?: Array<{ id?: string }>;
+            };
+            appObjectId = d.value?.[0]?.id;
+          }
+        } catch {
+          /* swallow — app may live in a partner tenant (no local app obj) */
+        }
+        if (!appObjectId) return;
+        try {
+          const fic = await fetchAllPages<Record<string, unknown>>(
+            `${GRAPH_BASE}/applications/${encodeURIComponent(appObjectId)}` +
+              `/federatedIdentityCredentials`,
+            token,
+            signal,
+          );
+          for (const row of fic) {
+            const issuer = String(row.issuer ?? "");
+            const subject = String(row.subject ?? "");
+            const audiences = Array.isArray(row.audiences)
+              ? (row.audiences as string[])
+              : [];
+            findings.push({
+              id: `sigB:${t.spId}:${row.id ?? subject}`,
+              servicePrincipalId: t.spId,
+              servicePrincipalDisplayName: t.spName,
+              applicationObjectId: appObjectId,
+              name: String(row.name ?? "(unnamed)"),
+              issuer,
+              subject,
+              audiences,
+              isPublicIssuer: isPublicFederationIssuer(issuer),
+            });
+          }
+        } catch {
+          /* swallow — Application.Read.All required; degrade quietly */
+        }
+      }),
+    );
+    if (findings.length === 0 && targets.length > 0) {
+      // Couldn't enumerate any — caller probably lacks Application.Read.All
+      // on /applications/{id}/federatedIdentityCredentials. Surface a hint
+      // so the empty card doesn't read as a clean bill of health.
+      warnings.push({
+        id: "signal-b:permission",
+        message:
+          "Signal B (federated identity credentials) did not enumerate any " +
+          "credentials. If your high-privilege SPs use WIF, the signed-in " +
+          "account likely needs Application.Read.All to read " +
+          "/applications/{id}/federatedIdentityCredentials.",
+      });
+    }
+    findings.sort((a, b) => {
+      // Public issuer first, then by name.
+      if (a.isPublicIssuer !== b.isPublicIssuer) {
+        return a.isPublicIssuer ? -1 : 1;
+      }
+      return a.name.localeCompare(b.name);
+    });
+    federatedCredentials = findings;
+  } catch (err) {
+    warnings.push({
+      id: "signal-b:failed",
+      message:
+        `Signal B (federated identity credentials) probe failed: ${
+          (err as Error).message
+        }.`,
+    });
+  }
+
+  // ---- Signal C — PIM eligibility with `noExpiration` ---------------------
+  //
+  // Citation:
+  //   `_bypass_staged_pim.md` §5.1 "The 'time bomb'" — PRA briefly compromised,
+  //     plant `noExpiration` eligibility for attacker user, then let the PRA
+  //     compromise be remediated. Eligibility persists.
+  //   `_AZURE_BYPASS_PLAYBOOK.md` Top-30 #27 + audit item #7
+  //
+  // Detection wire-up:
+  //   GET /roleManagement/directory/roleEligibilityScheduleRequests
+  //   (we deliberately read the *requests* endpoint not the *schedules*
+  //   endpoint, because the requests endpoint preserves createdDateTime
+  //   and is the closest read-only equivalent of the POST that creates
+  //   the eligibility — audit-event #7 in the master playbook).
+  //   If the *requests* endpoint 403s we degrade to *schedules*.
+  let pimEligibilities: PimEligibilityFinding[] = [];
+  const knownRoleIdByTemplate = new Map<string, DirectoryRoleSummary>();
+  for (const role of roles) {
+    knownRoleIdByTemplate.set(role.roleTemplateId, role);
+  }
+  const buildPimFinding = (
+    row: Record<string, unknown>,
+  ): PimEligibilityFinding | null => {
+    const principalId = String(row.principalId ?? "");
+    const roleTemplateId = String(row.roleDefinitionId ?? "");
+    if (!principalId || !roleTemplateId) return null;
+    const schedule = (row.scheduleInfo ?? {}) as Record<string, unknown>;
+    const expiration = (schedule.expiration ?? {}) as Record<string, unknown>;
+    const typeRaw = String(expiration.type ?? "").toLowerCase();
+    const expirationKind: PimExpirationKind =
+      typeRaw === "noexpiration"
+        ? "noExpiration"
+        : typeRaw === "afterdatetime"
+          ? "afterDateTime"
+          : typeRaw === "afterduration"
+            ? "afterDuration"
+            : "unknown";
+    const role = knownRoleIdByTemplate.get(roleTemplateId);
+    const tier = role?.tier ?? classifyRole(roleTemplateId, undefined);
+    const principalResolved = resolvedById.get(principalId);
+    const principalType = principalResolved
+      ? ((principalResolved.type as PrincipalType) ?? "Unknown")
+      : "Unknown";
+    return {
+      id: `sigC:${String(row.id ?? `${principalId}::${roleTemplateId}`)}`,
+      principalId,
+      principalDisplayName: principalResolved?.displayName,
+      principalSignInName: principalResolved?.signInName,
+      principalType,
+      roleTemplateId,
+      roleDisplayName: role?.displayName,
+      tier,
+      expirationKind,
+      endDateTime: expiration.endDateTime as string | undefined,
+      duration: expiration.duration as string | undefined,
+      createdDateTime: row.createdDateTime as string | undefined,
+      isCriticalTimeBomb: expirationKind === "noExpiration" && tier === "tier0",
+    };
+  };
+  try {
+    const eligibilityIdsToResolve = new Set<string>();
+    let raw: Record<string, unknown>[] = [];
+    try {
+      raw = await fetchAllPages<Record<string, unknown>>(
+        `${GRAPH_BASE}/roleManagement/directory/roleEligibilityScheduleRequests` +
+          `?$select=id,principalId,roleDefinitionId,status,action,scheduleInfo,createdDateTime` +
+          `&$filter=status eq 'Provisioned'`,
+        token,
+        signal,
+      );
+    } catch {
+      // Fallback: the *schedules* endpoint (current state, not historical
+      // request log). Some tenants don't grant RoleEligibilitySchedule.Read.All
+      // on the requests endpoint specifically.
+      raw = await fetchAllPages<Record<string, unknown>>(
+        `${GRAPH_BASE}/roleManagement/directory/roleEligibilitySchedules` +
+          `?$select=id,principalId,roleDefinitionId,scheduleInfo,createdDateTime`,
+        token,
+        signal,
+      );
+    }
+    const findings: PimEligibilityFinding[] = [];
+    for (const row of raw) {
+      const f = buildPimFinding(row);
+      if (f) findings.push(f);
+      const pid = String(row.principalId ?? "");
+      if (pid && !resolvedById.has(pid)) eligibilityIdsToResolve.add(pid);
+    }
+    // Best-effort resolve of any principal we haven't seen before.
+    if (eligibilityIdsToResolve.size > 0) {
+      try {
+        const extra = await getPrincipalsByIds(
+          tenantId,
+          Array.from(eligibilityIdsToResolve),
+          token,
+        );
+        for (const p of extra) {
+          resolvedById.set(p.id, p);
+          // Patch already-built findings with the resolved name.
+          for (const f of findings) {
+            if (f.principalId === p.id) {
+              f.principalDisplayName = p.displayName;
+              f.principalSignInName = p.signInName;
+              f.principalType =
+                (p.type as PrincipalType) ?? f.principalType;
+            }
+          }
+        }
+      } catch {
+        /* swallow — display name is decoration */
+      }
+    }
+    // Sort: criticals first, then noExpiration, then by tier order.
+    findings.sort((a, b) => {
+      if (a.isCriticalTimeBomb !== b.isCriticalTimeBomb) {
+        return a.isCriticalTimeBomb ? -1 : 1;
+      }
+      const sa = a.expirationKind === "noExpiration" ? 0 : 1;
+      const sb = b.expirationKind === "noExpiration" ? 0 : 1;
+      if (sa !== sb) return sa - sb;
+      return TIER_META[a.tier].order - TIER_META[b.tier].order;
+    });
+    pimEligibilities = findings;
+  } catch (err) {
+    warnings.push({
+      id: "signal-c:failed",
+      message:
+        `Signal C (PIM eligibility) probe failed: ${
+          (err as Error).message
+        }. Needs RoleEligibilitySchedule.Read.Directory or RoleManagement.Read.Directory.`,
+    });
+  }
+
+  // ---- Signal D — Recent TAP issuances to privileged users ----------------
+  //
+  // Citation:
+  //   `_AZURE_BYPASS_PLAYBOOK.md` "Critical Defender Audit Surface" #3
+  //                              + Top-30 #13
+  //
+  // Detection wire-up: for every USER principal that already surfaced in
+  // sections B/C, GET /users/{id}/authentication/temporaryAccessPassMethods.
+  // The endpoint is read-only and returns whatever TAP method(s) the user
+  // currently has on their account. Sees admin-issued TAPs (Auth Admin /
+  // Priv Auth Admin) — the canonical MFA-equivalent persistence vector.
+  let tapIssuances: TapIssuanceFinding[] = [];
+  try {
+    const privilegedUsers = principalsAll.filter((p) => p.type === "User");
+    const now = Date.now();
+    const findings: TapIssuanceFinding[] = [];
+    await Promise.allSettled(
+      privilegedUsers.map(async (u) => {
+        try {
+          const r = await fetch(
+            `${GRAPH_BASE}/users/${encodeURIComponent(u.id)}` +
+              `/authentication/temporaryAccessPassMethods`,
+            {
+              headers: graphHeaders(token),
+              ...(signal ? { signal } : {}),
+            },
+          );
+          if (!r.ok) {
+            // 404 means "no TAP" which is the expected default; only
+            // promote to a warning on 4xx-not-404 (permission missing).
+            if (r.status !== 404 && r.status !== 200) {
+              if (r.status === 401 || r.status === 403) {
+                warnings.push({
+                  id: `signal-d:perm:${u.id}`,
+                  message:
+                    `Signal D (TAP issuance) needs UserAuthenticationMethod.Read.All ` +
+                    `to read /users/${u.id.slice(0, 8)}…/authentication/temporaryAccessPassMethods.`,
+                });
+              }
+            }
+            return;
+          }
+          const data = (await r.json()) as {
+            value?: Array<{
+              id?: string;
+              startDateTime?: string;
+              lifetimeInMinutes?: number;
+              isUsable?: boolean;
+              methodUsabilityReason?: string;
+            }>;
+          };
+          for (const tap of data.value ?? []) {
+            const startMs = tap.startDateTime
+              ? new Date(tap.startDateTime).getTime()
+              : NaN;
+            const isRecent =
+              Number.isFinite(startMs) &&
+              now - startMs <= RECENT_TAP_WINDOW_MS;
+            const isTopTier =
+              u.topTier === "tier0" || u.topTier === "tier1";
+            findings.push({
+              id: `sigD:${u.id}:${tap.id ?? "tap"}`,
+              userId: u.id,
+              userDisplayName: u.displayName,
+              userPrincipalName: u.signInName,
+              userTier: u.topTier,
+              tapId: String(tap.id ?? ""),
+              startDateTime: tap.startDateTime,
+              lifetimeInMinutes: tap.lifetimeInMinutes,
+              isUsable: tap.isUsable,
+              methodUsabilityReason: tap.methodUsabilityReason,
+              isRecentToTierZero: isRecent && isTopTier,
+            });
+          }
+        } catch {
+          /* swallow — per-user TAP query failures are not page-level */
+        }
+      }),
+    );
+    findings.sort((a, b) => {
+      // Critical-on-T0 first, then any T0, then T1, then by time.
+      const sa = gradeTapIssuance(a) === "critical" ? 0 : 1;
+      const sb = gradeTapIssuance(b) === "critical" ? 0 : 1;
+      if (sa !== sb) return sa - sb;
+      const ta = TIER_META[a.userTier].order;
+      const tb = TIER_META[b.userTier].order;
+      if (ta !== tb) return ta - tb;
+      const aT = a.startDateTime ? new Date(a.startDateTime).getTime() : 0;
+      const bT = b.startDateTime ? new Date(b.startDateTime).getTime() : 0;
+      return bT - aT;
+    });
+    tapIssuances = findings;
+  } catch (err) {
+    warnings.push({
+      id: "signal-d:failed",
+      message:
+        `Signal D (TAP issuance) probe failed: ${
+          (err as Error).message
+        }. Needs UserAuthenticationMethod.Read.All.`,
+    });
+  }
+
   return {
     principals: principalsAll,
     shadowPaths,
@@ -640,6 +1212,10 @@ async function probeTenant(
     servicePrincipals,
     warnings,
     activatedRoleCount: roles.length,
+    highPrivGraphPermissions,
+    federatedCredentials,
+    pimEligibilities,
+    tapIssuances,
   };
 }
 
@@ -1041,6 +1617,53 @@ export const PrivilegedAuditPage: React.FC = () => {
   }, [setUrlState, recordFilterMutation]);
 
   // -------------------------------------------------------------------------
+  // Per-principal corpus-signal uplift — fold the four signals into the
+  // risk score so flagged principals sort up the matrix.
+  //
+  // Citation: `_AZURE_BYPASS_PLAYBOOK.md` "Critical Defender Audit Surface" —
+  // active indicators outweigh static role tier.
+  // -------------------------------------------------------------------------
+  const signalLiftById = React.useMemo<Map<string, number>>(() => {
+    const lift = new Map<string, number>();
+    const add = (id: string, sev: FindingSeverity) => {
+      const cur = lift.get(id) ?? 0;
+      lift.set(id, cur + SIGNAL_RISK_WEIGHTS[sev]);
+    };
+    // Signal A — every SP holding a high-priv Graph permission earns
+    // uplift on its OWN principal row (SPs appear in section E).
+    for (const f of dataset.highPrivGraphPermissions) {
+      add(f.servicePrincipalId, gradeHighPrivGraphPermission(f));
+    }
+    // Signal B — federated cred uplifts the SP it lives under. We pass
+    // "addKey recent" by joining against Signal A's hasRecentCredential.
+    const recentCredSet = new Set(
+      dataset.highPrivGraphPermissions
+        .filter((f) => f.hasRecentCredential)
+        .map((f) => f.servicePrincipalId),
+    );
+    for (const f of dataset.federatedCredentials) {
+      add(
+        f.servicePrincipalId,
+        gradeFederatedCredential(f, recentCredSet.has(f.servicePrincipalId)),
+      );
+    }
+    // Signal C — PIM eligibility lifts the principal directly.
+    for (const f of dataset.pimEligibilities) {
+      add(f.principalId, gradePimEligibility(f));
+    }
+    // Signal D — TAP issuance lifts the user it was issued to.
+    for (const f of dataset.tapIssuances) {
+      add(f.userId, gradeTapIssuance(f));
+    }
+    return lift;
+  }, [
+    dataset.highPrivGraphPermissions,
+    dataset.federatedCredentials,
+    dataset.pimEligibilities,
+    dataset.tapIssuances,
+  ]);
+
+  // -------------------------------------------------------------------------
   // Derived per-section views
   // -------------------------------------------------------------------------
   // Pre-sort principals by the chosen sort mode. The sort is the heaviest
@@ -1049,12 +1672,12 @@ export const PrivilegedAuditPage: React.FC = () => {
   const sortedPrincipals = React.useMemo(() => {
     const copy = dataset.principals.slice();
     if (sortMode === "risk") {
-      copy.sort(compareByRiskScore);
+      copy.sort(compareByRiskScoreWithSignals(signalLiftById));
     } else {
       copy.sort(compareByTierThenName);
     }
     return copy;
-  }, [dataset.principals, sortMode]);
+  }, [dataset.principals, sortMode, signalLiftById]);
 
   // Snapshot now() once per render so isStalePrincipal isn't re-evaluating
   // Date.now() inside .filter() on every principal.
@@ -1273,6 +1896,13 @@ export const PrivilegedAuditPage: React.FC = () => {
         tenantTotal={dataset.principals.length}
         dataset={dataset}
         summary={summary}
+        signalLiftById={signalLiftById}
+      />
+
+      {/* ─────────────────────── Corpus Detection Signals (A/B/C/D) ─── */}
+      <CorpusDetectionSignalsCard
+        dataset={dataset}
+        loading={loading}
       />
 
       {/* ─────────────────────────────────────────────────────────── C */}
@@ -1680,32 +2310,48 @@ const FilterChip: React.FC<{
 // Section B: privileged identity list
 // ===========================================================================
 
-const PRINCIPAL_EXPORT_COLUMNS: ReadonlyArray<ExportColumn<PrivilegedPrincipal>> = [
-  { header: "Display name", accessor: (p) => p.displayName },
-  { header: "Type", accessor: (p) => p.type },
-  { header: "Sign-in name", accessor: (p) => p.signInName ?? "" },
-  { header: "Object id", accessor: (p) => p.id },
-  { header: "Top tier", accessor: (p) => TIER_META[p.topTier].label },
-  { header: "Risk score", accessor: (p) => riskScore(p) },
-  {
-    header: "Roles",
-    accessor: (p) =>
-      Array.from(new Set(p.assignments.map((a) => a.roleDisplayName))).join("; "),
-  },
-  {
-    header: "Role template ids",
-    accessor: (p) =>
-      Array.from(new Set(p.assignments.map((a) => a.roleTemplateId))).join("; "),
-  },
-  {
-    header: "Assignment paths",
-    accessor: (p) =>
-      Array.from(new Set(p.assignments.map((a) => a.path))).join("; "),
-  },
-  { header: "Shadow admin", accessor: (p) => (p.isShadowAdmin ? "yes" : "no") },
-  { header: "Guest", accessor: (p) => (p.isExternal ? "yes" : "no") },
-  { header: "Stale (heuristic)", accessor: (p) => (isStalePrincipal(p) ? "yes" : "no") },
-];
+/**
+ * Build the principal-export column list. We pass the per-principal corpus
+ * signal-lift map in so the exported "Risk score" column matches the value
+ * used to sort the on-screen table.
+ */
+function principalExportColumns(
+  signalLiftById: ReadonlyMap<string, number>,
+): ReadonlyArray<ExportColumn<PrivilegedPrincipal>> {
+  return [
+    { header: "Display name", accessor: (p) => p.displayName },
+    { header: "Type", accessor: (p) => p.type },
+    { header: "Sign-in name", accessor: (p) => p.signInName ?? "" },
+    { header: "Object id", accessor: (p) => p.id },
+    { header: "Top tier", accessor: (p) => TIER_META[p.topTier].label },
+    {
+      header: "Risk score",
+      accessor: (p) => riskScore(p, signalLiftById.get(p.id) ?? 0),
+    },
+    {
+      header: "Signal lift",
+      accessor: (p) => signalLiftById.get(p.id) ?? 0,
+    },
+    {
+      header: "Roles",
+      accessor: (p) =>
+        Array.from(new Set(p.assignments.map((a) => a.roleDisplayName))).join("; "),
+    },
+    {
+      header: "Role template ids",
+      accessor: (p) =>
+        Array.from(new Set(p.assignments.map((a) => a.roleTemplateId))).join("; "),
+    },
+    {
+      header: "Assignment paths",
+      accessor: (p) =>
+        Array.from(new Set(p.assignments.map((a) => a.path))).join("; "),
+    },
+    { header: "Shadow admin", accessor: (p) => (p.isShadowAdmin ? "yes" : "no") },
+    { header: "Guest", accessor: (p) => (p.isExternal ? "yes" : "no") },
+    { header: "Stale (heuristic)", accessor: (p) => (isStalePrincipal(p) ? "yes" : "no") },
+  ];
+}
 
 interface PrivilegedIdentityListProps {
   principals: PrivilegedPrincipal[];
@@ -1721,6 +2367,8 @@ interface PrivilegedIdentityListProps {
     guestPrivileged: number;
     spPrivileged: number;
   };
+  /** Per-principal uplift from the corpus-derived detection signals. */
+  signalLiftById: ReadonlyMap<string, number>;
 }
 
 const PrivilegedIdentityList: React.FC<PrivilegedIdentityListProps> = ({
@@ -1730,6 +2378,7 @@ const PrivilegedIdentityList: React.FC<PrivilegedIdentityListProps> = ({
   loading,
   dataset,
   summary,
+  signalLiftById,
 }) => {
   const [expanded, setExpanded] = React.useState<Set<string>>(
     () => new Set(),
@@ -1744,7 +2393,8 @@ const PrivilegedIdentityList: React.FC<PrivilegedIdentityListProps> = ({
   }, []);
 
   // For JSON export we want EVERYTHING (paths, summary stats, partial-data
-  // warnings) so the file is self-contained per the spec.
+  // warnings, AND the corpus-derived detection signals A/B/C/D) so the file
+  // is self-contained per the spec.
   const exportPayload = React.useMemo(
     () => ({
       tenantId,
@@ -1754,8 +2404,22 @@ const PrivilegedIdentityList: React.FC<PrivilegedIdentityListProps> = ({
       groupsHoldingRoles: dataset.groups,
       servicePrincipals: dataset.servicePrincipals,
       warnings: dataset.warnings,
+      corpusSignals: {
+        // See privileged-audit-helpers.ts header for the corpus citations.
+        highPrivGraphPermissions: dataset.highPrivGraphPermissions,
+        federatedCredentials: dataset.federatedCredentials,
+        pimEligibilities: dataset.pimEligibilities,
+        tapIssuances: dataset.tapIssuances,
+      },
     }),
     [tenantId, summary, dataset],
+  );
+
+  // Build the principal export columns lazily so the "Risk score" column
+  // matches the on-screen value (base + corpus signal lift).
+  const exportColumns = React.useMemo(
+    () => principalExportColumns(signalLiftById),
+    [signalLiftById],
   );
 
   const columns: DataTableColumn<PrivilegedPrincipal>[] = React.useMemo(
@@ -1866,16 +2530,33 @@ const PrivilegedIdentityList: React.FC<PrivilegedIdentityListProps> = ({
         id: "risk",
         header: "Risk",
         width: "w-16",
-        sort: (a, b) => riskScore(b) - riskScore(a),
-        cell: (p) => (
-          <span
-            className="tabular-nums text-2xs text-muted-foreground"
-            title={`Composite risk score — Tier-weighted (T0=1000, T1=100, T2=10, T3=1) plus shadow/guest/SP modifiers. See helpers.riskScore() for the full breakdown.`}
-          >
-            {riskScore(p).toLocaleString()}
-          </span>
-        ),
-        csv: (p) => riskScore(p),
+        sort: (a, b) =>
+          riskScore(b, signalLiftById.get(b.id) ?? 0) -
+          riskScore(a, signalLiftById.get(a.id) ?? 0),
+        cell: (p) => {
+          const lift = signalLiftById.get(p.id) ?? 0;
+          const base = riskScore(p);
+          const total = riskScore(p, lift);
+          return (
+            <span
+              className={cn(
+                "tabular-nums text-2xs",
+                lift > 0
+                  ? "font-medium text-warning"
+                  : "text-muted-foreground",
+              )}
+              title={
+                lift > 0
+                  ? `Risk ${total.toLocaleString()} = base ${base.toLocaleString()} + corpus-signal lift ${lift.toLocaleString()}. ` +
+                    "Lift comes from Signals A/B/C/D — see Corpus Detection Signals card."
+                  : "Composite risk score — Tier-weighted (T0=1000, T1=100, T2=10, T3=1) plus shadow/guest/SP modifiers. See helpers.riskScore()."
+              }
+            >
+              {total.toLocaleString()}
+            </span>
+          );
+        },
+        csv: (p) => riskScore(p, signalLiftById.get(p.id) ?? 0),
       },
       {
         id: "activity",
@@ -1929,7 +2610,7 @@ const PrivilegedIdentityList: React.FC<PrivilegedIdentityListProps> = ({
         ),
       },
     ],
-    [tenantId, expanded],
+    [tenantId, expanded, signalLiftById, toggleExpand],
   );
 
   return (
@@ -1946,7 +2627,7 @@ const PrivilegedIdentityList: React.FC<PrivilegedIdentityListProps> = ({
         </div>
         <ExportMenu
           rows={principals}
-          columns={PRINCIPAL_EXPORT_COLUMNS}
+          columns={exportColumns}
           filename="privileged-audit"
           jsonMetadata={exportPayload}
         />
@@ -1992,6 +2673,7 @@ const PrivilegedIdentityList: React.FC<PrivilegedIdentityListProps> = ({
               key={`exp-${p.id}`}
               principal={p}
               tenantId={tenantId}
+              signalLift={signalLiftById.get(p.id) ?? 0}
             />
           ))}
       </CardContent>
@@ -2002,7 +2684,8 @@ const PrivilegedIdentityList: React.FC<PrivilegedIdentityListProps> = ({
 const ExpandedAssignmentDetail: React.FC<{
   principal: PrivilegedPrincipal;
   tenantId: string;
-}> = React.memo(({ principal, tenantId }) => (
+  signalLift?: number;
+}> = React.memo(({ principal, tenantId, signalLift = 0 }) => (
   <div
     className="mt-2 rounded-md border border-dashed border-border bg-muted/30 p-3"
     role="region"
@@ -2014,10 +2697,19 @@ const ExpandedAssignmentDetail: React.FC<{
           Every role this principal holds
         </span>
         <span
-          className="rounded bg-muted px-1.5 py-0.5 tabular-nums text-3xs text-muted-foreground"
-          title="Composite risk score (see Risk column tooltip)"
+          className={cn(
+            "rounded px-1.5 py-0.5 tabular-nums text-3xs",
+            signalLift > 0
+              ? "bg-warning/15 text-warning"
+              : "bg-muted text-muted-foreground",
+          )}
+          title={
+            signalLift > 0
+              ? `Risk ${riskScore(principal, signalLift).toLocaleString()} = base ${riskScore(principal).toLocaleString()} + corpus-signal lift ${signalLift.toLocaleString()}.`
+              : "Composite risk score (see Risk column tooltip)"
+          }
         >
-          risk {riskScore(principal).toLocaleString()}
+          risk {riskScore(principal, signalLift).toLocaleString()}
         </span>
       </div>
       <a
@@ -2435,5 +3127,605 @@ const ServicePrincipalsCard: React.FC<{
     </Card>
   );
 };
+
+// ===========================================================================
+// Corpus Detection Signals (A/B/C/D) — defensive read-only enumeration.
+//
+// EVERY finding category below is sourced from the corpus playbooks at
+//   C:\Users\baimgprodsesa1\Desktop\New folder\_*.md
+// and represents a drift-from-baseline indicator on the operator's OWN
+// tenant. None of the cards or rows here invoke offensive primitives —
+// the wiring is purely "GET → render → grade severity → sort up the matrix".
+// ===========================================================================
+
+const SeverityBadge: React.FC<{ severity: FindingSeverity }> = ({
+  severity,
+}) => {
+  const meta = SEVERITY_META[severity];
+  return (
+    <Badge variant={meta.badgeVariant} title={meta.description}>
+      {meta.label}
+    </Badge>
+  );
+};
+
+const SIGNAL_A_EXPORT_COLUMNS: ReadonlyArray<
+  ExportColumn<HighPrivGraphPermissionFinding>
+> = [
+  { header: "SP display name", accessor: (f) => f.servicePrincipalDisplayName },
+  { header: "SP object id", accessor: (f) => f.servicePrincipalId },
+  { header: "App id", accessor: (f) => f.appId ?? "" },
+  { header: "Sign-in audience", accessor: (f) => f.signInAudience ?? "" },
+  {
+    header: "Permissions",
+    accessor: (f) => f.permissions.map((p) => p.permissionName).join("; "),
+  },
+  { header: "Password credentials", accessor: (f) => f.passwordCredentialCount },
+  { header: "Key credentials", accessor: (f) => f.keyCredentialCount },
+  {
+    header: "Recent credential",
+    accessor: (f) => (f.hasRecentCredential ? "yes" : "no"),
+  },
+  {
+    header: "Most recent credential at",
+    accessor: (f) => f.mostRecentCredentialAt ?? "",
+  },
+  {
+    header: "Severity",
+    accessor: (f) => SEVERITY_META[gradeHighPrivGraphPermission(f)].label,
+  },
+];
+
+const SIGNAL_B_EXPORT_COLUMNS: ReadonlyArray<
+  ExportColumn<FederatedCredentialFinding>
+> = [
+  { header: "SP display name", accessor: (f) => f.servicePrincipalDisplayName },
+  { header: "SP object id", accessor: (f) => f.servicePrincipalId },
+  { header: "Federated credential name", accessor: (f) => f.name },
+  { header: "Issuer", accessor: (f) => f.issuer },
+  { header: "Subject", accessor: (f) => f.subject },
+  { header: "Audiences", accessor: (f) => f.audiences.join("; ") },
+  {
+    header: "Public issuer",
+    accessor: (f) => (f.isPublicIssuer ? "yes" : "no"),
+  },
+];
+
+const SIGNAL_C_EXPORT_COLUMNS: ReadonlyArray<
+  ExportColumn<PimEligibilityFinding>
+> = [
+  { header: "Principal", accessor: (f) => f.principalDisplayName ?? f.principalId },
+  { header: "Principal id", accessor: (f) => f.principalId },
+  { header: "Principal type", accessor: (f) => f.principalType },
+  { header: "Sign-in name", accessor: (f) => f.principalSignInName ?? "" },
+  { header: "Role", accessor: (f) => f.roleDisplayName ?? f.roleTemplateId },
+  { header: "Role template id", accessor: (f) => f.roleTemplateId },
+  { header: "Tier", accessor: (f) => TIER_META[f.tier].label },
+  { header: "Expiration kind", accessor: (f) => f.expirationKind },
+  { header: "End date", accessor: (f) => f.endDateTime ?? "" },
+  { header: "Duration", accessor: (f) => f.duration ?? "" },
+  { header: "Created", accessor: (f) => f.createdDateTime ?? "" },
+  {
+    header: "Critical time bomb",
+    accessor: (f) => (f.isCriticalTimeBomb ? "yes" : "no"),
+  },
+  {
+    header: "Severity",
+    accessor: (f) => SEVERITY_META[gradePimEligibility(f)].label,
+  },
+];
+
+const SIGNAL_D_EXPORT_COLUMNS: ReadonlyArray<
+  ExportColumn<TapIssuanceFinding>
+> = [
+  { header: "User", accessor: (f) => f.userDisplayName },
+  { header: "User id", accessor: (f) => f.userId },
+  { header: "UPN", accessor: (f) => f.userPrincipalName ?? "" },
+  { header: "User tier", accessor: (f) => TIER_META[f.userTier].label },
+  { header: "TAP id", accessor: (f) => f.tapId },
+  { header: "Issued at", accessor: (f) => f.startDateTime ?? "" },
+  {
+    header: "Lifetime minutes",
+    accessor: (f) => f.lifetimeInMinutes ?? "",
+  },
+  { header: "Usable", accessor: (f) => (f.isUsable ? "yes" : "no") },
+  {
+    header: "Usability reason",
+    accessor: (f) => f.methodUsabilityReason ?? "",
+  },
+  {
+    header: "Recent to Tier 0/1",
+    accessor: (f) => (f.isRecentToTierZero ? "yes" : "no"),
+  },
+  {
+    header: "Severity",
+    accessor: (f) => SEVERITY_META[gradeTapIssuance(f)].label,
+  },
+];
+
+const CorpusDetectionSignalsCard: React.FC<{
+  dataset: PrivilegedAuditDataset;
+  loading: boolean;
+}> = ({ dataset, loading }) => {
+  const {
+    highPrivGraphPermissions,
+    federatedCredentials,
+    pimEligibilities,
+    tapIssuances,
+  } = dataset;
+  const total =
+    highPrivGraphPermissions.length +
+    federatedCredentials.length +
+    pimEligibilities.length +
+    tapIssuances.length;
+  // Per-signal severity tallies for the top stat row.
+  const criticalCount = React.useMemo(() => {
+    let n = 0;
+    for (const f of highPrivGraphPermissions)
+      if (gradeHighPrivGraphPermission(f) === "critical") n++;
+    const recentCredSet = new Set(
+      highPrivGraphPermissions
+        .filter((f) => f.hasRecentCredential)
+        .map((f) => f.servicePrincipalId),
+    );
+    for (const f of federatedCredentials)
+      if (
+        gradeFederatedCredential(
+          f,
+          recentCredSet.has(f.servicePrincipalId),
+        ) === "critical"
+      )
+        n++;
+    for (const f of pimEligibilities)
+      if (gradePimEligibility(f) === "critical") n++;
+    for (const f of tapIssuances)
+      if (gradeTapIssuance(f) === "critical") n++;
+    return n;
+  }, [
+    highPrivGraphPermissions,
+    federatedCredentials,
+    pimEligibilities,
+    tapIssuances,
+  ]);
+  return (
+    <Card aria-labelledby="corpus-signals-title">
+      <CardHeader className="space-y-1">
+        <CardTitle
+          id="corpus-signals-title"
+          className="flex items-center gap-2 text-sm"
+        >
+          <ShieldAlert className="h-4 w-4 text-destructive" />
+          Corpus detection signals
+          <InfoTooltip content="Four drift-from-baseline indicators sourced from the cross-tool offensive playbooks. Read-only enumeration only — every row is a GET against the operator's own tenant. Severity grading mirrors the corpus' own risk framing." />
+        </CardTitle>
+        <CardDescription>
+          {total} indicator{total === 1 ? "" : "s"} surfaced
+          {criticalCount > 0 && (
+            <>
+              {", "}
+              <span className="font-semibold text-destructive">
+                {criticalCount} critical
+              </span>
+            </>
+          )}
+          . See{" "}
+          <code className="text-3xs">_AZURE_BYPASS_PLAYBOOK.md</code>{" "}
+          §"Critical Defender Audit Surface".
+        </CardDescription>
+      </CardHeader>
+      <CardContent className="flex flex-col gap-4">
+        <SignalAPanel
+          findings={highPrivGraphPermissions}
+          loading={loading}
+        />
+        <SignalBPanel
+          findings={federatedCredentials}
+          companionRecentCredSpIds={
+            new Set(
+              highPrivGraphPermissions
+                .filter((f) => f.hasRecentCredential)
+                .map((f) => f.servicePrincipalId),
+            )
+          }
+          loading={loading}
+        />
+        <SignalCPanel
+          findings={pimEligibilities}
+          loading={loading}
+        />
+        <SignalDPanel
+          findings={tapIssuances}
+          loading={loading}
+        />
+      </CardContent>
+    </Card>
+  );
+};
+
+// ---- Signal A panel ------------------------------------------------------
+
+const SignalAPanel: React.FC<{
+  findings: HighPrivGraphPermissionFinding[];
+  loading: boolean;
+}> = ({ findings, loading }) => (
+  <section
+    className="rounded-md border border-border bg-card/40 p-3"
+    aria-labelledby="signal-a-title"
+  >
+    <header className="mb-2 flex flex-wrap items-center gap-2">
+      <Sparkles className="h-3.5 w-3.5 text-warning" aria-hidden />
+      <h3 id="signal-a-title" className="text-2xs font-semibold uppercase tracking-wider">
+        Signal A — High-privilege Graph permissions on a service principal
+      </h3>
+      <InfoTooltip content="Citation: _bypass_role_grant.md §3.1 (canonical chain — Application.ReadWrite.All → addKey on Microsoft Graph SP → app-only Global Admin). Any SP holding Application.ReadWrite.All, RoleManagement.ReadWrite.Directory, AppRoleAssignment.ReadWrite.All, Directory.ReadWrite.All, or Domain.ReadWrite.All is a one-step path to GA." />
+      <span className="ml-auto">
+        <ExportMenu
+          rows={findings}
+          columns={SIGNAL_A_EXPORT_COLUMNS}
+          filename="privileged-audit-signal-a-graph-perms"
+        />
+      </span>
+    </header>
+    {loading ? (
+      <Skeleton className="h-12 w-full" />
+    ) : findings.length === 0 ? (
+      <p className="m-0 text-2xs text-muted-foreground">
+        No service principals hold the Top-30 Graph escalation permissions.
+        This is the safe baseline.
+      </p>
+    ) : (
+      <ul className="flex flex-col gap-1.5">
+        {findings.slice(0, 25).map((f) => {
+          const sev = gradeHighPrivGraphPermission(f);
+          return (
+            <li
+              key={f.id}
+              className={cn(
+                "flex flex-wrap items-center gap-2 rounded-md border px-3 py-2 text-2xs",
+                sev === "critical"
+                  ? "border-destructive/50 bg-destructive/5"
+                  : sev === "high"
+                    ? "border-warning/40 bg-warning/5"
+                    : "border-border bg-card",
+              )}
+            >
+              <SeverityBadge severity={sev} />
+              <span className="min-w-0 flex-1 truncate font-medium text-foreground">
+                {f.servicePrincipalDisplayName}
+              </span>
+              <div className="flex flex-wrap gap-1">
+                {f.permissions.map((p) => (
+                  <Badge key={p.appRoleId} variant="warning" title={p.permissionName}>
+                    {p.permissionName}
+                  </Badge>
+                ))}
+              </div>
+              <Badge variant="outline" title="passwordCredentials + keyCredentials">
+                {f.passwordCredentialCount + f.keyCredentialCount} cred
+                {f.passwordCredentialCount + f.keyCredentialCount === 1 ? "" : "s"}
+              </Badge>
+              {f.hasRecentCredential && f.mostRecentCredentialAt && (
+                <Badge
+                  variant="destructive"
+                  title={`Most recent credential at ${f.mostRecentCredentialAt}. Audit item #5 — addKey / addPassword detection.`}
+                >
+                  New cred {formatRelativeTime(f.mostRecentCredentialAt)}
+                </Badge>
+              )}
+              {f.appId && (
+                <span className="font-mono text-3xs text-muted-foreground">
+                  {f.appId}
+                </span>
+              )}
+            </li>
+          );
+        })}
+        {findings.length > 25 && (
+          <li className="px-3 py-1 text-2xs text-muted-foreground">
+            + {findings.length - 25} more (export for full list)
+          </li>
+        )}
+      </ul>
+    )}
+  </section>
+);
+
+// ---- Signal B panel ------------------------------------------------------
+
+const SignalBPanel: React.FC<{
+  findings: FederatedCredentialFinding[];
+  companionRecentCredSpIds: Set<string>;
+  loading: boolean;
+}> = ({ findings, companionRecentCredSpIds, loading }) => (
+  <section
+    className="rounded-md border border-border bg-card/40 p-3"
+    aria-labelledby="signal-b-title"
+  >
+    <header className="mb-2 flex flex-wrap items-center gap-2">
+      <GitBranch className="h-3.5 w-3.5 text-warning" aria-hidden />
+      <h3 id="signal-b-title" className="text-2xs font-semibold uppercase tracking-wider">
+        Signal B — Federated identity credentials on privileged service principals
+      </h3>
+      <InfoTooltip content="Citation: _bypass_role_grant.md §6 (Workload Identity Federation as role-grant bypass) + _AZURE_BYPASS_PLAYBOOK.md Top-30 #17. Any federated credential whose issuer is a public OIDC issuer (GitHub Actions, GitLab, CircleCI) on a high-privilege SP is a backdoor — anyone who controls that pipeline mints SP tokens." />
+      <span className="ml-auto">
+        <ExportMenu
+          rows={findings}
+          columns={SIGNAL_B_EXPORT_COLUMNS}
+          filename="privileged-audit-signal-b-fed-creds"
+        />
+      </span>
+    </header>
+    {loading ? (
+      <Skeleton className="h-12 w-full" />
+    ) : findings.length === 0 ? (
+      <p className="m-0 text-2xs text-muted-foreground">
+        No federated credentials on the high-privilege SPs from Signal A. If
+        your privileged SPs use WIF, ensure the signed-in account has{" "}
+        <code className="text-3xs">Application.Read.All</code> to enumerate{" "}
+        <code className="text-3xs">/applications/&#123;id&#125;/federatedIdentityCredentials</code>.
+      </p>
+    ) : (
+      <ul className="flex flex-col gap-1.5">
+        {findings.slice(0, 25).map((f) => {
+          const sev = gradeFederatedCredential(
+            f,
+            companionRecentCredSpIds.has(f.servicePrincipalId),
+          );
+          return (
+            <li
+              key={f.id}
+              className={cn(
+                "flex flex-wrap items-center gap-2 rounded-md border px-3 py-2 text-2xs",
+                sev === "critical"
+                  ? "border-destructive/50 bg-destructive/5"
+                  : sev === "high"
+                    ? "border-warning/40 bg-warning/5"
+                    : "border-border bg-card",
+              )}
+            >
+              <SeverityBadge severity={sev} />
+              <span className="min-w-0 flex-1 truncate font-medium text-foreground">
+                {f.servicePrincipalDisplayName}
+              </span>
+              <span className="font-mono text-3xs text-muted-foreground">
+                {f.name}
+              </span>
+              {f.isPublicIssuer && (
+                <Badge
+                  variant="destructive"
+                  title="Issuer is a public OIDC provider — anyone controlling that pipeline can mint tokens for this SP."
+                >
+                  Public issuer
+                </Badge>
+              )}
+              <span className="font-mono text-3xs text-muted-foreground" title={`issuer: ${f.issuer}`}>
+                {f.issuer}
+              </span>
+              <span className="font-mono text-3xs text-muted-foreground" title={`subject: ${f.subject}`}>
+                {f.subject.length > 64 ? f.subject.slice(0, 61) + "…" : f.subject}
+              </span>
+            </li>
+          );
+        })}
+        {findings.length > 25 && (
+          <li className="px-3 py-1 text-2xs text-muted-foreground">
+            + {findings.length - 25} more (export for full list)
+          </li>
+        )}
+      </ul>
+    )}
+  </section>
+);
+
+// ---- Signal C panel ------------------------------------------------------
+
+const SignalCPanel: React.FC<{
+  findings: PimEligibilityFinding[];
+  loading: boolean;
+}> = ({ findings, loading }) => (
+  <section
+    className="rounded-md border border-border bg-card/40 p-3"
+    aria-labelledby="signal-c-title"
+  >
+    <header className="mb-2 flex flex-wrap items-center gap-2">
+      <Bomb className="h-3.5 w-3.5 text-destructive" aria-hidden />
+      <h3 id="signal-c-title" className="text-2xs font-semibold uppercase tracking-wider">
+        Signal C — PIM eligibility with no expiration
+      </h3>
+      <InfoTooltip content="Citation: _bypass_staged_pim.md §5.1 'The time bomb' + Top-30 #27. Attacker briefly compromises Privileged Role Administrator, plants eligibility for attacker user with scheduleInfo.expiration.type = noExpiration, then PRA compromise is remediated — eligibility persists. Activation comes weeks later when nobody is watching." />
+      <span className="ml-auto">
+        <ExportMenu
+          rows={findings}
+          columns={SIGNAL_C_EXPORT_COLUMNS}
+          filename="privileged-audit-signal-c-pim-eligibility"
+        />
+      </span>
+    </header>
+    {loading ? (
+      <Skeleton className="h-12 w-full" />
+    ) : findings.length === 0 ? (
+      <p className="m-0 text-2xs text-muted-foreground">
+        No PIM eligibility schedules detected. If your tenant uses PIM,
+        ensure{" "}
+        <code className="text-3xs">RoleManagement.Read.Directory</code> is
+        granted so this signal can fire.
+      </p>
+    ) : (
+      <ul className="flex flex-col gap-1.5">
+        {findings.slice(0, 25).map((f) => {
+          const sev = gradePimEligibility(f);
+          return (
+            <li
+              key={f.id}
+              className={cn(
+                "flex flex-wrap items-center gap-2 rounded-md border px-3 py-2 text-2xs",
+                f.isCriticalTimeBomb
+                  ? "border-destructive/50 bg-destructive/5"
+                  : sev === "high"
+                    ? "border-warning/40 bg-warning/5"
+                    : "border-border bg-card",
+              )}
+            >
+              <SeverityBadge severity={sev} />
+              <span className="min-w-0 flex-1 truncate font-medium text-foreground">
+                {f.principalDisplayName ?? f.principalId}
+              </span>
+              {f.principalSignInName && (
+                <span className="font-mono text-3xs text-muted-foreground">
+                  {f.principalSignInName}
+                </span>
+              )}
+              <Badge variant="outline">
+                {f.principalType}
+              </Badge>
+              <TierBadge tier={f.tier} compact />
+              <span className="text-2xs text-muted-foreground">
+                eligible for
+              </span>
+              <Badge variant="secondary" title={f.roleTemplateId}>
+                {f.roleDisplayName ?? f.roleTemplateId.slice(0, 8) + "…"}
+              </Badge>
+              <Badge
+                variant={
+                  f.expirationKind === "noExpiration" ? "destructive" : "outline"
+                }
+                title={
+                  f.expirationKind === "noExpiration"
+                    ? "noExpiration matches the corpus 'time bomb' pattern."
+                    : f.expirationKind === "afterDateTime"
+                      ? `Until ${f.endDateTime ?? "?"}`
+                      : f.expirationKind === "afterDuration"
+                        ? `Duration ${f.duration ?? "?"}`
+                        : "Unknown expiration shape"
+                }
+              >
+                {f.expirationKind === "noExpiration"
+                  ? "noExpiration"
+                  : f.expirationKind === "afterDateTime"
+                    ? `until ${f.endDateTime?.slice(0, 10) ?? "?"}`
+                    : f.expirationKind === "afterDuration"
+                      ? f.duration ?? "duration"
+                      : "?"}
+              </Badge>
+              {f.createdDateTime && (
+                <span
+                  className="font-mono text-3xs text-muted-foreground"
+                  title={`Eligibility created ${f.createdDateTime}`}
+                >
+                  +{formatRelativeTime(f.createdDateTime)}
+                </span>
+              )}
+            </li>
+          );
+        })}
+        {findings.length > 25 && (
+          <li className="px-3 py-1 text-2xs text-muted-foreground">
+            + {findings.length - 25} more (export for full list)
+          </li>
+        )}
+      </ul>
+    )}
+  </section>
+);
+
+// ---- Signal D panel ------------------------------------------------------
+
+const SignalDPanel: React.FC<{
+  findings: TapIssuanceFinding[];
+  loading: boolean;
+}> = ({ findings, loading }) => (
+  <section
+    className="rounded-md border border-border bg-card/40 p-3"
+    aria-labelledby="signal-d-title"
+  >
+    <header className="mb-2 flex flex-wrap items-center gap-2">
+      <Ticket className="h-3.5 w-3.5 text-warning" aria-hidden />
+      <h3 id="signal-d-title" className="text-2xs font-semibold uppercase tracking-wider">
+        Signal D — Temporary Access Pass on a privileged user
+      </h3>
+      <InfoTooltip content="Citation: _AZURE_BYPASS_PLAYBOOK.md 'Critical Defender Audit Surface' #3 + Top-30 #13. Authentication Administrator can issue a TAP which is MFA-equivalent for the holder. A TAP on a Tier-0 user issued within the last 30 days is a critical persistence indicator." />
+      <span className="ml-auto">
+        <ExportMenu
+          rows={findings}
+          columns={SIGNAL_D_EXPORT_COLUMNS}
+          filename="privileged-audit-signal-d-tap"
+        />
+      </span>
+    </header>
+    {loading ? (
+      <Skeleton className="h-12 w-full" />
+    ) : findings.length === 0 ? (
+      <p className="m-0 text-2xs text-muted-foreground">
+        No active Temporary Access Pass found on any privileged user. If
+        TAPs are in use in this tenant, ensure the signed-in account has{" "}
+        <code className="text-3xs">UserAuthenticationMethod.Read.All</code>{" "}
+        to enumerate them.
+      </p>
+    ) : (
+      <ul className="flex flex-col gap-1.5">
+        {findings.slice(0, 25).map((f) => {
+          const sev = gradeTapIssuance(f);
+          return (
+            <li
+              key={f.id}
+              className={cn(
+                "flex flex-wrap items-center gap-2 rounded-md border px-3 py-2 text-2xs",
+                sev === "critical"
+                  ? "border-destructive/50 bg-destructive/5"
+                  : sev === "high"
+                    ? "border-warning/40 bg-warning/5"
+                    : "border-border bg-card",
+              )}
+            >
+              <SeverityBadge severity={sev} />
+              <span className="min-w-0 flex-1 truncate font-medium text-foreground">
+                {f.userDisplayName}
+              </span>
+              {f.userPrincipalName && (
+                <span className="font-mono text-3xs text-muted-foreground">
+                  {f.userPrincipalName}
+                </span>
+              )}
+              <TierBadge tier={f.userTier} compact />
+              {f.startDateTime && (
+                <span
+                  className="font-mono text-3xs text-muted-foreground"
+                  title={`Issued at ${f.startDateTime}`}
+                >
+                  issued {formatRelativeTime(f.startDateTime)}
+                </span>
+              )}
+              {typeof f.lifetimeInMinutes === "number" && (
+                <Badge variant="outline">
+                  {f.lifetimeInMinutes} min lifetime
+                </Badge>
+              )}
+              {f.isUsable && (
+                <Badge variant="warning" title="The TAP can be redeemed right now.">
+                  Usable now
+                </Badge>
+              )}
+              {f.isRecentToTierZero && (
+                <Badge variant="destructive" title="TAP within RECENT_TAP_WINDOW_MS on a Tier-0/Tier-1 principal — investigate.">
+                  Tier-0 + recent
+                </Badge>
+              )}
+              {f.methodUsabilityReason && (
+                <span className="text-3xs text-muted-foreground">
+                  {f.methodUsabilityReason}
+                </span>
+              )}
+            </li>
+          );
+        })}
+        {findings.length > 25 && (
+          <li className="px-3 py-1 text-2xs text-muted-foreground">
+            + {findings.length - 25} more (export for full list)
+          </li>
+        )}
+      </ul>
+    )}
+  </section>
+);
 
 export default PrivilegedAuditPage;

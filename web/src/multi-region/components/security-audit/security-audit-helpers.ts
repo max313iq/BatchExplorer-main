@@ -184,7 +184,24 @@ export function portalUrlFor(armId: string): string {
 // Finding shape
 // ----------------------------------------------------------------------
 
-export type ResourceType = "storage" | "keyvault";
+/**
+ * Resource categories that can produce a Finding row. The original
+ * MicroBurst-style audit emits "storage" / "keyvault" rows; the
+ * corpus-signal extension (security-audit-corpus-signals.ts) adds
+ * four more categories so the page can render diagnostic-setting,
+ * subscription, public-container, and idle resource-group findings
+ * through the same table without a parallel schema.
+ *
+ * Severity matrix + sort comparators are agnostic to the category —
+ * everything downstream operates on `Finding.severity` alone.
+ */
+export type ResourceType =
+  | "storage"
+  | "keyvault"
+  | "diagnostic-setting"
+  | "subscription"
+  | "storage-container"
+  | "resource-group";
 
 export interface Finding {
   /** Stable id for keying/selection — `${armId}::${ruleId}`. */
@@ -705,7 +722,14 @@ export function countBySeverity(
 export function countByResourceType(
   findings: readonly Finding[],
 ): Record<ResourceType, number> {
-  const acc: Record<ResourceType, number> = { storage: 0, keyvault: 0 };
+  const acc: Record<ResourceType, number> = {
+    storage: 0,
+    keyvault: 0,
+    "diagnostic-setting": 0,
+    subscription: 0,
+    "storage-container": 0,
+    "resource-group": 0,
+  };
   for (const f of findings) acc[f.resourceType] += 1;
   return acc;
 }

@@ -512,7 +512,10 @@ export const STALE_THRESHOLD_MS = 90 * 24 * 60 * 60 * 1000;
  * The score is deliberately bucketed (powers of ten between tiers) so it
  * always ranks T0 above any number of T3 holders, no matter how many.
  */
-export function riskScore(principal: PrivilegedPrincipal): number {
+export function riskScore(
+  principal: PrivilegedPrincipal,
+  signalLift?: number,
+): number {
   const weights: Record<RoleTier, number> = {
     tier0: 1000,
     tier1: 100,
@@ -536,7 +539,37 @@ export function riskScore(principal: PrivilegedPrincipal): number {
   }
   if (principal.isShadowAdmin) score += 200;
   if (principal.isServicePrincipal) score += 50;
+  // Corpus-derived signal uplift — see SIGNAL_RISK_WEIGHTS in this file
+  // for the rationale (critical=1500 to dominate any T0 baseline). Caller
+  // sums the SIGNAL_RISK_WEIGHTS[severity] across every active finding
+  // for the principal and passes the total here. Optional so existing
+  // call-sites that don't yet track signals stay correct.
+  if (typeof signalLift === "number" && Number.isFinite(signalLift)) {
+    score += Math.max(0, signalLift);
+  }
   return score;
+}
+
+/**
+ * Lookup-driven comparator factory. Sorts highest-risk principals first
+ * while accounting for the corpus-signal uplift the caller already
+ * computed per principal. When no lookup is provided behaves identically
+ * to `compareByRiskScore`.
+ *
+ * Citation rationale: `_AZURE_BYPASS_PLAYBOOK.md` "Critical Defender
+ * Audit Surface" — active indicators outweigh static role tier.
+ */
+export function compareByRiskScoreWithSignals(
+  signalLiftById: ReadonlyMap<string, number>,
+): (a: PrivilegedPrincipal, b: PrivilegedPrincipal) => number {
+  return (a, b) => {
+    const ra = riskScore(a, signalLiftById.get(a.id) ?? 0);
+    const rb = riskScore(b, signalLiftById.get(b.id) ?? 0);
+    if (ra !== rb) return rb - ra;
+    return a.displayName.localeCompare(b.displayName, undefined, {
+      sensitivity: "base",
+    });
+  };
 }
 
 /**
@@ -596,3 +629,389 @@ export function roleDeepLink(tenantId: string, roleId: string): string {
     encodeURIComponent(roleId)
   );
 }
+
+// ===========================================================================
+// Corpus-derived detection signals (defensive enumeration only)
+//
+// All four signal types below are READ-ONLY drift-from-baseline indicators.
+// They were wired in after re-reading the curated playbooks at:
+//   C:\Users\baimgprodsesa1\Desktop\New folder\_AZURE_BYPASS_PLAYBOOK.md
+//     §"Critical Defender Audit Surface" items 3, 4, 5, 6, 7.
+//
+// Per Top-30 across the corpus:
+//   A. App-role + addKey chain          — Top-30 #23 / #9
+//   B. Federated identity credentials   — Top-30 #17
+//   C. PIM noExpiration eligibility     — Top-30 #27
+//   D. Temporary Access Pass issuance   — Top-30 #13
+//
+// These are NEVER invoked — the page consumes them via read-only Graph
+// enumeration and surfaces deltas to the operator. No `addKey`,
+// `addPassword`, role-grant, TAP-issue, or PIM-create primitives are
+// reachable from this page.
+// ===========================================================================
+
+/**
+ * Microsoft Graph SP app-id (well-known). Holding any "RW" Graph app-role
+ * on this principal is the canonical takeover lever — see
+ * `_bypass_role_grant.md` §3.1 "Application.ReadWrite.All → app-only GA".
+ */
+export const MICROSOFT_GRAPH_APP_ID = "00000003-0000-0000-c000-000000000000";
+
+/**
+ * App-role (Graph permission) ids on the Microsoft Graph SP that, when
+ * held by any third-party SP, light up the canonical
+ *   `Application.ReadWrite.All` → `addKey` on Graph SP → app-only GA
+ * chain. These are the well-known appRoleId GUIDs Microsoft publishes on
+ * the Graph manifest.
+ *
+ * Citation (chain end-to-end):
+ *   `_bypass_role_grant.md` §3.1, §3.2, §3.3
+ *   `_AZURE_BYPASS_PLAYBOOK.md` Top-30 #23
+ *
+ * Tooling references (curated index):
+ *   - `dafthack/GraphRunner/GraphRunner.ps1`  — `Invoke-InjectOAuthApp`
+ *   - `Gerenios/AADInternals/MSGraphAPI.ps1`  — `New-AADIntApplication`
+ *   - `dirkjanm/ROADtools/roadlib/auth.py`    — FOCI / app-role enumeration
+ */
+export const HIGH_PRIV_GRAPH_APP_ROLES: ReadonlyMap<string, string> = new Map([
+  // Application.ReadWrite.All
+  ["1bfefb4e-e0b5-418b-a88f-73c46d2cc8e9", "Application.ReadWrite.All"],
+  // RoleManagement.ReadWrite.Directory
+  ["9e3f62cf-ca93-4989-b6ce-bf83c28f9fe8", "RoleManagement.ReadWrite.Directory"],
+  // Directory.ReadWrite.All
+  ["19dbc75e-c2e2-444c-a770-ec69d8559fc7", "Directory.ReadWrite.All"],
+  // AppRoleAssignment.ReadWrite.All
+  ["06b708a9-e830-4db3-a914-8e69da51d44f", "AppRoleAssignment.ReadWrite.All"],
+  // Domain.ReadWrite.All
+  ["7e05723c-0bb0-42da-be95-ae9f08a6e53c", "Domain.ReadWrite.All"],
+]);
+
+/**
+ * Window for "recent" credential-write detection on a privileged SP.
+ * Anything added inside this window is flagged as "addKey/addPassword
+ * sentinel" — matches Defender audit item 5 in the master playbook.
+ */
+export const RECENT_CREDENTIAL_WINDOW_MS = 7 * 24 * 60 * 60 * 1000;
+
+/**
+ * Window for "recent" TAP issuance to a privileged user. The master
+ * playbook (item 3) treats this as the critical Defender audit signal
+ * for "Issue temporary access pass".
+ */
+export const RECENT_TAP_WINDOW_MS = 30 * 24 * 60 * 60 * 1000;
+
+/**
+ * OIDC issuer hosts that the corpus flags as "public clouds where a
+ * federated credential maps to a low-trust principal". Pointing a
+ * privileged SP at one of these is the WIF backdoor pattern from
+ * `_bypass_tenant_switch.md` / `_bypass_role_grant.md` §6.
+ */
+export const PUBLIC_FEDERATION_ISSUER_HOSTS: ReadonlyArray<string> = [
+  "token.actions.githubusercontent.com",
+  "gitlab.com",
+  "vstoken.actions.githubusercontent.com",
+  "circleci.com",
+  "oidc.circleci.com",
+];
+
+/**
+ * Best-effort parse of an OIDC issuer URL down to its hostname. Tolerates
+ * issuers stored without a scheme (some tenants record `github.com` not
+ * `https://github.com`).
+ */
+export function issuerHost(issuer: string | undefined | null): string {
+  if (!issuer) return "";
+  const trimmed = issuer.trim();
+  if (!trimmed) return "";
+  try {
+    return new URL(
+      trimmed.startsWith("http") ? trimmed : `https://${trimmed}`,
+    ).hostname.toLowerCase();
+  } catch {
+    return trimmed.toLowerCase();
+  }
+}
+
+/**
+ * True when `issuer` resolves to a host in PUBLIC_FEDERATION_ISSUER_HOSTS.
+ * Used by Signal B grading.
+ */
+export function isPublicFederationIssuer(
+  issuer: string | undefined | null,
+): boolean {
+  const host = issuerHost(issuer);
+  if (!host) return false;
+  return PUBLIC_FEDERATION_ISSUER_HOSTS.some(
+    (h) => host === h || host.endsWith("." + h),
+  );
+}
+
+// ----- Signal A — High-privilege Graph permissions held by an SP ---------
+
+/**
+ * Citation: `_bypass_role_grant.md` §3.1 (canonical chain), §3.2
+ *           `_AZURE_BYPASS_PLAYBOOK.md` "Critical Defender Audit Surface" #5
+ */
+export interface HighPrivGraphPermissionFinding {
+  /** Stable React-list key. */
+  id: string;
+  /** SP object id (servicePrincipalId, *not* appId). */
+  servicePrincipalId: string;
+  /** SP `displayName`. */
+  servicePrincipalDisplayName: string;
+  /** SP `appId` (multi-tenant app's client id). */
+  appId?: string;
+  /** Sign-in audience (`AzureADMyOrg`, `AzureADMultipleOrgs`, etc.). */
+  signInAudience?: string;
+  /** When the SP itself was created. */
+  servicePrincipalCreatedDateTime?: string;
+  /** Each high-privilege Graph permission this SP holds. */
+  permissions: Array<{
+    /** appRoleAssignment id, for portal deep-linking. */
+    assignmentId: string;
+    /** The well-known appRoleId GUID on the Graph SP. */
+    appRoleId: string;
+    /** Friendly permission name (e.g. `Application.ReadWrite.All`). */
+    permissionName: string;
+    /** When the role was granted to this SP. */
+    createdDateTime?: string;
+  }>;
+  /** Total `passwordCredentials` count (app or SP shape). */
+  passwordCredentialCount: number;
+  /** Total `keyCredentials` count (app or SP shape). */
+  keyCredentialCount: number;
+  /** True when ANY credential was created within RECENT_CREDENTIAL_WINDOW_MS. */
+  hasRecentCredential: boolean;
+  /** Most-recent credential creation timestamp (across pwd + key). */
+  mostRecentCredentialAt?: string;
+}
+
+// ----- Signal B — Federated identity credentials on a privileged SP -------
+
+/**
+ * Citation: `_bypass_role_grant.md` §6 "Workload Identity Federation as Role-Grant Bypass"
+ *           `_AZURE_BYPASS_PLAYBOOK.md` Top-30 #17
+ */
+export interface FederatedCredentialFinding {
+  id: string;
+  servicePrincipalId: string;
+  servicePrincipalDisplayName: string;
+  /** Object id of the parent application object (federated creds live on
+   *  `/applications/{id}/federatedIdentityCredentials`, not on SP). */
+  applicationObjectId?: string;
+  /** Friendly federated-credential name. */
+  name: string;
+  issuer: string;
+  subject: string;
+  audiences: string[];
+  /** True when the issuer host matches PUBLIC_FEDERATION_ISSUER_HOSTS. */
+  isPublicIssuer: boolean;
+}
+
+// ----- Signal C — PIM eligibility with `noExpiration` --------------------
+
+/**
+ * Citation: `_bypass_staged_pim.md` §2 + §5.1 "The 'time bomb'"
+ *           `_AZURE_BYPASS_PLAYBOOK.md` Top-30 #27
+ *
+ * Detection rule: any roleEligibility schedule with
+ * `scheduleInfo.expiration.type === "noExpiration"` on a Tier-0 role is
+ * critical — that is exactly the stealth-persistence shape the playbook
+ * teaches.
+ */
+export type PimExpirationKind =
+  | "noExpiration"
+  | "afterDateTime"
+  | "afterDuration"
+  | "unknown";
+
+export interface PimEligibilityFinding {
+  id: string;
+  /** Principal object id. */
+  principalId: string;
+  /** Resolved principal display name (when getByIds returned it). */
+  principalDisplayName?: string;
+  /** Resolved principal sign-in name (UPN / appId). */
+  principalSignInName?: string;
+  /** Principal type discriminator. */
+  principalType: PrincipalType;
+  /** Directory role template id (e.g. Global Admin GUID). */
+  roleTemplateId: string;
+  /** Role display name when joinable. */
+  roleDisplayName?: string;
+  /** Tier classification, used for risk weighting. */
+  tier: RoleTier;
+  /** Eligibility expiration shape. */
+  expirationKind: PimExpirationKind;
+  /** When `afterDateTime`, the explicit endDateTime. */
+  endDateTime?: string;
+  /** When `afterDuration`, the ISO-8601 duration (e.g. `PT8H`). */
+  duration?: string;
+  /** When the eligibility schedule was created. */
+  createdDateTime?: string;
+  /** True for `noExpiration` on Tier-0 — the critical case. */
+  isCriticalTimeBomb: boolean;
+}
+
+// ----- Signal D — Recent Temporary Access Pass issuance ------------------
+
+/**
+ * Citation: `_bypass_login.md` (TAP issuance) +
+ *           `_AZURE_BYPASS_PLAYBOOK.md` "Critical Defender Audit Surface" #3
+ *           Top-30 #13 "TAP issuance via Auth Admin = MFA-equivalent pass"
+ */
+export interface TapIssuanceFinding {
+  id: string;
+  /** Privileged-user object id. */
+  userId: string;
+  /** User display name (best-effort). */
+  userDisplayName: string;
+  /** User principal name (best-effort). */
+  userPrincipalName?: string;
+  /** Top tier across the user's privileged-role holdings. Drives severity. */
+  userTier: RoleTier;
+  /** TAP method id. */
+  tapId: string;
+  /** When the TAP was issued (becomes valid). */
+  startDateTime?: string;
+  /** TAP lifetime in minutes. */
+  lifetimeInMinutes?: number;
+  /** Whether the TAP can be used right now. */
+  isUsable?: boolean;
+  /** Why it's usable / not usable (Graph-provided string). */
+  methodUsabilityReason?: string;
+  /** True when issued within RECENT_TAP_WINDOW_MS to a T0/T1 principal. */
+  isRecentToTierZero: boolean;
+}
+
+// ----- Severity helper used by all four signal categories ----------------
+
+export type FindingSeverity = "critical" | "high" | "medium" | "info";
+
+export interface SeverityMeta {
+  label: string;
+  description: string;
+  badgeVariant: "destructive" | "warning" | "info" | "secondary";
+}
+
+export const SEVERITY_META: Record<FindingSeverity, SeverityMeta> = {
+  critical: {
+    label: "Critical",
+    description:
+      "Matches a high-confidence corpus indicator on a Tier-0 principal. Investigate today.",
+    badgeVariant: "destructive",
+  },
+  high: {
+    label: "High",
+    description:
+      "Matches a corpus indicator on a Tier-0/Tier-1 principal, or a Tier-0 indicator with recency.",
+    badgeVariant: "warning",
+  },
+  medium: {
+    label: "Medium",
+    description:
+      "Drift-from-baseline indicator that warrants periodic review.",
+    badgeVariant: "info",
+  },
+  info: {
+    label: "Info",
+    description:
+      "Worth keeping in inventory; no immediate action implied.",
+    badgeVariant: "secondary",
+  },
+};
+
+/**
+ * Severity for a Signal-A finding (high-privilege Graph permissions on SP).
+ *
+ * - critical when there's a recent credential ON TOP OF Application.RW.All
+ *   or RoleManagement.RW.Directory (the canonical chain about to fire).
+ * - high when the SP holds a chainable permission set.
+ * - medium otherwise (single permission, no recent cred).
+ */
+export function gradeHighPrivGraphPermission(
+  finding: HighPrivGraphPermissionFinding,
+): FindingSeverity {
+  const names = new Set(finding.permissions.map((p) => p.permissionName));
+  const isCanonicalChain =
+    names.has("Application.ReadWrite.All") ||
+    names.has("RoleManagement.ReadWrite.Directory") ||
+    names.has("AppRoleAssignment.ReadWrite.All");
+  if (isCanonicalChain && finding.hasRecentCredential) return "critical";
+  if (isCanonicalChain) return "high";
+  if (names.size >= 2) return "high";
+  return "medium";
+}
+
+/**
+ * Severity for a Signal-B finding (federated credentials).
+ *
+ * Public OIDC issuer on a high-privilege SP is the WIF backdoor shape —
+ * `_bypass_role_grant.md` §6. Tagged "high" by default; "critical" when
+ * combined with a recent credential add on the same SP (caller passes
+ * `companionAddKeyRecent`).
+ */
+export function gradeFederatedCredential(
+  finding: FederatedCredentialFinding,
+  companionAddKeyRecent: boolean,
+): FindingSeverity {
+  if (finding.isPublicIssuer && companionAddKeyRecent) return "critical";
+  if (finding.isPublicIssuer) return "high";
+  return "medium";
+}
+
+/**
+ * Severity for a Signal-C finding (PIM eligibility).
+ *
+ * `noExpiration` on Tier-0 is the time-bomb pattern from
+ * `_bypass_staged_pim.md` §5.1 — always critical.
+ */
+export function gradePimEligibility(
+  finding: PimEligibilityFinding,
+): FindingSeverity {
+  if (finding.expirationKind === "noExpiration") {
+    if (finding.tier === "tier0") return "critical";
+    if (finding.tier === "tier1") return "high";
+    return "medium";
+  }
+  if (finding.tier === "tier0") return "medium";
+  return "info";
+}
+
+/**
+ * Severity for a Signal-D finding (recent TAP).
+ *
+ * A TAP issued to a Tier-0 principal in the last 30 days is the canonical
+ * "MFA-equivalent persistence pass" pattern — `_AZURE_BYPASS_PLAYBOOK.md`
+ * item 3.
+ */
+export function gradeTapIssuance(
+  finding: TapIssuanceFinding,
+): FindingSeverity {
+  if (finding.isRecentToTierZero && finding.userTier === "tier0") {
+    return "critical";
+  }
+  if (finding.userTier === "tier0" || finding.userTier === "tier1") {
+    return "high";
+  }
+  return "medium";
+}
+
+/**
+ * Per-signal risk uplift folded into the matrix scoring so flagged
+ * principals sort up the privileged-identity list. Each weight is
+ * deliberately bucketed (powers-of-ten between severities) so a single
+ * critical indicator always outranks any pile of mediums.
+ *
+ * The numbers below intentionally land between the existing T0 (1000)
+ * and T1 (100) tiers used by `riskScore` so a critical indicator on a
+ * Tier-1 principal still escalates above a Tier-0 with no findings —
+ * matching the corpus framing where active indicators of compromise
+ * trump static role tier.
+ */
+export const SIGNAL_RISK_WEIGHTS: Record<FindingSeverity, number> = {
+  critical: 1500,
+  high: 400,
+  medium: 60,
+  info: 5,
+};
