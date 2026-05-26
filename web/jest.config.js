@@ -24,6 +24,15 @@ module.exports = require("@batch/common-config/jest-common").createConfig(
         ],
         moduleNameMapper: {
             "^@/(.*)$": "<rootDir>/src/$1",
+            // Workspace has two React copies (root @17 for desktop/electron,
+            // web @18 for the web app). Hoisted Radix lives at root so it
+            // resolves to React 17 by default, but our test code uses web's
+            // React 18 — multi-React-copy = "Invalid hook call" errors. Pin
+            // every `react` / `react-dom` import to web's @18.
+            "^react$": "<rootDir>/node_modules/react",
+            "^react-dom$": "<rootDir>/node_modules/react-dom",
+            "^react-dom/(.*)$": "<rootDir>/node_modules/react-dom/$1",
+            "^react/(.*)$": "<rootDir>/node_modules/react/$1",
         },
         // Coverage: broadened from migration's narrow default. Layers under
         // multi-region/{services,store,agents,hooks,scheduling} are the
