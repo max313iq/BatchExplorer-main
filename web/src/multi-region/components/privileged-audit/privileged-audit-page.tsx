@@ -65,7 +65,7 @@ import {
 } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Skeleton } from "@/components/ui/skeleton";
-import { cn, formatRelativeTime } from "@/lib/utils";
+import { cn, downloadJson, formatRelativeTime } from "@/lib/utils";
 
 import {
   decodeJwtClaimsUnsafe,
@@ -98,20 +98,29 @@ import { TokenExpiryBadge } from "../shared/token-expiry-badge";
 
 import {
   ASSIGNMENT_PATH_META,
+  EMPTY_WATCHLIST,
   HIGH_PRIV_GRAPH_APP_ROLES,
   MICROSOFT_GRAPH_APP_ID,
+  MIXED_CHAIN_WINDOW_MS,
+  PRIVILEGED_AUDIT_ACTION_PREFIX,
   RECENT_CREDENTIAL_WINDOW_MS,
   RECENT_TAP_WINDOW_MS,
+  ROLE_DIRECTORY_SYNC_ACCOUNTS,
   SEVERITY_META,
   SIGNAL_RISK_WEIGHTS,
   STALE_THRESHOLD_MS,
+  TIER0_WATCHLIST_STORAGE_KEY_PREFIX,
   TIER_META,
+  buildMixedChainFindings,
   classifyRole,
   compareByRiskScoreWithSignals,
   compareByTierThenName,
+  computeWatchlistDrift,
   gradeFederatedCredential,
   gradeHighPrivGraphPermission,
   gradePimEligibility,
+  gradePimGroupEligibility,
+  gradeSyncAccount,
   gradeTapIssuance,
   hasShadowAdminPath,
   highestTier,
@@ -120,6 +129,7 @@ import {
   isPrivilegedRoleAdmin,
   isPublicFederationIssuer,
   isStalePrincipal,
+  looksLikeSyncAccount,
   portalDeepLink,
   riskScore,
   roleDeepLink,
@@ -128,15 +138,23 @@ import {
   type FederatedCredentialFinding,
   type FindingSeverity,
   type HighPrivGraphPermissionFinding,
+  type MixedChainFinding,
   type PimEligibilityFinding,
   type PimExpirationKind,
+  type PimGroupEligibilityFinding,
   type PrincipalType,
   type PrivilegedGroup,
   type PrivilegedPrincipal,
   type RoleTier,
   type ShadowAdminPath,
+  type SyncAccountFinding,
   type TapIssuanceFinding,
+  type WatchlistDrift,
+  type WatchlistEntry,
+  type WatchlistState,
 } from "./privileged-audit-helpers";
+import { useShortcut } from "../../hooks/use-shortcut";
+import type { AuditEntry } from "../../services/audit-log";
 
 // ===========================================================================
 // Constants
@@ -196,6 +214,18 @@ interface PrivilegedAuditDataset {
   /** Signal D — TAP issuances to privileged users. Corpus:
    *  `_AZURE_BYPASS_PLAYBOOK.md` "Critical Defender Audit Surface" #3 + Top-30 #13. */
   tapIssuances: TapIssuanceFinding[];
+  /** Signal E — AAD Connect / Cloud Sync sync-account drift. Corpus:
+   *  `_AZURE_BYPASS_PLAYBOOK.md` Top-30 #19 + `_bypass_mixed_chains.md` chain #1
+   *  + `_analysis_dirkjanm.md` adconnectdump. */
+  syncAccountFindings: SyncAccountFinding[];
+  /** Signal G — PIM-for-Groups eligibility on role-assignable groups. Corpus:
+   *  `_bypass_staged_pim.md` §6 + Top-30 #28. */
+  pimGroupEligibilities: PimGroupEligibilityFinding[];
+  /** Signal F — Mixed-chain temporal correlation across A/B/C/D. Corpus:
+   *  `_bypass_mixed_chains.md`. Derived in the page, NOT in the probe — it
+   *  composes A/B/C/D after they're collected. Carried on the dataset so
+   *  callers (exports, drift detection) see the same shape. */
+  mixedChainFindings: MixedChainFinding[];
 }
 
 const EMPTY_DATASET: PrivilegedAuditDataset = {
@@ -209,6 +239,9 @@ const EMPTY_DATASET: PrivilegedAuditDataset = {
   federatedCredentials: [],
   pimEligibilities: [],
   tapIssuances: [],
+  syncAccountFindings: [],
+  pimGroupEligibilities: [],
+  mixedChainFindings: [],
 };
 
 interface DirectoryRoleSummary {
@@ -604,6 +637,32 @@ async function probeTenant(
   });
 
   // ---- 8. Groups holding privileged roles (section D) --------------------
+  //
+  // Per-group `isAssignableToRole` is fetched in parallel so the Signal G
+  // (PIM-for-Groups eligibility) detector can join against the group facts
+  // and flag eligibilities on role-assignable groups. Citation:
+  //   `_bypass_staged_pim.md` §6 "Group-Based PIM" — eligibility on an
+  //    isAssignableToRole=true group is the canonical 3-layer indirection.
+  const isAssignableByGroup = new Map<string, boolean>();
+  await Promise.allSettled(
+    Array.from(rolesByGroup.keys()).map(async (gid) => {
+      try {
+        const r = await fetch(
+          `${GRAPH_BASE}/groups/${encodeURIComponent(gid)}?$select=id,isAssignableToRole`,
+          { headers: graphHeaders(token), ...(signal ? { signal } : {}) },
+        );
+        if (!r.ok) return;
+        const d = (await r.json()) as { isAssignableToRole?: boolean };
+        if (typeof d.isAssignableToRole === "boolean") {
+          isAssignableByGroup.set(gid, d.isAssignableToRole);
+        }
+      } catch {
+        /* swallow — isAssignableToRole is decoration; PIM-G detector
+           will still emit findings but won't flag the group-shape lift. */
+      }
+    }),
+  );
+
   const groupsOut: PrivilegedGroup[] = [];
   for (const [groupId, list] of rolesByGroup.entries()) {
     const resolved = resolvedById.get(groupId);
@@ -1205,6 +1264,210 @@ async function probeTenant(
     });
   }
 
+  // ---- Signal E — AAD Connect / Cloud Sync sync-account drift ------------
+  //
+  // Citation:
+  //   `_AZURE_BYPASS_PLAYBOOK.md` Top-30 #19 (AAD Connect `Sync_*` decrypt →
+  //      bidirectional forest control)
+  //   `_bypass_mixed_chains.md` chain #1 (the full kill-chain)
+  //   `_analysis_dirkjanm.md` adconnectdump
+  //
+  // Detection: any principal in the privileged-identity index whose
+  // display-name / sign-in-name matches the canonical sync-account pattern
+  // (`Sync_*`, `MSOL_*`, `ADToAADSyncServiceAccount`, "On-Premises Directory
+  //  Synchronization Service Account") is a candidate. We then split its
+  // roles into "canonical" (Directory Synchronization Accounts only) vs
+  // "drift" (any other privileged role); any drift role triggers the
+  // finding. Sync accounts holding T0 are critical — that is exactly the
+  // "compromise-bidirectional-forest" shape the playbook calls out.
+  const syncAccountFindings: SyncAccountFinding[] = [];
+  for (const p of principalsAll) {
+    if (!looksLikeSyncAccount(p.displayName, p.signInName)) continue;
+    // De-dup roles by template id — we only care about which roles, not
+    // through how many paths the sync account ended up holding them.
+    const uniqRoles = new Map<
+      string,
+      { roleTemplateId: string; roleDisplayName: string; tier: RoleTier }
+    >();
+    for (const a of p.assignments) {
+      if (!uniqRoles.has(a.roleTemplateId)) {
+        uniqRoles.set(a.roleTemplateId, {
+          roleTemplateId: a.roleTemplateId,
+          roleDisplayName: a.roleDisplayName,
+          tier: a.tier,
+        });
+      }
+    }
+    const allRoles = Array.from(uniqRoles.values()).map((r) => ({
+      ...r,
+      isCanonical: r.roleTemplateId === ROLE_DIRECTORY_SYNC_ACCOUNTS,
+    }));
+    const driftRoles = allRoles.filter((r) => !r.isCanonical);
+    const topDriftTier: RoleTier = driftRoles.length
+      ? driftRoles.reduce<RoleTier>(
+          (acc, r) =>
+            TIER_META[r.tier].order < TIER_META[acc].order ? r.tier : acc,
+          "other",
+        )
+      : "other";
+    syncAccountFindings.push({
+      id: `sigE:${p.id}`,
+      principalId: p.id,
+      principalDisplayName: p.displayName,
+      principalSignInName: p.signInName,
+      principalType: p.type,
+      roles: allRoles,
+      hasDriftRole: driftRoles.length > 0,
+      topDriftTier,
+    });
+  }
+  // Sort: drift findings first, T0 drift to the top, then by name.
+  syncAccountFindings.sort((a, b) => {
+    if (a.hasDriftRole !== b.hasDriftRole) return a.hasDriftRole ? -1 : 1;
+    const oa = TIER_META[a.topDriftTier].order;
+    const ob = TIER_META[b.topDriftTier].order;
+    if (oa !== ob) return oa - ob;
+    return a.principalDisplayName.localeCompare(
+      b.principalDisplayName,
+      undefined,
+      { sensitivity: "base" },
+    );
+  });
+
+  // ---- Signal G — PIM-for-Groups eligibility on role-assignable groups ---
+  //
+  // Citation:
+  //   `_bypass_staged_pim.md` §6 (Group-Based PIM):
+  //     POST /v1.0/identityGovernance/privilegedAccess/group/eligibilityScheduleRequests
+  //     with accessId=member; activator inherits any role the group holds.
+  //   `_AZURE_BYPASS_PLAYBOOK.md` Top-30 #28.
+  //
+  // We read the schedules endpoint (current eligible state). Failures
+  // degrade gracefully because PIMforGroups isn't enabled in every tenant.
+  let pimGroupEligibilities: PimGroupEligibilityFinding[] = [];
+  try {
+    const raw = await fetchAllPages<Record<string, unknown>>(
+      `${GRAPH_BASE}/identityGovernance/privilegedAccess/group/eligibilitySchedules` +
+        `?$select=id,principalId,groupId,accessId,scheduleInfo,createdDateTime`,
+      token,
+      signal,
+    );
+    const idsToResolve = new Set<string>();
+    for (const row of raw) {
+      const pid = String(row.principalId ?? "");
+      if (pid && !resolvedById.has(pid)) idsToResolve.add(pid);
+    }
+    if (idsToResolve.size > 0) {
+      try {
+        const extra = await getPrincipalsByIds(
+          tenantId,
+          Array.from(idsToResolve),
+          token,
+        );
+        for (const e of extra) resolvedById.set(e.id, e);
+      } catch {
+        /* swallow */
+      }
+    }
+    const groupById = new Map(groupsOut.map((g) => [g.id, g] as const));
+    const findings: PimGroupEligibilityFinding[] = [];
+    for (const row of raw) {
+      const principalId = String(row.principalId ?? "");
+      const groupId = String(row.groupId ?? "");
+      if (!principalId || !groupId) continue;
+      const group = groupById.get(groupId);
+      // We surface every eligibility but score it as "info" when the group
+      // doesn't hold a privileged role — that way operators can still see
+      // the inventory but they aren't drowned in non-actionable rows.
+      const groupRoles = group?.roles.map((r) => ({
+        roleTemplateId: r.roleTemplateId,
+        roleDisplayName: r.roleDisplayName,
+        tier: r.tier,
+      })) ?? [];
+      const topTier: RoleTier = group?.topTier ?? "other";
+      const schedule = (row.scheduleInfo ?? {}) as Record<string, unknown>;
+      const expiration = (schedule.expiration ?? {}) as Record<string, unknown>;
+      const typeRaw = String(expiration.type ?? "").toLowerCase();
+      const expirationKind: PimExpirationKind =
+        typeRaw === "noexpiration"
+          ? "noExpiration"
+          : typeRaw === "afterdatetime"
+            ? "afterDateTime"
+            : typeRaw === "afterduration"
+              ? "afterDuration"
+              : "unknown";
+      const principalResolved = resolvedById.get(principalId);
+      const isAssignable = isAssignableByGroup.get(groupId) ?? false;
+      findings.push({
+        id: `sigG:${row.id ?? `${principalId}::${groupId}`}`,
+        principalId,
+        principalDisplayName: principalResolved?.displayName,
+        principalSignInName: principalResolved?.signInName,
+        principalType:
+          (principalResolved?.type as PrincipalType) ?? "Unknown",
+        groupId,
+        groupDisplayName: group?.displayName ?? groupId,
+        isAssignableToRole: isAssignable,
+        groupRoles,
+        topTier,
+        expirationKind,
+        endDateTime: expiration.endDateTime as string | undefined,
+        duration: expiration.duration as string | undefined,
+        createdDateTime: row.createdDateTime as string | undefined,
+        isCriticalTimeBomb:
+          expirationKind === "noExpiration" && topTier === "tier0",
+      });
+    }
+    // Critical first, then T0, then by name.
+    findings.sort((a, b) => {
+      if (a.isCriticalTimeBomb !== b.isCriticalTimeBomb) {
+        return a.isCriticalTimeBomb ? -1 : 1;
+      }
+      const oa = TIER_META[a.topTier].order;
+      const ob = TIER_META[b.topTier].order;
+      if (oa !== ob) return oa - ob;
+      return a.groupDisplayName.localeCompare(b.groupDisplayName);
+    });
+    pimGroupEligibilities = findings;
+  } catch (err) {
+    // PIM-for-Groups isn't enabled / Graph permission missing — best-effort.
+    // 404 is the common case ("identityGovernance not present"); we only
+    // emit a warning when the failure looks permission-related.
+    const msg = (err as Error).message ?? "";
+    const status = (err as Error & { status?: number }).status;
+    if (status === 401 || status === 403) {
+      warnings.push({
+        id: "signal-g:perm",
+        message:
+          "Signal G (PIM-for-Groups eligibility) requires " +
+          "PrivilegedAccess.Read.AzureADGroup or RoleManagement.Read.All. " +
+          "PIM-for-Groups inventory is therefore empty.",
+      });
+    } else if (status !== 404 && msg) {
+      warnings.push({
+        id: "signal-g:failed",
+        message: `Signal G probe failed: ${msg}.`,
+      });
+    }
+  }
+
+  // ---- Signal F — Mixed-chain correlation -------------------------------
+  //
+  // Citation: `_bypass_mixed_chains.md` — composing primitives is the
+  // attacker's actual workflow; two indicators on the same principal inside
+  // MIXED_CHAIN_WINDOW_MS is the kill-chain signature. Pure / deterministic
+  // — produced by combining the already-collected A/B/C/D arrays.
+  const principalIndex = new Map<string, PrivilegedPrincipal>();
+  for (const p of principalsAll) principalIndex.set(p.id, p);
+  const mixedChainFindings = buildMixedChainFindings(
+    highPrivGraphPermissions,
+    federatedCredentials,
+    pimEligibilities,
+    tapIssuances,
+    principalIndex,
+    MIXED_CHAIN_WINDOW_MS,
+  );
+
   return {
     principals: principalsAll,
     shadowPaths,
@@ -1216,6 +1479,9 @@ async function probeTenant(
     federatedCredentials,
     pimEligibilities,
     tapIssuances,
+    syncAccountFindings,
+    pimGroupEligibilities,
+    mixedChainFindings,
   };
 }
 
@@ -1655,12 +1921,31 @@ export const PrivilegedAuditPage: React.FC = () => {
     for (const f of dataset.tapIssuances) {
       add(f.userId, gradeTapIssuance(f));
     }
+    // Signal E — sync-account drift lifts the sync principal so it sorts to
+    // the top of the matrix when it holds non-canonical roles.
+    for (const f of dataset.syncAccountFindings) {
+      if (f.hasDriftRole) add(f.principalId, gradeSyncAccount(f));
+    }
+    // Signal G — PIM-for-Groups eligibility lifts the eligible principal
+    // (NOT the group — the principal is the one with latent privilege).
+    for (const f of dataset.pimGroupEligibilities) {
+      add(f.principalId, gradePimGroupEligibility(f));
+    }
+    // Signal F — Mixed-chain temporal correlation. Adds on top of the
+    // individual contributors because the corpus framing treats temporal
+    // coincidence as a force-multiplier beyond any single indicator.
+    for (const f of dataset.mixedChainFindings) {
+      add(f.principalId, f.severity);
+    }
     return lift;
   }, [
     dataset.highPrivGraphPermissions,
     dataset.federatedCredentials,
     dataset.pimEligibilities,
     dataset.tapIssuances,
+    dataset.syncAccountFindings,
+    dataset.pimGroupEligibilities,
+    dataset.mixedChainFindings,
   ]);
 
   // -------------------------------------------------------------------------
@@ -1747,6 +2032,242 @@ export const PrivilegedAuditPage: React.FC = () => {
       ),
     [dataset.principals],
   );
+
+  // -------------------------------------------------------------------------
+  // Tier-0 Watchlist — operator-curated set of principals to monitor for
+  // drift between probes. Persisted per-tenant in localStorage so that
+  // adding "expected break-glass account" once survives reloads.
+  //
+  // The watchlist is INTENTIONALLY separate from the auto-detected Tier-0
+  // set (every T0 holder is already shown in section B). It's an operator
+  // override layer: "I want to know if THIS principal's roles change between
+  // probes" — useful for break-glass accounts, vetted SPs, post-incident
+  // monitoring of a previously-compromised principal, etc.
+  // -------------------------------------------------------------------------
+  // The watchlist + captured-roles maps are stored under a SINGLE storage
+  // key with the tenant id as the inner map key, NOT as part of the storage
+  // key itself. Reason: usePersistedState's persist effect fires on key
+  // change, which means switching tenants with the live in-memory state
+  // would otherwise overwrite the new tenant's persisted slot with the old
+  // tenant's data (race between key change and value reset). The
+  // tenant-indexed map avoids that race entirely.
+  const [watchlistByTenant, setWatchlistByTenant] = usePersistedState<
+    Record<string, WatchlistState>
+  >(TIER0_WATCHLIST_STORAGE_KEY_PREFIX, {}, { version: 1 });
+  const [watchlistRolesByTenant, setWatchlistRolesByTenant] =
+    usePersistedState<Record<string, Record<string, string[]>>>(
+      `${TIER0_WATCHLIST_STORAGE_KEY_PREFIX}:roles`,
+      {},
+      { version: 1 },
+    );
+
+  const watchlist: WatchlistState = React.useMemo(
+    () => watchlistByTenant[tenantId] ?? EMPTY_WATCHLIST,
+    [watchlistByTenant, tenantId],
+  );
+  const setWatchlist = React.useCallback(
+    (updater: WatchlistState | ((prev: WatchlistState) => WatchlistState)) => {
+      setWatchlistByTenant((prev) => {
+        const current = prev[tenantId] ?? EMPTY_WATCHLIST;
+        const next =
+          typeof updater === "function"
+            ? (updater as (p: WatchlistState) => WatchlistState)(current)
+            : updater;
+        return { ...prev, [tenantId]: next };
+      });
+    },
+    [setWatchlistByTenant, tenantId],
+  );
+  const watchlistCapturedRoles = React.useMemo(
+    () => watchlistRolesByTenant[tenantId] ?? {},
+    [watchlistRolesByTenant, tenantId],
+  );
+  const setWatchlistCapturedRoles = React.useCallback(
+    (
+      updater:
+        | Record<string, string[]>
+        | ((prev: Record<string, string[]>) => Record<string, string[]>),
+    ) => {
+      setWatchlistRolesByTenant((prev) => {
+        const current = prev[tenantId] ?? {};
+        const next =
+          typeof updater === "function"
+            ? (updater as (
+                p: Record<string, string[]>,
+              ) => Record<string, string[]>)(current)
+            : updater;
+        return { ...prev, [tenantId]: next };
+      });
+    },
+    [setWatchlistRolesByTenant, tenantId],
+  );
+
+  const capturedRolesByPrincipalId = React.useMemo(() => {
+    const m = new Map<string, ReadonlySet<string>>();
+    for (const [k, v] of Object.entries(watchlistCapturedRoles)) {
+      m.set(k, new Set(v));
+    }
+    return m;
+  }, [watchlistCapturedRoles]);
+
+  const watchlistDrift = React.useMemo<WatchlistDrift[]>(
+    () =>
+      computeWatchlistDrift(
+        watchlist,
+        dataset.principals,
+        capturedRolesByPrincipalId,
+      ),
+    [watchlist, dataset.principals, capturedRolesByPrincipalId],
+  );
+
+  const watchlistIds = React.useMemo(
+    () => new Set(watchlist.entries.map((e) => e.principalId)),
+    [watchlist],
+  );
+
+  const addToWatchlist = React.useCallback(
+    (principal: PrivilegedPrincipal, note?: string) => {
+      setWatchlist((prev) => {
+        if (prev.entries.some((e) => e.principalId === principal.id)) {
+          return prev;
+        }
+        const newEntry: WatchlistEntry = {
+          principalId: principal.id,
+          capturedDisplayName: principal.displayName,
+          capturedSignInName: principal.signInName,
+          capturedTier: principal.topTier,
+          addedAt: new Date().toISOString(),
+          note,
+        };
+        return { entries: [...prev.entries, newEntry] };
+      });
+      setWatchlistCapturedRoles((prev) => ({
+        ...prev,
+        [principal.id]: Array.from(
+          new Set(principal.assignments.map((a) => a.roleTemplateId)),
+        ),
+      }));
+      auditLog.record({
+        actor: primaryAccount?.username ?? "unknown",
+        action: `${PRIVILEGED_AUDIT_ACTION_PREFIX}watchlist_add`,
+        target: principal.id,
+        status: "success",
+        details: { displayName: principal.displayName, note },
+      });
+    },
+    [setWatchlist, setWatchlistCapturedRoles, primaryAccount?.username],
+  );
+
+  const removeFromWatchlist = React.useCallback(
+    (principalId: string) => {
+      setWatchlist((prev) => ({
+        entries: prev.entries.filter((e) => e.principalId !== principalId),
+      }));
+      setWatchlistCapturedRoles((prev) => {
+        const next = { ...prev };
+        delete next[principalId];
+        return next;
+      });
+      auditLog.record({
+        actor: primaryAccount?.username ?? "unknown",
+        action: `${PRIVILEGED_AUDIT_ACTION_PREFIX}watchlist_remove`,
+        target: principalId,
+        status: "success",
+      });
+    },
+    [setWatchlist, setWatchlistCapturedRoles, primaryAccount?.username],
+  );
+
+  // -------------------------------------------------------------------------
+  // Audit-log mirror — feeds the per-principal timeline inside expanded
+  // assignment-detail rows. We subscribe to the auditLog singleton and
+  // re-render the page when a privileged-audit event lands so the timeline
+  // updates live (filter mutations, watchlist add/remove, signal exports).
+  // The subscription is read-only — we never write through this view.
+  // -------------------------------------------------------------------------
+  const [auditMirror, setAuditMirror] = React.useState<AuditEntry[]>(() =>
+    auditLog.getEntries(200),
+  );
+  React.useEffect(() => {
+    const refresh = () => {
+      if (!mountedRef.current) return;
+      setAuditMirror(auditLog.getEntries(200));
+    };
+    refresh();
+    return auditLog.subscribe(
+      (e) => e.action.startsWith(PRIVILEGED_AUDIT_ACTION_PREFIX),
+      refresh,
+    );
+  }, []);
+  const auditEventsByTarget = React.useMemo(() => {
+    const m = new Map<string, AuditEntry[]>();
+    for (const e of auditMirror) {
+      const list = m.get(e.target) ?? [];
+      list.push(e);
+      m.set(e.target, list);
+    }
+    return m;
+  }, [auditMirror]);
+
+  // -------------------------------------------------------------------------
+  // Critical-finding count for the ARIA-live region. Recomputes from the
+  // signal arrays; a change is announced to screen-reader users via the
+  // <output> below the page header.
+  // -------------------------------------------------------------------------
+  const criticalFindingCount = React.useMemo(() => {
+    let n = 0;
+    for (const f of dataset.highPrivGraphPermissions)
+      if (gradeHighPrivGraphPermission(f) === "critical") n++;
+    const recentCredSet = new Set(
+      dataset.highPrivGraphPermissions
+        .filter((f) => f.hasRecentCredential)
+        .map((f) => f.servicePrincipalId),
+    );
+    for (const f of dataset.federatedCredentials)
+      if (
+        gradeFederatedCredential(
+          f,
+          recentCredSet.has(f.servicePrincipalId),
+        ) === "critical"
+      )
+        n++;
+    for (const f of dataset.pimEligibilities)
+      if (gradePimEligibility(f) === "critical") n++;
+    for (const f of dataset.tapIssuances)
+      if (gradeTapIssuance(f) === "critical") n++;
+    for (const f of dataset.syncAccountFindings)
+      if (gradeSyncAccount(f) === "critical") n++;
+    for (const f of dataset.pimGroupEligibilities)
+      if (gradePimGroupEligibility(f) === "critical") n++;
+    for (const f of dataset.mixedChainFindings)
+      if (f.severity === "critical") n++;
+    return n;
+  }, [
+    dataset.highPrivGraphPermissions,
+    dataset.federatedCredentials,
+    dataset.pimEligibilities,
+    dataset.tapIssuances,
+    dataset.syncAccountFindings,
+    dataset.pimGroupEligibilities,
+    dataset.mixedChainFindings,
+  ]);
+
+  // -------------------------------------------------------------------------
+  // Hotkey commands. Live in a ref so the Section B list can call them
+  // without dragging the entire callback chain through props. Per the
+  // brief: `c` collapses all expanded; `e` exports the critical-findings
+  // subset only.
+  // -------------------------------------------------------------------------
+  const collapseAllRef = React.useRef<(() => void) | null>(null);
+  const exportCriticalRef = React.useRef<(() => void) | null>(null);
+  useShortcut("c", () => collapseAllRef.current?.(), {
+    allowInInputs: false,
+    preventDefault: false,
+  });
+  useShortcut("e", () => exportCriticalRef.current?.(), {
+    allowInInputs: false,
+    preventDefault: false,
+  });
 
   // Live tenant-change propagation. This page auto-targets the primary
   // signed-in account's active tenant, so when that account's active tenant
@@ -1865,8 +2386,38 @@ export const PrivilegedAuditPage: React.FC = () => {
         </Alert>
       )}
 
+      {/*
+        ARIA-live region for screen-reader users: announces the critical-
+        finding count whenever it changes (probe finished, signal grading
+        updated). `aria-live="polite"` so it never preempts user-typed
+        narration; `role="status"` for VoiceOver consistency. Visually
+        invisible — sighted users see the same number in the corpus-signals
+        card below.
+      */}
+      <p
+        className="sr-only"
+        role="status"
+        aria-live="polite"
+        aria-atomic="true"
+      >
+        {loading
+          ? "Privileged audit probing…"
+          : criticalFindingCount === 0
+            ? "Privileged audit complete. No critical findings."
+            : `Privileged audit complete. ${criticalFindingCount} critical finding${
+                criticalFindingCount === 1 ? "" : "s"
+              }.`}
+      </p>
+
       {/* ─────────────────────────────────────────────────────────── A */}
       <SummaryStatsRow summary={summary} loading={loading} />
+
+      {/* ─────────── Tier-0 Watchlist (operator-curated) ─────────────── */}
+      <Tier0WatchlistCard
+        watchlist={watchlist}
+        drift={watchlistDrift}
+        onRemove={removeFromWatchlist}
+      />
 
       {/* Filters bar (applies to section B). */}
       <FiltersBar
@@ -1897,6 +2448,13 @@ export const PrivilegedAuditPage: React.FC = () => {
         dataset={dataset}
         summary={summary}
         signalLiftById={signalLiftById}
+        watchlistIds={watchlistIds}
+        onAddToWatchlist={addToWatchlist}
+        onRemoveFromWatchlist={removeFromWatchlist}
+        auditEventsByTarget={auditEventsByTarget}
+        collapseAllRef={collapseAllRef}
+        exportCriticalRef={exportCriticalRef}
+        criticalFindingCount={criticalFindingCount}
       />
 
       {/* ─────────────────────── Corpus Detection Signals (A/B/C/D) ─── */}
@@ -2369,6 +2927,18 @@ interface PrivilegedIdentityListProps {
   };
   /** Per-principal uplift from the corpus-derived detection signals. */
   signalLiftById: ReadonlyMap<string, number>;
+  /** Object ids currently on the operator watchlist. */
+  watchlistIds: ReadonlySet<string>;
+  onAddToWatchlist: (p: PrivilegedPrincipal, note?: string) => void;
+  onRemoveFromWatchlist: (principalId: string) => void;
+  /** Audit-log events keyed by target id, for the per-principal timeline. */
+  auditEventsByTarget: ReadonlyMap<string, AuditEntry[]>;
+  /** Slot the parent fills with the "collapse all expanded" handler. */
+  collapseAllRef: React.MutableRefObject<(() => void) | null>;
+  /** Slot the parent fills with the "export critical findings only" handler. */
+  exportCriticalRef: React.MutableRefObject<(() => void) | null>;
+  /** Total critical findings across all 7 corpus signals. */
+  criticalFindingCount: number;
 }
 
 const PrivilegedIdentityList: React.FC<PrivilegedIdentityListProps> = ({
@@ -2379,6 +2949,13 @@ const PrivilegedIdentityList: React.FC<PrivilegedIdentityListProps> = ({
   dataset,
   summary,
   signalLiftById,
+  watchlistIds,
+  onAddToWatchlist,
+  onRemoveFromWatchlist,
+  auditEventsByTarget,
+  collapseAllRef,
+  exportCriticalRef,
+  criticalFindingCount,
 }) => {
   const [expanded, setExpanded] = React.useState<Set<string>>(
     () => new Set(),
@@ -2391,6 +2968,21 @@ const PrivilegedIdentityList: React.FC<PrivilegedIdentityListProps> = ({
       return next;
     });
   }, []);
+
+  // Wire the parent's hotkey refs to a stable "collapse all" handler.
+  // The hotkey 'c' is owned by the parent (useShortcut('c')) — we just
+  // install the implementation here so the parent doesn't need access to
+  // the expanded Set. Cleanup uses pointer-equality so we only NULL the
+  // slot if our handler is still the one installed.
+  React.useEffect(() => {
+    const handler = () => setExpanded(new Set());
+    collapseAllRef.current = handler;
+    return () => {
+      if (collapseAllRef.current === handler) {
+        collapseAllRef.current = null;
+      }
+    };
+  }, [collapseAllRef]);
 
   // For JSON export we want EVERYTHING (paths, summary stats, partial-data
   // warnings, AND the corpus-derived detection signals A/B/C/D) so the file
@@ -2406,10 +2998,15 @@ const PrivilegedIdentityList: React.FC<PrivilegedIdentityListProps> = ({
       warnings: dataset.warnings,
       corpusSignals: {
         // See privileged-audit-helpers.ts header for the corpus citations.
-        highPrivGraphPermissions: dataset.highPrivGraphPermissions,
-        federatedCredentials: dataset.federatedCredentials,
-        pimEligibilities: dataset.pimEligibilities,
-        tapIssuances: dataset.tapIssuances,
+        // The seven-signal set: A (Graph perms), B (FIC), C (PIM elig),
+        // D (TAP), E (sync drift), F (mixed chains), G (PIM-for-Groups).
+        A_highPrivGraphPermissions: dataset.highPrivGraphPermissions,
+        B_federatedCredentials: dataset.federatedCredentials,
+        C_pimEligibilities: dataset.pimEligibilities,
+        D_tapIssuances: dataset.tapIssuances,
+        E_syncAccountFindings: dataset.syncAccountFindings,
+        F_mixedChainFindings: dataset.mixedChainFindings,
+        G_pimGroupEligibilities: dataset.pimGroupEligibilities,
       },
     }),
     [tenantId, summary, dataset],
@@ -2421,6 +3018,83 @@ const PrivilegedIdentityList: React.FC<PrivilegedIdentityListProps> = ({
     () => principalExportColumns(signalLiftById),
     [signalLiftById],
   );
+
+  // -------------------------------------------------------------------------
+  // Hotkey: 'e' → export critical findings only.
+  //
+  // Composes a focused subset of the JSON export — only critical-graded
+  // findings across all 7 corpus signals, plus the critical-tagged
+  // mixed-chain rows. The download is silent (no menu) so an operator on
+  // call can grab the incident-handoff blob with one keystroke.
+  // -------------------------------------------------------------------------
+  React.useEffect(() => {
+    const handler = () => {
+      const recentCredSet = new Set(
+        dataset.highPrivGraphPermissions
+          .filter((f) => f.hasRecentCredential)
+          .map((f) => f.servicePrincipalId),
+      );
+      const payload = {
+        tenantId,
+        exportedAt: new Date().toISOString(),
+        kind: "privileged-audit-critical-only",
+        criticalCount: criticalFindingCount,
+        signals: {
+          A_highPrivGraphPermissions: dataset.highPrivGraphPermissions.filter(
+            (f) => gradeHighPrivGraphPermission(f) === "critical",
+          ),
+          B_federatedCredentials: dataset.federatedCredentials.filter(
+            (f) =>
+              gradeFederatedCredential(
+                f,
+                recentCredSet.has(f.servicePrincipalId),
+              ) === "critical",
+          ),
+          C_pimEligibilities: dataset.pimEligibilities.filter(
+            (f) => gradePimEligibility(f) === "critical",
+          ),
+          D_tapIssuances: dataset.tapIssuances.filter(
+            (f) => gradeTapIssuance(f) === "critical",
+          ),
+          E_syncAccountFindings: dataset.syncAccountFindings.filter(
+            (f) => gradeSyncAccount(f) === "critical",
+          ),
+          F_mixedChainFindings: dataset.mixedChainFindings.filter(
+            (f) => f.severity === "critical",
+          ),
+          G_pimGroupEligibilities: dataset.pimGroupEligibilities.filter(
+            (f) => gradePimGroupEligibility(f) === "critical",
+          ),
+        },
+      };
+      const stamp = new Date().toISOString().slice(0, 10);
+      downloadJson(`privileged-audit-critical-${stamp}.json`, payload);
+      auditLog.record({
+        actor: "hotkey",
+        action: `${PRIVILEGED_AUDIT_ACTION_PREFIX}export_critical`,
+        target: tenantId || "no-tenant",
+        status: "success",
+        details: { count: criticalFindingCount },
+      });
+    };
+    exportCriticalRef.current = handler;
+    return () => {
+      if (exportCriticalRef.current === handler) {
+        exportCriticalRef.current = null;
+      }
+    };
+  }, [
+    exportCriticalRef,
+    dataset.highPrivGraphPermissions,
+    dataset.federatedCredentials,
+    dataset.pimEligibilities,
+    dataset.tapIssuances,
+    dataset.syncAccountFindings,
+    dataset.pimGroupEligibilities,
+    dataset.mixedChainFindings,
+    tenantId,
+    criticalFindingCount,
+  ]);
 
   const columns: DataTableColumn<PrivilegedPrincipal>[] = React.useMemo(
     () => [
@@ -2593,6 +3267,50 @@ const PrivilegedIdentityList: React.FC<PrivilegedIdentityListProps> = ({
         },
       },
       {
+        id: "watch",
+        header: "",
+        width: "w-8",
+        cell: (p) => {
+          const watched = watchlistIds.has(p.id);
+          return (
+            <button
+              type="button"
+              onClick={() =>
+                watched ? onRemoveFromWatchlist(p.id) : onAddToWatchlist(p)
+              }
+              className={cn(
+                "inline-flex h-6 w-6 items-center justify-center rounded",
+                watched
+                  ? "text-warning hover:bg-warning/15"
+                  : "text-muted-foreground/60 hover:bg-muted hover:text-foreground",
+              )}
+              title={
+                watched
+                  ? "Remove from Tier-0 Watchlist — stop monitoring drift"
+                  : "Add to Tier-0 Watchlist — alert on tier or role changes between probes"
+              }
+              aria-label={
+                watched
+                  ? `Remove ${p.displayName} from watchlist`
+                  : `Add ${p.displayName} to watchlist`
+              }
+              aria-pressed={watched}
+            >
+              {/* Filled bookmark when watched, outline otherwise — Sparkles
+                  re-used here as the visual cue without taking another
+                  lucide-react slot. */}
+              <Sparkles
+                className={cn(
+                  "h-3 w-3",
+                  watched ? "fill-warning/30" : "",
+                )}
+                aria-hidden
+              />
+            </button>
+          );
+        },
+      },
+      {
         id: "actions",
         header: "",
         width: "w-12",
@@ -2610,7 +3328,15 @@ const PrivilegedIdentityList: React.FC<PrivilegedIdentityListProps> = ({
         ),
       },
     ],
-    [tenantId, expanded, signalLiftById, toggleExpand],
+    [
+      tenantId,
+      expanded,
+      signalLiftById,
+      toggleExpand,
+      watchlistIds,
+      onAddToWatchlist,
+      onRemoveFromWatchlist,
+    ],
   );
 
   return (
@@ -2619,10 +3345,20 @@ const PrivilegedIdentityList: React.FC<PrivilegedIdentityListProps> = ({
         <div className="min-w-0">
           <CardTitle className="flex items-center gap-2 text-sm">
             <Users className="h-4 w-4 text-info" /> Privileged identities
-            <InfoTooltip content="Every user / group / service-principal that holds at least one activated directory role in the tenant — direct or transitive." />
+            <InfoTooltip content="Every user / group / service-principal that holds at least one activated directory role in the tenant — direct or transitive. Press `c` to collapse all expanded rows; press `e` to export critical findings only." />
           </CardTitle>
-          <CardDescription>
+          <CardDescription className="flex flex-wrap items-center gap-2">
             Showing {principals.length} of {tenantTotal} privileged identities.
+            <span className="hidden text-3xs text-muted-foreground/80 sm:inline">
+              <kbd className="rounded border border-border bg-muted px-1 font-mono text-3xs">
+                c
+              </kbd>{" "}
+              collapse all,{" "}
+              <kbd className="rounded border border-border bg-muted px-1 font-mono text-3xs">
+                e
+              </kbd>{" "}
+              export critical ({criticalFindingCount})
+            </span>
           </CardDescription>
         </div>
         <ExportMenu
@@ -2674,6 +3410,10 @@ const PrivilegedIdentityList: React.FC<PrivilegedIdentityListProps> = ({
               principal={p}
               tenantId={tenantId}
               signalLift={signalLiftById.get(p.id) ?? 0}
+              auditEvents={auditEventsByTarget.get(p.id) ?? []}
+              isWatched={watchlistIds.has(p.id)}
+              onAddToWatchlist={onAddToWatchlist}
+              onRemoveFromWatchlist={onRemoveFromWatchlist}
             />
           ))}
       </CardContent>
@@ -2685,80 +3425,180 @@ const ExpandedAssignmentDetail: React.FC<{
   principal: PrivilegedPrincipal;
   tenantId: string;
   signalLift?: number;
-}> = React.memo(({ principal, tenantId, signalLift = 0 }) => (
-  <div
-    className="mt-2 rounded-md border border-dashed border-border bg-muted/30 p-3"
-    role="region"
-    aria-label={`Assignment detail for ${principal.displayName}`}
-  >
-    <div className="mb-2 flex flex-wrap items-center justify-between gap-2 text-2xs">
-      <div className="flex items-center gap-2">
-        <span className="font-semibold uppercase tracking-wider text-muted-foreground">
-          Every role this principal holds
-        </span>
-        <span
-          className={cn(
-            "rounded px-1.5 py-0.5 tabular-nums text-3xs",
-            signalLift > 0
-              ? "bg-warning/15 text-warning"
-              : "bg-muted text-muted-foreground",
-          )}
-          title={
-            signalLift > 0
-              ? `Risk ${riskScore(principal, signalLift).toLocaleString()} = base ${riskScore(principal).toLocaleString()} + corpus-signal lift ${signalLift.toLocaleString()}.`
-              : "Composite risk score (see Risk column tooltip)"
-          }
-        >
-          risk {riskScore(principal, signalLift).toLocaleString()}
-        </span>
-      </div>
-      <a
-        href={portalDeepLink(tenantId, principal)}
-        target="_blank"
-        rel="noopener noreferrer"
-        className="inline-flex items-center gap-1 text-info hover:underline"
-        aria-label={`Open ${principal.displayName} in the Entra portal`}
+  /** Audit-log events targeting this principal (most-recent first). Empty
+   *  when the operator has never performed an action involving this id. */
+  auditEvents?: ReadonlyArray<AuditEntry>;
+  isWatched?: boolean;
+  onAddToWatchlist?: (p: PrivilegedPrincipal, note?: string) => void;
+  onRemoveFromWatchlist?: (principalId: string) => void;
+}> = React.memo(
+  ({
+    principal,
+    tenantId,
+    signalLift = 0,
+    auditEvents = [],
+    isWatched = false,
+    onAddToWatchlist,
+    onRemoveFromWatchlist,
+  }) => {
+    // Most-recent first, then cap at 8 — the timeline is meant to give
+    // immediate context, not a full audit dump (that lives on the
+    // audit-log page).
+    const recentEvents = React.useMemo(
+      () =>
+        auditEvents
+          .slice()
+          .sort(
+            (a, b) =>
+              new Date(b.timestamp).getTime() -
+              new Date(a.timestamp).getTime(),
+          )
+          .slice(0, 8),
+      [auditEvents],
+    );
+    return (
+      <div
+        className="mt-2 rounded-md border border-dashed border-border bg-muted/30 p-3"
+        role="region"
+        aria-label={`Assignment detail for ${principal.displayName}`}
       >
-        Open in Entra <ExternalLink className="h-3 w-3" aria-hidden />
-      </a>
-    </div>
-    <ul className="flex flex-col gap-1.5">
-      {principal.assignments.map((a) => (
-        <li
-          key={`${a.roleId}::${a.path}::${a.viaGroupId ?? ""}`}
-          className="group/copy flex flex-wrap items-center gap-2 text-2xs"
-        >
-          <TierBadge tier={a.tier} compact />
-          <span className="font-medium text-foreground">
-            {a.roleDisplayName}
-          </span>
-          <PathBadge path={a.path} />
-          {a.viaGroupName && (
-            <span className="text-muted-foreground">
-              via{" "}
-              <span className="font-mono">{a.viaGroupName}</span>
+        <div className="mb-2 flex flex-wrap items-center justify-between gap-2 text-2xs">
+          <div className="flex items-center gap-2">
+            <span className="font-semibold uppercase tracking-wider text-muted-foreground">
+              Every role this principal holds
             </span>
-          )}
-          {/* ENHANCEMENT — click-to-copy role-id + per-role portal link. */}
-          <span className="ml-auto inline-flex items-center gap-1 font-mono text-3xs text-muted-foreground/70">
-            {a.roleTemplateId.slice(0, 8)}…
-            <CopyButton value={a.roleTemplateId} />
+            <span
+              className={cn(
+                "rounded px-1.5 py-0.5 tabular-nums text-3xs",
+                signalLift > 0
+                  ? "bg-warning/15 text-warning"
+                  : "bg-muted text-muted-foreground",
+              )}
+              title={
+                signalLift > 0
+                  ? `Risk ${riskScore(principal, signalLift).toLocaleString()} = base ${riskScore(principal).toLocaleString()} + corpus-signal lift ${signalLift.toLocaleString()}.`
+                  : "Composite risk score (see Risk column tooltip)"
+              }
+            >
+              risk {riskScore(principal, signalLift).toLocaleString()}
+            </span>
+            {isWatched && (
+              <Badge
+                variant="warning"
+                title="On Tier-0 Watchlist — drift between probes will be flagged."
+              >
+                Watched
+              </Badge>
+            )}
+          </div>
+          <div className="flex items-center gap-2">
+            {onAddToWatchlist && onRemoveFromWatchlist && (
+              <button
+                type="button"
+                onClick={() =>
+                  isWatched
+                    ? onRemoveFromWatchlist(principal.id)
+                    : onAddToWatchlist(principal)
+                }
+                className="inline-flex items-center gap-1 rounded border border-border bg-card px-1.5 py-0.5 text-3xs text-muted-foreground hover:border-warning/40 hover:text-warning"
+              >
+                <Sparkles
+                  className={cn(
+                    "h-2.5 w-2.5",
+                    isWatched && "fill-warning/30 text-warning",
+                  )}
+                  aria-hidden
+                />
+                {isWatched ? "Unwatch" : "Watch"}
+              </button>
+            )}
             <a
-              href={roleDeepLink(tenantId, a.roleId)}
+              href={portalDeepLink(tenantId, principal)}
               target="_blank"
               rel="noopener noreferrer"
-              className="inline-flex h-4 w-4 items-center justify-center rounded text-muted-foreground hover:bg-muted hover:text-foreground"
-              title="Open role assignments in the Entra portal"
-              aria-label={`Open ${a.roleDisplayName} in the Entra portal`}
+              className="inline-flex items-center gap-1 text-info hover:underline"
+              aria-label={`Open ${principal.displayName} in the Entra portal`}
             >
-              <ExternalLink className="h-2.5 w-2.5" aria-hidden />
+              Open in Entra <ExternalLink className="h-3 w-3" aria-hidden />
             </a>
-          </span>
-        </li>
-      ))}
-    </ul>
-  </div>
-));
+          </div>
+        </div>
+        <ul className="flex flex-col gap-1.5">
+          {principal.assignments.map((a) => (
+            <li
+              key={`${a.roleId}::${a.path}::${a.viaGroupId ?? ""}`}
+              className="group/copy flex flex-wrap items-center gap-2 text-2xs"
+            >
+              <TierBadge tier={a.tier} compact />
+              <span className="font-medium text-foreground">
+                {a.roleDisplayName}
+              </span>
+              <PathBadge path={a.path} />
+              {a.viaGroupName && (
+                <span className="text-muted-foreground">
+                  via{" "}
+                  <span className="font-mono">{a.viaGroupName}</span>
+                </span>
+              )}
+              {/* ENHANCEMENT — click-to-copy role-id + per-role portal link. */}
+              <span className="ml-auto inline-flex items-center gap-1 font-mono text-3xs text-muted-foreground/70">
+                {a.roleTemplateId.slice(0, 8)}…
+                <CopyButton value={a.roleTemplateId} />
+                <a
+                  href={roleDeepLink(tenantId, a.roleId)}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="inline-flex h-4 w-4 items-center justify-center rounded text-muted-foreground hover:bg-muted hover:text-foreground"
+                  title="Open role assignments in the Entra portal"
+                  aria-label={`Open ${a.roleDisplayName} in the Entra portal`}
+                >
+                  <ExternalLink className="h-2.5 w-2.5" aria-hidden />
+                </a>
+              </span>
+            </li>
+          ))}
+        </ul>
+        {/*
+          Per-principal audit timeline — surfaces operator actions targeting
+          this principal (watchlist add/remove, filter toggles that mention
+          this id, etc.). Pulls from the in-app auditLog singleton. Lives
+          inside the expand panel so it never pushes layout for principals
+          the operator isn't actively investigating.
+        */}
+        {recentEvents.length > 0 && (
+          <div className="mt-3 border-t border-dashed border-border pt-2">
+            <p className="m-0 mb-1 text-3xs font-semibold uppercase tracking-wider text-muted-foreground">
+              Recent actions on this principal
+            </p>
+            <ol className="flex flex-col gap-0.5">
+              {recentEvents.map((e) => (
+                <li
+                  key={e.id}
+                  className="flex flex-wrap items-center gap-1.5 text-3xs text-muted-foreground"
+                >
+                  <span className="tabular-nums">
+                    {formatRelativeTime(e.timestamp)}
+                  </span>
+                  <span aria-hidden>·</span>
+                  <span className="font-mono">
+                    {e.action.replace(PRIVILEGED_AUDIT_ACTION_PREFIX, "")}
+                  </span>
+                  <span aria-hidden>·</span>
+                  <span>{e.actor}</span>
+                  <Badge
+                    variant={e.status === "success" ? "outline" : "destructive"}
+                  >
+                    {e.status}
+                  </Badge>
+                </li>
+              ))}
+            </ol>
+          </div>
+        )}
+      </div>
+    );
+  },
+);
 ExpandedAssignmentDetail.displayName = "ExpandedAssignmentDetail";
 
 // ===========================================================================
@@ -3252,12 +4092,18 @@ const CorpusDetectionSignalsCard: React.FC<{
     federatedCredentials,
     pimEligibilities,
     tapIssuances,
+    syncAccountFindings,
+    pimGroupEligibilities,
+    mixedChainFindings,
   } = dataset;
   const total =
     highPrivGraphPermissions.length +
     federatedCredentials.length +
     pimEligibilities.length +
-    tapIssuances.length;
+    tapIssuances.length +
+    syncAccountFindings.filter((f) => f.hasDriftRole).length +
+    pimGroupEligibilities.length +
+    mixedChainFindings.length;
   // Per-signal severity tallies for the top stat row.
   const criticalCount = React.useMemo(() => {
     let n = 0;
@@ -3280,12 +4126,21 @@ const CorpusDetectionSignalsCard: React.FC<{
       if (gradePimEligibility(f) === "critical") n++;
     for (const f of tapIssuances)
       if (gradeTapIssuance(f) === "critical") n++;
+    for (const f of syncAccountFindings)
+      if (gradeSyncAccount(f) === "critical") n++;
+    for (const f of pimGroupEligibilities)
+      if (gradePimGroupEligibility(f) === "critical") n++;
+    for (const f of mixedChainFindings)
+      if (f.severity === "critical") n++;
     return n;
   }, [
     highPrivGraphPermissions,
     federatedCredentials,
     pimEligibilities,
     tapIssuances,
+    syncAccountFindings,
+    pimGroupEligibilities,
+    mixedChainFindings,
   ]);
   return (
     <Card aria-labelledby="corpus-signals-title">
@@ -3296,7 +4151,7 @@ const CorpusDetectionSignalsCard: React.FC<{
         >
           <ShieldAlert className="h-4 w-4 text-destructive" />
           Corpus detection signals
-          <InfoTooltip content="Four drift-from-baseline indicators sourced from the cross-tool offensive playbooks. Read-only enumeration only — every row is a GET against the operator's own tenant. Severity grading mirrors the corpus' own risk framing." />
+          <InfoTooltip content="Seven drift-from-baseline indicators sourced from the cross-tool offensive playbooks. Read-only enumeration only — every row is a GET against the operator's own tenant. Severity grading mirrors the corpus' own risk framing." />
         </CardTitle>
         <CardDescription>
           {total} indicator{total === 1 ? "" : "s"} surfaced
@@ -3314,6 +4169,13 @@ const CorpusDetectionSignalsCard: React.FC<{
         </CardDescription>
       </CardHeader>
       <CardContent className="flex flex-col gap-4">
+        {/* Signal F goes FIRST because it is the highest-value composite —
+            two indicators on one principal in a tight window beats any
+            single-signal finding. */}
+        <SignalFPanel
+          findings={dataset.mixedChainFindings}
+          loading={loading}
+        />
         <SignalAPanel
           findings={highPrivGraphPermissions}
           loading={loading}
@@ -3333,8 +4195,16 @@ const CorpusDetectionSignalsCard: React.FC<{
           findings={pimEligibilities}
           loading={loading}
         />
+        <SignalGPanel
+          findings={dataset.pimGroupEligibilities}
+          loading={loading}
+        />
         <SignalDPanel
           findings={tapIssuances}
+          loading={loading}
+        />
+        <SignalEPanel
+          findings={dataset.syncAccountFindings}
           loading={loading}
         />
       </CardContent>
@@ -3713,6 +4583,497 @@ const SignalDPanel: React.FC<{
               {f.methodUsabilityReason && (
                 <span className="text-3xs text-muted-foreground">
                   {f.methodUsabilityReason}
+                </span>
+              )}
+            </li>
+          );
+        })}
+        {findings.length > 25 && (
+          <li className="px-3 py-1 text-2xs text-muted-foreground">
+            + {findings.length - 25} more (export for full list)
+          </li>
+        )}
+      </ul>
+    )}
+  </section>
+);
+
+// ===========================================================================
+// Tier-0 Watchlist card
+//
+// Persisted, manually-curated set of object ids the operator wants to
+// monitor for drift between probes. Surface drift in the same card so the
+// alert is impossible to miss — adding an entry without ever seeing drift
+// is just a noisier inventory.
+// ===========================================================================
+
+const WATCHLIST_DRIFT_TONE: Record<
+  WatchlistDrift["kind"],
+  "destructive" | "warning" | "info" | "secondary" | "outline"
+> = {
+  missing: "destructive",
+  "tier-up": "destructive",
+  "role-removed": "warning",
+  "new-role": "warning",
+  "tier-down": "info",
+  unchanged: "outline",
+};
+
+const Tier0WatchlistCard: React.FC<{
+  watchlist: WatchlistState;
+  drift: WatchlistDrift[];
+  onRemove: (principalId: string) => void;
+}> = ({ watchlist, drift, onRemove }) => {
+  // Hide the card entirely when the watchlist is empty — the affordance to
+  // ADD lives next to each row in section B so the empty card would just be
+  // visual noise on first load.
+  if (watchlist.entries.length === 0) return null;
+  const alertCount = drift.filter((d) => d.kind !== "unchanged").length;
+  return (
+    <Card>
+      <CardHeader className="flex flex-row flex-wrap items-end justify-between gap-2 space-y-0">
+        <div className="min-w-0">
+          <CardTitle className="flex items-center gap-2 text-sm">
+            <Sparkles className="h-4 w-4 text-warning" aria-hidden />
+            Tier-0 Watchlist
+            <InfoTooltip content="Operator-curated principals monitored for drift between probes. Use the bookmark icon next to any row in 'Privileged identities' to add/remove. Drift kinds: principal disappeared, tier escalated, new role gained, role removed." />
+          </CardTitle>
+          <CardDescription>
+            {watchlist.entries.length} watched principal
+            {watchlist.entries.length === 1 ? "" : "s"}
+            {alertCount > 0 && (
+              <>
+                {", "}
+                <span className="font-semibold text-destructive">
+                  {alertCount} drift alert{alertCount === 1 ? "" : "s"}
+                </span>
+              </>
+            )}
+            .
+          </CardDescription>
+        </div>
+      </CardHeader>
+      <CardContent>
+        <ul className="flex flex-col gap-1.5">
+          {drift.map((d) => (
+            <li
+              key={d.entry.principalId}
+              className={cn(
+                "flex flex-wrap items-center gap-2 rounded-md border px-3 py-2 text-2xs",
+                d.kind === "missing" || d.kind === "tier-up"
+                  ? "border-destructive/40 bg-destructive/5"
+                  : d.kind === "new-role" || d.kind === "role-removed"
+                    ? "border-warning/40 bg-warning/5"
+                    : d.kind === "tier-down"
+                      ? "border-info/40 bg-info/5"
+                      : "border-border bg-card",
+              )}
+            >
+              <Badge variant={WATCHLIST_DRIFT_TONE[d.kind]}>
+                {d.kind === "unchanged" ? "ok" : d.kind}
+              </Badge>
+              <span className="min-w-0 flex-1 truncate font-medium text-foreground">
+                {d.entry.capturedDisplayName}
+              </span>
+              {d.entry.capturedSignInName && (
+                <span className="font-mono text-3xs text-muted-foreground">
+                  {d.entry.capturedSignInName}
+                </span>
+              )}
+              <TierBadge tier={d.current?.topTier ?? d.entry.capturedTier} compact />
+              <span className="text-muted-foreground">{d.explanation}</span>
+              {d.entry.note && (
+                <span
+                  className="text-3xs italic text-muted-foreground"
+                  title={`Note: ${d.entry.note}`}
+                >
+                  "{d.entry.note}"
+                </span>
+              )}
+              <span className="font-mono text-3xs text-muted-foreground">
+                added {formatRelativeTime(d.entry.addedAt)}
+              </span>
+              <button
+                type="button"
+                onClick={() => onRemove(d.entry.principalId)}
+                className="ml-auto inline-flex h-5 w-5 items-center justify-center rounded text-muted-foreground hover:bg-muted hover:text-destructive"
+                title="Remove from watchlist"
+                aria-label={`Remove ${d.entry.capturedDisplayName} from watchlist`}
+              >
+                <EyeOff className="h-3 w-3" aria-hidden />
+              </button>
+            </li>
+          ))}
+        </ul>
+      </CardContent>
+    </Card>
+  );
+};
+
+// ===========================================================================
+// Signal E panel — AAD Connect / Cloud Sync sync-account drift
+// ===========================================================================
+
+const SIGNAL_E_EXPORT_COLUMNS: ReadonlyArray<ExportColumn<SyncAccountFinding>> = [
+  { header: "Principal", accessor: (f) => f.principalDisplayName },
+  { header: "Principal id", accessor: (f) => f.principalId },
+  { header: "Type", accessor: (f) => f.principalType },
+  { header: "Sign-in name", accessor: (f) => f.principalSignInName ?? "" },
+  {
+    header: "Roles held",
+    accessor: (f) =>
+      f.roles.map((r) => `${r.roleDisplayName}${r.isCanonical ? "(canonical)" : ""}`).join("; "),
+  },
+  { header: "Drift?", accessor: (f) => (f.hasDriftRole ? "yes" : "no") },
+  { header: "Top drift tier", accessor: (f) => TIER_META[f.topDriftTier].label },
+  { header: "Severity", accessor: (f) => SEVERITY_META[gradeSyncAccount(f)].label },
+];
+
+const SignalEPanel: React.FC<{
+  findings: SyncAccountFinding[];
+  loading: boolean;
+}> = ({ findings, loading }) => {
+  const driftFindings = findings.filter((f) => f.hasDriftRole);
+  return (
+    <section
+      className="rounded-md border border-border bg-card/40 p-3"
+      aria-labelledby="signal-e-title"
+    >
+      <header className="mb-2 flex flex-wrap items-center gap-2">
+        <ShieldAlert className="h-3.5 w-3.5 text-destructive" aria-hidden />
+        <h3
+          id="signal-e-title"
+          className="text-2xs font-semibold uppercase tracking-wider"
+        >
+          Signal E — AAD Connect / Cloud Sync sync-account drift
+        </h3>
+        <InfoTooltip content="Citation: _AZURE_BYPASS_PLAYBOOK.md Top-30 #19 + _bypass_mixed_chains.md chain #1 + _analysis_dirkjanm.md (adconnectdump). Any principal whose display name matches Sync_*, MSOL_*, ADToAADSyncServiceAccount, or 'On-Premises Directory Synchronization Service Account' is a sync identity. They are expected to hold ONLY the canonical 'Directory Synchronization Accounts' role (template d29b2b05-…). Any other privileged role is drift — and a compromised sync account is bidirectional forest control per the corpus." />
+        <span className="ml-auto">
+          <ExportMenu
+            rows={findings}
+            columns={SIGNAL_E_EXPORT_COLUMNS}
+            filename="privileged-audit-signal-e-sync-accounts"
+          />
+        </span>
+      </header>
+      {loading ? (
+        <Skeleton className="h-12 w-full" />
+      ) : findings.length === 0 ? (
+        <p className="m-0 text-2xs text-muted-foreground">
+          No AAD Connect / Cloud Sync identities detected in this tenant's
+          privileged-role holders. (If you DO use AAD Connect, ensure the sync
+          account's privileged-role membership is enumerable via{" "}
+          <code className="text-3xs">Directory.Read.All</code>.)
+        </p>
+      ) : (
+        <ul className="flex flex-col gap-1.5">
+          {findings.map((f) => {
+            const sev = gradeSyncAccount(f);
+            return (
+              <li
+                key={f.id}
+                className={cn(
+                  "flex flex-wrap items-center gap-2 rounded-md border px-3 py-2 text-2xs",
+                  sev === "critical"
+                    ? "border-destructive/50 bg-destructive/5"
+                    : sev === "high"
+                      ? "border-warning/40 bg-warning/5"
+                      : sev === "medium"
+                        ? "border-info/40 bg-info/5"
+                        : "border-border bg-card",
+                )}
+              >
+                <SeverityBadge severity={sev} />
+                <span className="min-w-0 flex-1 truncate font-medium text-foreground">
+                  {f.principalDisplayName}
+                </span>
+                {f.principalSignInName && (
+                  <span className="font-mono text-3xs text-muted-foreground">
+                    {f.principalSignInName}
+                  </span>
+                )}
+                <Badge variant="outline">{f.principalType}</Badge>
+                <div className="flex flex-wrap gap-1">
+                  {f.roles.map((r) => (
+                    <Badge
+                      key={r.roleTemplateId}
+                      variant={r.isCanonical ? "secondary" : "warning"}
+                      title={
+                        r.isCanonical
+                          ? `Canonical sync role — expected on a sync account.`
+                          : `Drift role ${TIER_META[r.tier].label} — investigate; sync accounts should hold ONLY the canonical Directory Synchronization Accounts role.`
+                      }
+                    >
+                      {r.roleDisplayName}
+                    </Badge>
+                  ))}
+                </div>
+                {f.hasDriftRole && (
+                  <Badge variant="destructive" title="Drift detected">
+                    Drift → {TIER_META[f.topDriftTier].label}
+                  </Badge>
+                )}
+              </li>
+            );
+          })}
+          {driftFindings.length === 0 && findings.length > 0 && (
+            <li className="px-3 py-1 text-2xs text-muted-foreground">
+              All sync-shaped principals hold only the canonical sync role —
+              no drift detected. This is the safe baseline.
+            </li>
+          )}
+        </ul>
+      )}
+    </section>
+  );
+};
+
+// ===========================================================================
+// Signal F panel — Mixed-chain temporal correlation
+// ===========================================================================
+
+const SIGNAL_F_EXPORT_COLUMNS: ReadonlyArray<ExportColumn<MixedChainFinding>> = [
+  { header: "Principal", accessor: (f) => f.principalDisplayName },
+  { header: "Principal id", accessor: (f) => f.principalId },
+  { header: "Type", accessor: (f) => f.principalType },
+  { header: "Tier", accessor: (f) => TIER_META[f.principalTier].label },
+  { header: "Signals", accessor: (f) => f.indicators.map((i) => i.signal).join(",") },
+  {
+    header: "Span (hours)",
+    accessor: (f) => (f.spanMs / (60 * 60 * 1000)).toFixed(2),
+  },
+  { header: "Severity", accessor: (f) => SEVERITY_META[f.severity].label },
+  {
+    header: "Indicators",
+    accessor: (f) =>
+      f.indicators.map((i) => `${i.signal}@${i.at}:${i.label}`).join(" | "),
+  },
+];
+
+const SignalFPanel: React.FC<{
+  findings: MixedChainFinding[];
+  loading: boolean;
+}> = ({ findings, loading }) => (
+  <section
+    className="rounded-md border border-border bg-card/40 p-3"
+    aria-labelledby="signal-f-title"
+  >
+    <header className="mb-2 flex flex-wrap items-center gap-2">
+      <Bomb className="h-3.5 w-3.5 text-destructive" aria-hidden />
+      <h3
+        id="signal-f-title"
+        className="text-2xs font-semibold uppercase tracking-wider"
+      >
+        Signal F — Mixed-chain temporal correlation
+      </h3>
+      <InfoTooltip content="Citation: _bypass_mixed_chains.md (chain composition is the actual attacker workflow). Fires when ≥ 2 indicators across A/B/C/D/G land on the same principal inside MIXED_CHAIN_WINDOW_MS (24h). One indicator alone is suspicious; two within hours is the kill-chain signature. Critical when ≥ 3 distinct signals or any contributor is critical-graded." />
+      <span className="ml-auto">
+        <ExportMenu
+          rows={findings}
+          columns={SIGNAL_F_EXPORT_COLUMNS}
+          filename="privileged-audit-signal-f-mixed-chains"
+        />
+      </span>
+    </header>
+    {loading ? (
+      <Skeleton className="h-12 w-full" />
+    ) : findings.length === 0 ? (
+      <p className="m-0 text-2xs text-muted-foreground">
+        No mixed-chain coincidences detected. Single-signal indicators may
+        still exist below; this card fires only when ≥ 2 of them land on
+        the same principal within {MIXED_CHAIN_WINDOW_MS / (60 * 60 * 1000)}h.
+      </p>
+    ) : (
+      <ul className="flex flex-col gap-1.5">
+        {findings.slice(0, 25).map((f) => (
+          <li
+            key={f.id}
+            className={cn(
+              "flex flex-col gap-1 rounded-md border px-3 py-2 text-2xs",
+              f.severity === "critical"
+                ? "border-destructive/50 bg-destructive/5"
+                : f.severity === "high"
+                  ? "border-warning/40 bg-warning/5"
+                  : "border-border bg-card",
+            )}
+          >
+            <div className="flex flex-wrap items-center gap-2">
+              <SeverityBadge severity={f.severity} />
+              <span className="min-w-0 flex-1 truncate font-medium text-foreground">
+                {f.principalDisplayName}
+              </span>
+              {f.principalSignInName && (
+                <span className="font-mono text-3xs text-muted-foreground">
+                  {f.principalSignInName}
+                </span>
+              )}
+              <TierBadge tier={f.principalTier} compact />
+              <Badge
+                variant="warning"
+                title={`Signals ${f.indicators
+                  .map((i) => i.signal)
+                  .join(" + ")} fired within ${(f.spanMs / (60 * 60 * 1000)).toFixed(1)}h`}
+              >
+                {f.indicators.map((i) => i.signal).join(" + ")} ·{" "}
+                {(f.spanMs / (60 * 60 * 1000)).toFixed(1)}h
+              </Badge>
+            </div>
+            <ol className="flex flex-wrap gap-x-3 gap-y-0.5 text-3xs text-muted-foreground">
+              {f.indicators.map((ind, idx) => (
+                <li key={`${f.id}:ind:${idx}`} className="flex items-center gap-1">
+                  <span className="font-mono">[{ind.signal}]</span>
+                  <span>{ind.label}</span>
+                  <span aria-hidden>·</span>
+                  <span>{formatRelativeTime(ind.at)}</span>
+                </li>
+              ))}
+            </ol>
+          </li>
+        ))}
+        {findings.length > 25 && (
+          <li className="px-3 py-1 text-2xs text-muted-foreground">
+            + {findings.length - 25} more chains (export for full list)
+          </li>
+        )}
+      </ul>
+    )}
+  </section>
+);
+
+// ===========================================================================
+// Signal G panel — PIM-for-Groups eligibility on role-assignable groups
+// ===========================================================================
+
+const SIGNAL_G_EXPORT_COLUMNS: ReadonlyArray<
+  ExportColumn<PimGroupEligibilityFinding>
+> = [
+  {
+    header: "Principal",
+    accessor: (f) => f.principalDisplayName ?? f.principalId,
+  },
+  { header: "Principal id", accessor: (f) => f.principalId },
+  { header: "Principal type", accessor: (f) => f.principalType },
+  { header: "Group", accessor: (f) => f.groupDisplayName },
+  { header: "Group id", accessor: (f) => f.groupId },
+  {
+    header: "isAssignableToRole",
+    accessor: (f) => (f.isAssignableToRole ? "yes" : "no"),
+  },
+  {
+    header: "Group roles",
+    accessor: (f) => f.groupRoles.map((r) => r.roleDisplayName).join("; "),
+  },
+  { header: "Top tier", accessor: (f) => TIER_META[f.topTier].label },
+  { header: "Expiration kind", accessor: (f) => f.expirationKind },
+  { header: "End date", accessor: (f) => f.endDateTime ?? "" },
+  { header: "Duration", accessor: (f) => f.duration ?? "" },
+  { header: "Created", accessor: (f) => f.createdDateTime ?? "" },
+  {
+    header: "Critical time bomb",
+    accessor: (f) => (f.isCriticalTimeBomb ? "yes" : "no"),
+  },
+  {
+    header: "Severity",
+    accessor: (f) => SEVERITY_META[gradePimGroupEligibility(f)].label,
+  },
+];
+
+const SignalGPanel: React.FC<{
+  findings: PimGroupEligibilityFinding[];
+  loading: boolean;
+}> = ({ findings, loading }) => (
+  <section
+    className="rounded-md border border-border bg-card/40 p-3"
+    aria-labelledby="signal-g-title"
+  >
+    <header className="mb-2 flex flex-wrap items-center gap-2">
+      <GitBranch className="h-3.5 w-3.5 text-warning" aria-hidden />
+      <h3
+        id="signal-g-title"
+        className="text-2xs font-semibold uppercase tracking-wider"
+      >
+        Signal G — PIM-for-Groups eligibility on role-assignable groups
+      </h3>
+      <InfoTooltip content="Citation: _bypass_staged_pim.md §6 (PIM for Groups) + _AZURE_BYPASS_PLAYBOOK.md Top-30 #28. Activating PIM-for-Groups eligibility transfers the activator into the group, transitively inheriting any role the group directly holds. The corpus calls this 'three-layer indirection — breaks most detection logic'. Critical when noExpiration eligibility is held against a group that directly holds a Tier-0 role." />
+      <span className="ml-auto">
+        <ExportMenu
+          rows={findings}
+          columns={SIGNAL_G_EXPORT_COLUMNS}
+          filename="privileged-audit-signal-g-pim-groups"
+        />
+      </span>
+    </header>
+    {loading ? (
+      <Skeleton className="h-12 w-full" />
+    ) : findings.length === 0 ? (
+      <p className="m-0 text-2xs text-muted-foreground">
+        No PIM-for-Groups eligibilities detected. (If PIM-for-Groups IS
+        configured, ensure the signed-in account has{" "}
+        <code className="text-3xs">PrivilegedAccess.Read.AzureADGroup</code>{" "}
+        or <code className="text-3xs">RoleManagement.Read.All</code>.)
+      </p>
+    ) : (
+      <ul className="flex flex-col gap-1.5">
+        {findings.slice(0, 25).map((f) => {
+          const sev = gradePimGroupEligibility(f);
+          return (
+            <li
+              key={f.id}
+              className={cn(
+                "flex flex-wrap items-center gap-2 rounded-md border px-3 py-2 text-2xs",
+                f.isCriticalTimeBomb
+                  ? "border-destructive/50 bg-destructive/5"
+                  : sev === "high"
+                    ? "border-warning/40 bg-warning/5"
+                    : "border-border bg-card",
+              )}
+            >
+              <SeverityBadge severity={sev} />
+              <span className="min-w-0 flex-1 truncate font-medium text-foreground">
+                {f.principalDisplayName ?? f.principalId}
+              </span>
+              {f.principalSignInName && (
+                <span className="font-mono text-3xs text-muted-foreground">
+                  {f.principalSignInName}
+                </span>
+              )}
+              <Badge variant="outline">{f.principalType}</Badge>
+              <span className="text-2xs text-muted-foreground">
+                eligible for member of
+              </span>
+              <Badge variant="secondary" title={f.groupId}>
+                {f.groupDisplayName}
+              </Badge>
+              {f.isAssignableToRole && (
+                <Badge
+                  variant="warning"
+                  title="Group has isAssignableToRole=true — eligibility on it grants role-assignment-capable membership"
+                >
+                  role-assignable
+                </Badge>
+              )}
+              {f.groupRoles.length > 0 && (
+                <TierBadge tier={f.topTier} compact />
+              )}
+              <Badge
+                variant={
+                  f.expirationKind === "noExpiration" ? "destructive" : "outline"
+                }
+              >
+                {f.expirationKind === "noExpiration"
+                  ? "noExpiration"
+                  : f.expirationKind === "afterDateTime"
+                    ? `until ${f.endDateTime?.slice(0, 10) ?? "?"}`
+                    : f.expirationKind === "afterDuration"
+                      ? f.duration ?? "duration"
+                      : "?"}
+              </Badge>
+              {f.createdDateTime && (
+                <span
+                  className="font-mono text-3xs text-muted-foreground"
+                  title={`Eligibility created ${f.createdDateTime}`}
+                >
+                  +{formatRelativeTime(f.createdDateTime)}
                 </span>
               )}
             </li>

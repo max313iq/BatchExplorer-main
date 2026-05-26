@@ -16,6 +16,7 @@ import {
   Download,
   Eraser,
   FileCode,
+  FileJson,
   Image as ImageIcon,
   Keyboard,
   Layers,
@@ -25,8 +26,10 @@ import {
   Network,
   Plus,
   RotateCw,
+  Save,
   Search,
   Server,
+  ShieldAlert,
   Sparkles,
   Square,
   Terminal,
@@ -283,6 +286,319 @@ function parseEnvPaste(raw: string): EnvParseResult {
     out.push({ name, value });
   }
   return { parsed: out, warnings };
+}
+
+// ---- Attack-surface analyzer -------------------------------------------
+// Corpus-grounded pre-create warning panel. The shape we're trying to
+// detect is the classic "compute hijack target" from
+// `New folder\_analysis_netspi.md §I (IMDS Variants)`:
+//
+//   * The Batch node has a managed-identity reachable IMDS endpoint at
+//     `169.254.169.254/metadata/identity/oauth2/token` — exactly the
+//     `Azure VM` row in the NetSPI IMDS matrix.
+//   * If the StartTask runs as autoUser with `elevationLevel: admin`,
+//     anything that compromises the start-task shell (apt registries,
+//     pip mirrors, Docker registries, GitHub releases) gets root and
+//     can read tokens out of IMDS, MSAL caches, and bound storage.
+//   * If the pool has public (no-subnet) networking AND outbound
+//     internet AND a writable filesystem, the same shape that NetSPI
+//     uses to hijack App Service / Functions identities applies one
+//     hop down — the attacker uploads a malicious tarball that the
+//     start-task fetches, then exfils the IMDS token.
+//
+// We DON'T block creation — operators are sometimes intentionally
+// running unsigned setup. We surface the chain so they SEE it before
+// pressing Create. Citations on the panel point at the corpus docs.
+
+interface AttackSurfaceFinding {
+  /** Stable key so render passes can keyframe. */
+  id: string;
+  /** Severity tone — drives Alert variant. */
+  severity: "info" | "warning" | "destructive";
+  /** Headline (short, scannable). */
+  title: string;
+  /** Body — why this matters, what the corpus says, how to mitigate. */
+  detail: string;
+  /** Corpus citation (relative path under `New folder\`). */
+  cite: string;
+}
+
+interface AttackSurfaceInput {
+  subnetId: string;
+  startTaskCmd: string;
+  elevationLevel: "admin" | "nonadmin";
+  envVars: { name: string; value: string }[];
+  smartMode: boolean;
+  selectedAccountCount: number;
+  crossSubDispatch: boolean;
+}
+
+// Commands whose presence in the StartTask implies the node will reach
+// out to the public internet during boot. The intersection with the
+// "no subnet + admin StartTask" shape is the high-risk case.
+const OUTBOUND_FETCH_PATTERNS = [
+  /\bcurl\b/i,
+  /\bwget\b/i,
+  /\bapt-get\s+(?:update|install)\b/i,
+  /\bapt\s+(?:update|install)\b/i,
+  /\byum\s+install\b/i,
+  /\bdnf\s+install\b/i,
+  /\bpip3?\s+install\b/i,
+  /\bnpm\s+(?:install|i)\b/i,
+  /\bdocker\s+(?:pull|run)\b/i,
+  /\bgit\s+clone\b/i,
+  /\bhuggingface-cli\s+download\b/i,
+  /\bnvidia-smi\b/i, // benign, but a marker that GPU + outbound is in play
+];
+
+// Patterns that write to filesystem with elevated privilege — the
+// "blast radius" amplifier. Caught with conservative regex so we
+// don't false-positive on legitimate echo into a file (which is fine).
+const FS_WRITE_PATTERNS = [
+  /\bchmod\s+[+u]\w*[sx]\b/i, // setuid / executable
+  /\bchown\s+root\b/i,
+  /\bsudo\b/i, // already root in autoUser:admin, but a marker
+  /\binstall\s+-D\b/i,
+  /\btar\s+(?:-x|xf|xzvf|xzf)\b/i,
+  /\bunzip\b/i,
+  />\s*\/etc\//i,
+  />\s*\/usr\/local\/bin\//i,
+];
+
+// Env-var names that hint at credentials being baked into the pool
+// definition. Plain-text on the wire AND on the pool resource — a
+// secondary leak path. Names match conservatively.
+const SECRET_ENV_PATTERNS = [
+  /pass(word)?$/i,
+  /^aws_secret/i,
+  /^azure_client_secret/i,
+  /token$/i,
+  /^github_token/i,
+  /apikey$/i,
+  /^openai_api_key/i,
+  /^anthropic_api_key/i,
+  /^hf_token/i,
+  /_secret$/i,
+];
+
+function analyzeAttackSurface(
+  input: AttackSurfaceInput,
+): AttackSurfaceFinding[] {
+  const out: AttackSurfaceFinding[] = [];
+  const cmd = input.startTaskCmd ?? "";
+  const isPublic = input.subnetId.trim().length === 0;
+  const isAdmin = input.elevationLevel === "admin";
+  const fetches = OUTBOUND_FETCH_PATTERNS.some((p) => p.test(cmd));
+  const fsWrite = FS_WRITE_PATTERNS.some((p) => p.test(cmd));
+
+  // 1. Compute-hijack shape: public IP + outbound + admin StartTask.
+  if (isPublic && fetches && isAdmin) {
+    out.push({
+      id: "compute-hijack",
+      severity: "destructive",
+      title:
+        "Compute-hijack shape: public IP + outbound fetch + admin StartTask",
+      detail:
+        "Pool nodes will boot on the public Batch fleet (no subnet attached), the StartTask will fetch from the internet, and it runs as root. A compromised apt/pip/docker mirror — or a single MITM on the fetch path — yields a root shell with IMDS access. The classic Azure VM IMDS at 169.254.169.254 (Metadata: true header) will mint managed-identity tokens for whatever identity the Batch account has, which AzureHound / MicroBurst then graph into the wider tenant. Mitigations: attach a subnet with a deny-by-default NSG, pin checksums on every fetched artifact, or drop elevation to nonadmin.",
+      cite: "_analysis_netspi.md §I (IMDS Variants — Azure VM row)",
+    });
+  } else if (isPublic && fetches) {
+    out.push({
+      id: "outbound-public",
+      severity: "warning",
+      title: "Public networking + outbound fetch in StartTask",
+      detail:
+        "No subnet attached, so the node uses default public networking. The StartTask reaches out to the internet during boot. A poisoned apt/pip/docker mirror compromises every node in the pool. Consider pinning checksums, mirroring artifacts to a private storage account, or attaching a subnet with controlled egress.",
+      cite: "_analysis_netspi.md §I (IMDS Variants)",
+    });
+  } else if (isAdmin && fsWrite) {
+    out.push({
+      id: "admin-fs-write",
+      severity: "warning",
+      title: "StartTask is elevated AND writes outside the task directory",
+      detail:
+        "elevationLevel=admin combined with chmod/chown/tar/install-D to system paths means a buggy or malicious StartTask leaves persistent state on the node. Even after the pool deallocates and a node is recycled into a new pool, Batch reformats the OS disk — but secrets baked into the start-task script remain in the pool's stored definition. Prefer dropping privileges (nonadmin) or fencing writes to /mnt/batch/tasks/.",
+      cite: "_analysis_netspi.md §III (App Service Token Theft — same blast-radius pattern)",
+    });
+  }
+
+  // 2. Secret-shaped env vars in the pool definition.
+  const secretEnvs = input.envVars
+    .filter((ev) => ev.name.trim() !== "")
+    .filter((ev) =>
+      SECRET_ENV_PATTERNS.some((p) => p.test(ev.name.trim())),
+    )
+    .map((ev) => ev.name);
+  if (secretEnvs.length > 0) {
+    out.push({
+      id: "secret-env",
+      severity: "warning",
+      title: `${secretEnvs.length} env-var name(s) look like secret(s)`,
+      detail:
+        `Plain-text env vars on a pool definition are visible to anyone with Reader on the Batch account — they're returned by the pool GET API, the Azure Portal, and pool exports. Names: ${secretEnvs.slice(0, 5).join(", ")}${secretEnvs.length > 5 ? ", …" : ""}. Move these to a Key Vault reference (Batch supports it natively) or fetch at runtime from an identity-bound source.`,
+      cite: "_analysis_netspi.md §VI (Key Vault enumeration / Get-AzPasswords)",
+    });
+  }
+
+  // 3. Cross-sub dispatch advisory.
+  if (input.smartMode && input.crossSubDispatch) {
+    out.push({
+      id: "cross-sub-dispatch",
+      severity: "info",
+      title: "Cross-subscription dispatch in progress",
+      detail:
+        "Selected accounts span multiple subscriptions / AAD identities. The orchestrator routes a fresh Batch token per account, but the StartTask above runs identically in every account. Verify the command does not embed sub-specific paths, role assignments, or storage accounts that only exist in one of the targets.",
+      cite: "_bypass_tenant_switch.md §multi-tenant token routing",
+    });
+  }
+
+  // 4. Pool-scale warning: many accounts × many SKUs = many nodes.
+  if (input.smartMode && input.selectedAccountCount >= 10) {
+    out.push({
+      id: "pool-scale",
+      severity: "info",
+      title: `Large dispatch: ${input.selectedAccountCount} accounts in smart-fill mode`,
+      detail:
+        "Each account fills its remaining LP quota, so the per-account node count is bounded by quota — but the aggregate fleet you're about to bring up could be thousands of nodes. Every node will run the StartTask above. A bug in the StartTask amplifies across the whole fleet.",
+      cite: "(operational guidance — not a corpus citation)",
+    });
+  }
+
+  return out;
+}
+
+// ---- PUT-body preview builder ------------------------------------------
+// Mirrors the exact body the submit path constructs in `handleCreate`
+// (smart mode), so the operator sees what's actually about to be PUT to
+// each Batch account before pressing Create. Two intentional differences
+// from `handleCreate`:
+//   1. `vmSize` is a placeholder string `"<one of N SKUs>"` since smart
+//      mode picks per account at dispatch time.
+//   2. `environmentSettings` filters out empty names AND redacts values
+//      whose name matches `SECRET_ENV_PATTERNS` — we don't want secrets
+//      copy-pasted out of the preview pane.
+// The preview also covers Manual JSON mode by passing through the operator's
+// JSON verbatim (with the same `targetDedicatedNodes=0` clamp the submit
+// path applies).
+interface PutPreviewInput {
+  smartMode: boolean;
+  poolIdInput: string;
+  poolConfigJson: string;
+  resizeTimeoutMin: number;
+  subnetId: string;
+  interNodeComm: boolean;
+  startTaskCmd: string;
+  envVars: { name: string; value: string }[];
+  maxRetryCount: number;
+  waitForSuccess: boolean;
+  poolDefaults: PoolDefaults | undefined;
+  smartVmSizes: string[];
+  smartVmCount: number;
+}
+
+function buildPutBodyPreview(input: PutPreviewInput): {
+  body: Record<string, unknown>;
+  redactedNames: string[];
+} {
+  const redactedNames: string[] = [];
+  if (!input.smartMode) {
+    try {
+      const parsed = JSON.parse(input.poolConfigJson) as Record<string, unknown>;
+      parsed.targetDedicatedNodes = 0;
+      // Redact secret-shaped env vars in the manual JSON preview too.
+      const env = (parsed.startTask as { environmentSettings?: unknown })
+        ?.environmentSettings;
+      if (Array.isArray(env)) {
+        const sanitized = env.map((e) => {
+          const item = e as { name?: unknown; value?: unknown };
+          const name = typeof item.name === "string" ? item.name : "";
+          const looksSecret = SECRET_ENV_PATTERNS.some((p) => p.test(name));
+          if (looksSecret) redactedNames.push(name);
+          return looksSecret
+            ? { name, value: "<redacted in preview>" }
+            : { name, value: typeof item.value === "string" ? item.value : "" };
+        });
+        (parsed.startTask as { environmentSettings?: unknown }).environmentSettings =
+          sanitized;
+      }
+      return { body: parsed, redactedNames };
+    } catch (e) {
+      return {
+        body: { _previewError: `Invalid JSON: ${(e as Error).message}` },
+        redactedNames: [],
+      };
+    }
+  }
+
+  const vmSizePlaceholder =
+    input.smartVmSizes.length > 0
+      ? `<one of ${input.smartVmSizes.length} picked SKUs>`
+      : `<one of ${input.smartVmCount} default GPU SKUs>`;
+
+  const environmentSettings = input.envVars
+    .filter((ev) => ev.name.trim() !== "")
+    .map((ev) => {
+      const looksSecret = SECRET_ENV_PATTERNS.some((p) => p.test(ev.name));
+      if (looksSecret) redactedNames.push(ev.name);
+      return {
+        name: ev.name,
+        value: looksSecret ? "<redacted in preview>" : ev.value,
+      };
+    });
+
+  let body: Record<string, unknown>;
+  if (input.poolDefaults) {
+    body = buildPoolConfigFromDefaults(input.poolDefaults, {
+      id: input.poolIdInput,
+      targetLowPriorityNodes: 0,
+      vmSize: vmSizePlaceholder,
+    });
+    (body as Record<string, unknown>).targetDedicatedNodes = 0;
+    (body as Record<string, unknown>).enableAutoScale = false;
+  } else {
+    body = {
+      id: input.poolIdInput,
+      vmSize: vmSizePlaceholder,
+      virtualMachineConfiguration: {
+        nodeAgentSKUId: "batch.node.ubuntu 22.04",
+        imageReference: {
+          publisher: "canonical",
+          offer: "0001-com-ubuntu-server-jammy",
+          sku: "22_04-lts-gen2",
+          version: "latest",
+        },
+      },
+      resizeTimeout: `PT${input.resizeTimeoutMin}M`,
+      targetDedicatedNodes: 0,
+      targetLowPriorityNodes: 0,
+      taskSlotsPerNode: 1,
+      taskSchedulingPolicy: { nodeFillType: "Pack" },
+      enableAutoScale: false,
+      enableInterNodeCommunication: input.interNodeComm,
+      certificateReferences: [],
+      metadata: [],
+      userAccounts: [],
+    };
+  }
+  body.resizeTimeout = `PT${input.resizeTimeoutMin}M`;
+  body.enableInterNodeCommunication = input.interNodeComm;
+  if (input.subnetId) {
+    body.networkConfiguration = { subnetId: input.subnetId };
+  }
+  body.startTask = {
+    commandLine: input.startTaskCmd,
+    environmentSettings,
+    maxTaskRetryCount: input.maxRetryCount,
+    resourceFiles: [],
+    userIdentity: {
+      autoUser: {
+        scope: "pool",
+        elevationLevel: "admin",
+      },
+    },
+    waitForSuccess: input.waitForSuccess,
+  };
+  return { body, redactedNames };
 }
 
 // ---- Validators ----------------------------------------------------------
@@ -1500,6 +1816,244 @@ const PoolCreationPageInner: React.FC<PoolCreationPageProps> = ({
     { allowInInputs: true, preventDefault: false },
   );
 
+  // Esc — close the confirmation dialog if open. Doesn't otherwise
+  // interfere; the dropdown menus / Monaco / etc. handle their own Esc
+  // before this listener (window-level) gets the event.
+  useShortcut(
+    "Escape",
+    React.useCallback(() => {
+      if (!confirmHidden) {
+        setConfirmHidden(true);
+      }
+    }, [confirmHidden]),
+    { allowInInputs: true, preventDefault: false },
+  );
+
+  // ARIA-live announcement for creation results — picked up by a polite
+  // live region rendered near the bottom. Without this, screen-reader
+  // users get no audible signal when a long-running smart-fill dispatch
+  // finishes; the visible badges only help sighted operators.
+  const [creationAnnouncement, setCreationAnnouncement] = React.useState("");
+
+  // Manual "save current wizard form as a template" — distinct from the
+  // auto-save on successful dispatch in `handleCreate`. Lets the operator
+  // checkpoint a half-built config (e.g. before swapping target accounts)
+  // without having to actually run the dispatch first.
+  const saveCurrentAsTemplate = React.useCallback(() => {
+    if (poolIdInput.trim().length === 0) return;
+    const snapshot: PoolTemplate = {
+      id: crypto.randomUUID(),
+      name: `${poolIdInput || "untitled"} (manual)`,
+      savedAt: new Date().toISOString(),
+      poolIdPrefix: poolIdInput,
+      osCategory,
+      resizeTimeoutMin,
+      subnetId,
+      interNodeComm,
+      startTaskCmd,
+      maxRetryCount,
+      waitForSuccess,
+      envVars: envVars.filter((ev) => ev.name.trim() !== ""),
+      smartMode,
+      smartVmSizes: [...smartVmSizes],
+    };
+    setTemplates((prev) => [snapshot, ...prev].slice(0, POOL_TEMPLATES_MAX));
+    store.addNotification({
+      type: "info",
+      message: `Saved "${snapshot.name}" to templates (Ctrl+S)`,
+      autoDismissMs: 2500,
+    });
+  }, [
+    poolIdInput,
+    osCategory,
+    resizeTimeoutMin,
+    subnetId,
+    interNodeComm,
+    startTaskCmd,
+    maxRetryCount,
+    waitForSuccess,
+    envVars,
+    smartMode,
+    smartVmSizes,
+    setTemplates,
+    store,
+  ]);
+
+  // Ctrl/Cmd+S — save the current wizard form as a named template.
+  // Browser default is "save page", which we always pre-empt.
+  useShortcut(
+    "Mod+s",
+    React.useCallback(
+      (event: KeyboardEvent) => {
+        // Monaco's own Ctrl+S handler should win when focus is inside.
+        const target = event.target as HTMLElement | null;
+        if (target) {
+          const ce =
+            target.closest("[contenteditable='true']") ??
+            target.closest(".monaco-editor");
+          if (ce) return;
+        }
+        event.preventDefault();
+        saveCurrentAsTemplate();
+      },
+      [saveCurrentAsTemplate],
+    ),
+    { allowInInputs: true, preventDefault: false },
+  );
+
+  // Export / import templates as JSON — the "share with the rest of the
+  // org" affordance. A template is a denormalised wizard snapshot
+  // (NOT the orchestrator payload), so a JSON exchange is safe to share
+  // — no account IDs, no tokens. Schema is captured by the
+  // `format: "pool-creation-templates"` envelope so a future
+  // schema-version bump can be detected on import.
+
+  const exportTemplates = React.useCallback(() => {
+    if (templates.length === 0) {
+      store.addNotification({
+        type: "info",
+        message: "No saved templates to export.",
+        autoDismissMs: 2500,
+      });
+      return;
+    }
+    const blob = new Blob(
+      [
+        JSON.stringify(
+          {
+            format: "pool-creation-templates",
+            schemaVersion: 1,
+            exportedAt: new Date().toISOString(),
+            templates,
+          },
+          null,
+          2,
+        ),
+      ],
+      { type: "application/json" },
+    );
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `pool-templates-${new Date().toISOString().slice(0, 10)}.json`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+    auditLog.record({
+      actor: primaryAccount?.username ?? "unknown",
+      action: "pool_templates:export",
+      target: `${templates.length} template(s)`,
+      status: "success",
+      details: { count: templates.length },
+    });
+  }, [templates, store, primaryAccount?.username]);
+
+  // Hidden file input — clicking the "Import templates" button forwards
+  // here. Conservative parser: rejects anything not matching the envelope,
+  // drops individual entries that fail per-field validation rather than
+  // bailing the whole import.
+  const importTemplatesRef = React.useRef<HTMLInputElement | null>(null);
+  const handleImportTemplatesFile = React.useCallback(
+    async (file: File) => {
+      try {
+        const text = await file.text();
+        const parsed = JSON.parse(text) as Record<string, unknown>;
+        if (parsed?.format !== "pool-creation-templates") {
+          store.addNotification({
+            type: "error",
+            message:
+              'Import failed: expected {"format": "pool-creation-templates"} envelope.',
+            autoDismissMs: 5000,
+          });
+          return;
+        }
+        const raw = parsed.templates;
+        if (!Array.isArray(raw)) {
+          store.addNotification({
+            type: "error",
+            message: "Import failed: templates field is not an array.",
+            autoDismissMs: 5000,
+          });
+          return;
+        }
+        const valid: PoolTemplate[] = [];
+        const skipped: string[] = [];
+        for (const candidate of raw) {
+          const c = candidate as Partial<PoolTemplate>;
+          if (
+            typeof c.poolIdPrefix !== "string" ||
+            (c.osCategory !== "linux" && c.osCategory !== "windows") ||
+            typeof c.startTaskCmd !== "string" ||
+            typeof c.resizeTimeoutMin !== "number"
+          ) {
+            skipped.push(c?.name ?? "<unnamed>");
+            continue;
+          }
+          valid.push({
+            id: typeof c.id === "string" && c.id.length > 0 ? c.id : crypto.randomUUID(),
+            name: typeof c.name === "string" ? c.name : c.poolIdPrefix,
+            savedAt:
+              typeof c.savedAt === "string" ? c.savedAt : new Date().toISOString(),
+            poolIdPrefix: c.poolIdPrefix,
+            osCategory: c.osCategory,
+            resizeTimeoutMin: c.resizeTimeoutMin,
+            subnetId: typeof c.subnetId === "string" ? c.subnetId : "",
+            interNodeComm: c.interNodeComm === true,
+            startTaskCmd: c.startTaskCmd,
+            maxRetryCount:
+              typeof c.maxRetryCount === "number" ? c.maxRetryCount : 3,
+            waitForSuccess: c.waitForSuccess !== false,
+            envVars: Array.isArray(c.envVars)
+              ? c.envVars
+                  .filter(
+                    (ev): ev is { name: string; value: string } =>
+                      ev != null &&
+                      typeof (ev as { name?: unknown }).name === "string" &&
+                      typeof (ev as { value?: unknown }).value === "string",
+                  )
+                  .map((ev) => ({ name: ev.name, value: ev.value }))
+              : [],
+            smartMode: c.smartMode !== false,
+            smartVmSizes: Array.isArray(c.smartVmSizes)
+              ? c.smartVmSizes.filter((s): s is string => typeof s === "string")
+              : [],
+          });
+        }
+        setTemplates((prev) =>
+          // Dedupe by id, keep imported entries first, cap at the persisted max.
+          [...valid, ...prev]
+            .filter(
+              (t, i, arr) => arr.findIndex((x) => x.id === t.id) === i,
+            )
+            .slice(0, POOL_TEMPLATES_MAX),
+        );
+        store.addNotification({
+          type: valid.length > 0 ? "success" : "warning",
+          message:
+            `Imported ${valid.length} template(s)` +
+            (skipped.length > 0 ? `; skipped ${skipped.length} malformed entry(ies).` : "."),
+          autoDismissMs: 4000,
+        });
+        auditLog.record({
+          actor: primaryAccount?.username ?? "unknown",
+          action: "pool_templates:import",
+          target: file.name,
+          status: "success",
+          details: { imported: valid.length, skipped: skipped.length },
+        });
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        store.addNotification({
+          type: "error",
+          message: `Import failed: ${msg}`,
+          autoDismissMs: 5000,
+        });
+      }
+    },
+    [setTemplates, store, primaryAccount?.username],
+  );
+
   const persistDefaultsFromForm = React.useCallback(() => {
     const updater = store as unknown as {
       updatePoolDefaults?: (patch: Partial<PoolDefaults>) => void;
@@ -1694,6 +2248,9 @@ const PoolCreationPageInner: React.FC<PoolCreationPageProps> = ({
           poolIdPrefix: poolIdInput,
         },
       });
+      setCreationAnnouncement(
+        `Pool creation dispatch completed for ${selectedAccountIds.size} account${selectedAccountIds.size === 1 ? "" : "s"}. Check the Pool Results table below for per-account status.`,
+      );
 
       // Save the just-dispatched config as a template (cap at the last N).
       // Skipped if every field matches the most recent template — avoids
@@ -1759,6 +2316,7 @@ const PoolCreationPageInner: React.FC<PoolCreationPageProps> = ({
           message: "Pool creation cancelled",
           autoDismissMs: 3000,
         });
+        setCreationAnnouncement("Pool creation cancelled by operator.");
       } else {
         const message =
           e instanceof Error ? e.message : "Unknown pool-creation error";
@@ -1775,6 +2333,7 @@ const PoolCreationPageInner: React.FC<PoolCreationPageProps> = ({
           error: message,
           details: { accountIds: Array.from(selectedAccountIds), smartMode },
         });
+        setCreationAnnouncement(`Pool creation failed: ${message}`);
       }
     } finally {
       setIsRunning(false);
@@ -1906,6 +2465,86 @@ const PoolCreationPageInner: React.FC<PoolCreationPageProps> = ({
     });
   }, [selectedAccountIds, state.accounts, state.subscriptions]);
   const crossSubDispatch = selectedAccountsBySub.length > 1;
+
+  // ---- Attack-surface preview (corpus-grounded warnings) ----
+  // Recomputed on every relevant field change — cheap (constant work in
+  // the number of envVars / start-task length). Rendered on the Review
+  // pane so the operator sees it before pressing Create.
+  const attackSurfaceFindings = React.useMemo(
+    () =>
+      analyzeAttackSurface({
+        subnetId,
+        startTaskCmd,
+        // The submit path hardcodes admin elevation in handleCreate;
+        // keep the analyzer in sync with that source of truth.
+        elevationLevel: "admin",
+        envVars,
+        smartMode,
+        selectedAccountCount: selectedAccountIds.size,
+        crossSubDispatch,
+      }),
+    [
+      subnetId,
+      startTaskCmd,
+      envVars,
+      smartMode,
+      selectedAccountIds.size,
+      crossSubDispatch,
+    ],
+  );
+  const worstSeverity = React.useMemo<
+    "info" | "warning" | "destructive" | null
+  >(() => {
+    if (attackSurfaceFindings.some((f) => f.severity === "destructive"))
+      return "destructive";
+    if (attackSurfaceFindings.some((f) => f.severity === "warning"))
+      return "warning";
+    if (attackSurfaceFindings.length > 0) return "info";
+    return null;
+  }, [attackSurfaceFindings]);
+
+  // ---- Sanitized PUT-body preview ----
+  // Mirrors the exact body the submit path constructs (smart-mode and
+  // manual-JSON). Secret-shaped env vars are redacted in the preview so
+  // the operator can copy/paste the body into a ticket without leaking
+  // creds. The vmSize is a placeholder in smart mode because the SKU is
+  // picked per-account at dispatch time.
+  const [previewOpen, setPreviewOpen] = React.useState(false);
+  const putBodyPreview = React.useMemo(() => {
+    return buildPutBodyPreview({
+      smartMode,
+      poolIdInput,
+      poolConfigJson,
+      resizeTimeoutMin,
+      subnetId,
+      interNodeComm,
+      startTaskCmd,
+      envVars,
+      maxRetryCount,
+      waitForSuccess,
+      poolDefaults,
+      smartVmSizes,
+      smartVmCount: effectiveSmartVmCount,
+    });
+  }, [
+    smartMode,
+    poolIdInput,
+    poolConfigJson,
+    resizeTimeoutMin,
+    subnetId,
+    interNodeComm,
+    startTaskCmd,
+    envVars,
+    maxRetryCount,
+    waitForSuccess,
+    poolDefaults,
+    smartVmSizes,
+    effectiveSmartVmCount,
+  ]);
+  const previewJsonString = React.useMemo(
+    () => JSON.stringify(putBodyPreview.body, null, 2),
+    [putBodyPreview],
+  );
 
   const confirmMessage = (
     <div className="space-y-2 text-sm leading-relaxed">
@@ -2075,6 +2714,77 @@ const PoolCreationPageInner: React.FC<PoolCreationPageProps> = ({
 
         {/* -------- Target step -------- */}
         <TabsContent value="target" className="flex flex-col gap-3">
+          {/* Hidden file input — clicked by the "Import" button below.
+              Lives at the top of the panel so it's available regardless
+              of whether `templates.length > 0` (an org member with an
+              empty cache needs to be able to import a shared file). */}
+          <input
+            ref={importTemplatesRef}
+            type="file"
+            accept="application/json,.json"
+            className="hidden"
+            aria-hidden
+            tabIndex={-1}
+            onChange={(e) => {
+              const file = e.target.files?.[0];
+              if (file) void handleImportTemplatesFile(file);
+              // Reset so the same file can be re-selected.
+              e.target.value = "";
+            }}
+          />
+          <div
+            className="flex flex-wrap items-center gap-1.5 rounded-md border border-dashed border-border bg-surface-sunken/40 p-2"
+            role="group"
+            aria-label="Saved pool templates"
+          >
+            <span className="text-2xs font-semibold uppercase tracking-wider text-muted-foreground">
+              Templates
+            </span>
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              onClick={saveCurrentAsTemplate}
+              disabled={poolIdInput.trim().length === 0}
+              aria-label="Save current wizard form as a template (Ctrl+S)"
+              title="Save current wizard form (Ctrl+S)"
+              className="gap-1.5"
+            >
+              <Save className="h-3.5 w-3.5" aria-hidden />
+              Save current
+            </Button>
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              onClick={exportTemplates}
+              disabled={templates.length === 0}
+              aria-label="Export saved templates as JSON"
+              title="Export saved templates as JSON (sharable across the org)"
+              className="gap-1.5"
+            >
+              <Download className="h-3.5 w-3.5" aria-hidden />
+              Export
+            </Button>
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              onClick={() => importTemplatesRef.current?.click()}
+              aria-label="Import shared templates from a JSON file"
+              title="Import templates from a JSON file (the schema is the same as Export)"
+              className="gap-1.5"
+            >
+              <Upload className="h-3.5 w-3.5" aria-hidden />
+              Import
+            </Button>
+            {templates.length === 0 && (
+              <span className="text-2xs italic text-muted-foreground">
+                No templates yet — save one with the button above or import
+                a JSON file shared by a teammate.
+              </span>
+            )}
+          </div>
           {templates.length > 0 && (
             <div
               className="flex flex-wrap items-center gap-1.5 rounded-md border border-dashed border-border bg-surface-sunken/40 p-2"
@@ -3862,6 +4572,182 @@ const PoolCreationPageInner: React.FC<PoolCreationPageProps> = ({
             </dl>
           </div>
 
+          {/* ------- Attack-surface preview -------
+              Corpus-grounded warnings: detection cases come from
+              `New folder\_analysis_netspi.md §I (IMDS Variants)` and
+              `_analysis_netspi.md §III (App Service Token Theft)`.
+              We DON'T block creation — only surface the shape so the
+              operator sees it before pressing Create. */}
+          {attackSurfaceFindings.length > 0 && (
+            <div
+              className={cn(
+                "flex flex-col gap-2 rounded-md border p-3",
+                worstSeverity === "destructive"
+                  ? "border-destructive/40 bg-destructive/5"
+                  : worstSeverity === "warning"
+                    ? "border-warning/40 bg-warning/5"
+                    : "border-border bg-card",
+              )}
+              role="region"
+              aria-label="Attack-surface preview"
+            >
+              <div className="flex items-center gap-2">
+                <ShieldAlert
+                  className={cn(
+                    "h-4 w-4 shrink-0",
+                    worstSeverity === "destructive"
+                      ? "text-destructive"
+                      : worstSeverity === "warning"
+                        ? "text-warning"
+                        : "text-info",
+                  )}
+                  aria-hidden
+                />
+                <h3 className="m-0 text-sm font-semibold text-foreground">
+                  Attack-surface preview
+                </h3>
+                <Badge
+                  variant={
+                    worstSeverity === "destructive"
+                      ? "destructive"
+                      : worstSeverity === "warning"
+                        ? "info"
+                        : "secondary"
+                  }
+                  className="font-mono tabular-nums"
+                >
+                  {attackSurfaceFindings.length} finding
+                  {attackSurfaceFindings.length === 1 ? "" : "s"}
+                </Badge>
+                <span className="ml-auto text-2xs text-muted-foreground">
+                  What an attacker would see if these credentials leaked.
+                </span>
+              </div>
+              <ul className="m-0 flex list-none flex-col gap-2 p-0">
+                {attackSurfaceFindings.map((finding) => (
+                  <li
+                    key={finding.id}
+                    className={cn(
+                      "rounded-md border px-3 py-2 text-xs leading-relaxed",
+                      finding.severity === "destructive"
+                        ? "border-destructive/40 bg-destructive/10"
+                        : finding.severity === "warning"
+                          ? "border-warning/40 bg-warning/10"
+                          : "border-border bg-surface-sunken/60",
+                    )}
+                  >
+                    <div className="flex flex-wrap items-baseline gap-2">
+                      <span
+                        className={cn(
+                          "text-2xs font-semibold uppercase tracking-wider",
+                          finding.severity === "destructive"
+                            ? "text-destructive"
+                            : finding.severity === "warning"
+                              ? "text-warning"
+                              : "text-info",
+                        )}
+                      >
+                        {finding.severity === "destructive"
+                          ? "high"
+                          : finding.severity}
+                      </span>
+                      <strong className="text-foreground">
+                        {finding.title}
+                      </strong>
+                    </div>
+                    <p className="m-0 mt-1 text-xs text-muted-foreground">
+                      {finding.detail}
+                    </p>
+                    <p className="m-0 mt-1 text-3xs font-mono text-muted-foreground/70">
+                      ref: {finding.cite}
+                    </p>
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
+
+          {/* ------- Sanitized PUT-body preview -------
+              Shows the operator the exact body the submit path will
+              construct, with secret-shaped env vars redacted so the
+              preview can be copied into a ticket without leaking creds.
+              In smart mode, vmSize is a placeholder because the SKU is
+              picked per-account at dispatch time. */}
+          <div className="flex flex-col gap-2 rounded-md border border-border bg-card p-3">
+            <div className="flex flex-wrap items-center gap-2">
+              <FileJson
+                className="h-4 w-4 shrink-0 text-muted-foreground"
+                aria-hidden
+              />
+              <h3 className="m-0 text-sm font-semibold text-foreground">
+                Pool PUT body preview
+              </h3>
+              {putBodyPreview.redactedNames.length > 0 && (
+                <Badge
+                  variant="info"
+                  className="font-mono tabular-nums"
+                  title={`Redacted env-var names: ${putBodyPreview.redactedNames.join(", ")}`}
+                >
+                  {putBodyPreview.redactedNames.length} redacted
+                </Badge>
+              )}
+              <Button
+                type="button"
+                variant="ghost"
+                size="sm"
+                onClick={() => setPreviewOpen((v) => !v)}
+                aria-expanded={previewOpen}
+                aria-controls="pool-put-body-preview"
+                className="ml-auto h-7 gap-1 text-2xs text-muted-foreground"
+              >
+                {previewOpen ? "Hide" : "Show"} preview
+              </Button>
+              {previewOpen && (
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="sm"
+                  onClick={async () => {
+                    try {
+                      if (
+                        typeof navigator !== "undefined" &&
+                        navigator.clipboard?.writeText
+                      ) {
+                        await navigator.clipboard.writeText(previewJsonString);
+                        store.addNotification({
+                          type: "info",
+                          message: "Preview JSON copied (secrets redacted).",
+                          autoDismissMs: 2500,
+                        });
+                      }
+                    } catch {
+                      // ignore — clipboard permission denied
+                    }
+                  }}
+                  aria-label="Copy preview JSON"
+                  className="h-7 gap-1 text-2xs text-muted-foreground"
+                >
+                  <Copy className="h-3 w-3" /> Copy
+                </Button>
+              )}
+            </div>
+            {previewOpen ? (
+              <pre
+                id="pool-put-body-preview"
+                className="m-0 max-h-[280px] overflow-auto rounded border border-border/60 bg-surface-sunken px-3 py-2 font-mono text-2xs leading-relaxed text-foreground"
+                aria-label="Sanitized pool PUT body"
+              >
+                {previewJsonString}
+              </pre>
+            ) : (
+              <span className="text-2xs text-muted-foreground">
+                Click <em>Show preview</em> to inspect the exact body that will
+                be PUT to each Batch account (vmSize is a placeholder in smart
+                mode, secret-shaped env vars are redacted).
+              </span>
+            )}
+          </div>
+
           <div className="flex items-center gap-2">
             <Checkbox
               id={saveAsDefaultId}
@@ -4019,6 +4905,19 @@ const PoolCreationPageInner: React.FC<PoolCreationPageProps> = ({
           accounts={state.accounts}
         />
       )}
+
+      {/* Visually-hidden ARIA-live region for assistive tech. Updated
+          when `handleCreate` resolves (success / cancel / failure). The
+          on-screen state is communicated by the PoolResultsSection
+          badges; this is the audible equivalent for screen-reader users. */}
+      <div
+        role="status"
+        aria-live="polite"
+        aria-atomic="true"
+        className="sr-only"
+      >
+        {creationAnnouncement}
+      </div>
 
       <ConfirmationDialog
         hidden={confirmHidden}

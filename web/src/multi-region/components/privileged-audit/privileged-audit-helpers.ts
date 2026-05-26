@@ -707,12 +707,406 @@ export const RECENT_TAP_WINDOW_MS = 30 * 24 * 60 * 60 * 1000;
  * `_bypass_tenant_switch.md` / `_bypass_role_grant.md` §6.
  */
 export const PUBLIC_FEDERATION_ISSUER_HOSTS: ReadonlyArray<string> = [
+  // GitHub Actions (the canonical WIF abuse example in
+  // `_bypass_role_grant.md` §6 — anyone with workflow-write on the linked
+  // repo mints SP tokens).
   "token.actions.githubusercontent.com",
-  "gitlab.com",
   "vstoken.actions.githubusercontent.com",
+  // GitLab CI/CD
+  "gitlab.com",
+  // CircleCI
   "circleci.com",
   "oidc.circleci.com",
+  // Buildkite — single-tenant cluster OIDC
+  "agent.buildkite.com",
+  // BitBucket Pipelines
+  "api.bitbucket.org",
+  // Terraform Cloud / HCP Terraform — single-tenant TFC OIDC
+  "app.terraform.io",
+  // Spacelift
+  "spacelift.io",
+  // AWS STS (cross-cloud federation to Entra)
+  "sts.amazonaws.com",
+  // Google identity-pool issuer (workforce federation back to Entra)
+  "accounts.google.com",
+  "iam.googleapis.com",
+  // Atlassian Bamboo / Forge
+  "api.atlassian.com",
+  // CodeFresh OIDC issuer
+  "oidc.codefresh.io",
+  // Cloudflare Zero Trust public OIDC
+  "cloudflareaccess.com",
+  // JumpCloud — public OIDC IdP
+  "oauth.id.jumpcloud.com",
+  // ngrok hosted OIDC (red-team / dev tunnels)
+  "oidc.ngrok.com",
 ];
+
+// ===========================================================================
+// Signal E — AAD Connect / Cloud-Sync directory-synchronization accounts
+//
+// Citation:
+//   `_AZURE_BYPASS_PLAYBOOK.md` Top-30 #19 (AAD Connect `Sync_*` decrypt →
+//      bidirectional forest control)
+//   `_bypass_mixed_chains.md` chain #1, steps 1–9 (Get-AADIntSyncCredentials
+//      → DCSync → Cross-Tenant Sync push)
+//   `_analysis_dirkjanm.md` (adconnectdump)
+//
+// What we detect: any principal that holds a privileged directory role AND
+// whose display name / sign-in name matches the on-prem-sync-account shape
+// AADInternals / adconnectdump target. The role-tier itself is informational;
+// the OUTLIER pattern is the sync-account principal showing up as the
+// principal_id on a Tier-0/Tier-1 role assignment, because the canonical
+// architecture for AAD Connect Sync is for the cloud-sync account to hold
+// only the built-in "Directory Synchronization Accounts" role (template id
+// `d29b2b05-8046-44ba-8758-1e26182fcf32`) — anything else is drift.
+// ===========================================================================
+
+/**
+ * Well-known role template id for "Directory Synchronization Accounts" — the
+ * role that AAD Connect Sync's cloud-side service account holds by design.
+ * Holders of THIS role are expected to be a Sync_* SP; holders of any OTHER
+ * privileged role with a sync-account-shaped name are the drift indicator.
+ */
+export const ROLE_DIRECTORY_SYNC_ACCOUNTS =
+  "d29b2b05-8046-44ba-8758-1e26182fcf32";
+
+/**
+ * Display-name / UPN patterns the corpus tooling uses for the cloud-side
+ * sync account. AAD Connect creates `Sync_<source>_<hash>@<tenant>.onmicrosoft.com`;
+ * Cloud Sync creates `ADToAADSyncServiceAccount@<tenant>...`; on-prem MSOL
+ * accounts use `MSOL_<hash>` (rare but seen on legacy DirSync).
+ */
+const SYNC_ACCOUNT_PATTERNS: ReadonlyArray<RegExp> = [
+  /^sync_/i,
+  /^msol_/i,
+  /adtoaadsyncserviceaccount/i,
+  /on-?premises directory synchronization/i,
+];
+
+/**
+ * True when the principal looks like an AAD Connect / Cloud Sync service
+ * account based on its display name OR sign-in name (UPN / appId).
+ */
+export function looksLikeSyncAccount(
+  displayName: string | undefined,
+  signInName: string | undefined,
+): boolean {
+  const hay = `${displayName ?? ""} ${signInName ?? ""}`;
+  return SYNC_ACCOUNT_PATTERNS.some((re) => re.test(hay));
+}
+
+/**
+ * One sync-account drift finding for Signal E. A finding is built when a
+ * sync-account-shaped principal holds ANY role other than (or in addition to)
+ * the canonical "Directory Synchronization Accounts" role.
+ */
+export interface SyncAccountFinding {
+  id: string;
+  /** Sync-account principal id. */
+  principalId: string;
+  /** Resolved display name (e.g. "Sync_AAD_abc123"). */
+  principalDisplayName: string;
+  /** Sign-in name / UPN (best-effort). */
+  principalSignInName?: string;
+  /** Principal type (usually User for AAD Connect, ServicePrincipal for Cloud Sync). */
+  principalType: PrincipalType;
+  /** Every role the sync account holds. */
+  roles: Array<{
+    roleTemplateId: string;
+    roleDisplayName: string;
+    tier: RoleTier;
+    /** True when this is the canonical Directory Sync Accounts role. */
+    isCanonical: boolean;
+  }>;
+  /** True when at least one role is NOT the canonical sync role — drift. */
+  hasDriftRole: boolean;
+  /** Highest non-canonical tier (for severity). */
+  topDriftTier: RoleTier;
+}
+
+/**
+ * Severity for a sync-account finding. A sync account holding the canonical
+ * Directory Sync Accounts role only is informational; any additional T0 role
+ * is critical; T1/T2 are high/medium.
+ *
+ * Citation: `_AZURE_BYPASS_PLAYBOOK.md` #19 — the corpus framing is that a
+ * compromised sync account is "bidirectional forest control", so we lift
+ * severity aggressively when ANY non-canonical privileged role is held.
+ */
+export function gradeSyncAccount(
+  finding: SyncAccountFinding,
+): FindingSeverity {
+  if (!finding.hasDriftRole) return "info";
+  if (finding.topDriftTier === "tier0") return "critical";
+  if (finding.topDriftTier === "tier1") return "high";
+  if (finding.topDriftTier === "tier2") return "medium";
+  return "info";
+}
+
+// ===========================================================================
+// Signal F — Mixed-chain temporal correlation
+//
+// Citation:
+//   `_bypass_mixed_chains.md` — chain composition primitives (recent
+//   credential write + TAP issuance + PIM eligibility within a tight window
+//   on the same principal is the kill-chain signature).
+//   `_AZURE_BYPASS_PLAYBOOK.md` Top-30 #23 + #13.
+//
+// Detection: any principal that exhibits two or more critical-grade indicators
+// (Signal A recent-cred, Signal C noExpiration PIM, Signal D recent-TAP)
+// inside MIXED_CHAIN_WINDOW_MS. The temporal coincidence is the alarm — one
+// indicator alone is suspicious; two on the same principal within hours is
+// the kill chain firing.
+// ===========================================================================
+
+/**
+ * Coincidence window for the mixed-chain detector. Anything tighter than 24h
+ * is the corpus "kill-chain firing" signature.
+ */
+export const MIXED_CHAIN_WINDOW_MS = 24 * 60 * 60 * 1000;
+
+/**
+ * One mixed-chain finding. `indicators` lists each contributing signal's
+ * grade so the operator can click straight through to the source row.
+ */
+export interface MixedChainFinding {
+  id: string;
+  principalId: string;
+  principalDisplayName: string;
+  principalSignInName?: string;
+  principalType: PrincipalType;
+  principalTier: RoleTier;
+  /** Each contributing signal (chronological). */
+  indicators: Array<{
+    /** Which signal letter contributed. */
+    signal: "A" | "B" | "C" | "D";
+    /** When the signal's underlying event occurred (best-effort). */
+    at: string;
+    /** Short human-readable description (for the chain summary row). */
+    label: string;
+    /** Per-indicator severity. */
+    severity: FindingSeverity;
+  }>;
+  /** Computed composite severity. */
+  severity: FindingSeverity;
+  /** Time-span between earliest and latest indicator (ms). */
+  spanMs: number;
+}
+
+/**
+ * Build mixed-chain findings from the four single-signal sets. Each input
+ * is the already-graded finding array; we collapse them into per-principal
+ * indicator streams and emit a MixedChainFinding when ≥ 2 indicators fall
+ * inside MIXED_CHAIN_WINDOW_MS.
+ *
+ * Pure: returns sorted findings, no I/O.
+ */
+export function buildMixedChainFindings(
+  highPrivGraphPermissions: ReadonlyArray<HighPrivGraphPermissionFinding>,
+  federatedCredentials: ReadonlyArray<FederatedCredentialFinding>,
+  pimEligibilities: ReadonlyArray<PimEligibilityFinding>,
+  tapIssuances: ReadonlyArray<TapIssuanceFinding>,
+  principalIndex: ReadonlyMap<string, PrivilegedPrincipal>,
+  windowMs: number = MIXED_CHAIN_WINDOW_MS,
+): MixedChainFinding[] {
+  type Indicator = MixedChainFinding["indicators"][number] & {
+    principalId: string;
+  };
+  const indicators: Indicator[] = [];
+  // Signal A — when the SP has a recent credential add we treat the credential
+  // start time as the indicator timestamp.
+  for (const f of highPrivGraphPermissions) {
+    if (!f.hasRecentCredential || !f.mostRecentCredentialAt) continue;
+    indicators.push({
+      principalId: f.servicePrincipalId,
+      signal: "A",
+      at: f.mostRecentCredentialAt,
+      label: `Recent credential add on SP "${f.servicePrincipalDisplayName}"`,
+      severity: gradeHighPrivGraphPermission(f),
+    });
+  }
+  // Signal B — federated credential on a SP whose Signal A also recently
+  // received a credential. We use createdDateTime is not exposed for FIC, so
+  // we conservatively skip B from the temporal chain unless the SP also has
+  // recent credentials — in which case we use that timestamp.
+  const recentCredTsBySp = new Map<string, string>();
+  for (const f of highPrivGraphPermissions) {
+    if (f.hasRecentCredential && f.mostRecentCredentialAt) {
+      recentCredTsBySp.set(f.servicePrincipalId, f.mostRecentCredentialAt);
+    }
+  }
+  for (const f of federatedCredentials) {
+    if (!f.isPublicIssuer) continue;
+    const ts = recentCredTsBySp.get(f.servicePrincipalId);
+    if (!ts) continue;
+    indicators.push({
+      principalId: f.servicePrincipalId,
+      signal: "B",
+      at: ts,
+      label: `Public-issuer federated credential "${f.name}" on same SP`,
+      severity: gradeFederatedCredential(f, true),
+    });
+  }
+  // Signal C — PIM eligibility createdDateTime is the indicator timestamp.
+  for (const f of pimEligibilities) {
+    if (!f.createdDateTime) continue;
+    indicators.push({
+      principalId: f.principalId,
+      signal: "C",
+      at: f.createdDateTime,
+      label: `PIM eligibility ${
+        f.expirationKind === "noExpiration" ? "(noExpiration) " : ""
+      }for ${f.roleDisplayName ?? "(role)"}`,
+      severity: gradePimEligibility(f),
+    });
+  }
+  // Signal D — TAP startDateTime is the indicator timestamp.
+  for (const f of tapIssuances) {
+    if (!f.startDateTime) continue;
+    indicators.push({
+      principalId: f.userId,
+      signal: "D",
+      at: f.startDateTime,
+      label: `TAP issued (${f.lifetimeInMinutes ?? "?"} min lifetime)`,
+      severity: gradeTapIssuance(f),
+    });
+  }
+  // Group by principal, sort each list by timestamp, sliding-window detect.
+  const byPrincipal = new Map<string, Indicator[]>();
+  for (const ind of indicators) {
+    const list = byPrincipal.get(ind.principalId) ?? [];
+    list.push(ind);
+    byPrincipal.set(ind.principalId, list);
+  }
+  const out: MixedChainFinding[] = [];
+  for (const [principalId, list] of byPrincipal.entries()) {
+    if (list.length < 2) continue;
+    list.sort(
+      (a, b) => new Date(a.at).getTime() - new Date(b.at).getTime(),
+    );
+    // Find any windowMs-window covering ≥ 2 indicators on distinct signal letters.
+    let lo = 0;
+    for (let hi = 1; hi < list.length; hi++) {
+      const hiT = new Date(list[hi]!.at).getTime();
+      while (lo < hi && hiT - new Date(list[lo]!.at).getTime() > windowMs) {
+        lo++;
+      }
+      const slice = list.slice(lo, hi + 1);
+      const distinctSignals = new Set(slice.map((x) => x.signal));
+      if (distinctSignals.size >= 2) {
+        const principal = principalIndex.get(principalId);
+        const spanMs =
+          new Date(slice[slice.length - 1]!.at).getTime() -
+          new Date(slice[0]!.at).getTime();
+        // Composite severity: critical if any contributor is critical or 3+
+        // distinct signals; high if any high; else medium.
+        const hasCritical = slice.some((x) => x.severity === "critical");
+        const hasHigh = slice.some((x) => x.severity === "high");
+        const severity: FindingSeverity =
+          hasCritical || distinctSignals.size >= 3
+            ? "critical"
+            : hasHigh
+              ? "high"
+              : "medium";
+        out.push({
+          id: `mixed:${principalId}:${lo}:${hi}`,
+          principalId,
+          principalDisplayName:
+            principal?.displayName ?? principalId,
+          principalSignInName: principal?.signInName,
+          principalType: principal?.type ?? "Unknown",
+          principalTier: principal?.topTier ?? "other",
+          indicators: slice.map(({ principalId: _id, ...rest }) => rest),
+          severity,
+          spanMs,
+        });
+        // Advance lo past this window to avoid duplicate emissions on the
+        // same group of indicators (one chain per principal is enough).
+        lo = hi + 1;
+      }
+    }
+  }
+  // Sort: critical first, then narrower spans first (tighter coincidence
+  // is more alarming), then by principal display name.
+  out.sort((a, b) => {
+    const sevOrder: Record<FindingSeverity, number> = {
+      critical: 0,
+      high: 1,
+      medium: 2,
+      info: 3,
+    };
+    const sa = sevOrder[a.severity];
+    const sb = sevOrder[b.severity];
+    if (sa !== sb) return sa - sb;
+    if (a.spanMs !== b.spanMs) return a.spanMs - b.spanMs;
+    return a.principalDisplayName.localeCompare(
+      b.principalDisplayName,
+      undefined,
+      { sensitivity: "base" },
+    );
+  });
+  return out;
+}
+
+// ===========================================================================
+// Signal G — PIM-for-Groups eligibility on role-assignable groups
+//
+// Citation:
+//   `_bypass_staged_pim.md` §6 (Group-Based PIM — POST to
+//     /identityGovernance/privilegedAccess/group/eligibilityScheduleRequests
+//     with accessId=member; activator inherits any role the group holds).
+//   `_AZURE_BYPASS_PLAYBOOK.md` Top-30 #28.
+//
+// Detection: enumerate `/identityGovernance/privilegedAccess/group/eligibilitySchedules`
+// and emit a finding for every (principal, group) pair where the group has
+// `isAssignableToRole = true` AND the eligibility is `noExpiration` OR the
+// group itself directly holds a Tier 0/1 role. The combination is the
+// "three-layer indirection" pattern the corpus calls out as "breaks most
+// detection logic".
+// ===========================================================================
+
+export interface PimGroupEligibilityFinding {
+  id: string;
+  /** Eligible principal id (user or SP). */
+  principalId: string;
+  principalDisplayName?: string;
+  principalSignInName?: string;
+  principalType: PrincipalType;
+  /** The role-assignable group the principal is eligible to activate into. */
+  groupId: string;
+  groupDisplayName: string;
+  /** True when the group is marked isAssignableToRole. */
+  isAssignableToRole: boolean;
+  /** Roles the group itself directly holds (resolved from rolesByGroup). */
+  groupRoles: Array<{
+    roleTemplateId: string;
+    roleDisplayName: string;
+    tier: RoleTier;
+  }>;
+  /** Highest tier across the group's roles. */
+  topTier: RoleTier;
+  /** Eligibility kind. */
+  expirationKind: PimExpirationKind;
+  endDateTime?: string;
+  duration?: string;
+  createdDateTime?: string;
+  /** True when noExpiration AND the group holds a T0 role. */
+  isCriticalTimeBomb: boolean;
+}
+
+/**
+ * Severity for a PIM-for-Groups finding. noExpiration + T0 group = critical;
+ * any T0 group = high; T1 group = medium; otherwise info.
+ */
+export function gradePimGroupEligibility(
+  finding: PimGroupEligibilityFinding,
+): FindingSeverity {
+  if (finding.isCriticalTimeBomb) return "critical";
+  if (finding.topTier === "tier0") return "high";
+  if (finding.topTier === "tier1") return "medium";
+  return "info";
+}
 
 /**
  * Best-effort parse of an OIDC issuer URL down to its hostname. Tolerates
@@ -1015,3 +1409,191 @@ export const SIGNAL_RISK_WEIGHTS: Record<FindingSeverity, number> = {
   medium: 60,
   info: 5,
 };
+
+// ===========================================================================
+// Operator-curated Tier-0 watchlist
+//
+// The Tier-0 watchlist is a manually-maintained set of object ids the
+// operator wants to monitor for drift between probes — added during a probe
+// review, persisted in localStorage, used to surface a "watched principal
+// changed / disappeared / gained roles" alert on the next probe.
+//
+// This complements (does NOT replace) the auto-detected Tier-0 set. Common
+// uses:
+//   - A new SP that the operator vetted: add to watchlist so any future role
+//     change is flagged.
+//   - An emergency break-glass account: keep on the watchlist to catch
+//     unintended role removal.
+//   - A guest admin who was supposed to leave: flag dropouts.
+// ===========================================================================
+
+/**
+ * localStorage key prefix for the watchlist. Tenant-id is appended so each
+ * tenant maintains its own list. Schema versioned via usePersistedState.
+ */
+export const TIER0_WATCHLIST_STORAGE_KEY_PREFIX = "privileged-audit:watchlist";
+
+/**
+ * One entry in the operator watchlist. Includes the human-meaningful
+ * display name AND sign-in name at the moment of addition so the operator
+ * can identify the principal even if it's later deleted (the only id left
+ * would otherwise be an object guid).
+ */
+export interface WatchlistEntry {
+  principalId: string;
+  /** Display name at the moment of addition. */
+  capturedDisplayName: string;
+  /** Sign-in name (UPN / appId) at the moment of addition. */
+  capturedSignInName?: string;
+  /** Tier at the moment of addition (for drift detection). */
+  capturedTier: RoleTier;
+  /** ISO timestamp when the operator added the entry. */
+  addedAt: string;
+  /** Optional operator note (e.g. "break-glass account — expected"). */
+  note?: string;
+}
+
+/**
+ * Persistent shape on disk. Schema-versioned (`v: 1`) via usePersistedState so
+ * future shape changes can migrate cleanly.
+ */
+export interface WatchlistState {
+  entries: WatchlistEntry[];
+}
+
+export const EMPTY_WATCHLIST: WatchlistState = { entries: [] };
+
+/**
+ * Drift kinds the watchlist drift-detector emits when comparing a previous
+ * watchlist snapshot against the current probe.
+ */
+export type WatchlistDriftKind =
+  | "missing" /* principal is in watchlist but not in dataset */
+  | "tier-up" /* tier escalated (e.g. T1 → T0) */
+  | "tier-down" /* tier de-escalated */
+  | "new-role" /* gained at least one role not present at capture time */
+  | "role-removed" /* lost at least one role present at capture time */
+  | "unchanged";
+
+export interface WatchlistDrift {
+  entry: WatchlistEntry;
+  /** Resolved principal from the current dataset (undefined when missing). */
+  current?: PrivilegedPrincipal;
+  kind: WatchlistDriftKind;
+  /** Human-readable explanation, e.g. "Tier T1 → T0". */
+  explanation: string;
+}
+
+/**
+ * Compute the drift kind for each watchlist entry against the current probe.
+ * Roles are compared by template id; tier is compared by `TIER_META.order`.
+ *
+ * Pure: no side effects, no I/O.
+ */
+export function computeWatchlistDrift(
+  watchlist: WatchlistState,
+  currentPrincipals: ReadonlyArray<PrivilegedPrincipal>,
+  capturedRolesByPrincipalId: ReadonlyMap<string, ReadonlySet<string>>,
+): WatchlistDrift[] {
+  const byId = new Map(currentPrincipals.map((p) => [p.id, p] as const));
+  const out: WatchlistDrift[] = [];
+  for (const entry of watchlist.entries) {
+    const current = byId.get(entry.principalId);
+    if (!current) {
+      out.push({
+        entry,
+        current: undefined,
+        kind: "missing",
+        explanation:
+          "Watched principal not present in current probe — it was deleted, " +
+          "lost all privileged roles, or moved tenants.",
+      });
+      continue;
+    }
+    const prevOrder = TIER_META[entry.capturedTier].order;
+    const nowOrder = TIER_META[current.topTier].order;
+    if (nowOrder < prevOrder) {
+      out.push({
+        entry,
+        current,
+        kind: "tier-up",
+        explanation: `Tier escalated: ${TIER_META[entry.capturedTier].label} → ${
+          TIER_META[current.topTier].label
+        }`,
+      });
+      continue;
+    }
+    if (nowOrder > prevOrder) {
+      out.push({
+        entry,
+        current,
+        kind: "tier-down",
+        explanation: `Tier de-escalated: ${TIER_META[entry.capturedTier].label} → ${
+          TIER_META[current.topTier].label
+        }`,
+      });
+      continue;
+    }
+    const captured = capturedRolesByPrincipalId.get(entry.principalId);
+    if (captured) {
+      const currentRoleIds = new Set(
+        current.assignments.map((a) => a.roleTemplateId),
+      );
+      const added: string[] = [];
+      const removed: string[] = [];
+      for (const r of currentRoleIds) if (!captured.has(r)) added.push(r);
+      for (const r of captured) if (!currentRoleIds.has(r)) removed.push(r);
+      if (added.length > 0) {
+        out.push({
+          entry,
+          current,
+          kind: "new-role",
+          explanation: `Gained ${added.length} role${added.length === 1 ? "" : "s"} since capture.`,
+        });
+        continue;
+      }
+      if (removed.length > 0) {
+        out.push({
+          entry,
+          current,
+          kind: "role-removed",
+          explanation: `Lost ${removed.length} role${removed.length === 1 ? "" : "s"} since capture.`,
+        });
+        continue;
+      }
+    }
+    out.push({
+      entry,
+      current,
+      kind: "unchanged",
+      explanation: "No tier or role change since capture.",
+    });
+  }
+  // Order: alerts first (anything other than unchanged), then by name.
+  const driftOrder: Record<WatchlistDriftKind, number> = {
+    missing: 0,
+    "tier-up": 1,
+    "role-removed": 2,
+    "new-role": 3,
+    "tier-down": 4,
+    unchanged: 5,
+  };
+  out.sort((a, b) => {
+    if (driftOrder[a.kind] !== driftOrder[b.kind]) {
+      return driftOrder[a.kind] - driftOrder[b.kind];
+    }
+    return a.entry.capturedDisplayName.localeCompare(
+      b.entry.capturedDisplayName,
+      undefined,
+      { sensitivity: "base" },
+    );
+  });
+  return out;
+}
+
+/**
+ * Audit-log action prefix the watchlist + critical-findings UI use so other
+ * pages can correlate. Stable string so any "audit log" page can `startsWith`
+ * to filter privileged-audit events.
+ */
+export const PRIVILEGED_AUDIT_ACTION_PREFIX = "privileged_audit_";

@@ -40,6 +40,8 @@ import {
   Power,
   RotateCw,
   Server,
+  Settings2,
+  ShieldAlert,
   Square,
   Trash2,
   TriangleAlert,
@@ -87,6 +89,7 @@ import {
 import { Switch } from "@/components/ui/switch";
 import { Donut, DonutLegend, type DonutSegment } from "@/components/ui/charts/donut";
 import { Gauge } from "@/components/ui/charts/gauge";
+import { Sparkline } from "@/components/ui/charts/sparkline";
 import {
   cn,
   compareNumbers,
@@ -261,12 +264,193 @@ const QUICK_CHIPS: ReadonlyArray<{
     predicate: (p) => p.enableAutoScale,
     tip: "Pools with autoscale enabled",
   },
+  // Defender-aware chip: pools whose StartTask appears to touch the
+  // instance metadata service. Cite: `_analysis_netspi.md` § I.
+  {
+    key: "imds",
+    label: "IMDS access",
+    className: "border-destructive/40 text-destructive",
+    predicate: (p) => detectImdsAccess(p).length > 0,
+    tip: "Pools whose StartTask command line touches IMDS (169.254.169.254 / metadata/identity/oauth2/token). Surfaces identity-exfil-shaped workloads for defender review — see `_analysis_netspi.md`.",
+  },
 ];
 
 // Token-fresh threshold — below this, resize is blocked because mid-call
 // expiry can leave the orchestrator unable to mint a fresh per-account
 // token before the request lands.
 const TOKEN_RESIZE_BLOCK_SECONDS = 60;
+
+// ---------------------------------------------------------------------------
+// Defender-aware heuristics (Wave 8 / Pass 2)
+// ---------------------------------------------------------------------------
+// Corpus reference: `_analysis_netspi.md` § I (IMDS Variants). Azure Batch
+// nodes are classic VMs from an identity-attack POV — if a pool has a managed
+// identity AND a start task that hits `169.254.169.254/metadata/identity/...`
+// or `metadata/identity/oauth2/token`, a low-privilege task author can mint
+// ARM tokens with whatever role is attached to the pool. This is *legitimate*
+// in some workloads but is a strong signal worth surfacing for the operator.
+// The heuristic is conservative — it only flags command lines that explicitly
+// contain the IMDS host or path, never workloads that simply *could* hit IMDS.
+// ---------------------------------------------------------------------------
+
+/**
+ * Patterns that suggest the StartTask is reaching the instance metadata
+ * service to mint identity tokens. Each pattern is matched case-insensitively
+ * against the start-task command line.
+ *
+ * Source: `_analysis_netspi.md` § I — classic VM IMDS is `169.254.169.254`
+ * with header `Metadata: true`; the OAuth2 path is
+ * `/metadata/identity/oauth2/token`. Batch nodes use the VM endpoint, not
+ * the App-Service `IDENTITY_ENDPOINT` localhost variant.
+ */
+const IMDS_PATTERNS: ReadonlyArray<{ rx: RegExp; reason: string }> = [
+  {
+    rx: /169\.254\.169\.254/i,
+    reason: "Hits classic IMDS IP 169.254.169.254",
+  },
+  {
+    rx: /metadata\/identity\/oauth2\/token/i,
+    reason: "Calls the IMDS OAuth2 token endpoint",
+  },
+  {
+    rx: /Metadata:\s*true/i,
+    reason: "Sets the `Metadata: true` header (IMDS access requirement)",
+  },
+];
+
+interface ImdsHit {
+  reason: string;
+  /** Truncated snippet of the command line for the operator to inspect. */
+  snippet: string;
+}
+
+/**
+ * Inspect a pool's StartTask command line for IMDS-token-minting patterns.
+ * Returns the list of matched reasons; an empty list means "looks clean".
+ * Cite: `_analysis_netspi.md` § I.
+ */
+function detectImdsAccess(pool: PoolInfo): ImdsHit[] {
+  const cmd = pool.startTask?.commandLine;
+  if (typeof cmd !== "string" || cmd.length === 0) return [];
+  const hits: ImdsHit[] = [];
+  for (const { rx, reason } of IMDS_PATTERNS) {
+    const m = cmd.match(rx);
+    if (m && m.index !== undefined) {
+      const start = Math.max(0, m.index - 24);
+      const end = Math.min(cmd.length, m.index + m[0].length + 24);
+      const snippet =
+        (start > 0 ? "..." : "") + cmd.slice(start, end) + (end < cmd.length ? "..." : "");
+      hits.push({ reason, snippet });
+    }
+  }
+  return hits;
+}
+
+/**
+ * Detect pools whose StartTask is failing across many of their nodes — these
+ * are typically "stuck" pools the operator wants to triage. Returns the count
+ * of nodes in the `starttaskfailed` state plus the ratio against the total
+ * known nodes for the pool.
+ */
+function detectStuckStartTask(
+  pool: PoolInfo,
+  poolNodes: ReadonlyArray<ManagedNode>,
+): { failed: number; total: number; ratio: number } {
+  let failed = 0;
+  let total = 0;
+  for (const n of poolNodes) {
+    total += 1;
+    if (n.state === "starttaskfailed") failed += 1;
+  }
+  return { failed, total, ratio: total > 0 ? failed / total : 0 };
+}
+
+/**
+ * Composite risk score 0–100 for a pool.
+ *
+ * Inputs (each clamped, then weighted):
+ *   - size               : ln(current+target nodes), heavier pools = higher blast radius
+ *   - elevation          : StartTask runs as admin / elevated auto-user (+15)
+ *   - imdsAccess         : StartTask touches IMDS (+25) — see `_analysis_netspi.md`
+ *   - stuckStartTask     : > 25% of nodes in starttaskfailed (+15)
+ *   - resizeErrors       : pool has unresolved resize errors (+10)
+ *   - nonSteady          : pool not in steady allocation state (+5)
+ *
+ * The score is intentionally a SIGNAL, not a verdict — a high score means
+ * "look here first" during incident triage, not "this pool is compromised".
+ */
+function computePoolRiskScore(
+  pool: PoolInfo,
+  poolNodes: ReadonlyArray<ManagedNode>,
+): {
+  score: number;
+  reasons: string[];
+} {
+  const reasons: string[] = [];
+  let score = 0;
+
+  const totalNodes =
+    pool.currentDedicatedNodes +
+    pool.currentLowPriorityNodes +
+    pool.targetDedicatedNodes +
+    pool.targetLowPriorityNodes;
+  const sizeWeight = Math.min(30, Math.round(Math.log10(1 + totalNodes) * 12));
+  if (sizeWeight > 0) {
+    score += sizeWeight;
+    if (sizeWeight >= 20) {
+      reasons.push(`Large blast radius (~${totalNodes} target+current nodes)`);
+    }
+  }
+
+  const startTask = pool.startTask as
+    | {
+        userIdentity?: {
+          autoUser?: { elevationLevel?: string };
+        };
+      }
+    | undefined;
+  const elevation = startTask?.userIdentity?.autoUser?.elevationLevel;
+  if (elevation === "admin") {
+    score += 15;
+    reasons.push("StartTask runs as admin auto-user");
+  }
+
+  const imdsHits = detectImdsAccess(pool);
+  if (imdsHits.length > 0) {
+    score += 25;
+    reasons.push(
+      `StartTask touches IMDS (${imdsHits.length} match${imdsHits.length === 1 ? "" : "es"})`,
+    );
+  }
+
+  const stuck = detectStuckStartTask(pool, poolNodes);
+  if (stuck.ratio > 0.25 && stuck.failed >= 2) {
+    score += 15;
+    reasons.push(
+      `${stuck.failed}/${stuck.total} nodes in starttaskfailed (${Math.round(stuck.ratio * 100)}%)`,
+    );
+  }
+
+  if ((pool.resizeErrors?.length ?? 0) > 0) {
+    score += 10;
+    reasons.push(`${pool.resizeErrors!.length} unresolved resize error(s)`);
+  }
+
+  if (pool.allocationState !== "steady") {
+    score += 5;
+    reasons.push(`Allocation is ${pool.allocationState}`);
+  }
+
+  return { score: Math.min(100, score), reasons };
+}
+
+/** Map a 0–100 score to a tone class for badge / sparkline rendering. */
+function riskTone(score: number): "success" | "info" | "warning" | "destructive" {
+  if (score >= 60) return "destructive";
+  if (score >= 35) return "warning";
+  if (score >= 15) return "info";
+  return "success";
+}
 
 const PoolInfoPageInner: React.FC<PoolInfoPageProps> = ({ orchestrator }) => {
   const state = useMultiRegionState();
@@ -618,6 +802,46 @@ const PoolInfoPageInner: React.FC<PoolInfoPageProps> = ({ orchestrator }) => {
     return m;
   }, [state.nodes]);
 
+  // ---------------------------------------------------------------------
+  // Per-pool node-count rolling history (session-scoped sparkline data).
+  //
+  // The store's `history` array is fleet-wide, not per-pool. To power the
+  // sparkline in the details Sheet without coordinator changes to the
+  // store, we accumulate samples in a ref keyed by `pool.id`. The ref
+  // stays alive across renders but is discarded on page unmount — exactly
+  // the right scope for "what has this pool been doing this session".
+  //
+  // We cap each pool's series at 60 samples (~30 min at the 30s auto-
+  // refresh interval). Sampling is driven by *any* re-render where the
+  // pool list changes — that includes manual refresh, autorefresh ticks,
+  // and store mutations from other pages — so the sparkline tracks
+  // genuine value changes, not wall-clock ticks.
+  // ---------------------------------------------------------------------
+  const poolHistoryRef = React.useRef<Map<string, number[]>>(new Map());
+  React.useEffect(() => {
+    const SERIES_CAP = 60;
+    const history = poolHistoryRef.current;
+    const seen = new Set<string>();
+    for (const p of pools) {
+      seen.add(p.id);
+      const total = p.currentDedicatedNodes + p.currentLowPriorityNodes;
+      const series = history.get(p.id) ?? [];
+      const last = series[series.length - 1];
+      // Only push a sample when the value changes — keeps the series
+      // information-dense even when refreshes are no-ops.
+      if (last !== total) {
+        series.push(total);
+        if (series.length > SERIES_CAP) series.shift();
+        history.set(p.id, series);
+      }
+    }
+    // GC pools that disappeared so the ref doesn't grow without bound
+    // across hours of "delete pool → discover new pool" churn.
+    for (const id of history.keys()) {
+      if (!seen.has(id)) history.delete(id);
+    }
+  }, [pools]);
+
   // Quick-chip counts (computed once, used in the chip labels for context).
   const chipCounts = React.useMemo(() => {
     const counts = new Map<string, number>();
@@ -628,6 +852,41 @@ const PoolInfoPageInner: React.FC<PoolInfoPageProps> = ({ orchestrator }) => {
     }
     return counts;
   }, [pools]);
+
+  // Per-pool risk index — keyed by pool.id, computed once per (pools, nodes)
+  // change so the table cell and Defender notes section don't each redo the
+  // walk over the start-task command line + node list.
+  // Corpus ref: `_analysis_netspi.md` § I.
+  const poolRiskById = React.useMemo(() => {
+    const m = new Map<string, { score: number; reasons: string[] }>();
+    for (const p of pools) {
+      const nodes = nodesByPoolKey.get(`${p.accountId}:${p.poolId}`) ?? [];
+      m.set(p.id, computePoolRiskScore(p, nodes));
+    }
+    return m;
+  }, [pools, nodesByPoolKey]);
+
+  // Per-pool IMDS-hit index (start-task command-line patterns).
+  const imdsHitsById = React.useMemo(() => {
+    const m = new Map<string, ImdsHit[]>();
+    for (const p of pools) {
+      const hits = detectImdsAccess(p);
+      if (hits.length > 0) m.set(p.id, hits);
+    }
+    return m;
+  }, [pools]);
+
+  // Per-pool stuck-StartTask index — count + ratio. Skipped when a pool's
+  // node list is empty (no signal vs no data).
+  const stuckStartTaskById = React.useMemo(() => {
+    const m = new Map<string, { failed: number; total: number; ratio: number }>();
+    for (const p of pools) {
+      const nodes = nodesByPoolKey.get(`${p.accountId}:${p.poolId}`) ?? [];
+      const s = detectStuckStartTask(p, nodes);
+      if (s.total > 0) m.set(p.id, s);
+    }
+    return m;
+  }, [pools, nodesByPoolKey]);
 
   // Summary stats.
   const totalPools = pools.length;
@@ -1397,6 +1656,143 @@ const PoolInfoPageInner: React.FC<PoolInfoPageProps> = ({ orchestrator }) => {
     }
   }, [selectedPools, orchestrator, store, recordAudit]);
 
+  // Bulk reimage — reimage every node in the selected pools via the
+  // orchestrator's bulk_node_action. Unlike reboot (which only restarts the
+  // OS), reimage rebuilds the node from the pool's image — useful when the
+  // StartTask environment has been corrupted but the pool config is fine.
+  // We feed in the explicit node-id list rather than letting bulk_node_action
+  // default to "all store nodes", which would clobber unselected pools.
+  const submitBulkReimage = React.useCallback(async () => {
+    if (selectedPools.length === 0) return;
+    const selectedKeys = new Set(
+      selectedPools.map((p) => `${p.accountId}:${p.poolId}`),
+    );
+    const targetNodes = state.nodes.filter((n) =>
+      selectedKeys.has(`${n.accountId}:${n.poolId}`),
+    );
+    if (targetNodes.length === 0) {
+      showToast(store, "No reachable nodes in selected pools to reimage", "info");
+      return;
+    }
+    try {
+      const result = await orchestrator.execute({
+        action: "bulk_node_action",
+        payload: {
+          actionType: "reimage",
+          nodeIds: targetNodes.map((n) => n.id),
+        },
+      });
+      const ok = result?.status !== "failed";
+      recordAudit({
+        action: "pool.reimage.bulk",
+        target: selectedPools.map((p) => `${p.accountName}/${p.poolId}`).join(", "),
+        status: ok ? "success" : "failure",
+        details: {
+          poolCount: selectedPools.length,
+          nodeCount: targetNodes.length,
+        },
+      });
+      showToast(
+        store,
+        ok
+          ? `Reimage requested on ${targetNodes.length} node${targetNodes.length === 1 ? "" : "s"}`
+          : `Reimage failed`,
+        ok ? "success" : "error",
+      );
+    } catch (err) {
+      showToast(
+        store,
+        `Reimage failed: ${err instanceof Error ? err.message : String(err)}`,
+        "error",
+      );
+    }
+  }, [selectedPools, state.nodes, orchestrator, store, recordAudit]);
+
+  // Bulk drain — disable scheduling on every node in the selected pools.
+  // This is the "evict" semantic the Batch API offers — new tasks won't be
+  // assigned, but running tasks continue until they complete. Useful for a
+  // graceful cordon before resize-down or delete.
+  const submitBulkDrain = React.useCallback(async () => {
+    if (selectedPools.length === 0) return;
+    const selectedKeys = new Set(
+      selectedPools.map((p) => `${p.accountId}:${p.poolId}`),
+    );
+    const targetNodes = state.nodes.filter((n) =>
+      selectedKeys.has(`${n.accountId}:${n.poolId}`),
+    );
+    if (targetNodes.length === 0) {
+      showToast(store, "No reachable nodes in selected pools to drain", "info");
+      return;
+    }
+    try {
+      const result = await orchestrator.execute({
+        action: "bulk_node_action",
+        payload: {
+          actionType: "disableScheduling",
+          nodeIds: targetNodes.map((n) => n.id),
+        },
+      });
+      const ok = result?.status !== "failed";
+      recordAudit({
+        action: "pool.drain.bulk",
+        target: selectedPools.map((p) => `${p.accountName}/${p.poolId}`).join(", "),
+        status: ok ? "success" : "failure",
+        details: {
+          poolCount: selectedPools.length,
+          nodeCount: targetNodes.length,
+        },
+      });
+      showToast(
+        store,
+        ok
+          ? `Drain requested on ${targetNodes.length} node${targetNodes.length === 1 ? "" : "s"} (no new tasks)`
+          : `Drain failed`,
+        ok ? "success" : "error",
+      );
+    } catch (err) {
+      showToast(
+        store,
+        `Drain failed: ${err instanceof Error ? err.message : String(err)}`,
+        "error",
+      );
+    }
+  }, [selectedPools, state.nodes, orchestrator, store, recordAudit]);
+
+  // Navigate to the pool-defaults page with the focused pool's
+  // configuration pre-filled in router state.
+  //
+  // COORDINATOR: pool-defaults-page.tsx does NOT yet consume
+  // `location.state.presetFrom`. The state survives the navigation because
+  // react-router preserves the state object on `useLocation()`, but the
+  // destination page currently just lands on its default form. Wiring
+  // pool-defaults to read this state and seed the form fields (vmSize,
+  // taskSlotsPerNode, autoScaleFormula, startTask) would close the loop
+  // and turn "Edit defaults from this pool" into a true single-click
+  // template-from-existing flow. Out of scope for this page.
+  const openPoolDefaultsForPool = React.useCallback(
+    (pool: PoolInfo | null) => {
+      if (!pool) {
+        navigate("/pool-defaults");
+        return;
+      }
+      navigate("/pool-defaults", {
+        state: {
+          presetFrom: {
+            poolId: pool.poolId,
+            accountName: pool.accountName,
+            region: pool.region,
+            vmSize: pool.vmSize,
+            taskSlotsPerNode: pool.taskSlotsPerNode,
+            enableAutoScale: pool.enableAutoScale,
+            autoScaleFormula: pool.autoScaleFormula,
+            startTask: pool.startTask,
+          },
+        },
+      });
+    },
+    [navigate],
+  );
+
   // -----------------------------------------------------------------------
   // Per-row action handlers (used by the kebab menu in each row)
   // -----------------------------------------------------------------------
@@ -1685,6 +2081,42 @@ const PoolInfoPageInner: React.FC<PoolInfoPageProps> = ({ orchestrator }) => {
         defaultHidden: true,
       },
       {
+        id: "risk",
+        header: "Risk",
+        cell: (row) => {
+          const r = poolRiskById.get(row.id);
+          const score = r?.score ?? 0;
+          const tone = riskTone(score);
+          // Compose the tooltip in one place so screen-reader + hover users
+          // see the same explanation.
+          const tip =
+            r && r.reasons.length > 0
+              ? `Risk ${score}/100\n${r.reasons.map((x) => `• ${x}`).join("\n")}`
+              : `Risk ${score}/100 — no flags`;
+          return (
+            <span
+              className={cn(
+                "inline-flex h-5 min-w-[34px] items-center justify-center rounded px-1.5 text-2xs font-semibold tabular-nums",
+                tone === "destructive" && "bg-destructive/15 text-destructive",
+                tone === "warning" && "bg-warning/15 text-warning",
+                tone === "info" && "bg-info/15 text-info",
+                tone === "success" && "bg-muted text-muted-foreground",
+              )}
+              title={tip}
+              aria-label={`Pool risk score ${score} of 100${r && r.reasons.length > 0 ? ", " + r.reasons.join(", ") : ""}`}
+            >
+              {score}
+            </span>
+          );
+        },
+        sort: (a, b) =>
+          compareNumbers(
+            poolRiskById.get(a.id)?.score ?? 0,
+            poolRiskById.get(b.id)?.score ?? 0,
+          ),
+        csv: (row) => poolRiskById.get(row.id)?.score ?? 0,
+      },
+      {
         id: "rowActions",
         header: "",
         className: "w-[44px]",
@@ -1723,6 +2155,16 @@ const PoolInfoPageInner: React.FC<PoolInfoPageProps> = ({ orchestrator }) => {
               >
                 <Server aria-hidden />
                 <span>View nodes</span>
+              </DropdownMenuItem>
+              <DropdownMenuItem
+                onSelect={(e) => {
+                  e.preventDefault();
+                  openPoolDefaultsForPool(row);
+                }}
+                title="Open Pool Defaults with this pool's configuration pre-filled (g d)"
+              >
+                <Settings2 aria-hidden />
+                <span>Edit defaults from this pool</span>
               </DropdownMenuItem>
               <DropdownMenuItem
                 disabled={row.allocationState !== "steady" || tokenStale}
@@ -1791,6 +2233,8 @@ const PoolInfoPageInner: React.FC<PoolInfoPageProps> = ({ orchestrator }) => {
       handleRowDelete,
       tokenStale,
       state.accountInfos,
+      poolRiskById,
+      openPoolDefaultsForPool,
     ],
   );
 
@@ -1838,6 +2282,9 @@ const PoolInfoPageInner: React.FC<PoolInfoPageProps> = ({ orchestrator }) => {
   //   r       — refresh
   //   Escape  — clear selection
   //   Delete  — open bulk-delete confirm for the selected pools
+  //   i       — reimage selected pools' nodes (no confirm — toast only)
+  //   e       — drain (disable scheduling) selected pools' nodes
+  //   g d     — go to Pool Defaults (two-key chord, see effect below)
   // -----------------------------------------------------------------------
   useShortcut(
     "r",
@@ -1866,6 +2313,89 @@ const PoolInfoPageInner: React.FC<PoolInfoPageProps> = ({ orchestrator }) => {
     },
     { enabled: selection.size > 0 && !showBulkDeleteDialog },
   );
+  // `i` / `e` are unconfirmed destructive-ish actions, so they're gated on
+  // there being a non-empty selection AND no open dialog (otherwise the
+  // operator typing in a still-open Start Task or Resize dialog could fire
+  // a reimage by accident the moment focus leaves the input).
+  const anyDialogOpen =
+    showResizeDialog ||
+    showResizeConfirm ||
+    showStartTaskDialog ||
+    showDeleteEmptyDialog ||
+    showBulkDeleteDialog ||
+    showRebootDialog;
+  useShortcut(
+    "i",
+    () => {
+      if (selection.size > 0 && !anyDialogOpen) void submitBulkReimage();
+    },
+    { enabled: selection.size > 0 && !anyDialogOpen },
+  );
+  useShortcut(
+    "e",
+    () => {
+      if (selection.size > 0 && !anyDialogOpen) void submitBulkDrain();
+    },
+    { enabled: selection.size > 0 && !anyDialogOpen },
+  );
+
+  // Two-key chord support for `g d` (go-to-defaults). `useShortcut` doesn't
+  // model multi-key chords, so we own this listener: pressing `g` arms the
+  // chord for 1.2s, and a subsequent `d` navigates. Any other key, focus
+  // change to an input, or the timeout cancels the chord. This mirrors the
+  // gmail/vim convention and keeps the keyboard hint discoverable without
+  // ballooning the shared hook.
+  React.useEffect(() => {
+    let armed = false;
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    const clearChord = () => {
+      armed = false;
+      if (timer) {
+        clearTimeout(timer);
+        timer = null;
+      }
+    };
+    const onKeyDown = (e: KeyboardEvent) => {
+      const target = e.target as HTMLElement | null;
+      if (target) {
+        const tag = target.tagName;
+        if (
+          tag === "INPUT" ||
+          tag === "TEXTAREA" ||
+          tag === "SELECT" ||
+          target.isContentEditable
+        ) {
+          return;
+        }
+      }
+      if (e.ctrlKey || e.metaKey || e.altKey) return;
+      // Don't arm or trigger the chord while a modal dialog is open — the
+      // dialog's own keyboard layer (Esc to dismiss, Enter to confirm)
+      // takes precedence.
+      if (anyDialogOpen) return;
+      const key = e.key.toLowerCase();
+      if (armed) {
+        // Chord is armed: only `d` completes it; anything else cancels.
+        if (key === "d") {
+          e.preventDefault();
+          clearChord();
+          openPoolDefaultsForPool(focusedPool ?? null);
+          return;
+        }
+        clearChord();
+        return;
+      }
+      if (key === "g") {
+        armed = true;
+        timer = setTimeout(clearChord, 1200);
+      }
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => {
+      window.removeEventListener("keydown", onKeyDown);
+      clearChord();
+    };
+  }, [openPoolDefaultsForPool, focusedPool, anyDialogOpen]);
 
   // Empty / loading guards.
   const initialLoading = loading && pools.length === 0 && !error;
@@ -1919,7 +2449,7 @@ const PoolInfoPageInner: React.FC<PoolInfoPageProps> = ({ orchestrator }) => {
     >
       <PageHeader
         title="Pool Info"
-        description="Inspect, resize, and manage Batch pools across regions. Press R to refresh, Esc to clear selection, Delete to delete selected pools."
+        description="Inspect, resize, and manage Batch pools across regions. Shortcuts: R refresh · Esc clear selection · Delete delete selected · I reimage selected · E drain (disable scheduling) selected · G then D open Pool Defaults."
         titleId="pool-info-heading"
       >
         {/* Inline ARM-token freshness cue. Quiet until < 10 min from
@@ -2054,13 +2584,20 @@ const PoolInfoPageInner: React.FC<PoolInfoPageProps> = ({ orchestrator }) => {
           aria-label="Bulk actions for selected pools"
           className="flex flex-wrap items-center gap-2 rounded-lg border border-primary/40 bg-primary/5 px-4 py-2"
         >
-          <span className="text-xs font-medium text-foreground">
+          {/* aria-live so the screen reader announces selection changes
+              without forcing focus into the toolbar — count and running-task
+              total update together as the operator selects/deselects rows. */}
+          <span
+            className="text-xs font-medium text-foreground"
+            aria-live="polite"
+            aria-atomic="true"
+          >
             {selectedPools.length} pool{selectedPools.length === 1 ? "" : "s"}{" "}
             selected
-          </span>
-          <span className="text-2xs text-muted-foreground">
-            ({selectedRunningTasks} running task
-            {selectedRunningTasks === 1 ? "" : "s"})
+            <span className="ml-2 text-2xs font-normal text-muted-foreground">
+              ({selectedRunningTasks} running task
+              {selectedRunningTasks === 1 ? "" : "s"})
+            </span>
           </span>
           <div className="ml-auto flex flex-wrap gap-2">
             <Button
@@ -2094,11 +2631,31 @@ const PoolInfoPageInner: React.FC<PoolInfoPageProps> = ({ orchestrator }) => {
               variant="outline"
               size="sm"
               onClick={() => setShowRebootDialog(true)}
-              title={`Reboot all nodes in ${selectedPools.length} pool${selectedPools.length === 1 ? "" : "s"}`}
-              aria-label="Reboot all nodes in selected pools"
+              title={`Reboot all nodes in ${selectedPools.length} pool${selectedPools.length === 1 ? "" : "s"} (R restarts the OS)`}
+              aria-label={`Reboot all nodes in ${selectedPools.length} selected pools`}
             >
               <Power className="h-3.5 w-3.5" />
               Reboot Nodes
+            </Button>
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => void submitBulkReimage()}
+              title="Reimage every node — rebuild from the pool image (shortcut: I)"
+              aria-label={`Reimage all nodes in ${selectedPools.length} selected pools`}
+            >
+              <RotateCw className="h-3.5 w-3.5" />
+              Reimage
+            </Button>
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => void submitBulkDrain()}
+              title="Disable scheduling on every node — running tasks continue, no new tasks assigned (shortcut: E)"
+              aria-label={`Drain (disable scheduling) all nodes in ${selectedPools.length} selected pools`}
+            >
+              <Square className="h-3.5 w-3.5" />
+              Drain
             </Button>
             <Button
               variant="outline"
@@ -2498,10 +3055,19 @@ const PoolInfoPageInner: React.FC<PoolInfoPageProps> = ({ orchestrator }) => {
         accountResourceId={
           focusedPool ? getAccountForPool(focusedPool) : null
         }
+        risk={focusedPool ? (poolRiskById.get(focusedPool.id) ?? null) : null}
+        imdsHits={focusedPool ? (imdsHitsById.get(focusedPool.id) ?? null) : null}
+        stuckStartTask={
+          focusedPool ? (stuckStartTaskById.get(focusedPool.id) ?? null) : null
+        }
+        nodeCountHistory={
+          focusedPool ? (poolHistoryRef.current.get(focusedPool.id) ?? null) : null
+        }
         onClose={closeFocusedSheet}
         onNavigateToNodes={(poolId) =>
           navigate(`/nodes?pool=${encodeURIComponent(poolId)}`)
         }
+        onEditDefaults={() => openPoolDefaultsForPool(focusedPool)}
         onResize={() => {
           if (focusedPool) {
             setSelection(new Set([focusedPool.id]));
@@ -3417,8 +3983,17 @@ interface PoolDetailsSheetProps {
   loading?: boolean;
   nodesByPoolKey: Map<string, ManagedNode[]>;
   accountResourceId: PortalAccountLike | null;
+  /** Pre-computed risk score + reasons for the focused pool (Wave 8). */
+  risk: { score: number; reasons: string[] } | null;
+  /** IMDS-pattern hits in the StartTask command line, if any. */
+  imdsHits: ImdsHit[] | null;
+  /** StartTask-failure ratio for the focused pool. */
+  stuckStartTask: { failed: number; total: number; ratio: number } | null;
+  /** Session-local node-count series for the sparkline (oldest first). */
+  nodeCountHistory: number[] | null;
   onClose: () => void;
   onNavigateToNodes: (poolId: string) => void;
+  onEditDefaults: () => void;
   onResize: () => void;
   onReboot: () => void;
   onDelete: () => void;
@@ -3507,8 +4082,13 @@ const PoolDetailsSheet: React.FC<PoolDetailsSheetProps> = ({
   loading = false,
   nodesByPoolKey,
   accountResourceId,
+  risk,
+  imdsHits,
+  stuckStartTask,
+  nodeCountHistory,
   onClose,
   onNavigateToNodes,
+  onEditDefaults,
   onResize,
   onReboot,
   onDelete,
@@ -3649,6 +4229,16 @@ const PoolDetailsSheet: React.FC<PoolDetailsSheetProps> = ({
                 <Button
                   variant="outline"
                   size="sm"
+                  onClick={onEditDefaults}
+                  title="Open Pool Defaults with this pool's settings pre-filled"
+                  aria-label="Edit Pool Defaults pre-filled from this pool"
+                >
+                  <Settings2 className="h-3.5 w-3.5" />
+                  Edit defaults
+                </Button>
+                <Button
+                  variant="outline"
+                  size="sm"
                   onClick={onDelete}
                   className="border-destructive/40 text-destructive hover:bg-destructive/10 hover:text-destructive"
                   aria-label="Delete this pool"
@@ -3776,6 +4366,171 @@ const PoolDetailsSheet: React.FC<PoolDetailsSheetProps> = ({
                   }
                 />
               </div>
+
+              {/* Per-pool risk score + sparkline + defender notes.
+                  The risk score is a composite signal (size × identity-tier ×
+                  IMDS-shaped StartTask × stuck-StartTask × resize errors —
+                  see `computePoolRiskScore` and `_analysis_netspi.md` § I).
+                  The sparkline is *session-local* because the store's
+                  `history` array is fleet-wide; we accumulate per-pool
+                  samples in a ref during this page's lifetime. */}
+              {(risk || (nodeCountHistory && nodeCountHistory.length > 1)) && (
+                <section
+                  className="flex items-center gap-4 rounded-md border border-border bg-card p-4"
+                  aria-label="Pool risk and recent node-count trend"
+                >
+                  {risk && (
+                    <div className="flex shrink-0 flex-col items-center">
+                      <span className="text-2xs font-medium uppercase tracking-wider text-muted-foreground">
+                        Risk
+                      </span>
+                      <span
+                        className={cn(
+                          "mt-1 inline-flex h-9 min-w-[52px] items-center justify-center rounded px-2 text-base font-bold tabular-nums",
+                          riskTone(risk.score) === "destructive" &&
+                            "bg-destructive/15 text-destructive",
+                          riskTone(risk.score) === "warning" &&
+                            "bg-warning/15 text-warning",
+                          riskTone(risk.score) === "info" &&
+                            "bg-info/15 text-info",
+                          riskTone(risk.score) === "success" &&
+                            "bg-muted text-muted-foreground",
+                        )}
+                        aria-label={`Risk score ${risk.score} of 100`}
+                      >
+                        {risk.score}
+                      </span>
+                      <span className="mt-1 text-3xs text-muted-foreground">
+                        / 100
+                      </span>
+                    </div>
+                  )}
+                  <div className="min-w-0 flex-1">
+                    {nodeCountHistory && nodeCountHistory.length > 1 ? (
+                      <>
+                        <div className="flex items-center justify-between">
+                          <span className="text-2xs font-medium uppercase tracking-wider text-muted-foreground">
+                            Node count (session)
+                          </span>
+                          <span className="text-2xs tabular-nums text-muted-foreground">
+                            {nodeCountHistory[nodeCountHistory.length - 1]}{" "}
+                            now · min{" "}
+                            {Math.min(...nodeCountHistory)} · max{" "}
+                            {Math.max(...nodeCountHistory)}
+                          </span>
+                        </div>
+                        <Sparkline
+                          data={nodeCountHistory}
+                          width={240}
+                          height={36}
+                          tone={
+                            riskTone(risk?.score ?? 0) === "destructive"
+                              ? "destructive"
+                              : "info"
+                          }
+                          ariaLabel={`Node-count trend over ${nodeCountHistory.length} samples this session`}
+                          className="mt-1"
+                        />
+                      </>
+                    ) : (
+                      <span className="text-2xs italic text-muted-foreground">
+                        Sparkline appears after the next node-count change this
+                        session.
+                      </span>
+                    )}
+                    {risk && risk.reasons.length > 0 && (
+                      <ul className="m-0 mt-2 flex list-disc flex-col gap-0.5 pl-4">
+                        {risk.reasons.map((reason, i) => (
+                          <li
+                            key={i}
+                            className="text-2xs text-foreground/80"
+                          >
+                            {reason}
+                          </li>
+                        ))}
+                      </ul>
+                    )}
+                  </div>
+                </section>
+              )}
+
+              {/* Defender notes — corpus-grounded heuristic findings the
+                  operator should triage. Currently surfaces:
+                    1) IMDS-shaped StartTask command lines (per
+                       `_analysis_netspi.md` § I — Batch nodes use the
+                       classic VM IMDS endpoint `169.254.169.254` to mint
+                       identity tokens, so a StartTask hitting that path
+                       can be either legitimate auth bootstrap or
+                       identity-exfil shaped).
+                    2) Stuck StartTask (high failure ratio across nodes —
+                       not a security issue per se, but a pool whose
+                       StartTask continues to fail on many nodes is a
+                       likely indicator of misconfigured credentials,
+                       network egress restriction, or a malformed
+                       command line). */}
+              {(imdsHits && imdsHits.length > 0) ||
+              (stuckStartTask && stuckStartTask.ratio > 0.25 && stuckStartTask.failed >= 2) ? (
+                <section
+                  className="flex flex-col gap-2 rounded-md border border-warning/40 bg-warning/10 p-4"
+                  aria-label="Defender notes"
+                >
+                  <h2 className="m-0 flex items-center gap-2 text-base font-semibold text-warning">
+                    <ShieldAlert className="h-4 w-4" aria-hidden />
+                    Defender notes
+                  </h2>
+                  {imdsHits && imdsHits.length > 0 && (
+                    <div className="flex flex-col gap-1.5">
+                      <span className="text-xs font-medium text-foreground">
+                        StartTask touches the instance metadata service
+                      </span>
+                      <span className="text-2xs text-muted-foreground">
+                        Batch nodes expose the classic VM IMDS at{" "}
+                        <code className="rounded bg-muted px-1">
+                          169.254.169.254
+                        </code>
+                        . If the pool has a managed identity, this command
+                        line can mint ARM tokens. Verify the workload is
+                        intentional. Source: <code>_analysis_netspi.md</code> §
+                        I.
+                      </span>
+                      <ul className="m-0 flex list-disc flex-col gap-0.5 pl-5">
+                        {imdsHits.map((hit, i) => (
+                          <li key={i} className="text-2xs">
+                            <span className="font-medium text-foreground">
+                              {hit.reason}
+                            </span>
+                            <span className="ml-1 break-all font-mono text-muted-foreground">
+                              {hit.snippet}
+                            </span>
+                          </li>
+                        ))}
+                      </ul>
+                    </div>
+                  )}
+                  {stuckStartTask &&
+                    stuckStartTask.ratio > 0.25 &&
+                    stuckStartTask.failed >= 2 && (
+                      <div className="flex flex-col gap-1">
+                        <span className="text-xs font-medium text-foreground">
+                          StartTask is failing across most nodes
+                        </span>
+                        <span className="text-2xs text-muted-foreground">
+                          {stuckStartTask.failed} of {stuckStartTask.total}{" "}
+                          known nodes are in{" "}
+                          <code className="rounded bg-muted px-1">
+                            starttaskfailed
+                          </code>{" "}
+                          ({Math.round(stuckStartTask.ratio * 100)}%). The pool
+                          will keep churning nodes until the start task either
+                          succeeds or is updated. Use{" "}
+                          <b>Update Start Task</b> from the bulk toolbar to fix
+                          the command and tick{" "}
+                          <i>Reboot all nodes after update</i>.
+                        </span>
+                      </div>
+                    )}
+                </section>
+              ) : null}
 
               {/* Node-state breakdown chart */}
               <section

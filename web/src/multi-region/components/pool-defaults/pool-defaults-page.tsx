@@ -25,7 +25,9 @@ import {
   ChevronsUpDown,
   CircleDot,
   CloudOff,
+  Columns,
   Download,
+  Eye,
   FileJson,
   FileUp,
   Keyboard,
@@ -33,6 +35,7 @@ import {
   RotateCcw,
   Save,
   Search,
+  ShieldAlert,
   Sparkles,
   Trash2,
   Undo2,
@@ -705,6 +708,118 @@ function summarizeDefaultsDiff(
 }
 
 /* ------------------------------------------------------------------ */
+/*  Privilege-propagation detection                                    */
+/* ------------------------------------------------------------------ */
+
+/**
+ * The Batch StartTask runs once per node on every pool that consumes these
+ * defaults. When the auto-user identity is `scope=pool, elevationLevel=admin`,
+ * the command runs as root (Linux) / LocalSystem (Windows) and any state it
+ * writes — installed binaries, dropped credentials, registered cron jobs —
+ * persists for the life of the pool. Multiplying that by "every future pool
+ * created from this UI" makes the default a force multiplier for privilege
+ * propagation.
+ *
+ * Corpus: per NetSPI's MicroBurst research, the resource-plane primitive
+ * defenders most often miss is a *baked-in* elevated identity (Automation
+ * Account RunAs, App Service Easy-Auth key, Logic-App API connection). The
+ * Batch StartTask is the same shape — a centrally-edited "thing every node
+ * will run as admin", which is exactly the surface MicroBurst's
+ * `Get-AzPasswords` is built to harvest. The right mitigation here is to
+ * make the operator *see* the privilege boundary they are committing to
+ * before they save.
+ *
+ * See: C:\Users\baimgprodsesa1\Desktop\New folder\_analysis_netspi.md §II
+ *      (Automation Account RunAs persistence pattern).
+ */
+function detectPrivilegedDefault(d: PoolDefaults): {
+  elevated: boolean;
+  poolScope: boolean;
+  hasCommand: boolean;
+  hasResourceFiles: boolean;
+  hasInsecureHttpFile: boolean;
+  hasUnscopedSecretEnv: boolean;
+} {
+  const st = d.startTask;
+  const elevated = st.userIdentity.autoUser.elevationLevel === "admin";
+  const poolScope = st.userIdentity.autoUser.scope === "pool";
+  const hasCommand = st.commandLine.trim().length > 0;
+  const hasResourceFiles = st.resourceFiles.some(
+    (rf) => (rf.httpUrl ?? "").trim().length > 0,
+  );
+  const hasInsecureHttpFile = st.resourceFiles.some((rf) =>
+    (rf.httpUrl ?? "").toLowerCase().startsWith("http://"),
+  );
+  // Heuristic: env-var names that *look* like a credential being baked into
+  // every node's StartTask shell. The value itself isn't logged anywhere by
+  // this UI, but operators who paste tokens into env vars and forget about
+  // them are the recurring incident in the corpus.
+  const SECRET_NAME_RE =
+    /(secret|token|key|password|passwd|pwd|sas|connstr|connectionstring|credential|api[_-]?key|access[_-]?key)/i;
+  const hasUnscopedSecretEnv = st.environmentSettings.some(
+    (e) =>
+      e.name.trim().length > 0 &&
+      e.value.trim().length > 0 &&
+      SECRET_NAME_RE.test(e.name),
+  );
+  return {
+    elevated,
+    poolScope,
+    hasCommand,
+    hasResourceFiles,
+    hasInsecureHttpFile,
+    hasUnscopedSecretEnv,
+  };
+}
+
+/* ------------------------------------------------------------------ */
+/*  Section-level field diff (used for richer audit payloads)          */
+/* ------------------------------------------------------------------ */
+
+/**
+ * For a single section, list the top-level fields that differ between two
+ * snapshots. Used by the per-section discard handler so the audit record
+ * captures which keys were actually rolled back, not just the section name.
+ */
+function listSectionChangedFields(
+  key: SectionKey,
+  before: PoolDefaults,
+  after: PoolDefaults,
+): string[] {
+  const changed: string[] = [];
+  const pushIfDiff = (label: string, a: unknown, b: unknown) => {
+    if (!deepEqual(a, b)) changed.push(label);
+  };
+  if (key === "os") {
+    pushIfDiff("osCategory", before.osCategory, after.osCategory);
+    pushIfDiff(
+      "virtualMachineConfiguration",
+      before.virtualMachineConfiguration,
+      after.virtualMachineConfiguration,
+    );
+  } else if (key === "optional") {
+    pushIfDiff("taskSlotsPerNode", before.taskSlotsPerNode, after.taskSlotsPerNode);
+    pushIfDiff(
+      "enableInterNodeCommunication",
+      before.enableInterNodeCommunication,
+      after.enableInterNodeCommunication,
+    );
+    pushIfDiff(
+      "taskSchedulingPolicy",
+      before.taskSchedulingPolicy,
+      after.taskSchedulingPolicy,
+    );
+    pushIfDiff("metadata", before.metadata, after.metadata);
+    pushIfDiff("userAccounts", before.userAccounts, after.userAccounts);
+  } else if (key === "startTask") {
+    pushIfDiff("startTask", before.startTask, after.startTask);
+  } else if (key === "network") {
+    pushIfDiff("subnetId", before.subnetId, after.subnetId);
+  }
+  return changed;
+}
+
+/* ------------------------------------------------------------------ */
 /*  Field wrapper — label + control                                    */
 /* ------------------------------------------------------------------ */
 
@@ -1075,6 +1190,26 @@ const PoolDefaultsForm: React.FC<PoolDefaultsFormProps> = ({
   const [presetNameInput, setPresetNameInput] = React.useState("");
   const [keyboardHelpOpen, setKeyboardHelpOpen] = React.useState(false);
 
+  // Side-by-side compare picker — names of the two presets being diffed.
+  // Either side may also be set to the special sentinel "__current__" to
+  // diff a saved preset against the in-form values, and "__saved__" to diff
+  // against the last-saved snapshot. Comparing two profiles side by side
+  // mirrors the "what's the smallest privilege boundary I can ship" review
+  // step every defensive-tooling playbook recommends.
+  const [compareDialogOpen, setCompareDialogOpen] = React.useState(false);
+  const [compareLeft, setCompareLeft] = React.useState<string>("__current__");
+  const [compareRight, setCompareRight] = React.useState<string>("__saved__");
+
+  // "Try before save" preview — renders a read-only pool-creation form
+  // populated from the current defaults so the operator sees exactly what
+  // a downstream pool-creation page will look like before they commit.
+  const [tryPreviewOpen, setTryPreviewOpen] = React.useState(false);
+
+  // ARIA-live region dedicated to non-modal action confirmations. Distinct
+  // from `savedMsg` (which is a *visible* toast) so a screen reader gets a
+  // polite hint even when the toast has already faded.
+  const [ariaAnnouncement, setAriaAnnouncement] = React.useState("");
+
   // Save banner ref — focus moved here on save success/fail for a11y
   const saveBannerRef = React.useRef<HTMLDivElement | null>(null);
 
@@ -1194,8 +1329,11 @@ const PoolDefaultsForm: React.FC<PoolDefaultsFormProps> = ({
   );
 
   // Toast helper — short-lived inline confirmation that doesn't require a save.
+  // Also updates a dedicated polite ARIA-live region so screen-reader users
+  // hear the confirmation even after the visible toast fades.
   const flashToast = React.useCallback((msg: string) => {
     setSavedMsg(msg);
+    setAriaAnnouncement(msg);
     window.setTimeout(() => setSavedMsg(null), 2500);
   }, []);
 
@@ -1213,20 +1351,49 @@ const PoolDefaultsForm: React.FC<PoolDefaultsFormProps> = ({
     setSavedSnapshot(defaults);
     setConfirmSaveOpen(false);
     // These defaults flow into every future pool created via this UI —
-    // record the snapshot diff so the audit log has a footprint.
+    // record the snapshot diff PLUS the privilege footprint of the saved
+    // start task so the audit log captures sufficient context to
+    // reconstruct an incident around a privileged-StartTask change.
+    // (Corpus rationale: see _analysis_netspi.md §II — "elevated identity
+    // baked into every new resource" is the recurring resource-plane
+    // attack primitive.)
+    const priv = detectPrivilegedDefault(defaults);
     auditLog.record({
       actor: AUDIT_ACTOR,
       action: "save_pool_defaults",
       target: "pool-defaults",
       status: "success",
-      details: summarizeDefaultsDiff(savedSnapshot, defaults),
+      details: {
+        ...summarizeDefaultsDiff(savedSnapshot, defaults),
+        warningCount,
+        startTaskElevation:
+          defaults.startTask.userIdentity.autoUser.elevationLevel,
+        startTaskScope:
+          defaults.startTask.userIdentity.autoUser.scope,
+        startTaskHasCommand: priv.hasCommand,
+        startTaskHasResourceFiles: priv.hasResourceFiles,
+        startTaskHasInsecureHttp: priv.hasInsecureHttpFile,
+        startTaskHasSecretEnv: priv.hasUnscopedSecretEnv,
+        userAccountCount: defaults.userAccounts.length,
+        userAccountAdminCount: defaults.userAccounts.filter(
+          (u) => u.elevationLevel === "admin",
+        ).length,
+        hasVNet: !!defaults.subnetId,
+      },
     });
     flashToast("Saved to localStorage");
     // Move focus to the success banner for screen-reader users.
     window.setTimeout(() => {
       saveBannerRef.current?.focus();
     }, 0);
-  }, [setEverything, defaults, setSavedSnapshot, savedSnapshot, flashToast]);
+  }, [
+    setEverything,
+    defaults,
+    setSavedSnapshot,
+    savedSnapshot,
+    flashToast,
+    warningCount,
+  ]);
 
   // Revert handler — restores the saved snapshot.
   const handleRevert = React.useCallback(() => {
@@ -1275,16 +1442,25 @@ const PoolDefaultsForm: React.FC<PoolDefaultsFormProps> = ({
       patch = { subnetId: savedSnapshot.subnetId };
     }
     update(patch);
+    // Capture which top-level fields were actually rolled back so the
+    // audit log can reconstruct the operator's intent, not just the
+    // section header. Sufficient for incident-reconstruction even if the
+    // user makes a second edit immediately afterwards.
+    const rolledBack = listSectionChangedFields(key, defaults, savedSnapshot);
     auditLog.record({
       actor: AUDIT_ACTOR,
       action: "discard_section_changes",
       target: `pool-defaults:${key}`,
       status: "success",
-      details: { section: key },
+      details: {
+        section: key,
+        rolledBackFields: rolledBack,
+        rolledBackFieldCount: rolledBack.length,
+      },
     });
     flashToast(`Discarded changes in ${SECTION_LABELS[key]}`);
     setConfirmDiscardSection(null);
-  }, [savedSnapshot, confirmDiscardSection, update, flashToast]);
+  }, [savedSnapshot, confirmDiscardSection, update, flashToast, defaults]);
 
   // Reset handler — wraps in shared ConfirmationDialog (no native window.confirm).
   const handleReset = React.useCallback(() => {
@@ -1411,6 +1587,130 @@ const PoolDefaultsForm: React.FC<PoolDefaultsFormProps> = ({
       flashToast(`Deleted preset "${name}"`);
     },
     [namedPresets, setNamedPresets, flashToast],
+  );
+
+  // Export a single named preset as a JSON envelope. Wave-1 only supported
+  // wholesale export of the *current* defaults; this lets the operator
+  // hand off a known-good preset to a peer or check it into source control.
+  const handleExportPreset = React.useCallback(
+    (preset: NamedPreset) => {
+      const date = new Date().toISOString().slice(0, 10);
+      const safeName = preset.name.replace(/[^a-zA-Z0-9._-]+/g, "_");
+      const payload = {
+        exportedAt: new Date().toISOString(),
+        schema: "pool-defaults-preset/v1",
+        preset,
+      };
+      const blob = new Blob([JSON.stringify(payload, null, 2)], {
+        type: "application/json;charset=utf-8;",
+      });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `pool-defaults-preset-${safeName}-${date}.json`;
+      a.style.display = "none";
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+      auditLog.record({
+        actor: AUDIT_ACTOR,
+        action: "export_named_preset",
+        target: `preset:${preset.name}`,
+        status: "success",
+        details: { createdAt: preset.createdAt },
+      });
+      flashToast(`Exported preset "${preset.name}"`);
+    },
+    [flashToast],
+  );
+
+  // Hidden file input for importing a single preset envelope. Distinct from
+  // the wholesale defaults importer so a preset never silently overwrites
+  // the live form — it lands in the named-preset library instead.
+  const presetImportInputRef = React.useRef<HTMLInputElement | null>(null);
+  const triggerPresetImport = React.useCallback(() => {
+    setImportError(null);
+    presetImportInputRef.current?.click();
+  }, []);
+
+  const handleImportPresetFile = React.useCallback(
+    async (file: File | undefined) => {
+      if (!file) return;
+      try {
+        const text = await file.text();
+        const parsed = JSON.parse(text) as unknown;
+        // Accept either the wrapped envelope or a bare NamedPreset object.
+        const rawPreset: unknown =
+          parsed && typeof parsed === "object" && "preset" in parsed
+            ? (parsed as { preset: unknown }).preset
+            : parsed;
+        if (!rawPreset || typeof rawPreset !== "object") {
+          throw new Error("Top-level object expected");
+        }
+        const candidate = rawPreset as Partial<NamedPreset>;
+        if (!candidate.name || typeof candidate.name !== "string") {
+          throw new Error("Preset is missing a 'name' field");
+        }
+        if (!candidate.defaults || typeof candidate.defaults !== "object") {
+          throw new Error("Preset is missing a 'defaults' field");
+        }
+        // Merge with INITIAL_POOL_DEFAULTS so older presets don't crash.
+        const mergedDefaults: PoolDefaults = {
+          ...INITIAL_POOL_DEFAULTS,
+          ...(candidate.defaults as Partial<PoolDefaults>),
+        };
+        const newPreset: NamedPreset = {
+          name: candidate.name,
+          createdAt: candidate.createdAt ?? new Date().toISOString(),
+          defaults: mergedDefaults,
+        };
+        const next: NamedPreset[] = [
+          ...namedPresets.filter((p) => p.name !== newPreset.name),
+          newPreset,
+        ].sort((a, b) => a.name.localeCompare(b.name));
+        setNamedPresets(next);
+        auditLog.record({
+          actor: AUDIT_ACTOR,
+          action: "import_named_preset",
+          target: `preset:${newPreset.name}`,
+          status: "success",
+          details: { fileBytes: file.size, totalPresets: next.length },
+        });
+        flashToast(`Imported preset "${newPreset.name}"`);
+      } catch (err) {
+        const msg =
+          err instanceof Error ? err.message : "Unknown parse error";
+        setImportError(`Failed to import preset: ${msg}`);
+        auditLog.record({
+          actor: AUDIT_ACTOR,
+          action: "import_named_preset",
+          target: `file:${file.name}`,
+          status: "failure",
+          error: msg,
+        });
+      } finally {
+        if (presetImportInputRef.current)
+          presetImportInputRef.current.value = "";
+      }
+    },
+    [namedPresets, setNamedPresets, flashToast],
+  );
+
+  // Compare picker — resolves the sentinel values "__current__" /
+  // "__saved__" against the in-memory snapshot so the diff renderer can
+  // treat every option uniformly.
+  const resolveCompareSnapshot = React.useCallback(
+    (id: string): { label: string; data: PoolDefaults | null } => {
+      if (id === "__current__")
+        return { label: "Current form", data: defaults };
+      if (id === "__saved__")
+        return { label: "Last saved", data: savedSnapshot };
+      const p = namedPresets.find((n) => n.name === id);
+      if (!p) return { label: id, data: null };
+      return { label: `Preset: ${p.name}`, data: p.defaults };
+    },
+    [defaults, savedSnapshot, namedPresets],
   );
 
   // JSON import/export
@@ -1695,6 +1995,21 @@ const PoolDefaultsForm: React.FC<PoolDefaultsFormProps> = ({
     [defaults],
   );
 
+  // Privileged-default detector — surfaces an inline banner BEFORE the
+  // operator hits Save when the default StartTask would run as root /
+  // LocalSystem on every future pool. Mirrors the resource-plane
+  // "centrally-edited elevated identity" primitive analyzed in
+  // _analysis_netspi.md §II (RunAs / Logic-App connection hijack).
+  const privFootprint = React.useMemo(
+    () => detectPrivilegedDefault(defaults),
+    [defaults],
+  );
+  const showPrivBanner =
+    privFootprint.elevated &&
+    (privFootprint.hasCommand ||
+      privFootprint.hasResourceFiles ||
+      privFootprint.hasUnscopedSecretEnv);
+
   // Keyboard shortcuts — only active when no input/textarea/select is focused
   // except for the special Cmd+S / Cmd+E which we always intercept.
   React.useEffect(() => {
@@ -1726,6 +2041,22 @@ const PoolDefaultsForm: React.FC<PoolDefaultsFormProps> = ({
         if (isDirty) handleRevert();
         return;
       }
+      // Cmd/Ctrl+R — Reset to factory (with confirm). Browsers' default
+      // Ctrl+R is "reload page" which would silently lose all unsaved edits
+      // and be ambiguous with our "reset". We intercept and open the safe
+      // confirmation dialog instead. NEVER swallow when typing in a field
+      // — the user might genuinely want to reload.
+      if (
+        mod &&
+        !e.shiftKey &&
+        !e.altKey &&
+        e.key.toLowerCase() === "r" &&
+        !inEditable
+      ) {
+        e.preventDefault();
+        handleReset();
+        return;
+      }
       // Alt+E / Alt+C — Expand / collapse all sections (avoid when typing).
       if (e.altKey && !mod && !inEditable) {
         if (e.key.toLowerCase() === "e") {
@@ -1746,6 +2077,7 @@ const PoolDefaultsForm: React.FC<PoolDefaultsFormProps> = ({
     isDirty,
     handleSave,
     handleRevert,
+    handleReset,
     handleExportJson,
     expandAll,
     collapseAll,
@@ -2048,6 +2380,28 @@ const PoolDefaultsForm: React.FC<PoolDefaultsFormProps> = ({
         <Button
           type="button"
           variant="ghost"
+          size="sm"
+          onClick={() => setCompareDialogOpen(true)}
+          aria-label="Compare two pool-default profiles side by side"
+          title="Side-by-side diff of any two presets, the current form, or the last saved snapshot"
+        >
+          <Columns className="h-3.5 w-3.5" aria-hidden />
+          Compare
+        </Button>
+        <Button
+          type="button"
+          variant="ghost"
+          size="sm"
+          onClick={() => setTryPreviewOpen(true)}
+          aria-label="Try the defaults in a pool-creation form preview before saving"
+          title="Render a read-only pool-creation form pre-filled with these defaults"
+        >
+          <Eye className="h-3.5 w-3.5" aria-hidden />
+          Try before save
+        </Button>
+        <Button
+          type="button"
+          variant="ghost"
           size="icon-sm"
           onClick={() => setKeyboardHelpOpen(true)}
           aria-label="Show keyboard shortcuts"
@@ -2116,6 +2470,75 @@ const PoolDefaultsForm: React.FC<PoolDefaultsFormProps> = ({
         </Alert>
       )}
 
+      {/* Privileged-default detector — fires whenever the auto-user is
+          admin AND there's something for it to do (command, resource file,
+          or secret-shaped env var). The point is *visibility before save*:
+          the operator should consciously commit to baking an elevated
+          identity into every future pool. Citation:
+          C:\Users\baimgprodsesa1\Desktop\New folder\_analysis_netspi.md §II
+          — centrally-edited "every node will run as admin" is the
+          recurring resource-plane attack primitive (MicroBurst
+          Get-AzPasswords, Logic-App connection hijack, Easy-Auth key). */}
+      {showPrivBanner && (
+        <Alert variant="warning" role="status" aria-live="polite">
+          <ShieldAlert className="h-4 w-4" aria-hidden />
+          <AlertTitle>
+            Elevated start task will propagate to all future pools
+          </AlertTitle>
+          <AlertDescription>
+            <p className="m-0">
+              The default start task runs as{" "}
+              <b>
+                {privFootprint.poolScope ? "pool-scope" : "task-scope"} admin
+              </b>{" "}
+              (
+              {defaults.osCategory === "windows"
+                ? "Administrator / LocalSystem on Windows"
+                : "root on Linux"}
+              ). Every pool created through this tool — pool-creation,
+              unused-quota recovery, and the orchestrator's auto-pool flow —
+              will inherit this identity and execute the configured command
+              on every node.
+            </p>
+            <ul className="m-0 mt-1 list-disc space-y-0.5 pl-4 text-2xs">
+              {privFootprint.hasResourceFiles && (
+                <li>
+                  Resource files are downloaded as admin before the command
+                  runs — anyone who controls those URLs controls the node.
+                </li>
+              )}
+              {privFootprint.hasInsecureHttpFile && (
+                <li>
+                  At least one resource file uses plain <b>http://</b>. An
+                  on-path attacker can swap the payload — use https:// or a
+                  SAS URL.
+                </li>
+              )}
+              {privFootprint.hasUnscopedSecretEnv && (
+                <li>
+                  An environment variable name looks like a credential
+                  (token / secret / key / password). It will be exposed to
+                  every task that reads the start-task environment — prefer
+                  Key Vault references or job-scoped secrets.
+                </li>
+              )}
+              {privFootprint.poolScope && (
+                <li>
+                  Pool-scope means state written by the start task survives
+                  across tasks — installed binaries, cron jobs, and dropped
+                  files persist for the pool's lifetime.
+                </li>
+              )}
+            </ul>
+            <p className="m-0 mt-1 text-2xs text-muted-foreground">
+              Mitigations: switch to task-scope user, drop to non-admin, or
+              move secrets to a per-job context. This is a warning, not a
+              blocker — save anyway if it's intentional.
+            </p>
+          </AlertDescription>
+        </Alert>
+      )}
+
       {/* Import error banner */}
       {importError && (
         <Alert variant="destructive" role="alert">
@@ -2147,6 +2570,19 @@ const PoolDefaultsForm: React.FC<PoolDefaultsFormProps> = ({
           </Alert>
         </div>
       )}
+
+      {/* Visually-hidden polite ARIA-live region for save / revert / reset
+          confirmations. Persists in the DOM so screen readers always
+          announce, even when the visible toast above has already faded. */}
+      <div
+        role="status"
+        aria-live="polite"
+        aria-atomic="true"
+        className="sr-only absolute h-px w-px overflow-hidden"
+        style={{ clip: "rect(0, 0, 0, 0)" }}
+      >
+        {ariaAnnouncement}
+      </div>
 
       {/* ============ SECTION 1: OS Configuration ============ */}
       {sectionVisible.os && (
@@ -3478,6 +3914,16 @@ const PoolDefaultsForm: React.FC<PoolDefaultsFormProps> = ({
                     type="button"
                     variant="ghost"
                     size="icon-sm"
+                    onClick={() => handleExportPreset(p)}
+                    aria-label={`Export preset ${p.name} as JSON`}
+                    title="Export this preset as JSON"
+                  >
+                    <Download className="h-3.5 w-3.5" />
+                  </Button>
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="icon-sm"
                     onClick={() => setConfirmDeletePreset(p.name)}
                     aria-label={`Delete preset ${p.name}`}
                     className="text-destructive hover:bg-destructive/10 hover:text-destructive"
@@ -3489,10 +3935,365 @@ const PoolDefaultsForm: React.FC<PoolDefaultsFormProps> = ({
             </ul>
           </div>
           <DialogFooter>
+            <input
+              ref={presetImportInputRef}
+              type="file"
+              accept="application/json,.json"
+              className="hidden"
+              aria-hidden
+              tabIndex={-1}
+              onChange={(e) => handleImportPresetFile(e.target.files?.[0])}
+            />
+            <Button
+              type="button"
+              variant="outline"
+              onClick={triggerPresetImport}
+              aria-label="Import a preset from JSON"
+              title="Load a previously exported preset JSON into the library"
+            >
+              <FileUp className="h-3.5 w-3.5" aria-hidden />
+              Import preset
+            </Button>
             <Button
               type="button"
               variant="outline"
               onClick={() => setPresetsDialogOpen(false)}
+            >
+              Close
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      {/* Side-by-side compare dialog — diff any two snapshots (presets,
+          current form, last-saved). The two-column field-level view makes
+          it obvious which knob differs without re-reading two JSON blobs. */}
+      <Dialog
+        open={compareDialogOpen}
+        onOpenChange={(open) => !open && setCompareDialogOpen(false)}
+      >
+        <DialogContent className="max-w-5xl">
+          <DialogHeader>
+            <DialogTitle>Compare profiles</DialogTitle>
+            <DialogDescription>
+              Pick two profiles to diff side by side. Both sides are
+              read-only — close the dialog and use Load to apply a preset.
+            </DialogDescription>
+          </DialogHeader>
+          {(() => {
+            const left = resolveCompareSnapshot(compareLeft);
+            const right = resolveCompareSnapshot(compareRight);
+            const renderJson = (d: PoolDefaults | null) =>
+              d ? JSON.stringify(d, null, 2) : "(no data)";
+            const leftJson = renderJson(left.data);
+            const rightJson = renderJson(right.data);
+            // Field-level summary — top-level keys that differ between the
+            // two snapshots. Anchors a quick "what's actually different"
+            // glance before the user dives into the JSON.
+            const diffKeys: string[] = [];
+            if (left.data && right.data) {
+              (Object.keys(left.data) as (keyof PoolDefaults)[]).forEach(
+                (k) => {
+                  if (!deepEqual(left.data![k], right.data![k]))
+                    diffKeys.push(String(k));
+                },
+              );
+            }
+            const options: { value: string; label: string }[] = [
+              { value: "__current__", label: "Current form" },
+              { value: "__saved__", label: "Last saved snapshot" },
+              ...namedPresets.map((p) => ({
+                value: p.name,
+                label: `Preset: ${p.name}`,
+              })),
+            ];
+            return (
+              <div className="flex flex-col gap-3">
+                <div className="grid grid-cols-2 gap-3">
+                  <div className="flex flex-col gap-1">
+                    <Label className="text-xs font-medium text-muted-foreground">
+                      Left
+                    </Label>
+                    <Select
+                      value={compareLeft}
+                      onValueChange={setCompareLeft}
+                    >
+                      <SelectTrigger aria-label="Left side of compare">
+                        <SelectValue />
+                      </SelectTrigger>
+                      <SelectContent>
+                        {options.map((o) => (
+                          <SelectItem key={o.value} value={o.value}>
+                            {o.label}
+                          </SelectItem>
+                        ))}
+                      </SelectContent>
+                    </Select>
+                  </div>
+                  <div className="flex flex-col gap-1">
+                    <Label className="text-xs font-medium text-muted-foreground">
+                      Right
+                    </Label>
+                    <Select
+                      value={compareRight}
+                      onValueChange={setCompareRight}
+                    >
+                      <SelectTrigger aria-label="Right side of compare">
+                        <SelectValue />
+                      </SelectTrigger>
+                      <SelectContent>
+                        {options.map((o) => (
+                          <SelectItem key={o.value} value={o.value}>
+                            {o.label}
+                          </SelectItem>
+                        ))}
+                      </SelectContent>
+                    </Select>
+                  </div>
+                </div>
+                {left.data && right.data ? (
+                  diffKeys.length === 0 ? (
+                    <Alert variant="success">
+                      <Check className="h-4 w-4" aria-hidden />
+                      <AlertTitle>Identical</AlertTitle>
+                      <AlertDescription>
+                        <b>{left.label}</b> and <b>{right.label}</b> have
+                        the same top-level fields.
+                      </AlertDescription>
+                    </Alert>
+                  ) : (
+                    <Alert variant="warning">
+                      <CircleDot className="h-4 w-4" aria-hidden />
+                      <AlertTitle>
+                        {diffKeys.length} field
+                        {diffKeys.length === 1 ? "" : "s"} differ
+                      </AlertTitle>
+                      <AlertDescription>
+                        <code className="font-mono text-2xs">
+                          {diffKeys.join(", ")}
+                        </code>
+                      </AlertDescription>
+                    </Alert>
+                  )
+                ) : (
+                  <Alert variant="default">
+                    <AlertTriangle className="h-4 w-4" aria-hidden />
+                    <AlertDescription>
+                      One side has no data — pick two valid profiles to
+                      diff.
+                    </AlertDescription>
+                  </Alert>
+                )}
+                <div className="grid grid-cols-2 gap-3">
+                  <div className="flex flex-col gap-1">
+                    <Label className="text-xs font-medium text-muted-foreground">
+                      {left.label}
+                    </Label>
+                    <pre
+                      className="m-0 max-h-[20rem] overflow-auto whitespace-pre-wrap break-words rounded-md border border-border bg-surface-sunken p-3 font-mono text-2xs text-foreground"
+                      aria-label={`${left.label} JSON`}
+                    >
+                      {leftJson}
+                    </pre>
+                  </div>
+                  <div className="flex flex-col gap-1">
+                    <Label className="text-xs font-medium text-muted-foreground">
+                      {right.label}
+                    </Label>
+                    <pre
+                      className="m-0 max-h-[20rem] overflow-auto whitespace-pre-wrap break-words rounded-md border border-border bg-surface-sunken p-3 font-mono text-2xs text-foreground"
+                      aria-label={`${right.label} JSON`}
+                    >
+                      {rightJson}
+                    </pre>
+                  </div>
+                </div>
+              </div>
+            );
+          })()}
+          <DialogFooter>
+            <Button
+              type="button"
+              variant="outline"
+              onClick={() => setCompareDialogOpen(false)}
+            >
+              Close
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      {/* Try-before-save preview — renders a *read-only* mock of the
+          pool-creation form, populated from the in-form defaults. The
+          downstream pool-creation page is owned by a different agent
+          (out-of-scope for edits), so this preview is a self-contained
+          static mirror of what the operator can expect there. */}
+      <Dialog
+        open={tryPreviewOpen}
+        onOpenChange={(open) => !open && setTryPreviewOpen(false)}
+      >
+        <DialogContent className="max-w-3xl">
+          <DialogHeader>
+            <DialogTitle>Pool-creation form preview</DialogTitle>
+            <DialogDescription>
+              A read-only mock of the pool-creation form pre-filled with
+              the current defaults. Use this to validate the operator
+              experience before committing.
+            </DialogDescription>
+          </DialogHeader>
+          <div className="flex max-h-[28rem] flex-col gap-3 overflow-y-auto rounded-md border border-border bg-surface-sunken p-4">
+            <div className="flex flex-col gap-1">
+              <span className="text-2xs uppercase tracking-wider text-muted-foreground">
+                Pool ID (set on the pool-creation page)
+              </span>
+              <Input
+                value="batch-pool-{auto-generated}"
+                readOnly
+                aria-readonly
+                className="font-mono text-xs"
+                aria-label="Pool ID preview"
+              />
+            </div>
+            <div className="grid grid-cols-2 gap-3">
+              <div className="flex flex-col gap-1">
+                <span className="text-2xs uppercase tracking-wider text-muted-foreground">
+                  OS category
+                </span>
+                <Input
+                  value={defaults.osCategory}
+                  readOnly
+                  aria-readonly
+                  aria-label="OS category preview"
+                />
+              </div>
+              <div className="flex flex-col gap-1">
+                <span className="text-2xs uppercase tracking-wider text-muted-foreground">
+                  Node agent SKU
+                </span>
+                <Input
+                  value={defaults.virtualMachineConfiguration.nodeAgentSKUId}
+                  readOnly
+                  aria-readonly
+                  className="font-mono text-xs"
+                  aria-label="Node agent SKU preview"
+                />
+              </div>
+            </div>
+            <div className="grid grid-cols-2 gap-3">
+              <div className="flex flex-col gap-1">
+                <span className="text-2xs uppercase tracking-wider text-muted-foreground">
+                  Publisher / Offer
+                </span>
+                <Input
+                  value={`${defaults.virtualMachineConfiguration.imageReference.publisher} / ${defaults.virtualMachineConfiguration.imageReference.offer}`}
+                  readOnly
+                  aria-readonly
+                  className="font-mono text-xs"
+                  aria-label="Publisher and offer preview"
+                />
+              </div>
+              <div className="flex flex-col gap-1">
+                <span className="text-2xs uppercase tracking-wider text-muted-foreground">
+                  SKU / Version
+                </span>
+                <Input
+                  value={`${defaults.virtualMachineConfiguration.imageReference.sku} / ${defaults.virtualMachineConfiguration.imageReference.version}`}
+                  readOnly
+                  aria-readonly
+                  className="font-mono text-xs"
+                  aria-label="SKU and version preview"
+                />
+              </div>
+            </div>
+            <div className="grid grid-cols-3 gap-3">
+              <div className="flex flex-col gap-1">
+                <span className="text-2xs uppercase tracking-wider text-muted-foreground">
+                  Task slots / node
+                </span>
+                <Input
+                  value={String(defaults.taskSlotsPerNode)}
+                  readOnly
+                  aria-readonly
+                  aria-label="Task slots per node preview"
+                />
+              </div>
+              <div className="flex flex-col gap-1">
+                <span className="text-2xs uppercase tracking-wider text-muted-foreground">
+                  Inter-node comms
+                </span>
+                <Input
+                  value={
+                    defaults.enableInterNodeCommunication ? "ON" : "OFF"
+                  }
+                  readOnly
+                  aria-readonly
+                  aria-label="Inter-node communication preview"
+                />
+              </div>
+              <div className="flex flex-col gap-1">
+                <span className="text-2xs uppercase tracking-wider text-muted-foreground">
+                  Scheduling
+                </span>
+                <Input
+                  value={defaults.taskSchedulingPolicy}
+                  readOnly
+                  aria-readonly
+                  aria-label="Scheduling policy preview"
+                />
+              </div>
+            </div>
+            <div className="flex flex-col gap-1">
+              <span className="text-2xs uppercase tracking-wider text-muted-foreground">
+                Start task command
+              </span>
+              <textarea
+                value={defaults.startTask.commandLine || "(empty)"}
+                readOnly
+                aria-readonly
+                rows={2}
+                className="flex min-h-[3rem] w-full resize-none rounded-md border border-input bg-surface-raised px-3 py-2 font-mono text-xs text-foreground"
+                aria-label="Start task command preview"
+              />
+            </div>
+            <div className="grid grid-cols-2 gap-3">
+              <div className="flex flex-col gap-1">
+                <span className="text-2xs uppercase tracking-wider text-muted-foreground">
+                  Start task identity
+                </span>
+                <Input
+                  value={`${defaults.startTask.userIdentity.autoUser.scope} / ${defaults.startTask.userIdentity.autoUser.elevationLevel}`}
+                  readOnly
+                  aria-readonly
+                  className={cn(
+                    privFootprint.elevated &&
+                      "border-warning text-warning",
+                  )}
+                  aria-label="Start task identity preview"
+                />
+              </div>
+              <div className="flex flex-col gap-1">
+                <span className="text-2xs uppercase tracking-wider text-muted-foreground">
+                  Subnet
+                </span>
+                <Input
+                  value={defaults.subnetId || "(no VNet)"}
+                  readOnly
+                  aria-readonly
+                  className="font-mono text-xs"
+                  aria-label="Subnet preview"
+                />
+              </div>
+            </div>
+            <p className="m-0 text-2xs italic text-muted-foreground">
+              This is a static preview. Actual fields on the pool-creation
+              page are owned by that page's renderer.
+            </p>
+          </div>
+          <DialogFooter>
+            <Button
+              type="button"
+              variant="outline"
+              onClick={() => setTryPreviewOpen(false)}
             >
               Close
             </Button>
@@ -3520,6 +4321,10 @@ const PoolDefaultsForm: React.FC<PoolDefaultsFormProps> = ({
             <li className="flex items-center justify-between gap-3">
               <span>Revert unsaved changes</span>
               <KbdChord keys="Ctrl+Shift+Z" />
+            </li>
+            <li className="flex items-center justify-between gap-3">
+              <span>Reset to factory (with confirm)</span>
+              <KbdChord keys="Ctrl+R" />
             </li>
             <li className="flex items-center justify-between gap-3">
               <span>Export defaults as JSON</span>

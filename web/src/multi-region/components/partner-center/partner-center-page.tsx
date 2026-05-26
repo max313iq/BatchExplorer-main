@@ -34,11 +34,16 @@ import {
   Link2,
   Link2Off,
   Loader2,
+  Network,
+  Radar,
   RotateCcw,
   RotateCw,
+  Search,
   ShieldAlert,
   ShieldCheck,
   Sparkles,
+  StopCircle,
+  Users,
   XCircle,
 } from "lucide-react";
 
@@ -54,6 +59,7 @@ import {
 } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { Progress } from "@/components/ui/progress";
 import {
   Select,
   SelectContent,
@@ -66,6 +72,7 @@ import { cn } from "@/lib/utils";
 import {
   getActiveTenant,
   getArmTokenForAccount,
+  getGraphTokenForAccount,
   getPartnerCenterTokenForAccount,
 } from "../../auth/msal-auth";
 import { resolveActiveTenantId } from "../../auth/perform-tenant-switch";
@@ -89,6 +96,17 @@ import {
   type ProbeResult,
 } from "../../services/partner-center-service";
 import { useMultiRegionState, useMultiRegionStore } from "../../store/store-context";
+
+import {
+  bulkProbeCustomers,
+  probeGdapDelegations,
+  probePalDrift,
+  type CustomerMatrixRow,
+  type GdapDelegation,
+  type GdapDelegationSummary,
+  type PalDriftSummary,
+  type SubscriptionPalRow,
+} from "./partner-relationships-probe";
 
 import { useDashboardOutletContext } from "../page-router";
 import { ConfirmationDialog } from "../shared/confirmation-dialog";
@@ -116,6 +134,55 @@ const PARTNER_ID_RE = /^\d{6,10}$/;
  * attribution decisions.
  */
 const STALE_PROBE_MS = 24 * 60 * 60 * 1000;
+
+/**
+ * Longer "haven't even bothered to probe" threshold (60d). When the
+ * operator's CSP customer matrix carries customers we haven't poked at
+ * in two months, those rows are the most likely to harbour a dormant
+ * MSP relationship that has drifted (cf. corpus playbook
+ * `_bypass_tenant_switch.md` §6.3 — MSP supply-chain abuse is most
+ * effective against dormant relationships because they generate no
+ * alerts).
+ */
+const STALE_CUSTOMER_MS = 60 * 24 * 60 * 60 * 1000;
+
+/** Session-storage key for the bulk-customer-probe last-run timestamps. */
+const CUSTOMER_PROBE_KEY = "partner-center:customer-last-probe";
+
+/**
+ * Loose container for "when did we last touch this CSP customer?". Kept
+ * in sessionStorage so a reload doesn't lose the timeline — but
+ * deliberately NOT persistent (a per-account view that survives the
+ * session is enough; persisting across sessions would invite confusion
+ * if the operator pivots tenants).
+ */
+type CustomerProbeLedger = Record<string, number>;
+
+function loadCustomerLedger(key: string): CustomerProbeLedger {
+  try {
+    const raw = sessionStorage.getItem(key);
+    if (!raw) return {};
+    const parsed = JSON.parse(raw) as unknown;
+    if (parsed && typeof parsed === "object") {
+      const out: CustomerProbeLedger = {};
+      for (const [k, v] of Object.entries(parsed as Record<string, unknown>)) {
+        if (typeof v === "number" && Number.isFinite(v)) out[k] = v;
+      }
+      return out;
+    }
+  } catch {
+    /* corrupt — ignore */
+  }
+  return {};
+}
+
+function saveCustomerLedger(key: string, ledger: CustomerProbeLedger): void {
+  try {
+    sessionStorage.setItem(key, JSON.stringify(ledger));
+  } catch {
+    /* ignore quota errors */
+  }
+}
 
 /**
  * Truncate the middle of a long opaque id (tenantId, GUID, etc.) so it
@@ -710,6 +777,248 @@ export const PartnerCenterPage: React.FC<PartnerCenterPageProps> = ({
     }
   }, [account, probes, runProbe]);
 
+  /* ───────────────────────────────────────────────────────────────────
+   * Corpus-grounded extra probes — GDAP delegation creep + subscription-
+   * level PAL drift. Both are off-by-default; the operator clicks "Run"
+   * to fire them. See `partner-relationships-probe.ts` for the
+   * implementation and `_bypass_tenant_switch.md` §6 for the rationale.
+   * ─────────────────────────────────────────────────────────────────── */
+  const [gdapProbe, setGdapProbe] =
+    React.useState<ProbeResult<GdapDelegationSummary> | null>(null);
+  const [gdapBusy, setGdapBusy] = React.useState(false);
+  const [palDriftProbe, setPalDriftProbe] =
+    React.useState<ProbeResult<PalDriftSummary> | null>(null);
+  const [palDriftBusy, setPalDriftBusy] = React.useState(false);
+
+  const runGdapProbe = React.useCallback(async () => {
+    if (!account) return;
+    const gen = accountGenRef.current;
+    const actorAccount = account;
+    setGdapBusy(true);
+    try {
+      const graphToken = await getGraphTokenForAccount(
+        actorAccount.homeAccountId,
+        getActiveTenantIdForSelected() ?? actorAccount.tenantId,
+      );
+      const r = await probeGdapDelegations(graphToken);
+      if (accountGenRef.current !== gen) return;
+      setGdapProbe(r);
+      const status = r.outcome === "pass" ? "success" : "failure";
+      auditLog.record({
+        actor: actorAccount.username,
+        action: "probe_partner_center:gdap",
+        target: "tenantRelationships/delegatedAdminRelationships",
+        status,
+        error: status === "failure" ? r.summary : undefined,
+        details: {
+          tenantId:
+            getActiveTenantIdForSelected() ?? actorAccount.tenantId,
+          outcome: r.outcome,
+          activeCount: r.data?.activeCount,
+          highPrivActiveCount: r.data?.highPrivActiveCount,
+          creep: r.data?.creep,
+        },
+      });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      const synthetic: ProbeResult<GdapDelegationSummary> = {
+        outcome: /interaction_required|consent_required|AADSTS/i.test(msg)
+          ? "unauthorized"
+          : "unknown",
+        summary: "Graph token acquisition failed",
+        detail: msg,
+        data: null,
+      };
+      if (accountGenRef.current === gen) setGdapProbe(synthetic);
+    } finally {
+      setGdapBusy(false);
+    }
+  }, [account, getActiveTenantIdForSelected]);
+
+  const runPalDriftProbe = React.useCallback(async () => {
+    if (!account) return;
+    const gen = accountGenRef.current;
+    const actorAccount = account;
+    setPalDriftBusy(true);
+    try {
+      const armToken = await getArmTokenForAccount(actorAccount.homeAccountId);
+      const r = await probePalDrift(
+        armToken,
+        preferredMpn.trim() || null,
+      );
+      if (accountGenRef.current !== gen) return;
+      setPalDriftProbe(r);
+      const status = r.outcome === "pass" ? "success" : "failure";
+      auditLog.record({
+        actor: actorAccount.username,
+        action: "probe_partner_center:pal_drift",
+        target:
+          preferredMpn.trim() ||
+          "(no preferred mpn — no-PAL gaps only)",
+        status,
+        error: status === "failure" ? r.summary : undefined,
+        details: {
+          tenantId:
+            getActiveTenantIdForSelected() ?? actorAccount.tenantId,
+          outcome: r.outcome,
+          mismatchCount: r.data?.mismatchCount,
+          noPalCount: r.data?.noPalCount,
+          totalSubscriptions: r.data?.totalSubscriptions,
+        },
+      });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      const synthetic: ProbeResult<PalDriftSummary> = {
+        outcome: /interaction_required|consent_required|AADSTS/i.test(msg)
+          ? "unauthorized"
+          : "unknown",
+        summary: "ARM token acquisition failed",
+        detail: msg,
+        data: null,
+      };
+      if (accountGenRef.current === gen) setPalDriftProbe(synthetic);
+    } finally {
+      setPalDriftBusy(false);
+    }
+  }, [account, getActiveTenantIdForSelected, preferredMpn]);
+
+  /* ───────────────────────────────────────────────────────────────────
+   * Bulk customer probe. Walks the CSP customer sample (or all visible
+   * customer IDs in `probes.csp.data.sample`) and probes each one in
+   * sequence so we don't trip Partner Center's per-principal throttle.
+   * Renders a progress bar; cancellable mid-sweep.
+   * ─────────────────────────────────────────────────────────────────── */
+  const [bulkBusy, setBulkBusy] = React.useState(false);
+  const [bulkDone, setBulkDone] = React.useState(0);
+  const [bulkTotal, setBulkTotal] = React.useState(0);
+  const [bulkRows, setBulkRows] = React.useState<CustomerMatrixRow[]>([]);
+  const bulkAbortRef = React.useRef<AbortController | null>(null);
+
+  /** Per-customer last-probe timestamps (per account, sessionStorage). */
+  const customerLedgerKey = account
+    ? `${CUSTOMER_PROBE_KEY}:${account.homeAccountId}`
+    : CUSTOMER_PROBE_KEY;
+  const [customerLedger, setCustomerLedger] = React.useState<CustomerProbeLedger>(
+    () => loadCustomerLedger(customerLedgerKey),
+  );
+  // Rehydrate the ledger when the active account changes.
+  React.useEffect(() => {
+    setCustomerLedger(loadCustomerLedger(customerLedgerKey));
+  }, [customerLedgerKey]);
+
+  const runBulkCustomerProbe = React.useCallback(async () => {
+    if (!account) return;
+    const cspData =
+      probes.csp?.outcome === "pass"
+        ? (probes.csp.data as CspCustomerSummary | null | undefined) ?? null
+        : null;
+    const ids = cspData?.sample ?? [];
+    if (ids.length === 0) return;
+    const gen = accountGenRef.current;
+    const actorAccount = account;
+    const { token, error } = await acquirePcToken();
+    if (!token) {
+      store.addNotification({
+        type: "error",
+        message: error?.summary ?? "Partner Center token unavailable.",
+      });
+      return;
+    }
+    setBulkBusy(true);
+    setBulkDone(0);
+    setBulkTotal(ids.length);
+    setBulkRows([]);
+    const ctrl = new AbortController();
+    bulkAbortRef.current = ctrl;
+    try {
+      const ledgerUpdate: CustomerProbeLedger = { ...customerLedger };
+      const rows = await bulkProbeCustomers(ids, token, {
+        signal: ctrl.signal,
+        onProgress: (done, total, row) => {
+          if (accountGenRef.current !== gen) return;
+          setBulkDone(done);
+          setBulkRows((prev) => [...prev, row]);
+          ledgerUpdate[row.customerId] = Date.now();
+        },
+      });
+      if (accountGenRef.current === gen) {
+        saveCustomerLedger(customerLedgerKey, ledgerUpdate);
+        setCustomerLedger(ledgerUpdate);
+        const passCount = rows.filter((r) => r.outcome === "pass").length;
+        auditLog.record({
+          actor: actorAccount.username,
+          action: "probe_partner_center:bulk_customers",
+          target: `${rows.length} customers`,
+          status: ctrl.signal.aborted
+            ? "failure"
+            : passCount > 0
+              ? "success"
+              : "failure",
+          error: ctrl.signal.aborted ? "operator cancelled" : undefined,
+          details: {
+            tenantId:
+              getActiveTenantIdForSelected() ?? actorAccount.tenantId,
+            scanned: rows.length,
+            passed: passCount,
+          },
+        });
+      }
+    } finally {
+      bulkAbortRef.current = null;
+      setBulkBusy(false);
+    }
+  }, [
+    account,
+    acquirePcToken,
+    customerLedger,
+    customerLedgerKey,
+    getActiveTenantIdForSelected,
+    probes.csp,
+    store,
+  ]);
+
+  const cancelBulkProbe = React.useCallback(() => {
+    bulkAbortRef.current?.abort();
+  }, []);
+
+  /* ───────────────────────────────────────────────────────────────────
+   * Stale-customer (60d) view. Cross-references the most recent
+   * customer ledger against the current CSP probe's sample — any
+   * customer that's been seen in the sample but hasn't been probed in
+   * 60 days bubbles up. The threshold is corpus-grounded: dormant MSP
+   * relationships are the classic supply-chain pivot
+   * (`_bypass_tenant_switch.md` §6.3).
+   * ─────────────────────────────────────────────────────────────────── */
+  const staleCustomers = React.useMemo(() => {
+    const cspData =
+      probes.csp?.outcome === "pass"
+        ? (probes.csp.data as CspCustomerSummary | null | undefined) ?? null
+        : null;
+    const ids = cspData?.sample ?? [];
+    if (ids.length === 0) return [];
+    const now = Date.now();
+    return ids
+      .map((id) => ({
+        id,
+        lastProbedMs: customerLedger[id] ?? null,
+      }))
+      .filter(
+        (e) =>
+          e.lastProbedMs === null ||
+          now - (e.lastProbedMs ?? 0) > STALE_CUSTOMER_MS,
+      );
+  }, [customerLedger, probes.csp]);
+
+  /* ───────────────────────────────────────────────────────────────────
+   * MPN-mismatch filter (chip). Extends wave-1 warning into an
+   * "explicit, only-show-mismatched" filter. When on AND the MPN probe
+   * has a `data.mpnId`, the page emphasises the mismatch warning.
+   * ─────────────────────────────────────────────────────────────────── */
+  const [showMismatchedOnly, setShowMismatchedOnly] = usePersistedState<boolean>(
+    `${PREFERRED_MPN_KEY}:mismatched-only`,
+    false,
+  );
+
   const handleConfirmLink = React.useCallback(async () => {
     if (!account || !partnerIdValid) return;
     setPendingLink(false);
@@ -911,17 +1220,48 @@ export const PartnerCenterPage: React.FC<PartnerCenterPageProps> = ({
     if (!account) return;
     void retryFailedProbes();
   });
+  // Bare-key shortcuts. These intentionally do NOT use Mod+ so they
+  // mirror the bare-key conventions on similar list / probe pages.
+  // Suppressed automatically while focus is inside an input (the
+  // useShortcut hook handles that).
+  //
+  // NOTE: do NOT reference values declared after the early-return for
+  // "no candidates" below — the handler closure would TDZ on those
+  // when the keypress fires from a render that took the early return.
+  // Compute "any failed/unauthorised/unknown" inline from `probes`.
+  useShortcut("r", () => {
+    if (!account) return;
+    // `r` re-runs the failed probes if any, otherwise runs all four.
+    // The "selected" intent (per spec) collapses to "the probes that
+    // need running" — no row-selection UI exists.
+    const hasFailures = ALL_PROBES.some((k) => {
+      const r = probes[k];
+      return r != null && r.outcome !== "pass";
+    });
+    if (hasFailures) {
+      void retryFailedProbes();
+    } else {
+      void runAllProbes();
+    }
+  });
+  useShortcut("/", () => {
+    // `/` focuses the Partner ID input as the page's primary "search /
+    // narrow" affordance — the input doubles as the PAL probe target
+    // and the preferred-MPN seed.
+    partnerIdInputRef.current?.focus();
+    partnerIdInputRef.current?.select();
+  });
 
   useTenantChange(undefined, (detail) => {
     const candidate = detail.homeAccountId;
     if (!candidates.some((c) => c.homeAccountId === candidate)) return;
     if (accountId === candidate) return;
-    setAccountId(candidate);
-    try {
-      sessionStorage.setItem(ACTIVE_ACCOUNT_KEY, candidate);
-    } catch {
-      /* ignore */
-    }
+    // Route through handleSelectAccount so the generation counter bumps
+    // AND the probe state resets — otherwise an in-flight probe fired
+    // against the previous account can land its result in the new
+    // account's slot (the bare setAccountId path skipped both
+    // accountGenRef++ and setProbes(EMPTY_PROBES)).
+    handleSelectAccount(candidate);
   });
 
   /* ───────────────────────────────────────────────────────────────────
@@ -1150,11 +1490,34 @@ export const PartnerCenterPage: React.FC<PartnerCenterPageProps> = ({
             Use as Partner ID
           </Button>
         )}
+        <Button
+          type="button"
+          variant={showMismatchedOnly ? "default" : "outline"}
+          size="sm"
+          className="h-7 px-2 text-3xs"
+          aria-pressed={showMismatchedOnly}
+          onClick={() => setShowMismatchedOnly((v) => !v)}
+          disabled={!mpnFilterOn || !trimmedPreferredMpn}
+          title={
+            !mpnFilterOn
+              ? "Turn the preferred-MPN filter on first"
+              : showMismatchedOnly
+                ? "Stop emphasising mismatched MPNs"
+                : "Emphasise customers / subs whose MPN ≠ preferred"
+          }
+        >
+          Mismatched only
+        </Button>
         {mpnMismatch && (
           <span className="ml-auto inline-flex items-center gap-1 rounded border border-warning/40 bg-warning/10 px-1.5 py-0.5 font-medium text-warning">
             <AlertTriangle className="h-3 w-3" aria-hidden />
             MPN mismatch: observed{" "}
             <code className="font-mono">{observedMpnId}</code>
+            <CopyButton
+              value={observedMpnId}
+              alwaysVisible
+              ariaLabel={`Copy observed MPN ${observedMpnId}`}
+            />
           </span>
         )}
       </div>
@@ -1402,6 +1765,599 @@ export const PartnerCenterPage: React.FC<PartnerCenterPageProps> = ({
           />
         </CardContent>
       </Card>
+
+      {/* ─────────────────────────────────────────────────────────────────
+          Corpus-grounded "partner-relationships" probes.
+
+          - GDAP delegation creep — `/v1.0/tenantRelationships/
+            delegatedAdminRelationships`. The corpus playbook
+            (_bypass_tenant_switch.md §6.2) flags this as the canonical
+            MSP-pivot vector: a high or skewed delegation set means the
+            operator's tenant carries significant downstream blast
+            radius if compromised. Surfaces active count, high-priv
+            count, expiring-soon count, and a creep heuristic.
+
+          - Subscription PAL drift — pulls accessible subscriptions and
+            reads the subscription-scoped
+            `Microsoft.ManagementPartner/partners` collection per sub.
+            Cross-references against the preferred MPN to surface
+            mismatches (third-party partner of record) and gaps
+            (no-PAL). The corpus (§6.3) calls out PAL stale-relationship
+            checks as a "looks routine but isn't" defender finding.
+          ───────────────────────────────────────────────────────────── */}
+      <Card className="border-border bg-card shadow-sm">
+        <CardHeader className="pb-3">
+          <CardTitle className="flex items-center gap-2 text-sm font-semibold">
+            <Radar className="h-4 w-4 text-primary" aria-hidden />
+            Partner-relationships probes
+            <InfoTooltip content="Defensive probes derived from the MSP-pivot corpus. They reveal how much downstream surface the operator's tenant carries via GDAP delegations, and whether subscriptions in this tenant are stamped with an unexpected (or no) partner-of-record." />
+          </CardTitle>
+          <CardDescription>
+            Catches the two MSP / GDAP / PAL drift signals that don't
+            show up in the per-capability probes above. Cite:{" "}
+            <code className="font-mono">_bypass_tenant_switch.md</code>{" "}
+            §6 (Lighthouse-GDAP, MSP supply-chain).
+          </CardDescription>
+        </CardHeader>
+        <CardContent className="flex flex-col gap-3">
+          {/* GDAP delegation creep row */}
+          <div className="flex flex-col gap-2 rounded-md border border-border bg-surface-base p-2.5">
+            <div className="flex flex-wrap items-center gap-2">
+              <Network
+                className="h-3.5 w-3.5 text-muted-foreground"
+                aria-hidden
+              />
+              <span className="text-xs font-semibold text-foreground">
+                GDAP delegations (partner side)
+              </span>
+              <InfoTooltip content="Lists every customer tenant this tenant has a delegated-admin relationship with (active or terminated), and the directory roles delegated. Corpus: defenders rarely audit GDAP delegations because they're invisible in the customer's role list." />
+              <Badge
+                variant={
+                  gdapProbe?.outcome === "pass"
+                    ? gdapProbe.data?.creep
+                      ? "warning"
+                      : "success"
+                    : gdapProbe?.outcome === "unauthorized"
+                      ? "warning"
+                      : gdapProbe?.outcome === "fail" ||
+                          gdapProbe?.outcome === "unknown"
+                        ? "destructive"
+                        : "outline"
+                }
+                className="ml-auto text-2xs"
+              >
+                {gdapBusy ? (
+                  <span className="flex items-center gap-1">
+                    <Loader2 className="h-3 w-3 animate-spin motion-reduce:animate-none" />
+                    Running
+                  </span>
+                ) : gdapProbe ? (
+                  gdapProbe.outcome === "pass"
+                    ? gdapProbe.data?.creep
+                      ? "Creep"
+                      : "Pass"
+                    : outcomeBadge(gdapProbe.outcome).label
+                ) : (
+                  "Not run"
+                )}
+              </Badge>
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                className="h-6 px-2 text-2xs"
+                onClick={() => void runGdapProbe()}
+                loading={gdapBusy}
+                disabled={!account}
+                aria-label={
+                  gdapProbe ? "Re-run GDAP probe" : "Run GDAP probe"
+                }
+              >
+                {gdapProbe ? "Re-run" : "Run"}
+              </Button>
+            </div>
+            {gdapProbe?.outcome === "pass" && gdapProbe.data && (
+              <div className="flex flex-col gap-1.5">
+                <div className="grid grid-cols-2 gap-2 text-2xs sm:grid-cols-4">
+                  <span className="rounded border border-border/60 bg-card/40 px-2 py-1">
+                    <span className="block text-3xs font-semibold uppercase tracking-wider text-muted-foreground">
+                      Active
+                    </span>
+                    <span className="font-mono">
+                      {gdapProbe.data.activeCount}
+                    </span>
+                  </span>
+                  <span
+                    className={cn(
+                      "rounded border border-border/60 bg-card/40 px-2 py-1",
+                      gdapProbe.data.highPrivActiveCount > 0 &&
+                        "border-destructive/40 bg-destructive/10",
+                    )}
+                  >
+                    <span className="block text-3xs font-semibold uppercase tracking-wider text-muted-foreground">
+                      High-priv active
+                    </span>
+                    <span className="font-mono">
+                      {gdapProbe.data.highPrivActiveCount}
+                    </span>
+                  </span>
+                  <span
+                    className={cn(
+                      "rounded border border-border/60 bg-card/40 px-2 py-1",
+                      gdapProbe.data.expiringSoonCount > 0 &&
+                        "border-warning/40 bg-warning/10",
+                    )}
+                  >
+                    <span className="block text-3xs font-semibold uppercase tracking-wider text-muted-foreground">
+                      Expiring &lt;30d
+                    </span>
+                    <span className="font-mono">
+                      {gdapProbe.data.expiringSoonCount}
+                    </span>
+                  </span>
+                  <span className="rounded border border-border/60 bg-card/40 px-2 py-1">
+                    <span className="block text-3xs font-semibold uppercase tracking-wider text-muted-foreground">
+                      Total
+                    </span>
+                    <span className="font-mono">
+                      {gdapProbe.data.totalCount}
+                    </span>
+                  </span>
+                </div>
+                {gdapProbe.data.creep && (
+                  <Alert variant="warning" className="text-2xs">
+                    <AlertTriangle className="h-3 w-3" />
+                    <AlertDescription>
+                      Delegation creep detected. This tenant holds
+                      delegated-admin authority over a large or
+                      privilege-heavy customer set — supply-chain risk
+                      if any operator account is compromised.
+                    </AlertDescription>
+                  </Alert>
+                )}
+                {gdapProbe.data.sample.length > 0 && (
+                  <details className="text-2xs">
+                    <summary className="cursor-pointer select-none text-muted-foreground hover:text-foreground">
+                      Show first {gdapProbe.data.sample.length} delegation
+                      {gdapProbe.data.sample.length === 1 ? "" : "s"}
+                    </summary>
+                    <div className="mt-1 flex flex-col gap-1">
+                      {gdapProbe.data.sample.map((d: GdapDelegation) => (
+                        <div
+                          key={d.id}
+                          className={cn(
+                            "group/copy flex flex-wrap items-center gap-1.5 rounded border border-border/60 bg-card/40 px-2 py-1",
+                            d.highPriv && "border-destructive/40",
+                          )}
+                        >
+                          <span className="font-semibold">
+                            {d.customerDisplayName || d.displayName}
+                          </span>
+                          {d.customerTenantId && (
+                            <CopyableText
+                              value={d.customerTenantId}
+                              mono
+                              display={
+                                <code className="font-mono">
+                                  {truncateMiddle(d.customerTenantId, 6, 4)}
+                                </code>
+                              }
+                              ariaLabel={`Copy customer tenant id ${d.customerTenantId}`}
+                              alwaysVisibleButton
+                            />
+                          )}
+                          <Badge
+                            variant={
+                              d.status === "active" ? "outline" : "secondary"
+                            }
+                            className="text-3xs"
+                          >
+                            {d.status}
+                          </Badge>
+                          {d.roleNames.length > 0 && (
+                            <span className="ml-auto text-3xs text-muted-foreground">
+                              {d.roleNames.slice(0, 3).join(", ")}
+                              {d.roleNames.length > 3 ? "…" : ""}
+                            </span>
+                          )}
+                          {d.highPriv && (
+                            <Badge
+                              variant="destructive"
+                              className="text-3xs"
+                            >
+                              Tier-0
+                            </Badge>
+                          )}
+                        </div>
+                      ))}
+                    </div>
+                  </details>
+                )}
+              </div>
+            )}
+            {gdapProbe &&
+              gdapProbe.outcome !== "pass" &&
+              gdapProbe.summary && (
+                <div className="text-2xs text-muted-foreground">
+                  {gdapProbe.summary}
+                  {gdapProbe.detail && (
+                    <span className="ml-1 opacity-70">
+                      · {gdapProbe.detail.slice(0, 160)}
+                    </span>
+                  )}
+                </div>
+              )}
+          </div>
+
+          {/* Subscription PAL drift row */}
+          <div className="flex flex-col gap-2 rounded-md border border-border bg-surface-base p-2.5">
+            <div className="flex flex-wrap items-center gap-2">
+              <Link2
+                className="h-3.5 w-3.5 text-muted-foreground"
+                aria-hidden
+              />
+              <span className="text-xs font-semibold text-foreground">
+                Subscription PAL drift
+              </span>
+              <InfoTooltip content="Walks accessible subscriptions and checks the per-subscription Partner Admin Link stamp. Subscriptions whose PAL partnerId ≠ the configured preferred MPN are surfaced as drift; no-PAL subs are surfaced as revenue-attribution gaps." />
+              <Badge
+                variant={
+                  palDriftProbe?.outcome === "pass"
+                    ? palDriftProbe.data?.mismatchCount &&
+                      palDriftProbe.data.mismatchCount > 0
+                      ? "warning"
+                      : "success"
+                    : palDriftProbe?.outcome === "unauthorized"
+                      ? "warning"
+                      : palDriftProbe?.outcome === "fail" ||
+                          palDriftProbe?.outcome === "unknown"
+                        ? "destructive"
+                        : "outline"
+                }
+                className="ml-auto text-2xs"
+              >
+                {palDriftBusy ? (
+                  <span className="flex items-center gap-1">
+                    <Loader2 className="h-3 w-3 animate-spin motion-reduce:animate-none" />
+                    Running
+                  </span>
+                ) : palDriftProbe ? (
+                  outcomeBadge(palDriftProbe.outcome).label
+                ) : (
+                  "Not run"
+                )}
+              </Badge>
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                className="h-6 px-2 text-2xs"
+                onClick={() => void runPalDriftProbe()}
+                loading={palDriftBusy}
+                disabled={!account}
+                aria-label={
+                  palDriftProbe
+                    ? "Re-run PAL drift probe"
+                    : "Run PAL drift probe"
+                }
+              >
+                {palDriftProbe ? "Re-run" : "Run"}
+              </Button>
+            </div>
+            {palDriftProbe?.outcome === "pass" && palDriftProbe.data && (
+              <div className="flex flex-col gap-1.5">
+                <div className="grid grid-cols-3 gap-2 text-2xs">
+                  <span className="rounded border border-border/60 bg-card/40 px-2 py-1">
+                    <span className="block text-3xs font-semibold uppercase tracking-wider text-muted-foreground">
+                      Scanned
+                    </span>
+                    <span className="font-mono">
+                      {palDriftProbe.data.totalSubscriptions}
+                    </span>
+                  </span>
+                  <span
+                    className={cn(
+                      "rounded border border-border/60 bg-card/40 px-2 py-1",
+                      palDriftProbe.data.mismatchCount > 0 &&
+                        "border-warning/40 bg-warning/10",
+                    )}
+                  >
+                    <span className="block text-3xs font-semibold uppercase tracking-wider text-muted-foreground">
+                      Mismatched
+                    </span>
+                    <span className="font-mono">
+                      {palDriftProbe.data.mismatchCount}
+                    </span>
+                  </span>
+                  <span className="rounded border border-border/60 bg-card/40 px-2 py-1">
+                    <span className="block text-3xs font-semibold uppercase tracking-wider text-muted-foreground">
+                      No-PAL
+                    </span>
+                    <span className="font-mono">
+                      {palDriftProbe.data.noPalCount}
+                    </span>
+                  </span>
+                </div>
+                {!trimmedPreferredMpn && (
+                  <div className="text-3xs text-muted-foreground">
+                    Set a preferred MPN above to enable the mismatch
+                    check; without one only no-PAL subs are flagged.
+                  </div>
+                )}
+                {palDriftProbe.data.rows.length > 0 && (
+                  <details className="text-2xs">
+                    <summary className="cursor-pointer select-none text-muted-foreground hover:text-foreground">
+                      Show {palDriftProbe.data.rows.length} subscription
+                      {palDriftProbe.data.rows.length === 1 ? "" : "s"}
+                    </summary>
+                    <div className="mt-1 flex flex-col gap-1">
+                      {palDriftProbe.data.rows
+                        .filter((r: SubscriptionPalRow) =>
+                          showMismatchedOnly
+                            ? r.mismatch
+                            : true,
+                        )
+                        .map((r: SubscriptionPalRow) => (
+                          <div
+                            key={r.subscriptionId}
+                            className={cn(
+                              "group/copy flex flex-wrap items-center gap-1.5 rounded border border-border/60 bg-card/40 px-2 py-1",
+                              r.mismatch && "border-warning/40",
+                              r.noPal && "border-destructive/30",
+                            )}
+                          >
+                            <span className="font-semibold">
+                              {r.displayName}
+                            </span>
+                            <CopyableText
+                              value={r.subscriptionId}
+                              mono
+                              display={
+                                <code className="font-mono">
+                                  {truncateMiddle(r.subscriptionId, 6, 4)}
+                                </code>
+                              }
+                              ariaLabel={`Copy subscription id ${r.subscriptionId}`}
+                              alwaysVisibleButton
+                            />
+                            <Badge variant="outline" className="text-3xs">
+                              {r.state}
+                            </Badge>
+                            {r.palPartnerId ? (
+                              <span className="ml-auto inline-flex items-center gap-1 text-3xs text-muted-foreground">
+                                PAL:{" "}
+                                <CopyableText
+                                  value={r.palPartnerId}
+                                  mono
+                                  alwaysVisibleButton
+                                />
+                              </span>
+                            ) : (
+                              <span className="ml-auto text-3xs text-destructive">
+                                no PAL
+                              </span>
+                            )}
+                            {r.mismatch && (
+                              <Badge variant="warning" className="text-3xs">
+                                ≠ preferred
+                              </Badge>
+                            )}
+                          </div>
+                        ))}
+                    </div>
+                  </details>
+                )}
+              </div>
+            )}
+            {palDriftProbe &&
+              palDriftProbe.outcome !== "pass" &&
+              palDriftProbe.summary && (
+                <div className="text-2xs text-muted-foreground">
+                  {palDriftProbe.summary}
+                  {palDriftProbe.detail && (
+                    <span className="ml-1 opacity-70">
+                      · {palDriftProbe.detail.slice(0, 160)}
+                    </span>
+                  )}
+                </div>
+              )}
+          </div>
+        </CardContent>
+      </Card>
+
+      {/* ─────────────────────────────────────────────────────────────────
+          Bulk CSP-customer probe + 60d stale-customer panel.
+
+          The CSP probe above samples up to 5 customer ids. This panel
+          drives a per-customer sweep over the whole sample (rate-limited
+          one-at-a-time so we don't tip Partner Center's throttle) and
+          stamps each customer's last-probe timestamp into the session
+          ledger. The 60d threshold mirrors the corpus' "dormant MSP
+          relationship" guidance — anything we haven't touched in two
+          months is the first place to look during an audit.
+          ───────────────────────────────────────────────────────────── */}
+      {probes.csp?.outcome === "pass" &&
+        (probes.csp.data as CspCustomerSummary | null | undefined)
+          ?.sample &&
+        ((probes.csp.data as CspCustomerSummary).sample.length > 0) && (
+          <Card className="border-border bg-card shadow-sm">
+            <CardHeader className="pb-3">
+              <CardTitle className="flex items-center gap-2 text-sm font-semibold">
+                <Users className="h-4 w-4 text-primary" aria-hidden />
+                CSP customer sweep
+                <InfoTooltip content="Iterates the CSP customer sample one-by-one (rate-limited) and stamps each customer's last-probe time. The 60-day staleness panel flags customers in a dormant MSP relationship — the classic supply-chain pivot per _bypass_tenant_switch.md §6.3." />
+              </CardTitle>
+              <CardDescription>
+                Walks the CSP customer sample so the operator can
+                audit relationship health without leaving the page.
+                Stale (&gt;60d unprobed) customers are flagged
+                separately.
+              </CardDescription>
+            </CardHeader>
+            <CardContent className="flex flex-col gap-3">
+              <div className="flex flex-wrap items-center gap-2">
+                <Button
+                  type="button"
+                  variant="default"
+                  size="sm"
+                  onClick={() => void runBulkCustomerProbe()}
+                  loading={bulkBusy}
+                  disabled={!account || bulkBusy}
+                  aria-label="Probe each CSP customer in sequence"
+                >
+                  <Search className="h-3.5 w-3.5" />
+                  Probe all customers
+                </Button>
+                {bulkBusy && (
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="sm"
+                    onClick={cancelBulkProbe}
+                    aria-label="Stop bulk customer probe"
+                  >
+                    <StopCircle className="h-3.5 w-3.5" />
+                    Stop
+                  </Button>
+                )}
+                {bulkTotal > 0 && (
+                  <span className="text-2xs text-muted-foreground">
+                    {bulkDone} / {bulkTotal}
+                    {bulkRows.length > 0 &&
+                      ` · ${bulkRows.filter((r) => r.outcome === "pass").length} ok`}
+                  </span>
+                )}
+              </div>
+              {bulkBusy && bulkTotal > 0 && (
+                <Progress
+                  value={Math.round((bulkDone / bulkTotal) * 100)}
+                  aria-label="Bulk customer probe progress"
+                />
+              )}
+              {bulkRows.length > 0 && (
+                <ExportMenu<CustomerMatrixRow>
+                  rows={bulkRows}
+                  columns={[
+                    { header: "Customer ID", accessor: (r) => r.customerId },
+                    {
+                      header: "Company",
+                      accessor: (r) => r.companyName ?? "",
+                    },
+                    { header: "Domain", accessor: (r) => r.domain ?? "" },
+                    { header: "Outcome", accessor: (r) => r.outcome },
+                    { header: "Error", accessor: (r) => r.error ?? "" },
+                  ]}
+                  filename="partner-center-customer-matrix"
+                  jsonMetadata={{
+                    tenantId:
+                      getActiveTenantIdForSelected() ??
+                      account?.tenantId ??
+                      null,
+                    preferredMpn: trimmedPreferredMpn || null,
+                    scannedAt: new Date().toISOString(),
+                  }}
+                  rowCount={bulkRows.length}
+                  label="Export matrix"
+                />
+              )}
+              {bulkRows.length > 0 && (
+                <details className="text-2xs">
+                  <summary className="cursor-pointer select-none text-muted-foreground hover:text-foreground">
+                    Show {bulkRows.length} customer
+                    {bulkRows.length === 1 ? "" : "s"}
+                  </summary>
+                  <div className="mt-1 flex flex-col gap-1">
+                    {bulkRows.map((r) => (
+                      <div
+                        key={r.customerId}
+                        className={cn(
+                          "group/copy flex flex-wrap items-center gap-1.5 rounded border border-border/60 bg-card/40 px-2 py-1",
+                          r.outcome === "fail" && "border-destructive/30",
+                          r.outcome === "unauthorized" && "border-warning/40",
+                        )}
+                      >
+                        <span className="font-semibold">
+                          {r.companyName || "(unknown)"}
+                        </span>
+                        <CopyableText
+                          value={r.customerId}
+                          mono
+                          display={
+                            <code className="font-mono">
+                              {truncateMiddle(r.customerId, 6, 4)}
+                            </code>
+                          }
+                          ariaLabel={`Copy customer id ${r.customerId}`}
+                          alwaysVisibleButton
+                        />
+                        {r.domain && (
+                          <span className="text-3xs text-muted-foreground">
+                            {r.domain}
+                          </span>
+                        )}
+                        <Badge
+                          variant={
+                            r.outcome === "pass"
+                              ? "success"
+                              : r.outcome === "unauthorized"
+                                ? "warning"
+                                : r.outcome === "fail"
+                                  ? "destructive"
+                                  : "outline"
+                          }
+                          className="ml-auto text-3xs"
+                        >
+                          {r.outcome}
+                        </Badge>
+                        {r.error && (
+                          <span className="text-3xs text-destructive">
+                            {r.error}
+                          </span>
+                        )}
+                      </div>
+                    ))}
+                  </div>
+                </details>
+              )}
+              {staleCustomers.length > 0 && (
+                <div className="flex flex-col gap-1 rounded-md border border-warning/40 bg-warning/10 px-2.5 py-2 text-2xs">
+                  <div className="flex items-center gap-1.5 font-semibold text-warning">
+                    <Clock className="h-3 w-3" aria-hidden />
+                    {staleCustomers.length} customer
+                    {staleCustomers.length === 1 ? " has" : "s have"} not
+                    been probed in &gt;60d
+                  </div>
+                  <div className="flex flex-wrap gap-1">
+                    {staleCustomers.slice(0, 10).map((e) => (
+                      <span
+                        key={e.id}
+                        className="group/copy inline-flex items-center gap-1 rounded border border-warning/40 bg-card/40 px-1.5 py-0.5"
+                      >
+                        <code className="font-mono">
+                          {truncateMiddle(e.id, 6, 4)}
+                        </code>
+                        <CopyButton
+                          value={e.id}
+                          ariaLabel={`Copy customer id ${e.id}`}
+                        />
+                        <span className="text-3xs text-muted-foreground">
+                          {e.lastProbedMs
+                            ? new Date(e.lastProbedMs).toLocaleDateString()
+                            : "never"}
+                        </span>
+                      </span>
+                    ))}
+                    {staleCustomers.length > 10 && (
+                      <span className="text-3xs text-muted-foreground">
+                        +{staleCustomers.length - 10} more
+                      </span>
+                    )}
+                  </div>
+                </div>
+              )}
+            </CardContent>
+          </Card>
+        )}
 
       <Card className="border-border bg-card shadow-sm">
         <CardHeader className="pb-3">
@@ -1774,6 +2730,14 @@ const KeyboardHintBadge: React.FC = () => {
                 {mod}+L
               </kbd>{" "}
               Focus Partner ID input
+            </li>
+            <li>
+              <kbd className="rounded border px-1 py-0.5 text-3xs">r</kbd>{" "}
+              Run / re-run probes (retry-failed first)
+            </li>
+            <li>
+              <kbd className="rounded border px-1 py-0.5 text-3xs">/</kbd>{" "}
+              Focus Partner ID (search)
             </li>
           </ul>
         </div>

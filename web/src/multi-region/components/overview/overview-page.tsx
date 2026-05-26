@@ -36,14 +36,19 @@ import {
   EyeOff,
   HardDrive,
   Layers,
+  ListChecks,
   Loader2,
   LogIn,
+  Maximize2,
+  Minimize2,
   Minus,
   PiggyBank,
   Plus,
   RefreshCw,
   Search,
   Server,
+  Settings2,
+  ShieldAlert,
   TrendingDown,
   TrendingUp,
   X,
@@ -74,7 +79,7 @@ import { useArmToken } from "../../auth/use-arm-token";
 import { usePersistedState } from "../../hooks/use-persisted-state";
 import { useShortcut } from "../../hooks/use-shortcut";
 import { useUrlState } from "../../hooks/use-url-state";
-import { auditLog } from "../../services/audit-log";
+import { auditLog, type AuditEntry } from "../../services/audit-log";
 import { MultiRegionStore } from "../../store/multi-region-store";
 import {
   useDashboardStats,
@@ -234,6 +239,16 @@ interface StatCardProps {
   sparkData?: number[];
   /** Optional tone override for the sparkline (defaults to the card tone). */
   sparkTone?: SparklineTone;
+  /**
+   * Quick-filter shortcut: when `failedCount > 0`, render a secondary
+   * "View N failed" link inside the card. Clicking it stops propagation
+   * (so the whole-card `onClick` doesn't double-fire) and invokes
+   * `onFilterFailed`, which the parent uses to deep-link into the
+   * destination page with `?status=failed`.
+   */
+  onFilterFailed?: () => void;
+  /** Count of failed items used for the "View N failed" link label. */
+  failedCount?: number;
 }
 
 const StatCard: React.FC<StatCardProps> = ({
@@ -250,6 +265,8 @@ const StatCard: React.FC<StatCardProps> = ({
   goodDirection = "up",
   sparkData,
   sparkTone,
+  onFilterFailed,
+  failedCount = 0,
 }) => {
   const headingId = `${id}-heading`;
   const total =
@@ -442,6 +459,31 @@ const StatCard: React.FC<StatCardProps> = ({
           </div>
         ))}
       </div>
+      {onFilterFailed && failedCount > 0 && (
+        <button
+          type="button"
+          // Stop propagation so the outer Card's onClick (whole-card
+          // navigate-to-detail) doesn't also fire — we want the filtered
+          // deep-link, not the default landing page.
+          onClick={(e) => {
+            e.stopPropagation();
+            onFilterFailed();
+          }}
+          onKeyDown={(e) => {
+            if (e.key === "Enter" || e.key === " ") {
+              e.stopPropagation();
+            }
+          }}
+          className={cn(
+            "mt-2 inline-flex items-center gap-1 self-start rounded px-1.5 py-0.5 text-2xs font-medium",
+            TONE_CLASSES.destructive.text,
+            "hover:bg-destructive/10 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring",
+          )}
+          aria-label={`Open ${title} filtered to ${failedCount} failed`}
+        >
+          View {failedCount} failed →
+        </button>
+      )}
     </Card>
   );
 };
@@ -806,21 +848,36 @@ function formatLogTime(ts: string | undefined): string {
 interface RecentActivityProps {
   collapsed: boolean;
   onToggleCollapsed: () => void;
+  /** Click-through into the audit-log page; passed so the unified feed can
+   *  deep-link each audit row instead of just dumping text. */
+  onOpenAuditAction: (actionKey: string) => void;
 }
 
 const RecentActivity: React.FC<RecentActivityProps> = ({
   collapsed,
   onToggleCollapsed,
+  onOpenAuditAction,
 }) => {
   const state = useMultiRegionState();
   const recentLogs = React.useMemo(
     () => state.agentLogs.slice(-8),
     [state.agentLogs],
   );
+  // Last-10 audit entries — clickable rows deep-link into the audit-log
+  // page filtered to that action. Reading directly from `state.auditEntries`
+  // means any `auditLog.record(...)` from any page reactively shows here.
+  const recentAudit = React.useMemo(
+    () => (state.auditEntries ?? []).slice(-10).reverse(),
+    [state.auditEntries],
+  );
 
   const errorCount = React.useMemo(
     () => recentLogs.filter((l) => l.level === "error").length,
     [recentLogs],
+  );
+  const auditFailureCount = React.useMemo(
+    () => recentAudit.filter((e) => e.status === "failure").length,
+    [recentAudit],
   );
 
   return (
@@ -857,48 +914,119 @@ const RecentActivity: React.FC<RecentActivityProps> = ({
               {errorCount} err
             </span>
           )}
+          {auditFailureCount > 0 && (
+            <span
+              className={cn(
+                "ml-1 rounded-full px-1.5 py-0.5 text-3xs font-semibold uppercase tracking-wider",
+                TONE_CLASSES.warning.bgSubtle,
+                TONE_CLASSES.warning.text,
+              )}
+              aria-label={`${auditFailureCount} recent audit failure${auditFailureCount === 1 ? "" : "s"}`}
+            >
+              {auditFailureCount} audit fail
+            </span>
+          )}
         </button>
-        {recentLogs.length > 0 && (
+        {(recentLogs.length > 0 || recentAudit.length > 0) && (
           <span className="text-2xs text-muted-foreground">
-            Last {recentLogs.length} event{recentLogs.length === 1 ? "" : "s"}
+            {recentAudit.length > 0
+              ? `Last ${recentAudit.length} audit · ${recentLogs.length} agent`
+              : `Last ${recentLogs.length} event${recentLogs.length === 1 ? "" : "s"}`}
           </span>
         )}
       </div>
       {!collapsed && (
-        <div id="recent-activity-body">
-          {recentLogs.length === 0 ? (
+        <div id="recent-activity-body" className="flex flex-col gap-3">
+          {/* Audit feed — click-to-page deep links. Newest first. Empty
+              when no operator action has been audited; the agent log below
+              still surfaces non-audit telemetry. */}
+          {recentAudit.length > 0 && (
+            <div>
+              <p className="m-0 mb-1 text-2xs font-semibold uppercase tracking-wider text-muted-foreground">
+                Audit trail
+              </p>
+              <ul className="m-0 flex list-none flex-col gap-0.5 p-0">
+                {recentAudit.map((e) => (
+                  <li key={e.id}>
+                    <button
+                      type="button"
+                      onClick={() => onOpenAuditAction(e.action)}
+                      className={cn(
+                        "flex w-full items-baseline gap-2 rounded px-1.5 py-1 text-left text-xs hover:bg-accent/40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring",
+                        e.status === "failure" && "text-destructive",
+                      )}
+                      aria-label={`Open audit log filtered to ${e.action}`}
+                    >
+                      <span className="min-w-[60px] font-mono text-2xs text-muted-foreground/70 tabular-nums">
+                        {formatLogTime(e.timestamp)}
+                      </span>
+                      <StatusBadge
+                        status={e.status === "failure" ? "error" : "success"}
+                      />
+                      <span className="font-mono text-2xs text-muted-foreground">
+                        {e.action}
+                      </span>
+                      <span
+                        className={cn(
+                          "flex-1 overflow-hidden text-ellipsis whitespace-nowrap text-xs",
+                          e.status === "failure"
+                            ? "text-destructive"
+                            : "text-foreground/80",
+                        )}
+                      >
+                        {e.target}
+                      </span>
+                      <ChevronRight
+                        className="h-3 w-3 shrink-0 text-muted-foreground/50"
+                        aria-hidden
+                      />
+                    </button>
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
+
+          {/* Agent log — unchanged from wave 1, kept below the audit feed
+              so the high-signal audit entries get visual priority. */}
+          {recentLogs.length === 0 && recentAudit.length === 0 ? (
             <p className="m-0 text-xs text-muted-foreground">
               No activity yet. Trigger a refresh to begin populating events.
             </p>
-          ) : (
-            <HoverList
-              items={recentLogs}
-              getKey={(log, i) => `${log.timestamp}-${i}`}
-              tone="primary"
-              className="gap-1.5"
-              renderItem={(log) => (
-                <div className="flex items-baseline gap-2 text-xs">
-                  <span className="min-w-[60px] font-mono text-2xs text-muted-foreground/70 tabular-nums">
-                    {formatLogTime(log.timestamp)}
-                  </span>
-                  <StatusBadge status={log.level} />
-                  <span className="text-xs text-muted-foreground">
-                    [{log.agent}]
-                  </span>
-                  <span
-                    className={cn(
-                      "flex-1 overflow-hidden text-ellipsis whitespace-nowrap",
-                      log.level === "error"
-                        ? "text-destructive"
-                        : "text-foreground/80",
-                    )}
-                  >
-                    {log.message}
-                  </span>
-                </div>
-              )}
-            />
-          )}
+          ) : recentLogs.length > 0 ? (
+            <div>
+              <p className="m-0 mb-1 text-2xs font-semibold uppercase tracking-wider text-muted-foreground">
+                Agent log
+              </p>
+              <HoverList
+                items={recentLogs}
+                getKey={(log, i) => `${log.timestamp}-${i}`}
+                tone="primary"
+                className="gap-1.5"
+                renderItem={(log) => (
+                  <div className="flex items-baseline gap-2 text-xs">
+                    <span className="min-w-[60px] font-mono text-2xs text-muted-foreground/70 tabular-nums">
+                      {formatLogTime(log.timestamp)}
+                    </span>
+                    <StatusBadge status={log.level} />
+                    <span className="text-xs text-muted-foreground">
+                      [{log.agent}]
+                    </span>
+                    <span
+                      className={cn(
+                        "flex-1 overflow-hidden text-ellipsis whitespace-nowrap",
+                        log.level === "error"
+                          ? "text-destructive"
+                          : "text-foreground/80",
+                      )}
+                    >
+                      {log.message}
+                    </span>
+                  </div>
+                )}
+              />
+            </div>
+          ) : null}
         </div>
       )}
     </Card>
@@ -1968,6 +2096,559 @@ const UnusedQuotaSection: React.FC<UnusedQuotaSectionProps> = ({
 };
 
 // ---------------------------------------------------------------------------
+// Defender Posture Summary — corpus-grounded "Today's signals"
+// ---------------------------------------------------------------------------
+//
+// Surfaces counts of audit entries (last 24h) whose `action` matches one of
+// the ten high-risk operator events catalogued in the corpus playbook:
+//
+//   New folder\_AZURE_BYPASS_PLAYBOOK.md  §"Critical Defender Audit Surface"
+//
+// Each row reads from `state.auditEntries` (single source — bound to the
+// audit-log singleton at app boot, so any `auditLog.record(...)` from any
+// page is reactive here). Clicking a row deep-links into the audit-log page
+// with `?action=<key>` so the operator can immediately inspect the matched
+// rows — this is the missing "today's defender posture summary" gap. The
+// match is **prefix / substring** on `action`, NOT an exact equal, so the
+// existing varied action strings (e.g.
+// `auto_create_pools_from_quota:start`, `update_ca_policy_disable`,
+// `delete_diagnostic_setting`, `cancel_subscription`) line up with the
+// corpus ordering without forcing rename of every audit call site.
+
+interface DefenderSignal {
+  /** Stable id used in the deep-link `?action=` query. */
+  key: string;
+  /** Operator-readable label. */
+  label: string;
+  /** Severity ordinal from the playbook (1 = highest priority). */
+  rank: number;
+  /** Substrings to match against `AuditEntry.action`, case-insensitive. */
+  match: string[];
+}
+
+const DEFENDER_SIGNALS: DefenderSignal[] = [
+  {
+    key: "set_domain_authentication",
+    label: "Federated domain change",
+    rank: 1,
+    match: ["set_domain_authentication", "federated_domain", "set domain"],
+  },
+  {
+    key: "update_ca_policy",
+    label: "Conditional access policy change",
+    rank: 2,
+    match: [
+      "update_conditional_access",
+      "ca_policy",
+      "conditional_access_policy",
+      "update conditional access",
+    ],
+  },
+  {
+    key: "issue_tap",
+    label: "Temporary access pass issued",
+    rank: 3,
+    match: ["issue_temporary_access", "temporary_access_pass", "issue tap"],
+  },
+  {
+    key: "add_sp_app_role",
+    label: "App role granted to service principal",
+    rank: 4,
+    match: [
+      "add_app_role_assignment",
+      "app_role_assignment_to_service_principal",
+      "grant_app_role",
+    ],
+  },
+  {
+    key: "add_app_secret",
+    label: "App credential added (secret / cert)",
+    rank: 5,
+    match: [
+      "add_application_password",
+      "add_application_key",
+      "addpassword",
+      "addkey",
+      "application_credential_added",
+    ],
+  },
+  {
+    key: "add_federated_credential",
+    label: "Federated identity credential added",
+    rank: 6,
+    match: ["federatedidentitycredential", "federated_identity_credential"],
+  },
+  {
+    key: "pim_eligibility",
+    label: "PIM eligibility created",
+    rank: 7,
+    match: ["roleeligibilityschedule", "pim_eligibility", "pim_create"],
+  },
+  {
+    key: "delete_diagnostic_setting",
+    label: "Diagnostic setting deleted",
+    rank: 8,
+    match: ["delete_diagnostic_setting", "diagnostic_setting_delete"],
+  },
+  {
+    key: "hard_delete_user",
+    label: "User hard-deleted",
+    rank: 9,
+    match: ["hard_delete_user", "hard delete user", "permanently_delete_user"],
+  },
+  {
+    key: "cancel_subscription",
+    label: "Subscription cancelled",
+    rank: 10,
+    match: ["cancel_subscription", "subscription_cancel"],
+  },
+];
+
+const TWENTY_FOUR_HOURS_MS = 24 * 60 * 60 * 1000;
+
+function matchesDefenderSignal(action: string, signal: DefenderSignal): boolean {
+  const lower = action.toLowerCase();
+  return signal.match.some((needle) => lower.includes(needle));
+}
+
+interface DefenderPostureRow extends DefenderSignal {
+  count: number;
+  failures: number;
+}
+
+interface DefenderPostureSummaryProps {
+  entries: AuditEntry[];
+  /** Deep-link into the audit-log page with the action filter applied. */
+  onOpenAuditLog: (actionKey: string) => void;
+}
+
+/**
+ * Compact card summarising defender posture against the 10 corpus events.
+ * Rows with zero matches in the last 24h render in muted tone; non-zero
+ * rows highlight via severity colour and become clickable.
+ */
+const DefenderPostureSummary: React.FC<DefenderPostureSummaryProps> = ({
+  entries,
+  onOpenAuditLog,
+}) => {
+  const rows = React.useMemo<DefenderPostureRow[]>(() => {
+    const cutoff = Date.now() - TWENTY_FOUR_HOURS_MS;
+    const recent = entries.filter((e) => {
+      const t = Date.parse(e.timestamp);
+      return Number.isFinite(t) && t >= cutoff;
+    });
+    return DEFENDER_SIGNALS.map((sig) => {
+      let count = 0;
+      let failures = 0;
+      for (const e of recent) {
+        if (matchesDefenderSignal(e.action, sig)) {
+          count += 1;
+          if (e.status === "failure") failures += 1;
+        }
+      }
+      return { ...sig, count, failures };
+    });
+  }, [entries]);
+
+  const totalHits = rows.reduce((s, r) => s + r.count, 0);
+  const topHits = rows.filter((r) => r.count > 0);
+  const overallTone: Tone =
+    totalHits === 0
+      ? "success"
+      : topHits.some((r) => r.rank <= 3)
+        ? "destructive"
+        : "warning";
+  const toneClasses = TONE_CLASSES[overallTone];
+
+  return (
+    <Card
+      role="region"
+      aria-labelledby="defender-posture-heading"
+      className={cn(
+        "border-l-4 bg-card p-4",
+        toneClasses.borderTop.replace("border-t-", "border-l-"),
+      )}
+    >
+      <div className="mb-3 flex flex-wrap items-baseline justify-between gap-2">
+        <div className="flex items-baseline gap-2">
+          <h2
+            id="defender-posture-heading"
+            className="m-0 flex items-baseline gap-1.5 text-base font-semibold text-foreground"
+          >
+            <ShieldAlert
+              className={cn("h-3.5 w-3.5 self-center", toneClasses.text)}
+              aria-hidden
+            />
+            Today&apos;s Defender Signals
+          </h2>
+          <InfoTooltip
+            content="Counts last-24h audit entries against the 10 highest-priority operator events from the offensive-tooling research corpus (New folder/_AZURE_BYPASS_PLAYBOOK.md §Critical Defender Audit Surface). Click a non-zero row to open the audit log filtered to that action."
+            ariaLabel="What are defender signals?"
+            size={12}
+          />
+          <span
+            className={cn(
+              "rounded-full px-2 py-0.5 text-2xs font-semibold uppercase tracking-wider",
+              toneClasses.bgSubtle,
+              toneClasses.text,
+            )}
+            aria-label={`${totalHits} signals in the last 24 hours`}
+          >
+            {totalHits === 0 ? "Quiet" : `${totalHits} hit${totalHits === 1 ? "" : "s"}`}
+          </span>
+        </div>
+        <span className="text-2xs text-muted-foreground">
+          Last 24h · ranked by corpus severity
+        </span>
+      </div>
+      {totalHits === 0 ? (
+        <p className="m-0 text-2xs text-muted-foreground">
+          No corpus-matched audit events in the last 24h. This is the
+          truthful answer when no operator actions of interest have fired —
+          source-of-truth lives in `state.auditEntries`.
+        </p>
+      ) : (
+        <ul
+          className="m-0 grid list-none gap-1 p-0 sm:grid-cols-2"
+          aria-label="Defender signal counts"
+        >
+          {rows
+            .slice()
+            .sort((a, b) => b.count - a.count || a.rank - b.rank)
+            .map((row) => {
+              const active = row.count > 0;
+              const tone: Tone =
+                row.failures > 0
+                  ? "destructive"
+                  : row.rank <= 3
+                    ? "warning"
+                    : "info";
+              const rowToneClasses = TONE_CLASSES[tone];
+              return (
+                <li key={row.key}>
+                  <button
+                    type="button"
+                    onClick={() => active && onOpenAuditLog(row.key)}
+                    disabled={!active}
+                    className={cn(
+                      "flex w-full items-center justify-between gap-2 rounded-md border px-2 py-1.5 text-left transition-colors duration-fast",
+                      active
+                        ? cn(
+                            rowToneClasses.border,
+                            rowToneClasses.bgSubtle,
+                            "hover:brightness-110 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring",
+                          )
+                        : "border-border/40 bg-card/30 text-muted-foreground/70 cursor-default",
+                    )}
+                    aria-label={
+                      active
+                        ? `${row.count} ${row.label} event${row.count === 1 ? "" : "s"} — click to open audit log`
+                        : `No ${row.label} events in the last 24h`
+                    }
+                  >
+                    <span className="flex items-center gap-1.5">
+                      <span
+                        className={cn(
+                          "inline-flex h-4 w-4 items-center justify-center rounded-full text-3xs font-bold tabular-nums",
+                          active
+                            ? cn(rowToneClasses.bg, "text-white")
+                            : "bg-muted text-muted-foreground/60",
+                        )}
+                        aria-hidden
+                      >
+                        {row.rank}
+                      </span>
+                      <span
+                        className={cn(
+                          "text-xs",
+                          active ? "text-foreground" : "text-muted-foreground/70",
+                        )}
+                      >
+                        {row.label}
+                      </span>
+                    </span>
+                    <span className="flex items-center gap-2 text-2xs tabular-nums">
+                      {row.failures > 0 && (
+                        <span className={TONE_CLASSES.destructive.text}>
+                          {row.failures} fail
+                        </span>
+                      )}
+                      <span
+                        className={cn(
+                          "font-semibold",
+                          active ? rowToneClasses.text : "text-muted-foreground/50",
+                        )}
+                      >
+                        {row.count}
+                      </span>
+                    </span>
+                  </button>
+                </li>
+              );
+            })}
+        </ul>
+      )}
+    </Card>
+  );
+};
+
+// ---------------------------------------------------------------------------
+// Suggested Next Actions — heuristics derived from store state
+// ---------------------------------------------------------------------------
+//
+// Static heuristics — no remote calls — that surface the most actionable
+// page based on the *current* store snapshot. Re-evaluates whenever the
+// inputs (failed counts, stale account ages, defender hits) change. Each
+// suggestion is a (label, rationale, target PageKey) triple — clicking
+// navigates via the same `navTo` helper the rest of the page uses, so the
+// suggestion always lands on a page wired into the router.
+
+interface SuggestionRow {
+  id: string;
+  label: string;
+  rationale: string;
+  target: PageKey;
+  /** When set, button tone shifts and the icon is the alert variant. */
+  urgency: "low" | "medium" | "high";
+}
+
+interface SuggestedActionsProps {
+  suggestions: SuggestionRow[];
+  onNavigate: (key: PageKey) => void;
+}
+
+const SuggestedActions: React.FC<SuggestedActionsProps> = ({
+  suggestions,
+  onNavigate,
+}) => {
+  if (suggestions.length === 0) return null;
+  return (
+    <Card
+      role="region"
+      aria-labelledby="suggested-actions-heading"
+      className="border-l-4 border-l-primary/60 bg-card p-4"
+    >
+      <div className="mb-2 flex items-baseline gap-2">
+        <ListChecks
+          className="h-3.5 w-3.5 self-center text-primary"
+          aria-hidden
+        />
+        <h2
+          id="suggested-actions-heading"
+          className="m-0 text-base font-semibold text-foreground"
+        >
+          Suggested Next Actions
+        </h2>
+        <span className="text-2xs text-muted-foreground">
+          {suggestions.length} suggestion
+          {suggestions.length === 1 ? "" : "s"} from current state
+        </span>
+      </div>
+      <ul className="m-0 flex list-none flex-col gap-1.5 p-0">
+        {suggestions.map((s) => {
+          const tone: Tone =
+            s.urgency === "high"
+              ? "destructive"
+              : s.urgency === "medium"
+                ? "warning"
+                : "primary";
+          const tc = TONE_CLASSES[tone];
+          return (
+            <li key={s.id}>
+              <button
+                type="button"
+                onClick={() => onNavigate(s.target)}
+                className={cn(
+                  "flex w-full items-start justify-between gap-2 rounded-md border px-2 py-1.5 text-left transition-colors duration-fast",
+                  tc.border,
+                  tc.bgSubtle,
+                  "hover:brightness-110 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring",
+                )}
+                aria-label={`${s.label} — ${s.rationale}`}
+              >
+                <span className="flex flex-col gap-0.5">
+                  <span className={cn("text-xs font-semibold", tc.text)}>
+                    {s.label}
+                  </span>
+                  <span className="text-2xs text-muted-foreground">
+                    {s.rationale}
+                  </span>
+                </span>
+                <ChevronRight
+                  className="h-3.5 w-3.5 shrink-0 self-center text-muted-foreground"
+                  aria-hidden
+                />
+              </button>
+            </li>
+          );
+        })}
+      </ul>
+    </Card>
+  );
+};
+
+// ---------------------------------------------------------------------------
+// Widget visibility — operator-customizable dashboard sections
+// ---------------------------------------------------------------------------
+//
+// Backing store: `usePersistedState` envelope (versioned). Defaults to all
+// sections on; the customize popover lets the operator hide noisy panels
+// (e.g. defender posture in a dev tenant, or the agent strip when only
+// one agent is registered).
+
+const WIDGET_KEYS = [
+  "defender",
+  "suggestions",
+  "kpis",
+  "quotaSummary",
+  "clusterHealth",
+  "regionHealth",
+  "unusedQuota",
+  "agents",
+  "quickActions",
+  "recentActivity",
+] as const;
+type WidgetKey = (typeof WIDGET_KEYS)[number];
+
+const WIDGET_LABEL: Record<WidgetKey, string> = {
+  defender: "Defender signals",
+  suggestions: "Suggested actions",
+  kpis: "KPI cards",
+  quotaSummary: "Per-account quota summary",
+  clusterHealth: "Cluster health",
+  regionHealth: "Region health",
+  unusedQuota: "Unused quota",
+  agents: "Agent status",
+  quickActions: "Quick actions",
+  recentActivity: "Recent activity",
+};
+
+type WidgetVisibility = Record<WidgetKey, boolean>;
+
+const DEFAULT_WIDGET_VISIBILITY: WidgetVisibility = WIDGET_KEYS.reduce(
+  (acc, k) => {
+    acc[k] = true;
+    return acc;
+  },
+  {} as WidgetVisibility,
+);
+
+interface WidgetCustomizerProps {
+  visibility: WidgetVisibility;
+  onToggle: (key: WidgetKey) => void;
+  onResetAll: () => void;
+  density: DashboardDensity;
+  onDensityChange: (d: DashboardDensity) => void;
+}
+
+type DashboardDensity = "comfortable" | "compact";
+
+const WidgetCustomizer: React.FC<WidgetCustomizerProps> = ({
+  visibility,
+  onToggle,
+  onResetAll,
+  density,
+  onDensityChange,
+}) => {
+  const [open, setOpen] = React.useState(false);
+  const hiddenCount = WIDGET_KEYS.filter((k) => !visibility[k]).length;
+  return (
+    <div className="relative">
+      <Button
+        variant="ghost"
+        size="sm"
+        onClick={() => setOpen((v) => !v)}
+        aria-expanded={open}
+        aria-haspopup="true"
+        aria-label="Customize visible dashboard sections"
+        className="text-2xs"
+      >
+        <Settings2 className="h-3.5 w-3.5" aria-hidden />
+        Customize
+        {hiddenCount > 0 && (
+          <span className="ml-1 rounded-full bg-muted px-1.5 py-0 text-3xs font-semibold text-muted-foreground tabular-nums">
+            {hiddenCount} hidden
+          </span>
+        )}
+      </Button>
+      {open && (
+        <>
+          <button
+            type="button"
+            aria-label="Close customize panel"
+            className="fixed inset-0 z-30 cursor-default bg-transparent"
+            onClick={() => setOpen(false)}
+          />
+          <div
+            role="dialog"
+            aria-label="Customize dashboard"
+            className="absolute right-0 top-full z-40 mt-1 w-64 rounded-md border bg-popover p-2 shadow-md"
+          >
+            <p className="m-0 mb-1 text-2xs font-semibold uppercase tracking-wider text-muted-foreground">
+              Visible sections
+            </p>
+            <ul className="m-0 flex list-none flex-col gap-0.5 p-0">
+              {WIDGET_KEYS.map((k) => (
+                <li key={k}>
+                  <label className="flex cursor-pointer items-center gap-2 rounded p-1 text-xs hover:bg-accent/40">
+                    <input
+                      type="checkbox"
+                      checked={visibility[k]}
+                      onChange={() => onToggle(k)}
+                      aria-label={`Toggle ${WIDGET_LABEL[k]}`}
+                      className="h-3.5 w-3.5 cursor-pointer accent-primary"
+                    />
+                    <span>{WIDGET_LABEL[k]}</span>
+                  </label>
+                </li>
+              ))}
+            </ul>
+            <hr className="my-2 border-border" />
+            <p className="m-0 mb-1 text-2xs font-semibold uppercase tracking-wider text-muted-foreground">
+              Density
+            </p>
+            <div className="flex gap-1">
+              <Button
+                type="button"
+                variant={density === "comfortable" ? "default" : "outline"}
+                size="sm"
+                onClick={() => onDensityChange("comfortable")}
+                className="flex-1 text-2xs"
+                aria-pressed={density === "comfortable"}
+              >
+                <Maximize2 className="h-3 w-3" aria-hidden />
+                Comfortable
+              </Button>
+              <Button
+                type="button"
+                variant={density === "compact" ? "default" : "outline"}
+                size="sm"
+                onClick={() => onDensityChange("compact")}
+                className="flex-1 text-2xs"
+                aria-pressed={density === "compact"}
+              >
+                <Minimize2 className="h-3 w-3" aria-hidden />
+                Compact
+              </Button>
+            </div>
+            <hr className="my-2 border-border" />
+            <Button
+              type="button"
+              variant="ghost"
+              size="sm"
+              onClick={onResetAll}
+              className="w-full text-2xs text-muted-foreground"
+            >
+              Reset all
+            </Button>
+          </div>
+        </>
+      )}
+    </div>
+  );
+};
+
+// ---------------------------------------------------------------------------
 // Main Overview Page
 // ---------------------------------------------------------------------------
 
@@ -2039,6 +2720,58 @@ const OverviewPageInner: React.FC<OverviewPageProps> = ({
     false,
     { version: 1 },
   );
+
+  // Persisted widget-visibility map — operator picks which sections appear
+  // on this dashboard. Versioned: the migrate adds new keys (with default =
+  // visible) as the WIDGET_KEYS list grows so a stored blob with fewer keys
+  // doesn't blank out a freshly-added widget.
+  const [widgetVisibility, setWidgetVisibility] = usePersistedState<WidgetVisibility>(
+    "overview.widgetVisibility",
+    DEFAULT_WIDGET_VISIBILITY,
+    {
+      version: 1,
+      migrate: (raw: unknown): WidgetVisibility => {
+        if (!raw || typeof raw !== "object") return DEFAULT_WIDGET_VISIBILITY;
+        const next: WidgetVisibility = { ...DEFAULT_WIDGET_VISIBILITY };
+        for (const k of WIDGET_KEYS) {
+          const v = (raw as Record<string, unknown>)[k];
+          if (typeof v === "boolean") next[k] = v;
+        }
+        return next;
+      },
+    },
+  );
+
+  // Persisted compact/comfortable density toggle. Applied via a wrapper
+  // class on the outermost div — section spacing tightens but per-row
+  // semantics are unchanged.
+  const [density, setDensity] = usePersistedState<DashboardDensity>(
+    "overview.density",
+    "comfortable",
+    {
+      version: 1,
+      migrate: (raw: unknown): DashboardDensity =>
+        raw === "compact" || raw === "comfortable"
+          ? (raw as DashboardDensity)
+          : "comfortable",
+    },
+  );
+
+  // ARIA-live announcement buffer — flipped on every successful auto-refresh
+  // so AT users hear "Dashboard refreshed" without having to inspect every
+  // KPI cell. Cleared after a tick so a repeat refresh re-fires.
+  const [liveAnnouncement, setLiveAnnouncement] = React.useState("");
+
+  const toggleWidget = React.useCallback(
+    (key: WidgetKey) => {
+      setWidgetVisibility((prev) => ({ ...prev, [key]: !prev[key] }));
+    },
+    [setWidgetVisibility],
+  );
+  const resetWidgets = React.useCallback(() => {
+    setWidgetVisibility(DEFAULT_WIDGET_VISIBILITY);
+    setDensity("comfortable");
+  }, [setWidgetVisibility, setDensity]);
 
   // Single URL-state bag — collapsing every flag into one record keeps the
   // url-state hook's effect dependency stable and the URL ordering tidy.
@@ -2209,6 +2942,90 @@ const OverviewPageInner: React.FC<OverviewPageProps> = ({
     sparkSeries.lpUsed,
   ]);
 
+  // Suggested next actions — purely derived from current store state. Each
+  // suggestion's urgency is a function of the failing population size; the
+  // list is capped at 4 rows to keep the panel scannable. Recomputes only
+  // when the source slices change so the operator doesn't see flicker on
+  // unrelated state churn (e.g. a notification toast).
+  const suggestions = React.useMemo<SuggestionRow[]>(() => {
+    const rows: SuggestionRow[] = [];
+    const failedAccounts = state.accounts.filter(
+      (a) => a.provisioningState === "failed",
+    ).length;
+    const failedPools = state.pools.filter(
+      (p) => p.provisioningState === "failed",
+    ).length;
+    // "Stale" here = MSAL session reported signed-out, OR status=error.
+    // The store no longer tracks a per-account "last refreshed" timestamp;
+    // `signedOut === true` is the canonical "needs re-login" signal (see
+    // store-types.ts:355) so we lean on that plus the `error` bucket.
+    const staleAccounts = (state.azureAccounts ?? []).filter(
+      (a) => a.signedOut === true || a.status === "error",
+    ).length;
+    // Critical: any failed pools — block on a pool delivers no compute.
+    if (failedPools > 0) {
+      rows.push({
+        id: "failed-pools",
+        label: `Resolve ${failedPools} failed pool${failedPools === 1 ? "" : "s"}`,
+        rationale:
+          "Provisioning is stuck — open Pool Info to retry or read per-row error detail.",
+        target: "pool-info",
+        urgency: "high",
+      });
+    }
+    if (failedAccounts > 0) {
+      rows.push({
+        id: "failed-accounts",
+        label: `Recover ${failedAccounts} failed account${failedAccounts === 1 ? "" : "s"}`,
+        rationale: "Batch account creation failed — see Accounts for ARM error.",
+        target: "accounts",
+        urgency: "high",
+      });
+    }
+    // Medium: signed-out / errored azure-accounts. Operator should re-auth.
+    if (staleAccounts > 0) {
+      rows.push({
+        id: "stale-azure-accounts",
+        label: `${staleAccounts} Azure account${staleAccounts === 1 ? "" : "s"} need re-auth`,
+        rationale:
+          "MSAL session lost or ARM/Graph call failed — open Azure Accounts to re-sign-in.",
+        target: "azure-accounts",
+        urgency: "medium",
+      });
+    }
+    // Low: idle capacity worth provisioning.
+    if (
+      accountQuotaSummary.totalFreeLp > 0 &&
+      accountQuotaSummary.withFreeLp >= 1
+    ) {
+      rows.push({
+        id: "idle-lp",
+        label: `${formatNumber(accountQuotaSummary.totalFreeLp)} LP cores idle`,
+        rationale:
+          "Spare low-priority quota across accounts — run Detect Unused Quota below or open the full Unused Quota page.",
+        target: "unused-quota",
+        urgency: "low",
+      });
+    }
+    return rows.slice(0, 4);
+  }, [
+    state.accounts,
+    state.pools,
+    state.azureAccounts,
+    accountQuotaSummary.totalFreeLp,
+    accountQuotaSummary.withFreeLp,
+  ]);
+
+  // Deep-link into the audit-log page with the action filter prefilled.
+  // The audit-log page already honours `?action=...` for its toolbar filter
+  // (route adapter); we just stamp the path here.
+  const handleOpenAuditLogForAction = React.useCallback(
+    (actionKey: string) => {
+      navigate(`/audit-log?action=${encodeURIComponent(actionKey)}`);
+    },
+    [navigate],
+  );
+
   const retryAction = React.useCallback(
     async (
       action: "refresh_account_info" | "refresh_pool_info",
@@ -2289,6 +3106,16 @@ const OverviewPageInner: React.FC<OverviewPageProps> = ({
       setCardErrors(nextErrors);
       const allOk =
         poolRes.status === "fulfilled" && acctRes.status === "fulfilled";
+      // ARIA-live announcement so screen-reader users hear the dashboard
+      // refreshed instead of having to inspect every KPI silently. Cycle a
+      // trailing space so consecutive identical announcements still fire
+      // (AT typically de-dupes when the text is character-for-character
+      // identical between updates).
+      setLiveAnnouncement(
+        allOk
+          ? `Dashboard refreshed at ${new Date().toLocaleTimeString()}.`
+          : `Dashboard refresh completed with errors at ${new Date().toLocaleTimeString()}.`,
+      );
       // COORDINATOR: services/audit-log singleton bridges to the store; one
       // call writes through to `state.auditEntries`. Previous code wrote
       // directly via `store.addAuditEntry` — equivalent but bypassed the
@@ -2402,6 +3229,40 @@ const OverviewPageInner: React.FC<OverviewPageProps> = ({
     enabled: true,
     preventDefault: false,
   });
+  // Extended hotkeys — top-10 destinations. `4`-`0` extend the wave-1 1/2/3
+  // trio so the same vim-style quick-jump pattern covers every page the
+  // overview most-commonly drills into. The sidebar's modifier-protected
+  // Alt+digit nav is unchanged; these mirror it for keyboard-first users
+  // who don't want to chord. Blocked while focus is in an input by the
+  // shortcut hook's default `allowInInputs: false`.
+  useShortcut("4", () => navTo("account-info"), {
+    enabled: true,
+    preventDefault: false,
+  });
+  useShortcut("5", () => navTo("unused-quota"), {
+    enabled: true,
+    preventDefault: false,
+  });
+  useShortcut("6", () => navTo("monitoring"), {
+    enabled: true,
+    preventDefault: false,
+  });
+  useShortcut("7", () => navTo("pools"), {
+    enabled: true,
+    preventDefault: false,
+  });
+  useShortcut("8", () => navTo("audit-log"), {
+    enabled: true,
+    preventDefault: false,
+  });
+  useShortcut("9", () => navTo("gpu-calculator"), {
+    enabled: true,
+    preventDefault: false,
+  });
+  useShortcut("0", () => navTo("azure-accounts"), {
+    enabled: true,
+    preventDefault: false,
+  });
 
   const isLoading = refreshing || state.accounts.length === 0;
   const isEmptyState =
@@ -2430,14 +3291,32 @@ const OverviewPageInner: React.FC<OverviewPageProps> = ({
   );
 
   return (
-    <div className="flex flex-col gap-4 py-4">
+    <div
+      className={cn(
+        "flex flex-col py-4",
+        density === "compact" ? "gap-2" : "gap-4",
+      )}
+      data-density={density}
+    >
+      {/* Visually-hidden ARIA-live region. Mounted once at the top of the
+          page so screen readers consistently latch onto it for refresh
+          announcements regardless of which sections are currently visible
+          (the widget customizer can hide any of the lower sections). */}
+      <div
+        role="status"
+        aria-live="polite"
+        aria-atomic="true"
+        className="sr-only"
+      >
+        {liveAnnouncement}
+      </div>
       <div className="relative overflow-hidden rounded-xl border bg-card/50 p-6">
         <DotPattern fade="top-left" className="absolute inset-0" />
         <Meteors count={12} tone="primary" className="absolute inset-0" />
         <div className="relative z-10">
           <PageHeader
             title="Multi-Region Manager"
-            description="Cross-region snapshot of accounts, pools, and node health. Use the range toggle to scope trends. Hotkeys: R refresh · / filter unused quota · 1 accounts · 2 pools · 3 nodes."
+            description="Cross-region snapshot of accounts, pools, and node health. Use the range toggle to scope trends. Hotkeys: R refresh · / filter unused quota · 1 accounts · 2 pools · 3 nodes · 4 account info · 5 unused quota · 6 monitoring · 7 pools list · 8 audit log · 9 GPU calc · 0 Azure accounts."
           >
             {/* Quiet until < 10 min from expiry; click to force-refresh
                 BEFORE drilling into an ARM-heavy KPI (Accounts / Pools /
@@ -2489,6 +3368,13 @@ const OverviewPageInner: React.FC<OverviewPageProps> = ({
                 aria-label="Refreshing"
               />
             )}
+            <WidgetCustomizer
+              visibility={widgetVisibility}
+              onToggle={toggleWidget}
+              onResetAll={resetWidgets}
+              density={density}
+              onDensityChange={setDensity}
+            />
           </PageHeader>
         </div>
       </div>
@@ -2506,8 +3392,36 @@ const OverviewPageInner: React.FC<OverviewPageProps> = ({
         />
       )}
 
+      {/*
+       * Defender posture summary — corpus-grounded "today's signals" panel.
+       * Reads `state.auditEntries` (bound to the auditLog singleton at app
+       * boot) so every audit call site flows through this view without any
+       * additional plumbing. Click a non-zero row to deep-link into the
+       * audit-log page filtered to that action.
+       *
+       * Corpus citation:
+       *   New folder/_AZURE_BYPASS_PLAYBOOK.md §"Critical Defender Audit
+       *   Surface" (lines 139-152) — the 10 events listed there map 1:1 to
+       *   the `DEFENDER_SIGNALS` table at the top of this file.
+       */}
+      {widgetVisibility.defender && (
+        <DefenderPostureSummary
+          entries={state.auditEntries ?? []}
+          onOpenAuditLog={handleOpenAuditLogForAction}
+        />
+      )}
+
+      {/* Suggested next actions — derived from current store state. Empty
+          when nothing is actionable so the dashboard doesn't grow a
+          permanent "no suggestions" block. */}
+      {widgetVisibility.suggestions && (
+        <SuggestedActions suggestions={suggestions} onNavigate={navTo} />
+      )}
+
       {/* Stats Cards */}
-      {isLoading && stats.totalAccounts === 0 && stats.totalPools === 0 ? (
+      {!widgetVisibility.kpis ? null : isLoading &&
+        stats.totalAccounts === 0 &&
+        stats.totalPools === 0 ? (
         <div role="region" aria-label="Dashboard statistics">
           <SkeletonLoader variant="stat-bar" />
         </div>
@@ -2531,6 +3445,11 @@ const OverviewPageInner: React.FC<OverviewPageProps> = ({
             trend={trendByCard.accounts}
             goodDirection="up"
             sparkData={sparkSeries.accounts}
+            // Click-through filter — the Accounts page already honours
+            // `?status=failed` on its provisioning-state filter via
+            // useUrlState; deep-link straight to the filtered view.
+            failedCount={stats.failedAccounts}
+            onFilterFailed={() => navigate("/accounts?status=failed")}
             items={[
               { label: "Total", value: stats.totalAccounts, tone: "primary" },
               {
@@ -2557,6 +3476,8 @@ const OverviewPageInner: React.FC<OverviewPageProps> = ({
             trend={trendByCard.pools}
             goodDirection="up"
             sparkData={sparkSeries.pools}
+            failedCount={stats.failedPools}
+            onFilterFailed={() => navigate("/pool-info?status=failed")}
             items={[
               { label: "Total", value: stats.totalPools, tone: "info" },
               {
@@ -2584,6 +3505,8 @@ const OverviewPageInner: React.FC<OverviewPageProps> = ({
             goodDirection="up"
             sparkData={sparkSeries.runningNodes}
             sparkTone="success"
+            failedCount={stats.nonWorkingNodes}
+            onFilterFailed={() => navigate("/nodes?status=issues")}
             items={[
               { label: "Total", value: stats.totalNodes, tone: "warning" },
               {
@@ -2665,7 +3588,7 @@ const OverviewPageInner: React.FC<OverviewPageProps> = ({
        * Hidden when account info hasn't been refreshed yet — empty row
        * would be misleading noise.
        */}
-      {accountQuotaSummary.totalAccounts > 0 && (
+      {widgetVisibility.quotaSummary && accountQuotaSummary.totalAccounts > 0 && (
         <div
           role="group"
           aria-label="Per-account quota summary"
@@ -2711,7 +3634,7 @@ const OverviewPageInner: React.FC<OverviewPageProps> = ({
       )}
 
       {/* Cluster Health — at-a-glance traffic light per region */}
-      {regionHealthRows.length > 0 && (
+      {widgetVisibility.clusterHealth && regionHealthRows.length > 0 && (
         <div className="flex flex-col gap-1">
           <div className="flex items-center justify-end gap-2">
             <Button
@@ -2775,6 +3698,7 @@ const OverviewPageInner: React.FC<OverviewPageProps> = ({
       )}
 
       {/* Region Health */}
+      {widgetVisibility.regionHealth && (
       <div role="region" aria-label="Region health">
         <Card className="p-4">
           <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
@@ -2817,8 +3741,10 @@ const OverviewPageInner: React.FC<OverviewPageProps> = ({
           )}
         </Card>
       </div>
+      )}
 
       {/* Unused Quota */}
+      {widgetVisibility.unusedQuota && (
       <div role="region" aria-label="Unused quota">
         <div className="flex justify-end">
           <Button
@@ -2839,13 +3765,17 @@ const OverviewPageInner: React.FC<OverviewPageProps> = ({
           searchInputRef={quotaSearchRef}
         />
       </div>
+      )}
 
       {/* Agent Status */}
+      {widgetVisibility.agents && (
       <div role="region" aria-label="Agent status">
         <AgentStatusStrip />
       </div>
+      )}
 
       {/* Quick Actions */}
+      {widgetVisibility.quickActions && (
       <Card
         role="region"
         aria-label="Quick actions"
@@ -2862,14 +3792,18 @@ const OverviewPageInner: React.FC<OverviewPageProps> = ({
         </div>
         <QuickActions store={store} onNavigate={navTo} />
       </Card>
+      )}
 
       {/* Recent Activity */}
+      {widgetVisibility.recentActivity && (
       <div role="region" aria-label="Recent activity">
         <RecentActivity
           collapsed={activityCollapsed}
           onToggleCollapsed={handleToggleActivity}
+          onOpenAuditAction={handleOpenAuditLogForAction}
         />
       </div>
+      )}
     </div>
   );
 };

@@ -1,6 +1,27 @@
 /**
  * Nodes page — multi-region compute-node browser with bulk reboot/reimage/
  * delete/recreate, faceted filters synced to the URL, and DataTable rendering.
+ *
+ * Security / pivot-risk context (operator awareness, not enforcement here):
+ *   Every running compute node holds a managed-identity (MSI) token reachable
+ *   via the local IMDS endpoint (`http://169.254.169.254/metadata/identity/
+ *   oauth2/token?api-version=2018-02-01&resource=…` for VM-backed pools).
+ *   Anything that achieves arbitrary code execution INSIDE a node — a
+ *   poisoned start-task script, a job that runs untrusted user code, an
+ *   image pulled from a compromised registry — can mint an ARM/Graph token
+ *   for whatever scope the pool's identity holds and pivot from there. See
+ *   `C:\Users\baimgprodsesa1\Desktop\New folder\_analysis_netspi.md` §I
+ *   (per-service IMDS variant matrix) and §II (post-token enumeration)
+ *   plus `_AZURE_BYPASS_PLAYBOOK.md` Top-30 #7 (IMDS theft). The two
+ *   defender hooks surfaced here:
+ *     1. Forensic-export button — captures stuck + error-state node state
+ *        BEFORE the operator reimages/deletes and erases service-side
+ *        evidence. starttaskfailed nodes in particular are the common
+ *        "init script crashed mid-payload" footprint.
+ *     2. Connect dialog — uses a STABLE temp-user name + 24h auto-
+ *        expiring credential rather than per-click usernames that
+ *        accumulate up to the ~20-user cap. The audit-log entry on
+ *        every Connect captures who minted credentials for which node.
  */
 import * as React from "react";
 import {
@@ -168,7 +189,12 @@ type QuickFilterKey =
   | "transitioning"
   | "preempted"
   | "errors"
-  | "stuck";
+  | "stuck"
+  /** Nodes whose runningTasksCount > 0 — operator-facing "what's actually
+   *  doing work right now" slice. Distinct from `running` which is a node-
+   *  state check; a node can be in `running` state with 0 active tasks
+   *  (between batches) or in `idle` while finishing one final cleanup task. */
+  | "withActiveJobs";
 
 const AUTO_REFRESH_INTERVAL_MS = 30_000;
 const AUTO_RECOVERY_INTERVAL_MS = 60_000;
@@ -600,6 +626,9 @@ const NodesPageInner: React.FC<NodesPageProps> = ({ orchestrator }) => {
       case "stuck":
         nodes = nodes.filter((n) => stuckIdSet.has(n.id));
         break;
+      case "withActiveJobs":
+        nodes = nodes.filter((n) => (n.runningTasksCount ?? 0) > 0);
+        break;
       case "all":
       default:
         break;
@@ -638,24 +667,43 @@ const NodesPageInner: React.FC<NodesPageProps> = ({ orchestrator }) => {
   const visibleNodes = search.filteredItems;
 
   // ---- Summary stats --------------------------------------------------------
+  // Single-pass aggregation — the previous version re-iterated state.nodes
+  // 6 separate times (one per .filter().length). At fleet scale (thousands
+  // of nodes × 1 Hz re-render from the now-tick) this was a measurable
+  // hotspot. One walk computes every bucket; downstream consumers are
+  // unchanged.
   const summaryStats = React.useMemo(() => {
     const nodes = state.nodes;
+    let running = 0;
+    let idle = 0;
+    let preempted = 0;
+    let creating = 0;
     let transitioning = 0;
+    let errors = 0;
     let totalRunningTasks = 0;
+    let withActiveJobs = 0;
     for (const n of nodes) {
+      if (n.state === "running") running++;
+      if (n.state === "idle") idle++;
+      if (n.state === "preempted") preempted++;
+      if (n.state === "creating") creating++;
       if (TRANSITIONAL_STATES.has(n.state)) transitioning++;
-      totalRunningTasks += n.runningTasksCount ?? 0;
+      if (ERROR_STATES.has(n.state)) errors++;
+      const tasks = n.runningTasksCount ?? 0;
+      totalRunningTasks += tasks;
+      if (tasks > 0) withActiveJobs++;
     }
     return {
       total: nodes.length,
-      running: nodes.filter((n) => n.state === "running").length,
-      idle: nodes.filter((n) => n.state === "idle").length,
-      preempted: nodes.filter((n) => n.state === "preempted").length,
-      creating: nodes.filter((n) => n.state === "creating").length,
+      running,
+      idle,
+      preempted,
+      creating,
       transitioning,
-      errors: nodes.filter((n) => ERROR_STATES.has(n.state)).length,
+      errors,
       stuck: stuckNodes.length,
       runningTasks: totalRunningTasks,
+      withActiveJobs,
     };
   }, [state.nodes, stuckNodes.length]);
 
@@ -1720,6 +1768,12 @@ const NodesPageInner: React.FC<NodesPageProps> = ({ orchestrator }) => {
   // VM-size filter handlers removed along with the picker (see comment
   // in the toolbar JSX). `vmSize` URL state is preserved for backward
   // compatibility with old bookmarks but no UI sets it anymore.
+  // Depend on the stable `search.setQuery` reference (provided by
+  // useSearch) rather than the whole `search` object — the latter is a
+  // fresh object on every render, which would re-create this callback
+  // every render and cascade through every memoized child that takes
+  // `clearFilters` as a prop. Same pattern used for handleExportJson.
+  const searchSetQuery = search.setQuery;
   const clearFilters = React.useCallback(() => {
     setFilters({
       region: "",
@@ -1729,8 +1783,8 @@ const NodesPageInner: React.FC<NodesPageProps> = ({ orchestrator }) => {
       vmSize: "",
     });
     setQuickFilter("all");
-    search.setQuery("");
-  }, [setFilters, search]);
+    searchSetQuery("");
+  }, [setFilters, searchSetQuery]);
 
   const filtersActive = Boolean(
     regionFilter ||
@@ -1873,6 +1927,137 @@ const NodesPageInner: React.FC<NodesPageProps> = ({ orchestrator }) => {
     downloadCsv(`nodes-${stamp}.csv`, headers, rows);
   }, [visibleNodes, stuckIdSet]);
 
+  // ---- Forensic export (stuck + error nodes) -------------------------------
+  //
+  // Why a separate export for these:
+  //
+  // A compromised compute node is an extremely high-value pivot target in
+  // any cloud-native breach — once a tenant attacker has shell on a node,
+  // the local IMDS endpoint (`169.254.169.254/metadata/identity/oauth2/
+  // token` for VM-backed pools; `localhost:50342/oauth2/token` on App
+  // Service-style hosts) hands out short-lived MSI tokens for whatever
+  // RBAC scope the pool's identity holds. See `_analysis_netspi.md` §I
+  // (IMDS Variants) for the full per-host token endpoint matrix and §II
+  // for the post-token enumeration paths. A `starttaskfailed` or
+  // `unusable` node that lingers for hours often masks a real failure
+  // (driver crash, NSG hairpin, custom-image init script that pulled an
+  // attacker-controlled payload) that incident-response wants captured
+  // BEFORE the operator reimages the disk and erases the evidence.
+  //
+  // The forensic export captures the still-observable state at the
+  // moment of triage so the IR analyst can correlate this snapshot
+  // against the audit log even after the node has been recycled. Fields
+  // chosen:
+  //   - state + lastBootTime — when did this node last transition?
+  //   - schedulingState — was scheduling already disabled (a manual
+  //     "quarantine" gesture upstream)?
+  //   - startTaskExitCode — the canonical signal for "the install
+  //     blew up" (non-zero on GPU-driver pools is the #1 cause of
+  //     `starttaskfailed`).
+  //   - runningTasksCount — tasks lost to the recycle if the node is
+  //     about to be reimaged.
+  //   - vmSize + region + poolId — pivot keys; the same poolId across
+  //     many `starttaskfailed` nodes points at a broken start script.
+  //   - errors[] / error — the raw service-side error tail.
+  //
+  // The output stamp matches the JSON export for easy IR collation.
+  const handleForensicExport = React.useCallback(() => {
+    const forensicNodes = state.nodes.filter(
+      (n) => stuckIdSet.has(n.id) || ERROR_STATES.has(n.state),
+    );
+    if (forensicNodes.length === 0) return;
+    const now = Date.now();
+    const rows = forensicNodes.map((n) => {
+      const bootMs = n.lastBootTime
+        ? new Date(n.lastBootTime).getTime()
+        : NaN;
+      const ageMinutes = Number.isFinite(bootMs)
+        ? Math.round((now - bootMs) / 60_000)
+        : null;
+      return {
+        id: n.id,
+        nodeId: n.nodeId,
+        accountName: n.accountName,
+        subscriptionId: n.subscriptionId ?? null,
+        region: n.region,
+        poolId: n.poolId,
+        vmSize: n.vmSize ?? null,
+        ipAddress: n.ipAddress ?? null,
+        isDedicated: n.isDedicated,
+        state: n.state,
+        schedulingState: n.schedulingState ?? null,
+        lastBootTime: n.lastBootTime ?? null,
+        ageMinutesSinceBoot: ageMinutes,
+        startTaskExitCode: n.startTaskExitCode ?? null,
+        runningTasksCount: n.runningTasksCount ?? 0,
+        totalTasksRun: n.totalTasksRun ?? 0,
+        stuck: stuckIdSet.has(n.id),
+        errorState: ERROR_STATES.has(n.state),
+        errors: n.errors ?? [],
+        errorTail: n.error ?? null,
+      };
+    });
+    const stamp = new Date()
+      .toISOString()
+      .replace(/[:.]/g, "-")
+      .slice(0, 19);
+    downloadJson(`nodes-forensic-${stamp}.json`, {
+      exportedAt: new Date().toISOString(),
+      purpose:
+        "Forensic snapshot of stuck + error-state nodes for incident review " +
+        "before reimage/delete erases service-side state. See " +
+        "_analysis_netspi.md §I for compute-node pivot risk context.",
+      count: rows.length,
+      stuckCount: rows.filter((r) => r.stuck).length,
+      errorCount: rows.filter((r) => r.errorState).length,
+      stuckThresholdMinutes: stuckThresholdMin,
+      nodes: rows,
+    });
+    auditLog.record({
+      actor: primaryAccount?.homeAccountId ?? "ui",
+      action: "forensic_export",
+      target: `${rows.length} stuck/error node(s)`,
+      status: "success",
+      details: {
+        stuck: rows.filter((r) => r.stuck).length,
+        error: rows.filter((r) => r.errorState).length,
+        stuckThresholdMinutes: stuckThresholdMin,
+      },
+    });
+  }, [state.nodes, stuckIdSet, stuckThresholdMin, primaryAccount]);
+
+  // ---- Pre-computed bulk-toolbar action counts ----------------------------
+  // The toolbar shows "Reboot (N)" / "Reimage (N)" labels where N is the
+  // count of selected nodes that will ACTUALLY run the action (mirroring
+  // the orchestrator's pre-filter). Computing these inline in the JSX via
+  // an IIFE recomputed three times per render — and the parent re-renders
+  // every second (1 Hz now-tick). At fleet scale this is wasted work.
+  // Memoize on `selectedNodes` (already memoized) so the toolbar only
+  // recomputes on actual selection / store changes.
+  const toolbarCounts = React.useMemo(() => {
+    let rebootable = 0;
+    let reimageable = 0;
+    let schedulable = 0;
+    for (const n of selectedNodes) {
+      if (ACTIONABLE_STATES.has(n.state)) {
+        // ACTIONABLE_STATES is the same gate for reboot, reimage, and
+        // enable/disable scheduling per `filterActionable`. Walking the
+        // list once is N×, walking it three times is 3×N.
+        rebootable++;
+        reimageable++;
+        schedulable++;
+      }
+    }
+    return {
+      rebootable,
+      reimageable,
+      schedulable,
+      skippedReboot: selectedNodes.length - rebootable,
+      skippedReimage: selectedNodes.length - reimageable,
+      skippedSched: selectedNodes.length - schedulable,
+    };
+  }, [selectedNodes]);
+
   // ---- "Last refreshed Xs ago" string --------------------------------------
   // Not memoized — depends on Date.now() which we want to re-evaluate on
   // every render. The 1 Hz `setNowTick` interval keeps this fresh.
@@ -1888,23 +2073,38 @@ const NodesPageInner: React.FC<NodesPageProps> = ({ orchestrator }) => {
   // tagName check anymore.
   //
   //   /        → focus + select the search input
-  //   Escape   → clear the search when the search input is focused
+  //   Escape   → clear the search when the search input is focused;
+  //              otherwise clear the row selection (if any). Two-stage
+  //              dismiss matches the Gmail/Linear/GitHub pattern.
   //   r        → reboot selected (if any actionable; confirmation dialog)
+  //   i        → reimage selected (if any actionable; confirmation dialog)
   //   Delete   → delete selected (if any; confirmation dialog)
   const searchInputRef = React.useRef<HTMLInputElement | null>(null);
   useShortcut("/", () => {
     searchInputRef.current?.focus();
     searchInputRef.current?.select();
   });
-  // Escape: bound to the search input element itself so the hotkey only
-  // fires when search has focus — otherwise we'd be capturing Escape from
-  // dialogs/menus which all have their own dismiss semantics.
+  // Escape: two-stage dismiss.
+  //   stage 1 — focus is in the search input → clear the search query
+  //             (leave focus where it is so the operator can keep typing).
+  //   stage 2 — focus is anywhere else AND there's a row selection →
+  //             clear the selection. Lets the operator hit Esc as a
+  //             one-key "back out of this batch operation" without
+  //             reaching for the mouse. We don't preventDefault so
+  //             open dialogs / menus still get their native dismiss.
   useShortcut(
     "Escape",
     () => {
       if (document.activeElement === searchInputRef.current) {
-        search.setQuery("");
+        searchSetQuery("");
+        return;
       }
+      // Don't fight the global confirmation dialog — if any modal/dialog
+      // is open it handles its own Escape. Detect by checking for an
+      // open aria-modal element in the document.
+      const openModal = document.querySelector('[aria-modal="true"]');
+      if (openModal) return;
+      if (selection.size > 0) setSelection(new Set());
     },
     { allowInInputs: true, preventDefault: false },
   );
@@ -1915,6 +2115,18 @@ const NodesPageInner: React.FC<NodesPageProps> = ({ orchestrator }) => {
     () => {
       if (selection.size === 0 || isActing) return;
       void handleNodeAction("reboot");
+    },
+    { enabled: selection.size > 0 && !isActing },
+  );
+  // i → reimage selected. Uses the same confirmation dialog with the
+  // per-state breakdown as the toolbar button — destructive enough to
+  // warrant the dialog, common enough to deserve a single-key shortcut
+  // (stuck-node recovery is the canonical use case).
+  useShortcut(
+    "i",
+    () => {
+      if (selection.size === 0 || isActing) return;
+      void handleNodeAction("reimage");
     },
     { enabled: selection.size > 0 && !isActing },
   );
@@ -2547,6 +2759,11 @@ const NodesPageInner: React.FC<NodesPageProps> = ({ orchestrator }) => {
                 count: summaryStats.stuck,
                 warning: true,
               },
+              {
+                key: "withActiveJobs",
+                label: "With active jobs",
+                count: summaryStats.withActiveJobs,
+              },
             ] as const
           ).map((chip) => (
             <button
@@ -2673,7 +2890,8 @@ const NodesPageInner: React.FC<NodesPageProps> = ({ orchestrator }) => {
 
       {/* Standalone fleet actions — these don't depend on selection.
           Operates against the entire fleet (Recover preempted, Reimage
-          stuck) regardless of what's checked in the table. */}
+          stuck, Forensic export) regardless of what's checked in the
+          table. */}
       <div
         className="flex flex-wrap gap-2"
         role="group"
@@ -2704,6 +2922,25 @@ const NodesPageInner: React.FC<NodesPageProps> = ({ orchestrator }) => {
               : undefined
           }
           tone="warning"
+        />
+        {/* Forensic export — disabled when there are no stuck/error nodes
+            (nothing to capture). When enabled, the tooltip nudges the
+            operator to run this BEFORE reimaging/deleting so service-
+            side evidence is preserved. See `handleForensicExport` for
+            the citation chain. */}
+        <BulkActionButton
+          icon={FileJson}
+          label={`Forensic export (${summaryStats.stuck + summaryStats.errors})`}
+          ariaLabel={`Forensic export of ${summaryStats.stuck + summaryStats.errors} stuck or error-state node(s)`}
+          onClick={handleForensicExport}
+          disabled={
+            isActing || summaryStats.stuck + summaryStats.errors === 0
+          }
+          disabledReason={
+            summaryStats.stuck + summaryStats.errors === 0
+              ? "No stuck or error-state nodes — nothing to capture"
+              : "Capture stuck + error-state nodes to JSON for incident review before reimage/delete erases the evidence"
+          }
         />
       </div>
 
@@ -2789,18 +3026,18 @@ const NodesPageInner: React.FC<NodesPageProps> = ({ orchestrator }) => {
             selected
           </span>
           {(() => {
-            // Pre-compute actionable counts so each button can show how
-            // many of the N selected nodes the action will actually run
-            // on (rather than silently filtering on click).
-            const rebootable = filterActionable("reboot", selectedNodes).length;
-            const reimageable = filterActionable("reimage", selectedNodes).length;
-            const schedulable = filterActionable(
-              "enableScheduling",
-              selectedNodes,
-            ).length;
-            const skippedReboot = selectionCount - rebootable;
-            const skippedReimage = selectionCount - reimageable;
-            const skippedSched = selectionCount - schedulable;
+            // Actionable counts pre-computed in `toolbarCounts` so each
+            // button can show how many of the N selected nodes the action
+            // will actually run on (rather than silently filtering on
+            // click). Mirrors the orchestrator's per-node pre-filter.
+            const {
+              rebootable,
+              reimageable,
+              schedulable,
+              skippedReboot,
+              skippedReimage,
+              skippedSched,
+            } = toolbarCounts;
             return (
               <>
                 {(skippedReboot > 0 ||
@@ -2901,7 +3138,8 @@ const NodesPageInner: React.FC<NodesPageProps> = ({ orchestrator }) => {
                       ? "Reimage"
                       : `Reimage (${reimageable})`
                   }
-                  ariaLabel={`Reimage ${reimageable} actionable selected nodes`}
+                  ariaLabel={`Reimage ${reimageable} actionable selected nodes (keyboard shortcut: i)`}
+                  ariaKeyshortcuts="i"
                   onClick={() => handleNodeAction("reimage")}
                   disabled={isActing || reimageable === 0}
                   disabledReason={
@@ -2940,8 +3178,10 @@ const NodesPageInner: React.FC<NodesPageProps> = ({ orchestrator }) => {
             variant="ghost"
             size="sm"
             onClick={() => setSelection(new Set())}
-            aria-label="Clear selection"
+            aria-label="Clear selection (keyboard shortcut: Escape)"
+            aria-keyshortcuts="Escape"
             className="ml-auto text-muted-foreground"
+            title="Clear selection · Esc"
           >
             <X />
             Clear
