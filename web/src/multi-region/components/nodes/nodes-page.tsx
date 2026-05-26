@@ -1924,7 +1924,7 @@ const NodesPageInner: React.FC<NodesPageProps> = ({ orchestrator }) => {
       .toISOString()
       .replace(/[:.]/g, "-")
       .slice(0, 19);
-    downloadCsv(`nodes-${stamp}.csv`, headers, rows);
+    downloadCsv(`nodes-${stamp}.csv`, [headers, ...rows]);
   }, [visibleNodes, stuckIdSet]);
 
   // ---- Forensic export (stuck + error nodes) -------------------------------
@@ -2774,10 +2774,10 @@ const NodesPageInner: React.FC<NodesPageProps> = ({ orchestrator }) => {
               className={cn(
                 "rounded-md px-2.5 py-1 text-xs font-medium transition-colors duration-150 ease-out focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring motion-reduce:transition-none",
                 quickFilter === chip.key
-                  ? chip.warning && chip.count > 0
+                  ? ("warning" in chip ? chip.warning : false) && chip.count > 0
                     ? "bg-warning/20 text-warning"
                     : "bg-primary/15 text-primary"
-                  : chip.warning && chip.count > 0
+                  : ("warning" in chip ? chip.warning : false) && chip.count > 0
                     ? "text-warning hover:bg-warning/10"
                     : "text-muted-foreground hover:bg-muted/40 hover:text-foreground",
               )}
@@ -3715,7 +3715,7 @@ const CopyButton: React.FC<CopyButtonProps> = ({ label, value, extraLabel }) => 
 // ---------------------------------------------------------------------------
 
 interface BulkActionButtonProps {
-  icon: React.ComponentType<{ className?: string }>;
+  icon: React.ElementType;
   label: string;
   ariaLabel: string;
   onClick: () => void;

@@ -101,6 +101,7 @@ import { useShortcut } from "../../hooks/use-shortcut";
 import { useUrlState } from "../../hooks/use-url-state";
 import { getArmTokenForAccount } from "../../auth/msal-auth";
 import { resolveActiveTenantId } from "../../auth/perform-tenant-switch";
+import type { AzureLoginAccount } from "../../store/store-types";
 import { auditLog } from "../../services/audit-log";
 import { useDashboardOutletContext } from "../page-router";
 import {
@@ -673,7 +674,7 @@ function useVmCatalog(
           const account =
             accounts.find(
               (a) =>
-                resolveActiveTenantId(a) === tenantId ||
+                resolveActiveTenantId(a as unknown as AzureLoginAccount) === tenantId ||
                 a.tenantId === tenantId,
             ) ?? accounts[0];
           const token = await getArmTokenForAccount(
@@ -681,7 +682,7 @@ function useVmCatalog(
             tenantId,
           );
 
-          await listAllVmSkus(subscriptionId, token, {
+          await listAllVmSkus(subscriptionId!, token, {
             signal: ctrl.signal,
             filter: includeCpu ? undefined : GPU_ONLY_FILTER,
             onPartial: (skus, hasMore) => {
@@ -697,7 +698,7 @@ function useVmCatalog(
           });
 
           await runBatchProbes(
-            subscriptionId,
+            subscriptionId!,
             tenantId,
             regionsToProbe,
             setState,
@@ -758,7 +759,7 @@ async function runBatchProbes(
     const account =
       accounts.find(
         (a) =>
-          resolveActiveTenantId(a) === tenantId || a.tenantId === tenantId,
+          resolveActiveTenantId(a as unknown as AzureLoginAccount) === tenantId || a.tenantId === tenantId,
       ) ?? accounts[0];
     const token = await getArmTokenForAccount(account.homeAccountId, tenantId);
     for (const region of regions) {

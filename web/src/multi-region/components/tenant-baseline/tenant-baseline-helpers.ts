@@ -1415,7 +1415,7 @@ export function severityLabel(s: BaselineSeverity): string {
 
 /** Tally severities across an array of findings. */
 export function tallySeverities(
-  items: { severity: BaselineSeverity }[],
+  items: ReadonlyArray<{ severity: BaselineSeverity }>,
 ): Record<BaselineSeverity, number> {
   const out: Record<BaselineSeverity, number> = {
     critical: 0,

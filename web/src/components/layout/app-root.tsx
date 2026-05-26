@@ -13,12 +13,16 @@ export interface RootProps {
  * by bonito-ui) keep their `loadTheme()` wiring. Tailwind tokens drive
  * the rest of the surface via CSS variables on `<html>`.
  */
+const RootPaneAny = RootPane as unknown as React.FC<
+  React.PropsWithChildren<{ theme?: ThemeName }>
+>;
+
 export const AppRoot: React.FC<RootProps> = (props) => {
   return (
-    <RootPane theme={props.theme}>
+    <RootPaneAny theme={props.theme}>
       <div className="flex min-h-screen flex-col bg-background text-foreground">
         {props.children}
       </div>
-    </RootPane>
+    </RootPaneAny>
   );
 };

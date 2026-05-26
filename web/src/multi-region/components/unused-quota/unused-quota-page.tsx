@@ -460,7 +460,7 @@ const UnusedQuotaPageInner: React.FC<UnusedQuotaPageProps> = ({
       //     currently-active chip (set went empty after the toggle).
       let chosen: CapacityShape | null = null;
       for (const k of next) {
-        if (!capacityShapeSet.has(k) && isCapacityShape(k)) {
+        if (isCapacityShape(k) && !capacityShapeSet.has(k)) {
           chosen = k;
           break;
         }
@@ -3725,7 +3725,7 @@ export const UnusedQuotaPage: React.FC<UnusedQuotaPageProps> = (props) => (
 type SummaryCardTone = "info" | "success" | "warning" | "muted";
 
 interface SummaryStatCardProps {
-  icon: React.ComponentType<{ className?: string }>;
+  icon: React.ElementType;
   label: string;
   value: number;
   tone: SummaryCardTone;
@@ -4059,7 +4059,7 @@ interface ResultStatProps {
   value: number;
   total: number;
   tone: "success" | "destructive" | "muted";
-  icon: React.ComponentType<{ className?: string }>;
+  icon: React.ElementType;
 }
 
 const ResultStat: React.FC<ResultStatProps> = ({

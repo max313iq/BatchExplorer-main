@@ -19,10 +19,7 @@ import * as msalAuth from "../auth/msal-auth";
 import { setAuditLogger as setAuthAuditLogger } from "../auth/audit-binding";
 import { invalidateAllCachesForTenantChange } from "../services/cache-invalidation";
 import { auditLog } from "../services/audit-log";
-import {
-  getAuditLoggerForAuth,
-  wireAuditLoggers,
-} from "../services/audit-wiring";
+import { wireAuditLoggers } from "../services/audit-wiring";
 import { installDefaultAuditWiring } from "../services/audit-binding";
 import { useTenantChange } from "../hooks/use-tenant-change";
 import {

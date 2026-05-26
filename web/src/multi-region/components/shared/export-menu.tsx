@@ -104,7 +104,7 @@ export function ExportMenu<T>(props: ExportMenuProps<T>): JSX.Element {
     const csvRows = rows.map((row) =>
       columns.map((c) => csvValue(c.accessor(row))),
     );
-    downloadCsv(`${stampedName}.csv`, headers, csvRows);
+    downloadCsv(`${stampedName}.csv`, [headers, ...csvRows]);
   }, [rows, columns, stampedName]);
 
   const handleExportJson = React.useCallback(() => {

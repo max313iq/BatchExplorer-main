@@ -167,12 +167,6 @@ type CompareMode = "off" | "ab" | "abc";
 
 type ScenarioSlot = "a" | "b" | "c";
 
-const COMPARE_SLOTS: Record<CompareMode, ScenarioSlot[]> = {
-  off: ["a"],
-  ab: ["a", "b"],
-  abc: ["a", "b", "c"],
-};
-
 function parseCompareMode(raw: string): CompareMode {
   if (raw === "abc") return "abc";
   // Legacy form (compare=1) and the canonical "ab" both mean 2-way compare.
@@ -1938,17 +1932,17 @@ const GpuCalculatorPageInner: React.FC = () => {
     "a.count": String(DEFAULT_COUNT),
     "a.region": DEFAULT_REGION,
     "a.hours": String(DEFAULT_HOURS),
-    "a.priority": DEFAULT_PRIORITY,
+    "a.priority": DEFAULT_PRIORITY as ScenarioPriority,
     "b.gpu": "",
     "b.count": String(DEFAULT_COUNT),
     "b.region": DEFAULT_REGION,
     "b.hours": String(DEFAULT_HOURS),
-    "b.priority": DEFAULT_PRIORITY,
+    "b.priority": DEFAULT_PRIORITY as ScenarioPriority,
     "c.gpu": "",
     "c.count": String(DEFAULT_COUNT),
     "c.region": DEFAULT_REGION,
     "c.hours": String(DEFAULT_HOURS),
-    "c.priority": DEFAULT_PRIORITY,
+    "c.priority": DEFAULT_PRIORITY as ScenarioPriority,
     compare: "",
     target: "", // Gnos target for the reverse-calc card
     /** Which slot the 1/2/3 hotkey last focused. Purely a UI hint. */
@@ -2061,7 +2055,7 @@ const GpuCalculatorPageInner: React.FC = () => {
       "b.count": rawA.count,
       "b.region": rawA.region,
       "b.hours": rawA.hours,
-      "b.priority": rawA.priority,
+      "b.priority": parseScenarioPriority(rawA.priority),
       focus: "b",
     });
   }, [setUrlState, rawA.gpu, rawA.count, rawA.region, rawA.hours, rawA.priority]);
@@ -2093,7 +2087,7 @@ const GpuCalculatorPageInner: React.FC = () => {
       "c.count": seed.count,
       "c.region": seed.region,
       "c.hours": seed.hours,
-      "c.priority": seed.priority,
+      "c.priority": parseScenarioPriority(seed.priority),
       focus: "c",
     });
   }, [
@@ -2120,7 +2114,7 @@ const GpuCalculatorPageInner: React.FC = () => {
         "b.count": rawC.count,
         "b.region": rawC.region,
         "b.hours": rawC.hours,
-        "b.priority": rawC.priority,
+        "b.priority": parseScenarioPriority(rawC.priority),
         "c.gpu": "",
         "c.count": String(DEFAULT_COUNT),
         "c.region": DEFAULT_REGION,
@@ -2185,7 +2179,7 @@ const GpuCalculatorPageInner: React.FC = () => {
         "a.count": p.scenario.count,
         "a.region": p.scenario.region,
         "a.hours": p.scenario.hours,
-        "a.priority": p.scenario.priority,
+        "a.priority": parseScenarioPriority(p.scenario.priority),
       });
     },
     [setUrlState],
@@ -2343,7 +2337,7 @@ const GpuCalculatorPageInner: React.FC = () => {
         "a.count": s.scenario.count,
         "a.region": s.scenario.region,
         "a.hours": s.scenario.hours,
-        "a.priority": s.scenario.priority,
+        "a.priority": parseScenarioPriority(s.scenario.priority),
       });
     },
     [setUrlState],

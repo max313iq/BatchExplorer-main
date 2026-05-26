@@ -33,7 +33,7 @@ export interface FilterChipOption {
   /** Optional tone — drives the active-state colour. */
   tone?: "default" | "destructive" | "warning" | "success" | "info";
   /** Optional icon shown to the left of the label. */
-  icon?: React.ComponentType<{ className?: string }>;
+  icon?: React.ElementType;
 }
 
 export interface FilterChipRowProps {

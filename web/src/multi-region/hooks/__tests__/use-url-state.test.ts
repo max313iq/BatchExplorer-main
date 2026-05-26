@@ -15,7 +15,7 @@
 import * as React from "react";
 import { act, renderHook } from "@testing-library/react";
 import { MemoryRouter, useLocation } from "react-router-dom";
-import { useUrlState, useUrlParam } from "../use-url-state";
+import { useUrlState, useUrlParam, type UrlStateRecord } from "../use-url-state";
 
 // ---------------------------------------------------------------------------
 // Test harness: render the hook inside a MemoryRouter so useSearchParams works.
@@ -25,7 +25,7 @@ import { useUrlState, useUrlParam } from "../use-url-state";
 
 interface HarnessResult<T> {
     state: T;
-    setState: ReturnType<typeof useUrlState<Record<string, unknown>>>[1];
+    setState: ReturnType<typeof useUrlState<UrlStateRecord>>[1];
     search: string;
 }
 

@@ -257,29 +257,6 @@ export const DeletedUsersPanel: React.FC<DeletedUsersPanelProps> = ({
     return c;
   }, [scored]);
 
-  const handlePortalClick = React.useCallback(
-    (row: DeletedUserRow) => {
-      if (!tenantId) return;
-      // Audit ONLY the operator's click — never the probe itself. The
-      // click is operator intent ("I want to restore this user"); the
-      // actual state change happens in the audited Entra Portal UI.
-      auditLog.record({
-        actor: actor ?? "unknown",
-        action: "deleted_user_portal_link",
-        target: row.userPrincipalName || row.id,
-        status: "success",
-        details: {
-          tenantId,
-          userId: row.id,
-          deletedDateTime: row.deletedDateTime,
-          source: "tenant-users:deleted-panel",
-          mode: "portal-deep-link",
-        },
-      });
-    },
-    [actor, tenantId],
-  );
-
   // ---- Render branches ---------------------------------------------------
 
   if (!permissionGranted) {

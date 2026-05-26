@@ -490,13 +490,18 @@ export const LegacyEaSubCreatorPage: React.FC = () => {
   const candidates: SourceAccount[] = React.useMemo(
     () =>
       azureAccounts
-        .map((a) => ({
-          homeAccountId: a.homeAccountId,
-          tenantId: getActiveTenant(a.homeAccountId) ?? resolveActiveTenantId(a),
-          username: a.username,
-          name: a.name || a.username,
-        }))
-        .filter((a) => !!a.tenantId),
+        .map((a): SourceAccount | null => {
+          const tenantId =
+            getActiveTenant(a.homeAccountId) ?? resolveActiveTenantId(a);
+          if (!tenantId) return null;
+          return {
+            homeAccountId: a.homeAccountId,
+            tenantId,
+            username: a.username,
+            name: a.name || a.username,
+          };
+        })
+        .filter((a): a is SourceAccount => a !== null),
     [azureAccounts],
   );
 

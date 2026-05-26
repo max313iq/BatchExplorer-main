@@ -3391,7 +3391,7 @@ interface PrefsCycleChipProps {
   /** Short label rendered before the current value. */
   label: string;
   /** Icon component (lucide-react) rendered inside the chip. */
-  icon: React.ComponentType<{ className?: string; "aria-hidden"?: boolean }>;
+  icon: React.ElementType;
   /** Currently-selected value. */
   current: number;
   /** Ordered list of allowed values; the chip cycles through these. */

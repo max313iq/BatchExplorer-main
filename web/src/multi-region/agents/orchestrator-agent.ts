@@ -14,7 +14,7 @@ import { classifyAzureError } from "./error-classifier";
 import { pMapSettled } from "./_shared/parallel";
 import { correlationId as makeCorrelationId } from "./_shared/ids";
 import { accountEndpointHost } from "./_shared/endpoints";
-import { abortableSleep, isAbortError } from "./_shared/abortable-sleep";
+import { abortableSleep } from "./_shared/abortable-sleep";
 import { CancellationTracker } from "./_shared/cancellation";
 import {
   groupNodesByPool,
@@ -2345,9 +2345,9 @@ export class OrchestratorAgent implements Agent {
     // AND a per-sub Batch token cache (the previous tenant-keyed cache
     // handed the primary's token to every group, 401-ing on accounts
     // owned by non-primary signed-in AAD identities).
-    const targetNodes = nodeIds
+    const targetNodes: NodeForGrouping[] = nodeIds
       .map((id) => state.nodes.find((n) => n.id === id))
-      .filter((n): n is NodeForGrouping => !!n);
+      .filter((n): n is NonNullable<typeof n> => !!n);
     const accountIndex: AccountForGrouping[] = state.accounts;
     const groups = groupNodesByPool(targetNodes, accountIndex);
 
@@ -2485,9 +2485,9 @@ export class OrchestratorAgent implements Agent {
 
     const state = store.getState();
     // Audit fix #23 + #4 (same as _deleteNodes).
-    const targetNodes = nodeIds
+    const targetNodes: NodeForGrouping[] = nodeIds
       .map((id) => state.nodes.find((n) => n.id === id))
-      .filter((n): n is NodeForGrouping => !!n);
+      .filter((n): n is NonNullable<typeof n> => !!n);
     const accountIndex: AccountForGrouping[] = state.accounts;
     const groups = groupNodesByPool(targetNodes, accountIndex);
 

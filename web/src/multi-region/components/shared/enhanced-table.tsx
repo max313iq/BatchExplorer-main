@@ -284,7 +284,7 @@ export function DataTable<T>(props: DataTableProps<T>): JSX.Element {
       }),
     );
     const filename = csvFileName ?? `export-${tableId}.csv`;
-    downloadCsv(filename, headers, dataRows);
+    downloadCsv(filename, [headers, ...dataRows]);
   }, [visibleColumns, sortedRows, csvFileName, tableId]);
 
   // JSON export — derives a `{ [key]: value }` object per row from each
@@ -645,7 +645,12 @@ interface VirtualizedTableBodyProps<T> {
   selection: Set<string> | undefined;
   onRowToggle: (id: string) => void;
   onRowActivate?: (row: T) => void;
-  virtualizer: ReturnType<typeof useVirtualizer>;
+  // Use the concrete HTMLDivElement parameterization that matches the
+  // virtualizer instance we create in this file (whose scroll element is
+  // `HTMLDivElement | null`). The previous unparameterized
+  // `ReturnType<typeof useVirtualizer>` resolved to `Virtualizer<Element, Element>`
+  // and failed to accept the narrower `Virtualizer<HTMLDivElement, Element>`.
+  virtualizer: ReturnType<typeof useVirtualizer<HTMLDivElement, Element>>;
 }
 
 function VirtualizedTableBody<T>(

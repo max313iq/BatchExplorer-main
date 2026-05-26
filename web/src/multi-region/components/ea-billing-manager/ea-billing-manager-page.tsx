@@ -224,7 +224,7 @@ type TabKey =
   | "customization"
   | "cost";
 
-const TABS: { key: TabKey; label: string; icon: React.FC<{ className?: string }> }[] = [
+const TABS: { key: TabKey; label: string; icon: React.ElementType }[] = [
   { key: "overview", label: "Overview", icon: Info },
   { key: "permissions", label: "Permissions", icon: Shield },
   { key: "roles", label: "Role Assignments", icon: UserCheck },
@@ -819,7 +819,7 @@ export const EaBillingManagerPage: React.FC = () => {
  * Source: https://learn.microsoft.com/azure/cost-management-billing/manage/understand-ea-roles
  * ───────────────────────────────────────────────────────────────────── */
 interface RoleMeta {
-  icon: React.FC<{ className?: string; "aria-hidden"?: boolean }>;
+  icon: React.ElementType;
   /** Maps to existing Badge `variant` values + Alert tones. */
   tone: "destructive" | "warning" | "info" | "success" | "secondary" | "outline";
   /** Plain-English summary shown in a tooltip — never trust as a UI gate. */
@@ -901,7 +901,7 @@ function resolveRoleMeta(roleDefinitionId: string): RoleMeta {
  */
 const CapabilityBadge: React.FC<{
   ok: boolean;
-  icon: React.FC<{ className?: string; "aria-hidden"?: boolean }>;
+  icon: React.ElementType;
   label: string;
   detail: string;
 }> = ({ ok, icon: Icon, label, detail }) => (
@@ -992,7 +992,7 @@ function useAsyncLoad<T>(
 const TabCard: React.FC<{
   title: string;
   description?: string;
-  icon: React.FC<{ className?: string }>;
+  icon: React.ElementType;
   onReload?: () => void;
   reloading?: boolean;
   action?: React.ReactNode;

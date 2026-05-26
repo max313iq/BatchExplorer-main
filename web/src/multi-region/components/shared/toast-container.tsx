@@ -48,7 +48,7 @@ const TYPE_CLASS: Record<ToastNotification["type"], string> = {
 
 const TYPE_ICON: Record<
   ToastNotification["type"],
-  React.ComponentType<{ className?: string }>
+  React.ElementType
 > = {
   success: CheckCircle2,
   error: XCircle,

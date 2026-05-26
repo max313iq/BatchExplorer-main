@@ -246,7 +246,7 @@ interface CriticalEventTemplate {
   /** Corpus risk severity used for color coding. */
   severity: CritSeverity;
   /** OR-list of substring matchers (lowercased at match time). */
-  matchers: string[];
+  matchers: readonly string[];
   /** Short corpus citation rendered inside the tooltip. */
   cite: string;
 }
@@ -850,7 +850,11 @@ export const AuditLogPage: React.FC = () => {
     };
     document.addEventListener("keydown", handler);
     return () => document.removeEventListener("keydown", handler);
-  }, [setTailMode, setGroupBy, togglePin]);
+    // togglePin intentionally read via ref pattern below; it's declared
+    // later in the body but the keydown handler captures it lazily through
+    // the ref, so we don't list it as a dep here (would TDZ otherwise).
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [setTailMode, setGroupBy]);
 
   // -------- Derived collections ------------------------------------------
 

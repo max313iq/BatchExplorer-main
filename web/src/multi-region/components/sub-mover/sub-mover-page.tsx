@@ -1024,6 +1024,23 @@ export const SubMoverPage: React.FC = () => {
     [skipUnsafe, previewClassification.safeRows, selectedSubs],
   );
 
+  /**
+   * CORPUS-GROUNDED — derived flag: is this a bulk cross-tenant move that
+   * requires explicit operator acknowledgement? Defined as: change-tenant
+   * op + >= BULK_CROSS_TENANT_THRESHOLD rows + destination != source.
+   * Surfaced both as a warning banner and as a hard gate on the Confirm
+   * button (planValid AND-gates on this when applicable).
+   */
+  const requiresBulkCrossTenantAck = React.useMemo(() => {
+    if (opKind !== "change-tenant") return false;
+    if (rowsToRun.length < BULK_CROSS_TENANT_THRESHOLD) return false;
+    const dest = destTenantId.trim().toLowerCase();
+    const src = account?.tenantId?.toLowerCase();
+    if (!dest || !UUID_RE.test(dest)) return false;
+    if (src && src === dest) return false;
+    return true;
+  }, [opKind, rowsToRun.length, destTenantId, account?.tenantId]);
+
   const planValid = React.useMemo(() => {
     if (rowsToRun.length === 0) return false;
     if (opKind === "transfer-billing")
@@ -1108,23 +1125,6 @@ export const SubMoverPage: React.FC = () => {
     concurrency,
     armTokenTracker.secondsUntilExpiry,
   ]);
-
-  /**
-   * CORPUS-GROUNDED — derived flag: is this a bulk cross-tenant move that
-   * requires explicit operator acknowledgement? Defined as: change-tenant
-   * op + >= BULK_CROSS_TENANT_THRESHOLD rows + destination != source.
-   * Surfaced both as a warning banner and as a hard gate on the Confirm
-   * button (planValid AND-gates on this when applicable).
-   */
-  const requiresBulkCrossTenantAck = React.useMemo(() => {
-    if (opKind !== "change-tenant") return false;
-    if (rowsToRun.length < BULK_CROSS_TENANT_THRESHOLD) return false;
-    const dest = destTenantId.trim().toLowerCase();
-    const src = account?.tenantId?.toLowerCase();
-    if (!dest || !UUID_RE.test(dest)) return false;
-    if (src && src === dest) return false;
-    return true;
-  }, [opKind, rowsToRun.length, destTenantId, account?.tenantId]);
 
   // Reset the bulk-cross-tenant ack whenever the destination / op / row
   // count changes — a prior "I understand" tick must not carry over into a

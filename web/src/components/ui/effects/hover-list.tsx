@@ -58,7 +58,6 @@ export function HoverList<T>({
   itemClassName,
 }: HoverListProps<T>): React.ReactElement {
   const [hoveredIdx, setHoveredIdx] = React.useState<number | null>(null);
-  const Tag: keyof React.JSX.IntrinsicElements = onItemClick ? "button" : "div";
 
   return (
     <div role={role} className={cn("flex flex-col gap-1", className)}>

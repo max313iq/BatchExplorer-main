@@ -1,0 +1,1 @@
+{"version":3,"file":"tenant-changed-event.d.ts","sourceRoot":"","sources":["../../../src/multi-region/hooks/tenant-changed-event.ts"],"names":[],"mappings":"AAAA;;;;;;;;;;;;;GAaG;AAEH,eAAO,MAAM,oBAAoB,wBAAwB,CAAC;AAE1D,MAAM,WAAW,mBAAmB;IAClC,aAAa,EAAE,MAAM,CAAC;IACtB,QAAQ,EAAE,MAAM,CAAC;IACjB,YAAY,EAAE,MAAM,GAAG,IAAI,CAAC;CAC7B"}

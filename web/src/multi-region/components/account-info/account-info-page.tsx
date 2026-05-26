@@ -153,12 +153,19 @@ const UTILIZATION_BANDS: ReadonlySet<UtilizationBand> = new Set([
   "healthy",
 ]);
 
+// URL-synced filter shape. Field types are widened to `string | string[]` to
+// satisfy `UrlStateRecord = Record<string, string | string[] | undefined>` —
+// the `useUrlState` hook's generic constraint. Read sites narrow back to a
+// plain `string` via `firstString` below before passing to consumers.
 interface AccountInfoFilters {
-  region: string;
-  lowFree: string;
-  q: string;
+  region: string | string[];
+  lowFree: string | string[];
+  q: string | string[];
   /** URL-synced utilization band — empty / missing → "all". */
-  band: string;
+  band: string | string[];
+  // Index signature required to satisfy `useUrlState`'s `UrlStateRecord`
+  // constraint (`Record<string, string | string[] | undefined>`).
+  [key: string]: string | string[] | undefined;
 }
 
 const INITIAL_FILTERS: AccountInfoFilters = {
@@ -167,6 +174,18 @@ const INITIAL_FILTERS: AccountInfoFilters = {
   q: "",
   band: "",
 };
+
+/**
+ * Narrow a URL-state value (`string | string[] | undefined`) to a single
+ * string. Filters on this page only ever carry scalar values, but the URL
+ * state generic allows arrays for forward compatibility — pick the first
+ * element when it ever arrives as an array.
+ */
+function firstString(value: string | string[] | undefined): string {
+  if (value == null) return "";
+  if (Array.isArray(value)) return value[0] ?? "";
+  return value;
+}
 
 /** Narrow an arbitrary string from URL state to a known `UtilizationBand`. */
 function coerceBand(value: string): UtilizationBand {
@@ -1614,11 +1633,15 @@ const AccountInfoPageInner: React.FC<AccountInfoPageProps> = ({
   // the URL too so a deep link captures the operator's full view (region +
   // low-free threshold + free-text query + risk band).
   const [filters, setFilters] = useUrlState(INITIAL_FILTERS, { replace: true });
-  const regionFilter = filters.region ?? "";
-  const lowFreeFilter = filters.lowFree ?? "";
-  const urlQuery = filters.q ?? "";
+  // URL state values are `string | string[] | undefined` per the hook's
+  // generic constraint. Narrow to plain `string` here so downstream consumers
+  // (Select value props, search.setQuery, ExportMenu metadata) keep their
+  // scalar-string types.
+  const regionFilter = firstString(filters.region);
+  const lowFreeFilter = firstString(filters.lowFree);
+  const urlQuery = firstString(filters.q);
   const utilizationBand: UtilizationBand = React.useMemo(
-    () => coerceBand(filters.band ?? ""),
+    () => coerceBand(firstString(filters.band)),
     [filters.band],
   );
   const setUtilizationBand = React.useCallback(
@@ -1781,8 +1804,12 @@ const AccountInfoPageInner: React.FC<AccountInfoPageProps> = ({
   // Local input state (instant typing UX); we mirror the *debounced* query
   // into the URL so a deep link still reflects the search.
   const [searchInput, setSearchInput] = React.useState(urlQuery);
+  // `accountInfos` is typed `ReadonlyArray<AccountInfo>` (the memo above
+  // freezes the empty-array identity), but `useSearch` expects a mutable
+  // `AccountInfo[]`. The hook treats its input as read-only, so a structural
+  // cast is safe; spread would re-allocate every render and defeat the memo.
   const search = useSearch<AccountInfo>(
-    accountInfos,
+    accountInfos as AccountInfo[],
     ["accountName", "region", "resourceGroup", "subscriptionId"],
     200,
   );
@@ -2544,7 +2571,10 @@ const AccountInfoPageInner: React.FC<AccountInfoPageProps> = ({
           the store gains a history slice. */}
       {accountInfos.length > 0 && (
         <QuotaGlance
-          accounts={accountInfos}
+          // `accountInfos` is `ReadonlyArray<AccountInfo>` from the memo
+          // above; the consumer's prop type wants a mutable array but does
+          // not mutate. Structural cast keeps the memoized identity stable.
+          accounts={accountInfos as AccountInfo[]}
           onAccountClick={handleAccountIdActivate}
         />
       )}

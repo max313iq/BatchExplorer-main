@@ -156,7 +156,7 @@ export interface RoleGraphPageProps {
 }
 
 /** Friendly principal-type → Lucide icon mapping. */
-function principalIcon(type: string): React.FC<{ className?: string }> {
+function principalIcon(type: string): React.ElementType {
   if (type === "User") return User;
   if (type === "Group") return Users;
   if (type === "ServicePrincipal" || type === "Application") return Shield;
@@ -2414,7 +2414,9 @@ export const RoleGraphPage: React.FC<RoleGraphPageProps> = ({ onNavigate }) => {
         <TokenExpiryBadge
           secondsUntilExpiry={armTokenTracker.secondsUntilExpiry}
           loading={armTokenTracker.loading}
-          onRefresh={armTokenTracker.refresh}
+          onRefresh={() => {
+            void armTokenTracker.refresh();
+          }}
           needsReauth={armTokenTracker.needsReauth}
           onReauth={() =>
             void armTokenTracker.reauth({
@@ -2936,7 +2938,9 @@ export const RoleGraphPage: React.FC<RoleGraphPageProps> = ({ onNavigate }) => {
 
       {/* Loading skeleton */}
       {probing && summaries.length === 0 && (
-        <SkeletonLoader rows={4} columns={3} className="mt-1" />
+        <div className="mt-1">
+          <SkeletonLoader variant="table" rows={4} columns={3} />
+        </div>
       )}
 
       {/* Empty state */}

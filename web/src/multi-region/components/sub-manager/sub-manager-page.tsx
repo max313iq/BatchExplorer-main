@@ -192,7 +192,7 @@ const PRINCIPAL_TYPE_FILTERS = [
   { value: "ForeignGroup", label: "Foreign groups" },
 ] as const;
 
-function principalIcon(type: string): React.FC<{ className?: string }> {
+function principalIcon(type: string): React.ElementType {
   if (type === "User") return User;
   if (type === "Group") return Users;
   if (type === "ServicePrincipal" || type === "Application") return Shield;
@@ -3874,7 +3874,9 @@ const DepartmentsTab: React.FC<{
         confirmText="Delete"
         danger
         loading={!!pendingDelete && rowBusy === pendingDelete.name}
-        onConfirm={() => pendingDelete && void submitDelete(pendingDelete)}
+        onConfirm={() => {
+          if (pendingDelete) void submitDelete(pendingDelete);
+        }}
         onCancel={() => setPendingDelete(null)}
       />
     </div>

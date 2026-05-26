@@ -1,0 +1,1 @@
+{"version":3,"file":"status-badge.d.ts","sourceRoot":"","sources":["../../../../src/multi-region/components/shared/status-badge.tsx"],"names":[],"mappings":"AAAA,OAAO,KAAK,KAAK,MAAM,OAAO,CAAC;AAiD/B,UAAU,gBAAgB;IACxB,MAAM,EAAE,MAAM,CAAC;IACf,KAAK,CAAC,EAAE,MAAM,CAAC;CAChB;AAED,eAAO,MAAM,WAAW,EAAE,KAAK,CAAC,EAAE,CAAC,gBAAgB,CAiBlD,CAAC"}

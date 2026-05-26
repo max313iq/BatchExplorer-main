@@ -41,10 +41,11 @@ export interface RunbookEntry {
   url: string;
 }
 
-const STORAGE_HARDENING: RunbookEntry = {
-  label: "Storage hardening checklist",
-  url: "https://learn.microsoft.com/azure/storage/common/storage-security-guide",
-};
+// Note: a general "Storage hardening checklist" entry once lived here but
+// every concrete storage rule now maps to a more specific runbook
+// (`STORAGE_PUBLIC_ACCESS`, `STORAGE_HTTPS`, `STORAGE_TLS`, `STORAGE_NETWORK`,
+// `STORAGE_AAD`). Removed to avoid an unused-const compile warning; the
+// generic checklist URL still survives via `GENERIC_RUNBOOK` below.
 
 const KEYVAULT_BEST_PRACTICES: RunbookEntry = {
   label: "Key Vault best practices",

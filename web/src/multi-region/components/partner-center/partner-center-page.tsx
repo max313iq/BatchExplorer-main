@@ -2527,7 +2527,7 @@ export const PartnerCenterPage: React.FC<PartnerCenterPageProps> = ({
 interface ProbeRowProps {
   label: string;
   help: string;
-  icon: React.ComponentType<{ className?: string; "aria-hidden"?: boolean }>;
+  icon: React.ElementType;
   result: ProbeResult | null;
   loading: boolean;
   onRun: () => void;

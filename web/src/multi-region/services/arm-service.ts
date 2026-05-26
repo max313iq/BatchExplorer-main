@@ -24,7 +24,6 @@ import {
   CreateSubscriptionRequest,
 } from "./types";
 import { guardedFetch } from "../scheduling/request-governance";
-import { abortError } from "./abort-helpers";
 import { fetchAllPages as sharedFetchAllPages } from "./_shared/paginate";
 import {
   getBatchAccountQuota,
@@ -658,9 +657,13 @@ async function postMoveRequest(
     }
     try {
       const result = await pollAsyncOperation(pollUrl, token);
-      const ok = result.status >= 200 && result.status < 300;
+      // pollAsyncOperation throws on failure; reaching here means the op
+      // succeeded ("Succeeded"/"completed"). Map to HTTP 200 for the
+      // numeric ResourceMoveOutcome.status contract.
+      const ok = result.status.toLowerCase() === "succeeded" ||
+        result.status.toLowerCase() === "completed";
       return {
-        status: result.status,
+        status: ok ? 200 : 500,
         ok,
         body: result.body as Record<string, unknown>,
         error: ok
@@ -3633,7 +3636,8 @@ export async function createLegacyEaSubscription(
   return {
     subscriptionId: extractSubIdFromLink(data.subscriptionLink),
     subscriptionLink: data.subscriptionLink,
-    status: poll.status,
+    // pollAsyncOperation throws on failure; "Succeeded"/"completed" maps to HTTP 200.
+    status: 200,
   };
 }
 

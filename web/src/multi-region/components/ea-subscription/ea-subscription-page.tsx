@@ -1991,7 +1991,7 @@ const EaSubscriptionPageInner: React.FC<EaSubscriptionPageProps> = ({
           r.startedAtIso,
           r.completedAtIso,
         ]);
-        downloadCsv(`${baseFilename}.csv`, headers, csvRows);
+        downloadCsv(`${baseFilename}.csv`, [headers, ...csvRows]);
       } else {
         downloadJson(`${baseFilename}.json`, {
           exportedAt: new Date().toISOString(),
@@ -2244,12 +2244,6 @@ const EaSubscriptionPageInner: React.FC<EaSubscriptionPageProps> = ({
       </div>
     );
   }
-
-  const confirmRecipientsPreview = effectiveRecipients.slice(0, 10);
-  const confirmRecipientsExtra = Math.max(
-    0,
-    effectiveRecipients.length - confirmRecipientsPreview.length,
-  );
 
   const totalRecipients = effectiveRecipients.length;
 

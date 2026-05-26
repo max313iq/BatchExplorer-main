@@ -962,7 +962,9 @@ export class MultiRegionStore {
     setArray("notifications", "notifications");
     setObject("workflow", "workflow");
     setObject("poolDefaults", "poolDefaults");
-    setObject("preferences", "preferences");
+    // "preferences" is a forward-compat field not yet on MultiRegionState — keep
+    // restoring it so older session blobs round-trip cleanly.
+    setObject("preferences" as keyof MultiRegionState, "preferences");
     setObject("globalFilter", "globalFilter");
 
     if (typeof parsed.sessionId === "string" && parsed.sessionId.length > 0) {

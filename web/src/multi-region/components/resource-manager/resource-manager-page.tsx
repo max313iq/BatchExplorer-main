@@ -615,6 +615,19 @@ export const ResourceManagerPage: React.FC = () => {
   );
 
   /**
+   * Stale-only filter — persisted via `usePersistedState` so the chip
+   * remembers its on/off state across reloads. When true, the visible
+   * list is restricted to accounts flagged by `isStaleBatchAccount`
+   * (Failed/Canceled provisioning OR zero core quota). Independent of
+   * the provisioningState quick-filter — both compose with AND.
+   */
+  const [staleOnly, setStaleOnly] = usePersistedState<boolean>(
+    "resource-manager:stale-only",
+    false,
+    { syncAcrossTabs: true },
+  );
+
+  /**
    * Multi-token search: every whitespace-separated token must match SOME
    * searchable field. Operators with long account inventories often type
    * "westus succeeded" to narrow the list — single-substring search misses
@@ -840,19 +853,6 @@ export const ResourceManagerPage: React.FC = () => {
   const [rgTemplate, setRgTemplate] = usePersistedState<string>(
     STORAGE_RG_TEMPLATE,
     DEFAULT_RG_TEMPLATE,
-    { syncAcrossTabs: true },
-  );
-
-  /**
-   * Stale-only filter — persisted via `usePersistedState` so the chip
-   * remembers its on/off state across reloads. When true, the visible
-   * list is restricted to accounts flagged by `isStaleBatchAccount`
-   * (Failed/Canceled provisioning OR zero core quota). Independent of
-   * the provisioningState quick-filter — both compose with AND.
-   */
-  const [staleOnly, setStaleOnly] = usePersistedState<boolean>(
-    "resource-manager:stale-only",
-    false,
     { syncAcrossTabs: true },
   );
 

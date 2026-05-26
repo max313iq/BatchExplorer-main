@@ -751,7 +751,7 @@ function resourceTypeLabel(t: ResourceType): string {
   }
 }
 
-function resourceTypeIcon(t: ResourceType): React.FC<{ className?: string }> {
+function resourceTypeIcon(t: ResourceType): React.ElementType {
   switch (t) {
     case "storage":
       return FileText;
@@ -918,6 +918,31 @@ const SecurityAuditPageInner: React.FC = () => {
       },
     },
   );
+
+  // ----------------- Finding "first seen" tracking -----------------
+  // Hoisted above `runAudit` so the scan callback can stamp brand-new
+  // finding ids without a TDZ on the setter. The map is pruned to ids
+  // currently present in the findings list whenever a new scan
+  // completes (in the scan effect below).
+  type FirstSeenMap = Record<string, number /* ms since epoch */>;
+  const [firstSeenAt, setFirstSeenAt] = usePersistedState<FirstSeenMap>(
+    "security-audit:first-seen-v1",
+    () => ({}),
+    { version: 1 },
+  );
+
+  // ----------------- Posture-trend snapshots (wave 8) -----------------
+  // Hoisted above `runAudit` so the scan callback can push a fresh
+  // snapshot without a TDZ on the setter. Persists a small ring buffer
+  // of per-scan summaries so the operator sees movement between runs
+  // (sparkline + delta vs. previous). The ring is capped at
+  // POSTURE_TREND_MAX (30) inside the helper.
+  //
+  // citation: New folder\_analysis_defender_view.md §1 — ScoutSuite
+  // ships HTML reports keyed off snapshots; we mirror in-page.
+  const [postureSnapshots, setPostureSnapshots] = usePersistedState<
+    PostureSnapshot[]
+  >("security-audit:posture-trend-v1", () => [], { version: 1 });
 
   const runAudit = React.useCallback(async () => {
     if (selectedSubIds.size === 0) return;
@@ -1229,26 +1254,32 @@ const SecurityAuditPageInner: React.FC = () => {
   const [urlState, setUrlState] = useUrlState(URL_INITIAL);
 
   const activeSeverities = React.useMemo<Set<Severity>>(() => {
-    const raw = urlState.sev;
-    const arr = Array.isArray(raw)
-      ? (raw as string[])
+    // `useUrlState` typings tighten array keys to `string[]`, but the URL
+    // can round-trip a malformed value as a bare string. Cast through
+    // `unknown` to break the static-type narrowing so the
+    // `typeof raw === "string"` branch isn't reduced to `never`.
+    const raw = urlState.sev as unknown as string | string[] | undefined;
+    const arr: string[] = Array.isArray(raw)
+      ? raw
       : typeof raw === "string" && raw.length > 0
         ? raw.split(",")
-        : ALL_SEVERITIES;
-    const valid = arr.filter((s): s is Severity =>
+        : (ALL_SEVERITIES as readonly string[] as string[]);
+    const valid = arr.filter((s: string): s is Severity =>
       (ALL_SEVERITIES as readonly string[]).includes(s),
     );
     return new Set<Severity>(valid.length > 0 ? valid : ALL_SEVERITIES);
   }, [urlState.sev]);
 
   const activeResourceTypes = React.useMemo<Set<ResourceType>>(() => {
-    const raw = urlState.type;
-    const arr = Array.isArray(raw)
-      ? (raw as string[])
+    // See `activeSeverities` above — same widening rationale (cast through
+    // `unknown` to break the static-type narrowing).
+    const raw = urlState.type as unknown as string | string[] | undefined;
+    const arr: string[] = Array.isArray(raw)
+      ? raw
       : typeof raw === "string" && raw.length > 0
         ? raw.split(",")
-        : ALL_RESOURCE_TYPES;
-    const valid = arr.filter((t): t is ResourceType =>
+        : (ALL_RESOURCE_TYPES as readonly string[] as string[]);
+    const valid = arr.filter((t: string): t is ResourceType =>
       (ALL_RESOURCE_TYPES as readonly string[]).includes(t),
     );
     return new Set<ResourceType>(
@@ -1342,18 +1373,6 @@ const SecurityAuditPageInner: React.FC = () => {
     [setUrlState, recordFilterChange],
   );
 
-  // ----------------- Finding "first seen" tracking -----------------
-  // Persist when each finding-id was first observed so the "older than
-  // 30 days" filter chip has something to compare against. The map is
-  // pruned to ids currently present in the findings list whenever a
-  // new scan completes (in the scan effect below).
-  type FirstSeenMap = Record<string, number /* ms since epoch */>;
-  const [firstSeenAt, setFirstSeenAt] = usePersistedState<FirstSeenMap>(
-    "security-audit:first-seen-v1",
-    () => ({}),
-    { version: 1 },
-  );
-
   // ----------------- Acknowledge / suppress (wave 8) -----------------
   // Two-state per-finding decision the operator can persist:
   //   - acknowledged: finding is real but expected (e.g. legacy KV
@@ -1389,17 +1408,6 @@ const SecurityAuditPageInner: React.FC = () => {
     () => ({}),
     { version: 1 },
   );
-
-  // ----------------- Posture-trend snapshots (wave 8) -----------------
-  // Persist a small ring buffer of per-scan summaries so the operator
-  // sees movement between runs (sparkline + delta vs. previous). The
-  // ring is capped at POSTURE_TREND_MAX (30) inside the helper.
-  //
-  // citation: New folder\_analysis_defender_view.md §1 — ScoutSuite
-  // ships HTML reports keyed off snapshots; we mirror in-page.
-  const [postureSnapshots, setPostureSnapshots] = usePersistedState<
-    PostureSnapshot[]
-  >("security-audit:posture-trend-v1", () => [], { version: 1 });
 
   // Threshold for the "stale" chip — finding-id first observed more
   // than 30 days ago and still appears in the latest scan.

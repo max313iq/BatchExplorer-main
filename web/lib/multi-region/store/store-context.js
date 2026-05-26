@@ -1,0 +1,66 @@
+import * as React from "react";
+const StoreContext = React.createContext(null);
+export const MultiRegionStoreProvider = ({ store, children }) => {
+    return (React.createElement(StoreContext.Provider, { value: store }, children));
+};
+export function useMultiRegionStore() {
+    const store = React.useContext(StoreContext);
+    if (!store) {
+        throw new Error("useMultiRegionStore must be used within a <MultiRegionStoreProvider>");
+    }
+    return store;
+}
+export function useMultiRegionState() {
+    const store = useMultiRegionStore();
+    const [state, setState] = React.useState(store.getState());
+    React.useEffect(() => {
+        const unsubscribe = store.onChange(() => {
+            setState(store.getState());
+        });
+        setState(store.getState());
+        return unsubscribe;
+    }, [store]);
+    return state;
+}
+/** Only re-renders when the selected slice changes (shallow equality) */
+export function useMultiRegionSelector(selector) {
+    const store = useMultiRegionStore();
+    const selectorRef = React.useRef(selector);
+    selectorRef.current = selector;
+    const [value, setValue] = React.useState(() => selector(store.getState()));
+    React.useEffect(() => {
+        return store.onChange(() => {
+            const next = selectorRef.current(store.getState());
+            setValue((prev) => (prev === next ? prev : next));
+        });
+    }, [store]);
+    return value;
+}
+/** Memoized dashboard stats */
+export function useDashboardStats() {
+    const state = useMultiRegionState();
+    return React.useMemo(() => {
+        const accounts = state.accounts;
+        const pools = state.pools;
+        const nodes = state.nodes;
+        return {
+            totalAccounts: accounts.length,
+            createdAccounts: accounts.filter((a) => a.provisioningState === "created")
+                .length,
+            failedAccounts: accounts.filter((a) => a.provisioningState === "failed")
+                .length,
+            totalPools: pools.length,
+            createdPools: pools.filter((p) => p.provisioningState === "created")
+                .length,
+            failedPools: pools.filter((p) => p.provisioningState === "failed").length,
+            totalNodes: nodes.length,
+            runningNodes: nodes.filter((n) => n.state === "running" || n.state === "idle").length,
+            nonWorkingNodes: nodes.filter((n) => n.state === "unusable" ||
+                n.state === "starttaskfailed" ||
+                n.state === "offline" ||
+                n.state === "unknown" ||
+                n.state === "preempted").length,
+        };
+    }, [state.accounts, state.pools, state.nodes]);
+}
+//# sourceMappingURL=store-context.js.map

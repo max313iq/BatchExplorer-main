@@ -208,6 +208,8 @@ interface MatrixUrlState {
   sort: string;
   /** Sort direction — "asc" | "desc". Defaults to "asc". */
   dir: string;
+  // Index signature so this satisfies the `UrlStateRecord` constraint.
+  [key: string]: string | string[] | undefined;
 }
 
 const INITIAL_URL_STATE: MatrixUrlState = Object.freeze({
@@ -811,7 +813,7 @@ export const AudienceMatrixPage: React.FC = () => {
         target: `${row.id}|${audience.key}`,
         status: result.kind === "success" ? "success" : "failure",
         error: result.kind === "error" ? result.message : undefined,
-        details: detail,
+        details: detail as unknown as Record<string, unknown>,
       });
       return result;
     },
@@ -1166,7 +1168,9 @@ export const AudienceMatrixPage: React.FC = () => {
           <TokenExpiryBadge
             secondsUntilExpiry={armTokenTracker.secondsUntilExpiry}
             loading={armTokenTracker.loading}
-            onRefresh={armTokenTracker.refresh}
+            onRefresh={() => {
+              void armTokenTracker.refresh();
+            }}
             alwaysShow={false}
             needsReauth={armTokenTracker.needsReauth}
             onReauth={() =>

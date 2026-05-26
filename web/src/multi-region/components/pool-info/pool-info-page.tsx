@@ -160,6 +160,8 @@ interface PoolFilters {
    *   ""           — no quick filter
    */
   quick: string;
+  // Index signature so this satisfies the `UrlStateRecord` constraint.
+  [key: string]: string | string[] | undefined;
 }
 
 interface NodeBreakdownBucket {
@@ -2477,7 +2479,9 @@ const PoolInfoPageInner: React.FC<PoolInfoPageProps> = ({ orchestrator }) => {
         )}
         <Button
           variant="default"
-          onClick={refresh}
+          onClick={() => {
+            void refresh();
+          }}
           disabled={loading}
           aria-label="Refresh pools"
           title="Refresh pool data (R)"

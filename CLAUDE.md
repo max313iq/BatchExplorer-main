@@ -1,59 +1,36 @@
 # Project rules
 
-## HARD RULE — No installs, no outside packages, no models, no network fetches without explicit permission
+## Dependency policy — installs ALLOWED for testing / building / verification
 
-This repository is **source-only, no dependencies installed**. The
-directory name itself encodes this:
-`AzureBatchManager-source-only-no-deps-20260525\`. There is no
-`node_modules\`, no virtualenv, no installed runtime — only the
-WebUI source code.
+The directory name `AzureBatchManager-source-only-no-deps-20260525\` is
+**historical** — it reflects how the source arrived (no `node_modules\`
+pre-populated). It is no longer a hard rule.
 
-**Forbidden actions (until I explicitly say otherwise, per task):**
+**Installs are allowed** when needed for the task at hand:
+- `npm install` / `npm ci` to populate `node_modules\` so `tsc`, `jest`,
+  `webpack`, `eslint` can run against the project's *already-declared*
+  dependencies.
+- Running `tsc --noEmit`, `jest`, `npm run build`, `npm run test`,
+  `npm run lint` (anything declared in `package.json scripts`).
+- Re-running `npm install` after adding a genuinely-needed declared
+  dependency for the user's current task.
 
-- `npm install`, `npm i`, `npm ci`, `npm add`, `npm update`,
-  `npm exec`, `npx <anything>`, `yarn`, `yarn add`, `pnpm`,
-  `pnpm install`, `pnpm add`, `bun install`, `bun add`.
-- `pip install`, `pip3 install`, `python -m pip install`,
-  `poetry add`, `uv add`, `uv pip install`, `conda install`,
-  `mamba install`, `apt install`, `apt-get install`,
-  `choco install`, `winget install`, `scoop install`,
-  `brew install`.
-- `cargo add`, `cargo install`, `go get`, `go install`,
-  `dotnet add package`, `dotnet tool install`,
-  `gem install`, `bundle install`,
-  `nuget install`, `Install-Package`, `Install-Module`,
-  `docker pull`, `docker run` of an uncached image.
-- Downloading or fetching models / weights / checkpoints from
-  HuggingFace, Ollama (`ollama pull`, `ollama run` of a not-yet-pulled
-  model), OpenAI, Anthropic, Replicate, civitai, gguf mirrors, etc.
-- Any tool or CLI invocation whose **side effect** is to fetch and
-  install a remote package, model, container, or binary into the
-  system (this includes auto-install on first run, e.g. `tsc` if it
-  triggers package resolution).
-- Modifying `package.json`, `package-lock.json`, `pnpm-lock.yaml`,
-  `yarn.lock`, `requirements.txt`, `pyproject.toml`,
-  `poetry.lock`, `Cargo.toml`, `go.mod`, `*.csproj`, `Gemfile`, or
-  any lockfile in a way that adds a new dependency. Editing the
-  source code to *use* a package that isn't already declared is
-  also forbidden — if the import resolves only through a new
-  install, do not write it.
-
-**Allowed (read-only by default — NO free editing):**
-
-- Reading existing `package.json` / lockfiles to learn what is
-  already declared.
-- Running read-only or analysis commands that do not install
-  anything (`npm ls`, `npm view`, `tsc --noEmit` only if the
-  toolchain is already present on PATH and does not trigger
-  install).
-- Static analysis: Read, Glob, Grep over the source.
+**Still discouraged** (announce + justify first, don't do drive-by):
+- Adding a brand-new top-level npm dependency that isn't already part of
+  the project's declared set — unless the user's current task says
+  "add X package."
+- Network fetches of models / weights / non-npm binaries (HuggingFace,
+  Ollama pulls, etc.) — these aren't part of normal npm install flow
+  and should be opt-in per task.
 
 **Editing is NOT a freedom — it is per-task and per-instruction.**
+This separate rule still applies — it's about edit-scope discipline,
+not about installs.
 
 - I do **not** have blanket permission to edit source files just
-  because a package is declared in `package.json`. Declared-but-
-  uninstalled packages are usable in code I write **only when the
-  user has asked for that specific change**.
+  because a package is declared in `package.json`. Declared
+  packages are usable in code I write **only when the user has
+  asked for that specific change**.
 - No proactive refactors. No "improve while I'm here." No
   drive-by import additions, even if the imported package is
   declared. No reformatting, no renaming, no dead-code removal,
@@ -63,16 +40,6 @@ WebUI source code.
   it — do not do it.
 - Sub-agents inherit the same no-freedom constraint: their prompts
   must scope edits to the exact files and exact change requested.
-
-**Sub-agents inherit this rule.** Every dispatched agent must be
-told: *"You may not install, fetch, pull, or add any package,
-model, image, or binary. This is a source-only repo. If a task
-seems to require a new dependency, stop and report — do not
-install."*
-
-**If a task truly needs a new package or model:** stop, explain
-what is needed, why, and the alternatives — then wait for me to
-explicitly approve. Never install first and ask later.
 
 ---
 

@@ -1718,7 +1718,7 @@ const MonitoringPageInner: React.FC<MonitoringPageProps> = ({
       ]);
     }
     const ts = new Date().toISOString().replace(/[:.]/g, "-");
-    downloadCsv(`monitoring-combined-${range}-${ts}.csv`, headers, rows);
+    downloadCsv(`monitoring-combined-${range}-${ts}.csv`, [headers, ...rows]);
   }, [filteredActivities, filteredLogs, range]);
 
   /** Combined JSON — preserves structure + metadata for machine consumption. */
@@ -2451,12 +2451,8 @@ const MonitoringPageInner: React.FC<MonitoringPageProps> = ({
                 />
               </span>
               {LOG_LEVELS.map((lvl) => {
-                const Icon =
-                  lvl === "error"
-                    ? XCircle
-                    : lvl === "warn"
-                      ? AlertTriangle
-                      : InfoIcon;
+                // Icon is encoded via the colored chip + InlineLegend below,
+                // so we don't render a per-chip icon here. Tone color suffices.
                 const toneActive =
                   lvl === "error"
                     ? "bg-destructive/15 text-destructive border-destructive/40"
@@ -3535,7 +3531,7 @@ const ViewPresetsSection: React.FC<ViewPresetsSectionProps> = ({
 /* ------------------------------------------------------------------ */
 
 interface InlineLegendProps {
-  icons: ReadonlyArray<React.ComponentType<{ className?: string; "aria-hidden"?: boolean }>>;
+  icons: ReadonlyArray<React.ElementType>;
 }
 
 const InlineLegend: React.FC<InlineLegendProps> = ({ icons }) => (

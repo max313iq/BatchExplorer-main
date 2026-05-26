@@ -24,7 +24,6 @@ import {
   ChevronsDownUp,
   ChevronsUpDown,
   CircleDot,
-  CloudOff,
   Columns,
   Download,
   Eye,
@@ -3805,9 +3804,9 @@ const PoolDefaultsForm: React.FC<PoolDefaultsFormProps> = ({
         confirmText="Delete preset"
         cancelText="Cancel"
         danger
-        onConfirm={() =>
-          confirmDeletePreset && handleDeletePreset(confirmDeletePreset)
-        }
+        onConfirm={() => {
+          if (confirmDeletePreset) handleDeletePreset(confirmDeletePreset);
+        }}
         onCancel={() => setConfirmDeletePreset(null)}
       />
 

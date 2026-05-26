@@ -1,0 +1,924 @@
+import { __awaiter } from "tslib";
+import { RequestScheduler, RequestSchedulerQueueOverflowError, DEFAULT_SCHEDULER_OPTIONS, } from '../request-scheduler';
+const flush = (cycles = 5) => __awaiter(void 0, void 0, void 0, function* () {
+    for (let i = 0; i < cycles; i++) {
+        yield Promise.resolve();
+    }
+});
+const makeError = (status, extras) => {
+    const err = Object.assign({}, extras);
+    if (status !== null)
+        err.status = status;
+    return err;
+};
+describe('RequestScheduler', () => {
+    describe('constructor and option normalization', () => {
+        it('clamps concurrency to a minimum of 1', () => {
+            const s = new RequestScheduler({ concurrency: 0 });
+            expect(s.activeCount).toBe(0);
+            expect(s.inflightCount).toBe(0);
+        });
+        it('uses delayMsBetweenRequests when delayMs is not provided (back-compat)', () => __awaiter(void 0, void 0, void 0, function* () {
+            const sleeps = [];
+            const s = new RequestScheduler({
+                concurrency: 1,
+                delayMsBetweenRequests: 250,
+                retryAttempts: 0,
+                sleep: (ms) => {
+                    sleeps.push(ms);
+                    return Promise.resolve();
+                },
+                now: () => 0,
+            });
+            yield s.run('k', () => Promise.resolve('a'));
+            yield s.run('k', () => Promise.resolve('b'));
+            // Pacing waits 250ms (the deprecated delayMsBetweenRequests value)
+            expect(sleeps).toContain(250);
+        }));
+        it('falls back to defaults when no options are passed', () => __awaiter(void 0, void 0, void 0, function* () {
+            const s = new RequestScheduler();
+            const result = yield s.run('k', () => Promise.resolve(123));
+            expect(result).toBe(123);
+        }));
+        it('exposes DEFAULT_SCHEDULER_OPTIONS with production-tuned values', () => {
+            expect(DEFAULT_SCHEDULER_OPTIONS.concurrency).toBe(1);
+            expect(DEFAULT_SCHEDULER_OPTIONS.delayMs).toBe(2000);
+            expect(DEFAULT_SCHEDULER_OPTIONS.retryAttempts).toBe(5);
+            expect(DEFAULT_SCHEDULER_OPTIONS.retryBackoffSeconds).toEqual([2, 4, 8, 16, 32]);
+            expect(DEFAULT_SCHEDULER_OPTIONS.jitterPct).toBe(0.2);
+            expect(DEFAULT_SCHEDULER_OPTIONS.maxQueueSize).toBe(100);
+        });
+    });
+    describe('basic execution', () => {
+        it('runs a single request and resolves with its value', () => __awaiter(void 0, void 0, void 0, function* () {
+            const s = new RequestScheduler({
+                concurrency: 1,
+                delayMs: 0,
+                retryAttempts: 0,
+                sleep: () => Promise.resolve(),
+            });
+            const result = yield s.run('k', () => Promise.resolve('hello'));
+            expect(result).toBe('hello');
+            expect(s.activeCount).toBe(0);
+            expect(s.inflightCount).toBe(0);
+        }));
+        it('uses the literal "default" key when key is empty', () => __awaiter(void 0, void 0, void 0, function* () {
+            const s = new RequestScheduler({
+                concurrency: 1,
+                delayMs: 0,
+                retryAttempts: 0,
+                sleep: () => Promise.resolve(),
+            });
+            const result = yield s.run('', () => Promise.resolve('ok'));
+            expect(result).toBe('ok');
+        }));
+        it('decrements inflightCount after completion', () => __awaiter(void 0, void 0, void 0, function* () {
+            const s = new RequestScheduler({
+                concurrency: 5,
+                delayMs: 0,
+                retryAttempts: 0,
+                sleep: () => Promise.resolve(),
+            });
+            const p = s.run('a', () => Promise.resolve(1));
+            // inflight bumps synchronously inside run()
+            expect(s.inflightCount).toBe(1);
+            yield p;
+            // finally hook decrements inflight
+            yield flush(3);
+            expect(s.inflightCount).toBe(0);
+        }));
+    });
+    describe('rate-limit (concurrency) enforcement', () => {
+        it('does not execute more than `concurrency` callbacks at the same time', () => __awaiter(void 0, void 0, void 0, function* () {
+            const concurrency = 3;
+            let active = 0;
+            let maxActive = 0;
+            const resolvers = [];
+            const s = new RequestScheduler({
+                concurrency,
+                delayMs: 0,
+                retryAttempts: 0,
+                sleep: () => Promise.resolve(),
+            });
+            const fn = () => {
+                active++;
+                if (active > maxActive)
+                    maxActive = active;
+                return new Promise((resolve) => {
+                    resolvers.push(() => {
+                        active--;
+                        resolve();
+                    });
+                });
+            };
+            // Fire 10 concurrent requests; each request must use a distinct key
+            // so that the per-key serialization chain doesn't dominate the test.
+            const N = 10;
+            const promises = [];
+            for (let i = 0; i < N; i++) {
+                promises.push(s.run(`k${i}`, fn));
+            }
+            // Let the scheduler dispatch up to `concurrency` slots
+            yield flush(20);
+            expect(s.activeCount).toBeLessThanOrEqual(concurrency);
+            expect(active).toBeLessThanOrEqual(concurrency);
+            // Drain remaining work, ensuring max never exceeded concurrency
+            while (resolvers.length > 0) {
+                const r = resolvers.shift();
+                r();
+                yield flush(20);
+                expect(active).toBeLessThanOrEqual(concurrency);
+            }
+            yield Promise.all(promises);
+            expect(maxActive).toBeLessThanOrEqual(concurrency);
+            expect(s.activeCount).toBe(0);
+        }));
+        it('schedules waiters via the slot queue when concurrency is saturated', () => __awaiter(void 0, void 0, void 0, function* () {
+            const s = new RequestScheduler({
+                concurrency: 1,
+                delayMs: 0,
+                retryAttempts: 0,
+                sleep: () => Promise.resolve(),
+            });
+            let resolveFirst;
+            let secondStarted = false;
+            const first = s.run('a', () => new Promise((resolve) => {
+                resolveFirst = resolve;
+            }));
+            const second = s.run('b', () => {
+                secondStarted = true;
+                return Promise.resolve();
+            });
+            yield flush(10);
+            // First holds the only slot; second is queued and must not have started.
+            expect(secondStarted).toBe(false);
+            expect(s.activeCount).toBe(1);
+            resolveFirst();
+            yield first;
+            yield second;
+            expect(secondStarted).toBe(true);
+            expect(s.activeCount).toBe(0);
+        }));
+    });
+    describe('FIFO order preservation', () => {
+        it('serializes same-key calls so they complete in submission order', () => __awaiter(void 0, void 0, void 0, function* () {
+            const completed = [];
+            const s = new RequestScheduler({
+                concurrency: 5,
+                delayMs: 0,
+                retryAttempts: 0,
+                sleep: () => Promise.resolve(),
+            });
+            const fn = (id) => {
+                return () => new Promise((resolve) => {
+                    completed.push(id);
+                    resolve(id);
+                });
+            };
+            const p1 = s.run('shared', fn(1));
+            const p2 = s.run('shared', fn(2));
+            const p3 = s.run('shared', fn(3));
+            const p4 = s.run('shared', fn(4));
+            yield Promise.all([p1, p2, p3, p4]);
+            expect(completed).toEqual([1, 2, 3, 4]);
+        }));
+        it('preserves slot-queue FIFO across distinct keys at concurrency=1', () => __awaiter(void 0, void 0, void 0, function* () {
+            const order = [];
+            const resolvers = {};
+            const s = new RequestScheduler({
+                concurrency: 1,
+                delayMs: 0,
+                retryAttempts: 0,
+                sleep: () => Promise.resolve(),
+            });
+            const fn = (id) => {
+                return () => {
+                    order.push(id);
+                    return new Promise((resolve) => {
+                        resolvers[id] = resolve;
+                    });
+                };
+            };
+            const pA = s.run('a', fn('a'));
+            const pB = s.run('b', fn('b'));
+            const pC = s.run('c', fn('c'));
+            yield flush(20);
+            // Only the first should have started; queue holds B and C
+            expect(order).toEqual(['a']);
+            resolvers['a']();
+            yield pA;
+            yield flush(20);
+            expect(order).toEqual(['a', 'b']);
+            resolvers['b']();
+            yield pB;
+            yield flush(20);
+            expect(order).toEqual(['a', 'b', 'c']);
+            resolvers['c']();
+            yield pC;
+        }));
+    });
+    describe('queue overflow', () => {
+        it('rejects with RequestSchedulerQueueOverflowError when maxQueueSize is reached', () => __awaiter(void 0, void 0, void 0, function* () {
+            const s = new RequestScheduler({
+                concurrency: 1,
+                delayMs: 0,
+                retryAttempts: 0,
+                maxQueueSize: 2,
+                sleep: () => Promise.resolve(),
+            });
+            let resolveFirst;
+            const a = s.run('a', () => new Promise((resolve) => {
+                resolveFirst = resolve;
+            }));
+            const b = s.run('b', () => Promise.resolve());
+            // Now inflight = 2 = maxQueueSize. The third must reject.
+            yield expect(s.run('c', () => Promise.resolve())).rejects.toBeInstanceOf(RequestSchedulerQueueOverflowError);
+            resolveFirst();
+            yield a;
+            yield b;
+        }));
+        it('queue overflow error message contains the configured size', () => {
+            const err = new RequestSchedulerQueueOverflowError(42);
+            expect(err.name).toBe('RequestSchedulerQueueOverflowError');
+            expect(err.message).toContain('42');
+        });
+        it('clamps maxQueueSize to a minimum of 1', () => __awaiter(void 0, void 0, void 0, function* () {
+            const s = new RequestScheduler({
+                concurrency: 1,
+                delayMs: 0,
+                retryAttempts: 0,
+                maxQueueSize: 0,
+                sleep: () => Promise.resolve(),
+            });
+            let resolveFirst;
+            const a = s.run('a', () => new Promise((resolve) => {
+                resolveFirst = resolve;
+            }));
+            // With maxQueueSize=1 and 1 inflight, the next must overflow
+            yield expect(s.run('b', () => Promise.resolve())).rejects.toBeInstanceOf(RequestSchedulerQueueOverflowError);
+            resolveFirst();
+            yield a;
+        }));
+    });
+    describe('retry and backoff', () => {
+        it('retries on a 500 transient error and applies exponential backoff', () => __awaiter(void 0, void 0, void 0, function* () {
+            const sleepCalls = [];
+            const s = new RequestScheduler({
+                concurrency: 1,
+                delayMs: 0,
+                retryAttempts: 3,
+                retryBackoffSeconds: [1, 2, 4, 8],
+                jitterPct: 0,
+                sleep: (ms) => {
+                    sleepCalls.push(ms);
+                    return Promise.resolve();
+                },
+            });
+            let attempts = 0;
+            const fn = () => {
+                attempts++;
+                if (attempts < 3)
+                    return Promise.reject(makeError(500));
+                return Promise.resolve('ok');
+            };
+            const result = yield s.run('k', fn);
+            expect(result).toBe('ok');
+            expect(attempts).toBe(3);
+            // Backoff sleeps after attempt 1 (1s) and attempt 2 (2s), no jitter
+            const backoffSleeps = sleepCalls.filter((ms) => ms === 1000 || ms === 2000);
+            expect(backoffSleeps).toEqual([1000, 2000]);
+        }));
+        it('retries on 429 with throttle floor of at least 1000ms', () => __awaiter(void 0, void 0, void 0, function* () {
+            const sleeps = [];
+            const s = new RequestScheduler({
+                concurrency: 1,
+                delayMs: 0,
+                retryAttempts: 1,
+                retryBackoffSeconds: [0],
+                jitterPct: 0,
+                sleep: (ms) => {
+                    sleeps.push(ms);
+                    return Promise.resolve();
+                },
+            });
+            let attempts = 0;
+            const fn = () => {
+                attempts++;
+                if (attempts === 1)
+                    return Promise.reject(makeError(429));
+                return Promise.resolve('done');
+            };
+            const result = yield s.run('k', fn);
+            expect(result).toBe('done');
+            expect(sleeps).toContain(1000);
+        }));
+        it('honors numeric Retry-After headers (seconds) and uses the larger of base/retry-after', () => __awaiter(void 0, void 0, void 0, function* () {
+            const sleeps = [];
+            const s = new RequestScheduler({
+                concurrency: 1,
+                delayMs: 0,
+                retryAttempts: 1,
+                retryBackoffSeconds: [1],
+                jitterPct: 0,
+                sleep: (ms) => {
+                    sleeps.push(ms);
+                    return Promise.resolve();
+                },
+            });
+            let attempts = 0;
+            const fn = () => {
+                attempts++;
+                if (attempts === 1) {
+                    return Promise.reject(makeError(503, { headers: { 'retry-after': '5' } }));
+                }
+                return Promise.resolve('ok');
+            };
+            const result = yield s.run('k', fn);
+            expect(result).toBe('ok');
+            // 5 seconds = 5000ms wins over base backoff of 1000ms
+            expect(sleeps).toContain(5000);
+        }));
+        it('honors HTTP-date Retry-After headers', () => __awaiter(void 0, void 0, void 0, function* () {
+            const sleeps = [];
+            const fixedNow = Date.parse('2024-01-01T00:00:00Z');
+            const s = new RequestScheduler({
+                concurrency: 1,
+                delayMs: 0,
+                retryAttempts: 1,
+                retryBackoffSeconds: [0],
+                jitterPct: 0,
+                now: () => fixedNow,
+                sleep: (ms) => {
+                    sleeps.push(ms);
+                    return Promise.resolve();
+                },
+            });
+            let attempts = 0;
+            const futureDate = new Date(fixedNow + 7000).toUTCString();
+            const fn = () => {
+                attempts++;
+                if (attempts === 1) {
+                    return Promise.reject(makeError(503, { headers: { 'retry-after': futureDate } }));
+                }
+                return Promise.resolve('done');
+            };
+            yield s.run('k', fn);
+            expect(sleeps).toContain(7000);
+        }));
+        it('reads Retry-After via Headers-like .get accessor', () => __awaiter(void 0, void 0, void 0, function* () {
+            const sleeps = [];
+            const s = new RequestScheduler({
+                concurrency: 1,
+                delayMs: 0,
+                retryAttempts: 1,
+                retryBackoffSeconds: [1],
+                jitterPct: 0,
+                sleep: (ms) => {
+                    sleeps.push(ms);
+                    return Promise.resolve();
+                },
+            });
+            let attempts = 0;
+            const headersLike = {
+                get: (name) => {
+                    if (name.toLowerCase() === 'retry-after')
+                        return '3';
+                    return null;
+                },
+            };
+            const fn = () => {
+                attempts++;
+                if (attempts === 1) {
+                    return Promise.reject(makeError(503, { headers: headersLike }));
+                }
+                return Promise.resolve('ok');
+            };
+            yield s.run('k', fn);
+            expect(sleeps).toContain(3000);
+        }));
+        it('reads Retry-After from array values', () => __awaiter(void 0, void 0, void 0, function* () {
+            const sleeps = [];
+            const s = new RequestScheduler({
+                concurrency: 1,
+                delayMs: 0,
+                retryAttempts: 1,
+                retryBackoffSeconds: [1],
+                jitterPct: 0,
+                sleep: (ms) => {
+                    sleeps.push(ms);
+                    return Promise.resolve();
+                },
+            });
+            let attempts = 0;
+            const fn = () => {
+                attempts++;
+                if (attempts === 1) {
+                    return Promise.reject(makeError(503, { headers: { 'Retry-After': ['4'] } }));
+                }
+                return Promise.resolve('ok');
+            };
+            yield s.run('k', fn);
+            expect(sleeps).toContain(4000);
+        }));
+        it('does not retry non-retryable status codes (e.g. 401)', () => __awaiter(void 0, void 0, void 0, function* () {
+            const s = new RequestScheduler({
+                concurrency: 1,
+                delayMs: 0,
+                retryAttempts: 5,
+                retryBackoffSeconds: [1],
+                jitterPct: 0,
+                sleep: () => Promise.resolve(),
+            });
+            let attempts = 0;
+            const fn = () => {
+                attempts++;
+                return Promise.reject(makeError(401, { message: 'unauthorized' }));
+            };
+            yield expect(s.run('k', fn)).rejects.toMatchObject({ status: 401 });
+            expect(attempts).toBe(1);
+        }));
+        it('treats null/undefined status as a network error and retries', () => __awaiter(void 0, void 0, void 0, function* () {
+            const s = new RequestScheduler({
+                concurrency: 1,
+                delayMs: 0,
+                retryAttempts: 2,
+                retryBackoffSeconds: [0],
+                jitterPct: 0,
+                sleep: () => Promise.resolve(),
+            });
+            let attempts = 0;
+            const fn = () => {
+                attempts++;
+                if (attempts < 3) {
+                    // status 0 — counts as network
+                    return Promise.reject(makeError(0));
+                }
+                return Promise.resolve('recovered');
+            };
+            const r = yield s.run('k', fn);
+            expect(r).toBe('recovered');
+            expect(attempts).toBe(3);
+        }));
+        it('exhausts retryAttempts and rethrows the last error', () => __awaiter(void 0, void 0, void 0, function* () {
+            const s = new RequestScheduler({
+                concurrency: 1,
+                delayMs: 0,
+                retryAttempts: 2,
+                retryBackoffSeconds: [0],
+                jitterPct: 0,
+                sleep: () => Promise.resolve(),
+            });
+            let attempts = 0;
+            const fn = () => {
+                attempts++;
+                return Promise.reject(makeError(500));
+            };
+            yield expect(s.run('k', fn)).rejects.toMatchObject({ status: 500 });
+            // 2 retries + 1 initial = 3 total attempts
+            expect(attempts).toBe(3);
+        }));
+        it('retries 409 only when conflict message hints at a transient state', () => __awaiter(void 0, void 0, void 0, function* () {
+            const s = new RequestScheduler({
+                concurrency: 1,
+                delayMs: 0,
+                retryAttempts: 1,
+                retryBackoffSeconds: [0],
+                jitterPct: 0,
+                sleep: () => Promise.resolve(),
+            });
+            let attempts = 0;
+            const fn = () => {
+                attempts++;
+                if (attempts === 1) {
+                    return Promise.reject(makeError(409, { code: 'PoolIsResizing', message: 'pool busy' }));
+                }
+                return Promise.resolve('ok');
+            };
+            const r = yield s.run('k', fn);
+            expect(r).toBe('ok');
+            expect(attempts).toBe(2);
+        }));
+        it('does not retry a non-retriable 409 (no transient hint)', () => __awaiter(void 0, void 0, void 0, function* () {
+            const s = new RequestScheduler({
+                concurrency: 1,
+                delayMs: 0,
+                retryAttempts: 5,
+                retryBackoffSeconds: [0],
+                jitterPct: 0,
+                sleep: () => Promise.resolve(),
+            });
+            let attempts = 0;
+            const fn = () => {
+                attempts++;
+                return Promise.reject(makeError(409, { code: 'NameAlreadyTaken', message: 'duplicate' }));
+            };
+            yield expect(s.run('k', fn)).rejects.toMatchObject({ status: 409 });
+            expect(attempts).toBe(1);
+        }));
+        it('caps backoff index at the last entry of the table', () => __awaiter(void 0, void 0, void 0, function* () {
+            const sleeps = [];
+            const s = new RequestScheduler({
+                concurrency: 1,
+                delayMs: 0,
+                retryAttempts: 5,
+                retryBackoffSeconds: [1, 2],
+                jitterPct: 0,
+                sleep: (ms) => {
+                    sleeps.push(ms);
+                    return Promise.resolve();
+                },
+            });
+            let attempts = 0;
+            const fn = () => {
+                attempts++;
+                if (attempts < 5)
+                    return Promise.reject(makeError(500));
+                return Promise.resolve('done');
+            };
+            const r = yield s.run('k', fn);
+            expect(r).toBe('done');
+            // backoff sleeps: 1000, 2000, 2000, 2000 (last index repeated)
+            const backoffSleeps = sleeps.filter((ms) => ms === 1000 || ms === 2000);
+            expect(backoffSleeps).toEqual([1000, 2000, 2000, 2000]);
+        }));
+        it('applies jitter using the injected random source', () => __awaiter(void 0, void 0, void 0, function* () {
+            const sleeps = [];
+            // Random returns 0 → jitter = 0 - spread = -spread, clamped at 0
+            // Random returns 1 → jitter = +spread
+            const s = new RequestScheduler({
+                concurrency: 1,
+                delayMs: 0,
+                retryAttempts: 1,
+                retryBackoffSeconds: [10],
+                jitterPct: 0.2,
+                random: () => 1,
+                sleep: (ms) => {
+                    sleeps.push(ms);
+                    return Promise.resolve();
+                },
+            });
+            let attempts = 0;
+            const fn = () => {
+                attempts++;
+                if (attempts === 1)
+                    return Promise.reject(makeError(500));
+                return Promise.resolve('ok');
+            };
+            yield s.run('k', fn);
+            // base 10000ms + max jitter 2000ms = 12000ms exactly when random=1
+            expect(sleeps).toContain(12000);
+        }));
+        it('clamps jitterPct above 0.5 down to 0.5', () => __awaiter(void 0, void 0, void 0, function* () {
+            const sleeps = [];
+            const s = new RequestScheduler({
+                concurrency: 1,
+                delayMs: 0,
+                retryAttempts: 1,
+                retryBackoffSeconds: [10],
+                jitterPct: 5,
+                random: () => 1,
+                sleep: (ms) => {
+                    sleeps.push(ms);
+                    return Promise.resolve();
+                },
+            });
+            let attempts = 0;
+            const fn = () => {
+                attempts++;
+                if (attempts === 1)
+                    return Promise.reject(makeError(500));
+                return Promise.resolve('ok');
+            };
+            yield s.run('k', fn);
+            // 10000 + 50% spread = 15000 max
+            expect(sleeps).toContain(15000);
+        }));
+        it('uses deprecated backoffSeconds when retryBackoffSeconds is empty', () => __awaiter(void 0, void 0, void 0, function* () {
+            const sleeps = [];
+            const s = new RequestScheduler({
+                concurrency: 1,
+                delayMs: 0,
+                retryAttempts: 1,
+                retryBackoffSeconds: [],
+                backoffSeconds: [3],
+                jitterPct: 0,
+                sleep: (ms) => {
+                    sleeps.push(ms);
+                    return Promise.resolve();
+                },
+            });
+            let attempts = 0;
+            const fn = () => {
+                attempts++;
+                if (attempts === 1)
+                    return Promise.reject(makeError(500));
+                return Promise.resolve('ok');
+            };
+            yield s.run('k', fn);
+            expect(sleeps).toContain(3000);
+        }));
+        it('treats invalid Retry-After header as null and falls back to base backoff', () => __awaiter(void 0, void 0, void 0, function* () {
+            const sleeps = [];
+            const s = new RequestScheduler({
+                concurrency: 1,
+                delayMs: 0,
+                retryAttempts: 1,
+                retryBackoffSeconds: [2],
+                jitterPct: 0,
+                sleep: (ms) => {
+                    sleeps.push(ms);
+                    return Promise.resolve();
+                },
+            });
+            let attempts = 0;
+            const fn = () => {
+                attempts++;
+                if (attempts === 1) {
+                    return Promise.reject(makeError(503, { headers: { 'retry-after': 'not-a-date' } }));
+                }
+                return Promise.resolve('ok');
+            };
+            yield s.run('k', fn);
+            expect(sleeps).toContain(2000);
+        }));
+        it('reads Retry-After from error.error.headers when top-level headers are absent', () => __awaiter(void 0, void 0, void 0, function* () {
+            const sleeps = [];
+            const s = new RequestScheduler({
+                concurrency: 1,
+                delayMs: 0,
+                retryAttempts: 1,
+                retryBackoffSeconds: [0],
+                jitterPct: 0,
+                sleep: (ms) => {
+                    sleeps.push(ms);
+                    return Promise.resolve();
+                },
+            });
+            let attempts = 0;
+            const fn = () => {
+                attempts++;
+                if (attempts === 1) {
+                    return Promise.reject(makeError(503, { error: { headers: { 'retry-after': '6' } } }));
+                }
+                return Promise.resolve('ok');
+            };
+            yield s.run('k', fn);
+            expect(sleeps).toContain(6000);
+        }));
+        it('reads Retry-After from response.headers as last resort', () => __awaiter(void 0, void 0, void 0, function* () {
+            const sleeps = [];
+            const s = new RequestScheduler({
+                concurrency: 1,
+                delayMs: 0,
+                retryAttempts: 1,
+                retryBackoffSeconds: [0],
+                jitterPct: 0,
+                sleep: (ms) => {
+                    sleeps.push(ms);
+                    return Promise.resolve();
+                },
+            });
+            let attempts = 0;
+            const fn = () => {
+                attempts++;
+                if (attempts === 1) {
+                    return Promise.reject(makeError(503, { response: { headers: { 'Retry-After': '8' } } }));
+                }
+                return Promise.resolve('ok');
+            };
+            yield s.run('k', fn);
+            expect(sleeps).toContain(8000);
+        }));
+    });
+    describe('pacing (delay between requests)', () => {
+        it('sleeps for the remaining wait time between consecutive requests', () => __awaiter(void 0, void 0, void 0, function* () {
+            const sleeps = [];
+            let nowVal = 1000;
+            const s = new RequestScheduler({
+                concurrency: 1,
+                delayMs: 500,
+                retryAttempts: 0,
+                jitterPct: 0,
+                now: () => nowVal,
+                sleep: (ms) => {
+                    sleeps.push(ms);
+                    // simulate elapsed time
+                    nowVal += ms;
+                    return Promise.resolve();
+                },
+            });
+            // First call: nextStartAt is 0, so no wait. Sets nextStartAt to now+500.
+            yield s.run('k', () => Promise.resolve('a'));
+            // Second call: nextStartAt = previousNow+500. waitMs = 500.
+            yield s.run('k', () => Promise.resolve('b'));
+            expect(sleeps).toContain(500);
+        }));
+        it('skips pacing when next start is already in the past', () => __awaiter(void 0, void 0, void 0, function* () {
+            const sleeps = [];
+            let nowVal = 1000;
+            const s = new RequestScheduler({
+                concurrency: 1,
+                delayMs: 100,
+                retryAttempts: 0,
+                jitterPct: 0,
+                now: () => nowVal,
+                sleep: (ms) => {
+                    sleeps.push(ms);
+                    nowVal += ms;
+                    return Promise.resolve();
+                },
+            });
+            yield s.run('k', () => Promise.resolve('a'));
+            // Advance now far beyond the pacing window
+            nowVal += 10000;
+            yield s.run('k', () => Promise.resolve('b'));
+            // No 100ms pace sleep should have occurred for the second call
+            expect(sleeps).not.toContain(100);
+        }));
+        it('clamps negative delayMs to zero (no pacing sleeps observed)', () => __awaiter(void 0, void 0, void 0, function* () {
+            const sleeps = [];
+            const s = new RequestScheduler({
+                concurrency: 1,
+                delayMs: -500,
+                retryAttempts: 0,
+                sleep: (ms) => {
+                    sleeps.push(ms);
+                    return Promise.resolve();
+                },
+            });
+            yield s.run('k', () => Promise.resolve('a'));
+            yield s.run('k', () => Promise.resolve('b'));
+            // Pacing produces 0ms waits which short-circuit before invoking sleep
+            expect(sleeps).toHaveLength(0);
+        }));
+    });
+    describe('per-instance concurrency override', () => {
+        // Note: the scheduler exposes concurrency only as a constructor option,
+        // not a per-call override on `run`. The migration phase 5 supports
+        // per-call overrides at the governance layer, not directly on
+        // RequestScheduler. This test verifies that distinct instances honor
+        // independent concurrency settings, which is the equivalent unit-level
+        // contract.
+        it('respects independent concurrency limits across instances', () => __awaiter(void 0, void 0, void 0, function* () {
+            let activeA = 0;
+            let activeB = 0;
+            let maxA = 0;
+            let maxB = 0;
+            const resolversA = [];
+            const resolversB = [];
+            const sLow = new RequestScheduler({
+                concurrency: 1,
+                delayMs: 0,
+                retryAttempts: 0,
+                sleep: () => Promise.resolve(),
+            });
+            const sHigh = new RequestScheduler({
+                concurrency: 4,
+                delayMs: 0,
+                retryAttempts: 0,
+                sleep: () => Promise.resolve(),
+            });
+            const fnA = () => {
+                activeA++;
+                if (activeA > maxA)
+                    maxA = activeA;
+                return new Promise((resolve) => {
+                    resolversA.push(() => {
+                        activeA--;
+                        resolve();
+                    });
+                });
+            };
+            const fnB = () => {
+                activeB++;
+                if (activeB > maxB)
+                    maxB = activeB;
+                return new Promise((resolve) => {
+                    resolversB.push(() => {
+                        activeB--;
+                        resolve();
+                    });
+                });
+            };
+            const N = 6;
+            const promisesA = [];
+            const promisesB = [];
+            for (let i = 0; i < N; i++) {
+                promisesA.push(sLow.run(`a${i}`, fnA));
+                promisesB.push(sHigh.run(`b${i}`, fnB));
+            }
+            yield flush(20);
+            expect(activeA).toBeLessThanOrEqual(1);
+            expect(activeB).toBeLessThanOrEqual(4);
+            // Drain
+            while (resolversA.length > 0 || resolversB.length > 0) {
+                if (resolversA.length > 0)
+                    resolversA.shift()();
+                if (resolversB.length > 0)
+                    resolversB.shift()();
+                yield flush(10);
+            }
+            yield Promise.all([...promisesA, ...promisesB]);
+            expect(maxA).toBeLessThanOrEqual(1);
+            expect(maxB).toBeLessThanOrEqual(4);
+            expect(maxB).toBeGreaterThan(maxA);
+        }));
+    });
+    describe('error propagation and slot release', () => {
+        it('releases the concurrency slot even when the callback throws', () => __awaiter(void 0, void 0, void 0, function* () {
+            const s = new RequestScheduler({
+                concurrency: 1,
+                delayMs: 0,
+                retryAttempts: 0,
+                sleep: () => Promise.resolve(),
+            });
+            yield expect(s.run('k', () => Promise.reject(new Error('boom')))).rejects.toThrow('boom');
+            yield flush(5);
+            expect(s.activeCount).toBe(0);
+            // A subsequent call must be able to run
+            const r = yield s.run('k', () => Promise.resolve('ok'));
+            expect(r).toBe('ok');
+        }));
+        it('clears the keyChains entry after a same-key chain settles', () => __awaiter(void 0, void 0, void 0, function* () {
+            const s = new RequestScheduler({
+                concurrency: 5,
+                delayMs: 0,
+                retryAttempts: 0,
+                sleep: () => Promise.resolve(),
+            });
+            yield s.run('shared', () => Promise.resolve('a'));
+            yield flush(5);
+            // After settle, inflightCount returns to 0
+            expect(s.inflightCount).toBe(0);
+        }));
+    });
+    describe('cancellation-like propagation', () => {
+        // The scheduler doesn't accept an AbortSignal, but rejection inside
+        // the queued callback must propagate to the awaiter without leaking
+        // slots — equivalent semantics for "cancellation propagation".
+        it('propagates a rejected callback to its awaiter and frees the slot', () => __awaiter(void 0, void 0, void 0, function* () {
+            const s = new RequestScheduler({
+                concurrency: 1,
+                delayMs: 0,
+                retryAttempts: 0,
+                sleep: () => Promise.resolve(),
+            });
+            const cancelErr = new Error('cancelled');
+            let resolveSecond;
+            let secondStarted = false;
+            const first = s.run('a', () => Promise.reject(cancelErr));
+            const second = s.run('b', () => {
+                secondStarted = true;
+                return new Promise((resolve) => {
+                    resolveSecond = resolve;
+                });
+            });
+            yield expect(first).rejects.toBe(cancelErr);
+            yield flush(10);
+            expect(secondStarted).toBe(true);
+            resolveSecond();
+            yield second;
+        }));
+        it('propagates rejection across same-key chained calls without blocking later same-key calls', () => __awaiter(void 0, void 0, void 0, function* () {
+            const s = new RequestScheduler({
+                concurrency: 1,
+                delayMs: 0,
+                retryAttempts: 0,
+                sleep: () => Promise.resolve(),
+            });
+            const first = s.run('shared', () => Promise.reject(new Error('first-failed')));
+            const second = s.run('shared', () => Promise.resolve('after-failure'));
+            yield expect(first).rejects.toThrow('first-failed');
+            const r = yield second;
+            expect(r).toBe('after-failure');
+        }));
+    });
+    describe('inflight bookkeeping', () => {
+        it('tracks inflightCount through the lifetime of overlapping requests', () => __awaiter(void 0, void 0, void 0, function* () {
+            const s = new RequestScheduler({
+                concurrency: 5,
+                delayMs: 0,
+                retryAttempts: 0,
+                sleep: () => Promise.resolve(),
+            });
+            const resolvers = [];
+            const fn = () => new Promise((resolve) => {
+                resolvers.push(resolve);
+            });
+            const promises = [];
+            for (let i = 0; i < 4; i++) {
+                promises.push(s.run(`k${i}`, fn));
+            }
+            expect(s.inflightCount).toBe(4);
+            // Drain
+            while (resolvers.length > 0) {
+                resolvers.shift()();
+                yield flush(2);
+            }
+            yield Promise.all(promises);
+            yield flush(5);
+            expect(s.inflightCount).toBe(0);
+        }));
+    });
+});
+//# sourceMappingURL=request-scheduler.test.js.map

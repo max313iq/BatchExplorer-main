@@ -1,0 +1,1 @@
+{"version":3,"file":"use-tenant-change.d.ts","sourceRoot":"","sources":["../../../src/multi-region/hooks/use-tenant-change.ts"],"names":[],"mappings":"AA0CA,OAAO,EAEL,KAAK,mBAAmB,EACzB,MAAM,wBAAwB,CAAC;AAEhC,YAAY,EAAE,mBAAmB,EAAE,CAAC;AAEpC,wBAAgB,eAAe,CAC7B,YAAY,EAAE,MAAM,GAAG,SAAS,EAChC,QAAQ,EAAE,CAAC,MAAM,EAAE,mBAAmB,KAAK,IAAI,GAC9C,IAAI,CAoBN"}

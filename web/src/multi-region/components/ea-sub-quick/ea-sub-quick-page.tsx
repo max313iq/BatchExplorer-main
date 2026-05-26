@@ -263,10 +263,10 @@ function applyDisplayNameTokens(
   const counter = ctx.counter.toString().padStart(3, "0");
   const user = (ctx.username ?? "").split("@")[0] ?? "";
   return template
-    .replaceAll("{date}", date)
-    .replaceAll("{time}", time)
-    .replaceAll("{counter}", counter)
-    .replaceAll("{user}", user);
+    .split("{date}").join(date)
+    .split("{time}").join(time)
+    .split("{counter}").join(counter)
+    .split("{user}").join(user);
 }
 
 /**
@@ -4251,7 +4251,7 @@ export const EaSubQuickPage: React.FC<EaSubQuickPageProps> = ({
 
       {/* Silence "unused" warning for selectedEa — exposed for future
           use (deep-link to enrollment account, debug, etc.). */}
-      {false && selectedEa && <span aria-hidden>{selectedEa.name}</span>}
+      {false && selectedEa && <span aria-hidden>{selectedEa?.name}</span>}
     </div>
   );
 };

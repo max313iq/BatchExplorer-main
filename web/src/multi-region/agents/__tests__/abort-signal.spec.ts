@@ -62,7 +62,10 @@ jest.mock("../../scheduling/request-governance", () => ({
 // Mock just the node-agent — the rest of the orchestrator's
 // constructed sub-agents are real but inert because their service
 // calls are stubbed above.
-const nodeExec = jest.fn(async () => ({ status: "completed", summary: {} }));
+const nodeExec = jest.fn(async (_input?: { signal?: AbortSignal } & Record<string, unknown>) => ({
+  status: "completed",
+  summary: {},
+}));
 jest.mock("../node-agent", () => ({
   NodeAgent: jest.fn().mockImplementation(() => ({
     name: "node",
@@ -104,8 +107,8 @@ describe("OrchestratorAgent forwards AbortSignal to sub-agents", () => {
       signal: controller.signal,
     });
 
-    const arg = nodeExec.mock.calls[0][0];
-    expect(arg.signal).toBeInstanceOf(AbortSignal);
+    const arg = nodeExec.mock.calls[0]?.[0];
+    expect(arg?.signal).toBeInstanceOf(AbortSignal);
   });
 });
 

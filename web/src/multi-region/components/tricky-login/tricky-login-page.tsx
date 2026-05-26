@@ -583,14 +583,6 @@ export const TrickyLoginPage: React.FC = () => {
   const [customScope, setCustomScope] = React.useState<string>(
     "https://management.azure.com/.default",
   );
-  const activeScope =
-    audienceId === "custom" ? customScope : getAudienceChoice(audienceId).scope;
-  const effectiveAudience = audienceForScope(activeScope);
-  const effectiveExtendedAudience: TrickyAudienceId =
-    audienceId === "custom"
-      ? extendedAudienceForScope(customScope)
-      : audienceId;
-
   /* ----------------------------------------------------------------
    * D. Mint action state
    * ---------------------------------------------------------------- */
@@ -2398,7 +2390,9 @@ export const TrickyLoginPage: React.FC = () => {
         <TokenExpiryBadge
           secondsUntilExpiry={tokenState.secondsUntilExpiry}
           loading={tokenState.loading}
-          onRefresh={tokenState.refresh}
+          onRefresh={() => {
+            void tokenState.refresh();
+          }}
           needsReauth={tokenState.needsReauth}
           onReauth={() =>
             void tokenState.reauth({

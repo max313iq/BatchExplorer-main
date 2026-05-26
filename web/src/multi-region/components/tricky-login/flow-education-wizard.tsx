@@ -41,7 +41,7 @@ import { cn } from "@/lib/utils";
 import { FLOW_EDUCATION } from "./corpus-advisories";
 import type { TrickyLoginMethod } from "./tricky-login-helpers";
 
-const METHOD_ICON: Readonly<Record<TrickyLoginMethod, React.ComponentType<{ className?: string; "aria-hidden"?: boolean }>>> = {
+const METHOD_ICON: Readonly<Record<TrickyLoginMethod, React.ElementType>> = {
   "msal-silent": Repeat2,
   "foci-exchange": Zap,
   auto: Sparkles,

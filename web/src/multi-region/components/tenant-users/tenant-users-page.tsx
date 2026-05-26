@@ -482,7 +482,7 @@ function writePersistedNumber(key: string, value: number): void {
 // =============================================================================
 
 interface SummaryStatProps {
-  icon: React.ComponentType<{ className?: string }>;
+  icon: React.ElementType;
   label: string;
   value: number;
   tone: "primary" | "info" | "success" | "warning" | "destructive" | "muted";

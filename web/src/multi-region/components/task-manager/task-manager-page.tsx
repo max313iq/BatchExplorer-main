@@ -1304,6 +1304,37 @@ export const TaskManagerPage: React.FC = () => {
   );
 
   /**
+   * Confirmation dialog handlers — wired to a single state machine so we
+   * never end up with two dialogs simultaneously.
+   *
+   * Two openers: one for the header-driven kinds (no ids), one for the
+   * bulk-* kinds (with a frozen id snapshot so dialog confirmation
+   * operates on the selection at open-time, not at confirm-time).
+   *
+   * Declared here (above the bulk callbacks that depend on
+   * `openBulkConfirm`) to avoid a temporal-dead-zone reference.
+   */
+  const openConfirm = React.useCallback(
+    (kind: "clear-finished" | "discard-interrupted" | "remove-history") => {
+      setConfirmState({ kind });
+    },
+    [],
+  );
+  const openBulkConfirm = React.useCallback(
+    (
+      kind: "bulk-cancel" | "bulk-remove" | "bulk-resume" | "bulk-pause",
+      ids: string[],
+    ) => {
+      if (ids.length === 0) return;
+      setConfirmState({ kind, ids: ids.slice() });
+    },
+    [],
+  );
+  const closeConfirm = React.useCallback(() => {
+    setConfirmState({ kind: null });
+  }, []);
+
+  /**
    * Export helpers. `exportScope === "filtered"` uses the live filtered
    * list (status chips + search), "all" exports every task.
    */
@@ -1434,34 +1465,6 @@ export const TaskManagerPage: React.FC = () => {
 
   const dismissAutoResumed = React.useCallback(() => {
     setAutoResumedCount(null);
-  }, []);
-
-  /**
-   * Confirmation dialog handlers — wired to a single state machine so we
-   * never end up with two dialogs simultaneously.
-   *
-   * Two openers: one for the header-driven kinds (no ids), one for the
-   * bulk-* kinds (with a frozen id snapshot so dialog confirmation
-   * operates on the selection at open-time, not at confirm-time).
-   */
-  const openConfirm = React.useCallback(
-    (kind: "clear-finished" | "discard-interrupted" | "remove-history") => {
-      setConfirmState({ kind });
-    },
-    [],
-  );
-  const openBulkConfirm = React.useCallback(
-    (
-      kind: "bulk-cancel" | "bulk-remove" | "bulk-resume" | "bulk-pause",
-      ids: string[],
-    ) => {
-      if (ids.length === 0) return;
-      setConfirmState({ kind, ids: ids.slice() });
-    },
-    [],
-  );
-  const closeConfirm = React.useCallback(() => {
-    setConfirmState({ kind: null });
   }, []);
 
   const finishedTasks = React.useMemo(

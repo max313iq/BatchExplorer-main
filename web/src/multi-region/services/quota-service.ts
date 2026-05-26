@@ -592,7 +592,15 @@ export async function listBatchSupportedVmSkus(
   }>(url, token, subscriptionId);
 
   const skus: BatchVmSku[] = items
-    .filter((s): s is { name: string; familyName?: string } => Boolean(s.name))
+    .filter(
+      (
+        s,
+      ): s is {
+        name: string;
+        familyName?: string;
+        capabilities?: Array<{ name?: string; value?: string }>;
+      } => Boolean(s.name),
+    )
     .map((s) => ({
       name: s.name!,
       familyName: s.familyName ?? "",
@@ -662,7 +670,10 @@ function normalizeSku(s: RawSku): ComputeVmSku | null {
     resourceType: s.resourceType,
     locations: s.locations ?? [],
     locationInfo: (s.locationInfo ?? [])
-      .filter((li): li is { location: string } => typeof li.location === "string")
+      .filter(
+        (li): li is { location: string; zones?: string[] } =>
+          typeof li.location === "string",
+      )
       .map((li) => ({ location: li.location, zones: li.zones })),
     restrictions: (s.restrictions ?? []).map((r) => ({
       type: r.type,
@@ -725,7 +736,9 @@ export async function listAllVmSkus(
   // Cache key includes a filter hash so a "GPU-only" cached entry doesn't
   // mask a later "all SKUs" caller. The hash is the function source so
   // identical predicates share one entry.
-  const filterTag = options?.filter ? `f:${hashFn(options.filter)}` : "all";
+  const filterTag = options?.filter
+    ? `f:${hashFn(options.filter as (...args: unknown[]) => unknown)}`
+    : "all";
   const tenantSegment = options?.tenantId ?? "_notenant_";
   const cacheKey = `computeskus::${tenantSegment}::${subscriptionId}::${filterTag}`;
   const cached = cacheGet<ComputeVmSku[]>(cacheKey);
@@ -782,7 +795,9 @@ export function vmSkusCacheKey(
   gpuOnly: boolean,
   tenantId?: string,
 ): string {
-  const filterTag = gpuOnly ? `f:${hashFn(GPU_ONLY_FILTER_FOR_HASH)}` : "all";
+  const filterTag = gpuOnly
+    ? `f:${hashFn(GPU_ONLY_FILTER_FOR_HASH as (...args: unknown[]) => unknown)}`
+    : "all";
   const tenantSegment = tenantId ?? "_notenant_";
   return `computeskus::${tenantSegment}::${subscriptionId}::${filterTag}`;
 }

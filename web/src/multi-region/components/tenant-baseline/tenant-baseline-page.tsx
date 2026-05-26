@@ -601,11 +601,10 @@ async function graphList<T>(
     if (safety++ > 100) {
       throw new Error("Graph list pagination exceeded safety cap (100 pages)");
     }
-    const page = await graphGet<{ value?: T[]; "@odata.nextLink"?: string }>(
-      url,
-      token,
-      opts,
-    );
+    const page: { value?: T[]; "@odata.nextLink"?: string } = await graphGet<{
+      value?: T[];
+      "@odata.nextLink"?: string;
+    }>(url, token, opts);
     if (Array.isArray(page.value)) {
       out.push(...page.value);
     }

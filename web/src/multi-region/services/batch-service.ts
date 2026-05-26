@@ -17,7 +17,6 @@ import {
   classifyHttpError,
 } from "./types";
 import { guardedFetch } from "../scheduling/request-governance";
-import { abortError } from "./abort-helpers";
 import { fetchAllPages as sharedFetchAllPages } from "./_shared/paginate";
 import { isBlacklisted } from "../store/failure-blacklist";
 

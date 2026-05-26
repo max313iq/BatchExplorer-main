@@ -136,7 +136,7 @@ type StepKey =
 interface StepDescriptor {
   key: StepKey;
   label: string;
-  icon: React.ComponentType<{ className?: string; "aria-hidden"?: boolean }>;
+  icon: React.ElementType;
 }
 
 const STEPS: readonly StepDescriptor[] = [
@@ -893,9 +893,6 @@ const PoolCreationPageInner: React.FC<PoolCreationPageProps> = ({
   // is the least-disruptive way to keep them working.
   const subscriptionId =
     selectedSubIds.length > 0 ? selectedSubIds[0] : "";
-  const setSubscriptionId = React.useCallback((newValue: string) => {
-    setSelectedSubIds(newValue ? [newValue] : []);
-  }, []);
   // Catalog-availability dependency: the toggle is meaningless when the
   // cache has no data (no SKUs to pick from). Disable the switch in
   // that case and surface a "populate first" hint. Reactive — flips
@@ -1099,11 +1096,6 @@ const PoolCreationPageInner: React.FC<PoolCreationPageProps> = ({
       return filtered.length === prev.length ? prev : filtered;
     });
   }, [state.subscriptions, selectedSubIds.length]);
-
-  const handleSubscriptionChange = React.useCallback((newValue: string) => {
-    setSubscriptionId(newValue);
-    setAutoSelectedSubscription(false);
-  }, [setSubscriptionId]);
 
   // Toggle a sub in/out of the multi-pick set. Clears the auto-select
   // hint the moment the user makes a manual choice (positive OR negative

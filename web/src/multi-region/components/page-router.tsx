@@ -476,7 +476,7 @@ const LegacyEaSubRoute: React.FC = () => (
 );
 
 const EaSubQuickRoute: React.FC = () => {
-  const { navigateToPage } = useOutletContext<DashboardOutletProps>();
+  const { navigateToPage } = useDashboardOutletContext();
   return (
     <PageBoundary pageKey="ea-sub-quick">
       <EaSubQuickPage
@@ -493,7 +493,7 @@ const EaCreatorPregrantRoute: React.FC = () => (
 );
 
 const PartnerCenterRoute: React.FC = () => {
-  const { navigateToPage } = useOutletContext<DashboardOutletProps>();
+  const { navigateToPage } = useDashboardOutletContext();
   return (
     <PageBoundary pageKey="partner-center">
       <PartnerCenterPage

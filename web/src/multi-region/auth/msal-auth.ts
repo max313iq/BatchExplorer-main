@@ -733,11 +733,11 @@ export async function loginAccount(
     let popupCloseInterval: ReturnType<typeof setInterval> | null = null;
     let cancelClosePromise: ((reason: Error) => void) | null = null;
     const eventCallbackId = msalApp.addEventCallback(
-      (msg: { eventType?: string; payload?: { popupWindow?: Window } }) => {
+      ((msg: { eventType?: string; payload?: { popupWindow?: Window } }) => {
         if (msg.eventType === "msal:popupOpened" && msg.payload?.popupWindow) {
           popupRef = msg.payload.popupWindow;
         }
-      },
+      }) as unknown as Parameters<typeof msalApp.addEventCallback>[0],
     );
     // Race detail: when MSAL.loginPopup succeeds, broadcastResponseToMainFrame
     // in the popup calls window.close() AS PART of the success path. So the
@@ -916,7 +916,7 @@ export async function loginAccount(
         // Reject the still-pending close-watch promise harmlessly so its
         // rejection is observed (avoids unhandled-rejection warnings).
         try {
-          cancelClosePromise(
+          (cancelClosePromise as (reason: Error) => void)(
             new Error("loginAccount finished — close watcher cancelled"),
           );
         } catch {

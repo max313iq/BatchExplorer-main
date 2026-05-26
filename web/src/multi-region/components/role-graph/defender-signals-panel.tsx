@@ -97,7 +97,7 @@ export interface DefenderSignalsPanelProps {
   scoreLabel: string;
 }
 
-const SEVERITY_ICON: Record<SignalSeverity, React.FC<{ className?: string }>> = {
+const SEVERITY_ICON: Record<SignalSeverity, React.ElementType> = {
   critical: ShieldAlert,
   high: AlertTriangle,
   medium: Info,
@@ -121,7 +121,7 @@ const SeverityBadge: React.FC<{ severity: SignalSeverity }> = ({
 const SectionCard: React.FC<{
   title: string;
   description: string;
-  icon: React.FC<{ className?: string }>;
+  icon: React.ElementType;
   /** Cited corpus path for hover tooltip on the title. */
   corpusCitation: string;
   defaultOpen?: boolean;

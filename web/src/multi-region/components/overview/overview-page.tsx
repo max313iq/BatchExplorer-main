@@ -216,7 +216,7 @@ interface StatItem {
 
 interface StatCardProps {
   id: string;
-  icon: React.ComponentType<{ className?: string }>;
+  icon: React.ElementType;
   title: string;
   /** Optional info-tooltip text shown next to the title. */
   info?: string;

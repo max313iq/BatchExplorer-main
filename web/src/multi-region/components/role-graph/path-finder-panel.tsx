@@ -71,7 +71,7 @@ export interface PathFinderPanelProps {
 }
 
 /** Map a hop kind to an icon. */
-const HOP_ICON: Record<PathHop["kind"], React.FC<{ className?: string }>> = {
+const HOP_ICON: Record<PathHop["kind"], React.ElementType> = {
   principal: User,
   group: Users,
   role: Key,

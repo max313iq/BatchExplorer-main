@@ -339,7 +339,11 @@ describe("<DataTable>", () => {
 
     await user.click(csvBtn);
     expect(downloadCsvMock).toHaveBeenCalledTimes(1);
-    const [filename, headers, dataRows] = downloadCsvMock.mock.calls[0];
+    const [filename, headers, dataRows] = downloadCsvMock.mock.calls[0] as unknown as [
+      string,
+      readonly string[],
+      readonly (readonly unknown[])[],
+    ];
     expect(filename).toBe("export-tbl.csv");
     expect(headers).toEqual(["Name"]);
     expect(dataRows).toEqual([["Apple"], ["Banana"], ["Cherry"]]);

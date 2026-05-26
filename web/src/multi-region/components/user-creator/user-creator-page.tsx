@@ -1437,7 +1437,7 @@ interface CreateUserFormProps {
 }
 
 interface FormSectionProps {
-  icon: React.ComponentType<{ className?: string }>;
+  icon: React.ElementType;
   title: string;
   description?: string;
   children: React.ReactNode;
@@ -1744,7 +1744,8 @@ const CreateUserForm: React.FC<CreateUserFormProps> = ({
     setAvailability({ status: "checking" });
     (async () => {
       try {
-        await sleep(AVAILABILITY_DEBOUNCE_MS, controller.signal);
+        await sleep(AVAILABILITY_DEBOUNCE_MS);
+        if (controller.signal.aborted) return;
         const token = await getGraphTokenForAccount(
           account.homeAccountId,
           account.tenantId,
@@ -4482,7 +4483,7 @@ const CopyChip: React.FC<{
 // rather than in shared/* because the tone variants are tailored to this
 // page's iconography.
 const StatChip: React.FC<{
-  icon: React.ComponentType<{ className?: string }>;
+  icon: React.ElementType;
   label: string;
   value: number | string;
   tone: "primary" | "success" | "info" | "warning" | "muted";
