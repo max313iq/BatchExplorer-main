@@ -4,6 +4,37 @@
  * Uses a Popover + Command picker for fuzzy multi-recipient selection,
  * zod-validated form, EmptyState for the unauthenticated path, and
  * ConfirmationDialog for the irreversible create step.
+ *
+ * Sibling files (extracted from this page to keep its surface scannable
+ * and improve re-render isolation):
+ *
+ *   - `./accept-ownership-panel.tsx` — destination-tenant companion for
+ *     the cross-tenant flow (operator pastes a subscriptionId and accepts
+ *     ownership inline).
+ *   - `./copyable-id.tsx`            — shared "copy to clipboard" pill.
+ *   - `./ea-helpers.ts`              — pure utilities (parseBulkRecipients,
+ *     suggestRemediation, categorizeError, azurePortalLinkForSubscription,
+ *     formatElapsedSec, UUID/ALIAS regex, randomSuffix, generateBatchId).
+ *   - `./pre-flight-panel.tsx`       — corpus-grounded signature panel
+ *     (cross-tenant fan-out, mixed-recipient anomaly, self-replication,
+ *     manual-paste-heavy) + pre-create audit-event simulation.
+ *     Cite: `_ea_subscription_cross_tenant.md` §1, §9.
+ *   - `./reconciliation-tile.tsx`    — post-batch steady-state bucket
+ *     (steady / alias-only / pending-acceptance / failed / stale).
+ *     Cite: `_bypass_modify_delete.md`.
+ *   - `./recipient-templates.tsx`    — persisted recipient lists for
+ *     repeated batches; localStorage via `usePersistedState`.
+ *   - `./corpus-signatures.ts`       — pure detection helpers consumed by
+ *     `pre-flight-panel.tsx`.
+ *
+ * Hotkeys: `Ctrl/Cmd + Enter` opens the create-subscription confirmation
+ * when the form is ready; `Escape` cancels the confirm dialog (but never
+ * aborts an in-flight batch).
+ *
+ * Screen readers get an off-screen `aria-live="polite"` announcer near the
+ * top of the rendered tree that emits short batch-milestone strings
+ * ("Provisioning subscriptions: 3 of 10 complete", "Batch complete.")
+ * in addition to the visible Provisioning Summary card.
  */
 import * as React from "react";
 import { Controller, useForm } from "react-hook-form";
@@ -26,7 +57,6 @@ import {
   Hourglass,
   IdCard,
   Info,
-  Inbox,
   Link2,
   Loader2,
   PartyPopper,
@@ -35,7 +65,6 @@ import {
   RefreshCw,
   RotateCcw,
   ShieldAlert,
-  ShieldCheck,
   Sparkles,
   Trash2,
   Users,
@@ -95,13 +124,10 @@ import {
 import { resolveActiveTenantId } from "../../auth/perform-tenant-switch";
 import { auditLog } from "../../services/audit-log";
 import {
-  type AcceptOwnershipStatus,
-  acceptSubscriptionOwnership,
   buildAcceptOwnershipPortalUrl,
   type CallerBillingRoleDiagnostic,
   createEaSubscription,
   diagnoseCallerBillingRole,
-  getAcceptOwnershipStatus,
   listBillingProfiles,
   listEaBillingAccounts,
   listEnrollmentAccounts,
@@ -125,9 +151,9 @@ import {
 import { useArmToken } from "../../auth/use-arm-token";
 import { useAbortableEffect } from "../../hooks/use-abortable-effect";
 import { usePersistedState } from "../../hooks/use-persisted-state";
+import { useShortcut } from "../../hooks/use-shortcut";
 import { useTenantChange } from "../../hooks/use-tenant-change";
 import { ConfirmationDialog } from "../shared/confirmation-dialog";
-import { CopyButton } from "../shared/copy-button";
 import { EmptyState } from "../shared/empty-state";
 import { ErrorBoundary } from "../shared/error-boundary";
 import { PageHeader } from "../shared/page-header";
@@ -135,152 +161,29 @@ import { SkeletonLoader } from "../shared/skeleton-loader";
 import { SummaryStatItem } from "../shared/summary-stat-item";
 import { TokenExpiryBadge } from "../shared/token-expiry-badge";
 
+import { AcceptOwnershipPanel } from "./accept-ownership-panel";
+import { CopyableId } from "./copyable-id";
+import {
+  ALIAS_REGEX,
+  azurePortalLinkForSubscription,
+  categorizeError,
+  formatElapsedSec,
+  generateBatchId,
+  isValidAlias,
+  isValidUuid,
+  parseBulkRecipients,
+  randomSuffix,
+  suggestRemediation,
+  truncateMiddle,
+  UUID_REGEX,
+} from "./ea-helpers";
+import { PreFlightPanel } from "./pre-flight-panel";
+import { ReconciliationTile } from "./reconciliation-tile";
+import { RecipientTemplates } from "./recipient-templates";
+
 const ACTIVE_KEY_STORAGE = "ea-subscription:active-account";
 const RECIPIENTS_STORAGE = "ea-subscription:recipients";
 const SELF_ASSIGN_STORAGE = "ea-subscription:self-assign";
-
-const UUID_REGEX =
-  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-
-const ALIAS_REGEX = /^[a-z0-9-]{3,63}$/;
-
-/**
- * Map common Azure failure messages from the Subscription Alias API
- * to one-line remediation tips. The raw Azure message is still shown
- * inline; the tip appears below it as muted help text.
- */
-function suggestRemediation(rawError: string): string | null {
-  const msg = rawError.toLowerCase();
-  if (
-    msg.includes("not authorized to create subscriptions") ||
-    msg.includes("billingpermissiondenied") ||
-    msg.includes("does not have authorization to perform action") ||
-    (msg.includes("enrollmentaccount") && msg.includes("authoriz"))
-  ) {
-    return (
-      "If you DO have the EA Subscription Creator / Account Owner role: " +
-      "the role was likely granted after your access token was minted. " +
-      "Click the user menu -> Sign out, then sign back in (this forces a " +
-      "fresh token); OR wait ~5 minutes and retry — Entra propagation can " +
-      "lag. Verify the diagnostic below shows the expected upn/tid/oid. " +
-      "If you DON'T have the role: ask an Enterprise Administrator to grant " +
-      "you EA Subscription Creator on the enrollment account in EA Portal " +
-      "(ea.azure.com -> Manage -> Account -> Add Owner)."
-    );
-  }
-  // AADSTS70000 is a generic "couldn't validate user credentials" Entra
-  // ID family — typically appears when the token's claim set is rejected
-  // mid-flight (e.g. conditional-access policy fired, MFA stale, or the
-  // tenant is in a 'block sign-ins' state). The fix is essentially
-  // "re-acquire interactively" so MSAL can replay the MFA challenge.
-  if (msg.includes("aadsts70000") || msg.includes("70000:")) {
-    return (
-      "Entra ID rejected your token (AADSTS70000) — usually a stale MFA " +
-      "claim or a conditional-access policy that fired between sign-in " +
-      "and this submit. Sign out (user menu) and sign back in to replay " +
-      "MFA, then retry. If it keeps happening, ask your IT to verify " +
-      "that EA-billing endpoints aren't blocked by CA policy."
-    );
-  }
-  // "Commerce Account Is Null" / "BillingAccount is null" is the documented
-  // Azure error when the principal somehow does NOT have a Commerce Account
-  // attached at the enrollment scope. This is a known data-plane bug where
-  // the EA principal exists in the role graph but the back-end Commerce
-  // store hasn't propagated. There is no client-side fix — only a support
-  // case will repair it.
-  if (
-    msg.includes("commerce account is null") ||
-    msg.includes("commerceaccountisnull") ||
-    msg.includes("billingaccount is null") ||
-    msg.includes("billingaccountisnull")
-  ) {
-    return (
-      "Azure Commerce returned 'Commerce Account Is Null' — a back-end " +
-      "data issue where the EA principal exists in the role graph but " +
-      "the Commerce store hasn't fully propagated. There is no client-" +
-      "side fix. Open an Azure support case under 'Subscription " +
-      "Management → Cannot create subscription' and reference the " +
-      "enrollment account name. While waiting, try a different " +
-      "enrollment account on the same EA."
-    );
-  }
-  if (msg.includes("subscriptionownerid") && msg.includes("invalid")) {
-    return (
-      "The subscription owner object ID is not recognized in the " +
-      "destination tenant. Make sure the user / SPN you picked exists " +
-      "in that tenant - guests must accept their invitation first."
-    );
-  }
-  if (
-    msg.includes("subscriptiontenantid") &&
-    (msg.includes("invalid") || msg.includes("not found"))
-  ) {
-    return (
-      "The destination tenant ID was not found. Confirm the tenant GUID " +
-      "and that the EA-billing principal is allowed to provision " +
-      "subscriptions in that directory."
-    );
-  }
-  if (msg.includes("aliasalreadyexists")) {
-    return (
-      "An alias with that name already exists. Names auto-generate with " +
-      "a random suffix; just retry - the next attempt will pick a new " +
-      "name."
-    );
-  }
-  if (msg.includes("invalidbillingscope")) {
-    return (
-      "The billing scope was not accepted. Re-pick the enrollment / " +
-      "invoice-section above to refresh the path."
-    );
-  }
-  // Quota / spending limit on the EA — surfaces as 400 with a specific
-  // message; ask the operator to check the spending limit in EA portal.
-  if (
-    msg.includes("spendinglimit") ||
-    msg.includes("spending limit") ||
-    msg.includes("quotaexceeded") ||
-    msg.includes("quota exceeded")
-  ) {
-    return (
-      "The enrollment account is at or near its spending limit / quota. " +
-      "Open EA Portal (ea.azure.com) → Manage → Enrollment Account → " +
-      "increase the spending limit or wait for the next billing cycle. " +
-      "Subscriptions cannot be provisioned while the limit is reached."
-    );
-  }
-  // 429 throttle from ARM — clear; retry after a short pause.
-  if (msg.includes("toomanyrequests") || msg.includes("429")) {
-    return (
-      "ARM is throttling this caller (429). Wait 30-60 seconds and " +
-      "retry just the failed recipients (use Retry failed). Reduce " +
-      "batch size if this keeps happening."
-    );
-  }
-  // 5xx — transient; just retry.
-  if (
-    /\b5\d\d\b/.test(rawError) ||
-    msg.includes("internalservererror") ||
-    msg.includes("badgateway") ||
-    msg.includes("service unavailable")
-  ) {
-    return (
-      "Azure returned a server-side error (5xx). This is usually " +
-      "transient. Use Retry failed to re-run just the failures after a " +
-      "10-30s pause."
-    );
-  }
-  return null;
-}
-
-function isValidUuid(value: string): boolean {
-  return UUID_REGEX.test(value.trim());
-}
-
-function truncateMiddle(value: string, head = 8, tail = 4): string {
-  if (!value || value.length <= head + tail + 1) return value;
-  return `${value.slice(0, head)}...${value.slice(-tail)}`;
-}
 
 interface EaAccount {
   homeAccountId: string;
@@ -344,118 +247,6 @@ function dedupeKey(r: Pick<Recipient, "tenantId" | "ownerObjectId">): string {
   return `${(r.tenantId ?? "").toLowerCase()}:${(r.ownerObjectId ?? "").toLowerCase()}`;
 }
 
-function randomSuffix(n: number): string {
-  try {
-    const cryptoApi: Crypto | undefined =
-      typeof globalThis !== "undefined"
-        ? (globalThis as { crypto?: Crypto }).crypto
-        : undefined;
-    if (cryptoApi && typeof cryptoApi.getRandomValues === "function") {
-      const bytes = new Uint8Array(n);
-      cryptoApi.getRandomValues(bytes);
-      const alphabet = "abcdefghijklmnopqrstuvwxyz0123456789";
-      let out = "";
-      for (let i = 0; i < n; i += 1) {
-        out += alphabet[bytes[i]! % alphabet.length];
-      }
-      return out;
-    }
-  } catch {
-    /* fall through to Math.random fallback */
-  }
-  return Math.random()
-    .toString(36)
-    .slice(2, 2 + n)
-    .padEnd(n, "0");
-}
-
-/**
- * Parse a freeform paste into one or more `(tenantId, ownerObjectId)`
- * pairs. Tolerates:
- *   - tab / comma / whitespace separators between the two GUIDs
- *   - one row per line OR a single comma-stream
- *   - extra whitespace, surrounding quotes, BOM
- *   - blank lines and `#` / `//` comment lines
- *   - reversed order is NOT auto-corrected — the contract is
- *     `tenant, owner` and reversing would silently provision in the
- *     wrong directory
- *
- * Returns up to `cap` valid pairs. Invalid lines are returned as
- * `errors` with the original line text for the operator to fix.
- */
-function parseBulkRecipients(
-  raw: string,
-  cap = 500,
-): {
-  pairs: Array<{ tenantId: string; ownerObjectId: string; line: number }>;
-  errors: Array<{ line: number; text: string; reason: string }>;
-  truncated: boolean;
-} {
-  const pairs: Array<{
-    tenantId: string;
-    ownerObjectId: string;
-    line: number;
-  }> = [];
-  const errors: Array<{ line: number; text: string; reason: string }> = [];
-  if (!raw) return { pairs, errors, truncated: false };
-  const lines = raw.replace(/\r/g, "").split("\n");
-  let truncated = false;
-  for (let i = 0; i < lines.length; i += 1) {
-    const rawLine = lines[i] ?? "";
-    const trimmed = rawLine.trim();
-    if (!trimmed) continue;
-    if (trimmed.startsWith("#") || trimmed.startsWith("//")) continue;
-    const cleaned = trimmed.replace(/^["']|["']$/g, "");
-    const parts = cleaned
-      .split(/[,\t\s;]+/)
-      .map((p) => p.trim().replace(/^["']|["']$/g, ""))
-      .filter(Boolean);
-    if (parts.length < 2) {
-      errors.push({
-        line: i + 1,
-        text: trimmed,
-        reason: "Expected at least two GUIDs (tenantId then ownerObjectId).",
-      });
-      continue;
-    }
-    const [tenantPart, ownerPart] = parts;
-    if (!tenantPart || !ownerPart) {
-      errors.push({
-        line: i + 1,
-        text: trimmed,
-        reason: "Empty tenantId or ownerObjectId.",
-      });
-      continue;
-    }
-    if (!UUID_REGEX.test(tenantPart)) {
-      errors.push({
-        line: i + 1,
-        text: trimmed,
-        reason: `Not a GUID: '${tenantPart}' (column 1 = tenantId).`,
-      });
-      continue;
-    }
-    if (!UUID_REGEX.test(ownerPart)) {
-      errors.push({
-        line: i + 1,
-        text: trimmed,
-        reason: `Not a GUID: '${ownerPart}' (column 2 = ownerObjectId).`,
-      });
-      continue;
-    }
-    if (pairs.length >= cap) {
-      truncated = true;
-      break;
-    }
-    pairs.push({
-      tenantId: tenantPart,
-      ownerObjectId: ownerPart,
-      line: i + 1,
-    });
-  }
-  return { pairs, errors, truncated };
-}
-
 function deriveAlias(recipient: Recipient): string {
   const seedRaw =
     recipient.upn?.split("@")[0] ??
@@ -471,111 +262,9 @@ function deriveAlias(recipient: Recipient): string {
   return `sub-${seed}-${randomSuffix(5)}`;
 }
 
-function isValidAlias(alias: string): boolean {
-  return ALIAS_REGEX.test(alias);
-}
-
 function deriveDisplayName(recipient: Recipient): string {
   const base = `Sub for ${recipient.displayLabel || recipient.upn || recipient.ownerObjectId}`;
   return base.length > 64 ? `${base.slice(0, 61)}...` : base;
-}
-
-/**
- * Stable per-recipient idempotency key for a batch submit. The Subscription
- * Alias API treats the alias name itself as the idempotency key (a second
- * PUT with the same alias is a no-op when the first succeeded). We
- * additionally bake a batch-level uuid into the alias suffix so two
- * concurrent batches against the same recipient list never collide. The
- * key is also surfaced as a tag on the new subscription so it shows up in
- * audit logs and Azure Activity Log.
- */
-function generateBatchId(): string {
-  // Mirrors randomSuffix() but produces a 12-char base36-ish token; opaque.
-  return `${Date.now().toString(36)}-${randomSuffix(8)}`;
-}
-
-/**
- * Format a number of seconds as `mm:ss` (or `Xs` for under a minute).
- * Used in the per-recipient progress strip and the batch summary so
- * elapsed times are scannable without the operator counting digits.
- */
-function formatElapsedSec(secs: number): string {
-  if (!Number.isFinite(secs) || secs < 0) return "0s";
-  if (secs < 60) return `${Math.round(secs)}s`;
-  const m = Math.floor(secs / 60);
-  const s = Math.round(secs - m * 60);
-  return `${m}m ${s.toString().padStart(2, "0")}s`;
-}
-
-/**
- * Coarse classification of an Azure error message into a category. Used by
- * the failure panel to badge errors so the operator can scan a long batch
- * and spot which failures are e.g. all the same auth issue vs. random
- * mixed problems. Returned label is short enough for an inline pill.
- */
-function categorizeError(error: string): {
-  label: string;
-  tone: "auth" | "data" | "quota" | "transient" | "input" | "unknown";
-} {
-  const msg = error.toLowerCase();
-  if (
-    msg.includes("aadsts") ||
-    msg.includes("401") ||
-    msg.includes("not authorized") ||
-    msg.includes("authoriz") ||
-    msg.includes("billingpermission")
-  ) {
-    return { label: "auth", tone: "auth" };
-  }
-  if (
-    msg.includes("commerce account is null") ||
-    msg.includes("billingaccount is null") ||
-    msg.includes("commerceaccountisnull")
-  ) {
-    return { label: "commerce", tone: "data" };
-  }
-  if (
-    msg.includes("spendinglimit") ||
-    msg.includes("quota") ||
-    msg.includes("limit")
-  ) {
-    return { label: "quota", tone: "quota" };
-  }
-  if (msg.includes("toomanyrequests") || msg.includes("429")) {
-    return { label: "throttle", tone: "transient" };
-  }
-  if (
-    /\b5\d\d\b/.test(error) ||
-    msg.includes("internalservererror") ||
-    msg.includes("badgateway") ||
-    msg.includes("service unavailable") ||
-    msg.includes("timeout")
-  ) {
-    return { label: "transient", tone: "transient" };
-  }
-  if (
-    msg.includes("invalid") ||
-    msg.includes("alias") ||
-    msg.includes("subscriptionownerid") ||
-    msg.includes("subscriptiontenantid")
-  ) {
-    return { label: "input", tone: "input" };
-  }
-  return { label: "unknown", tone: "unknown" };
-}
-
-/**
- * Build the Azure Portal deep-link for a freshly-provisioned subscription.
- * The Subscription Alias API returns an ARM resource id like
- * `/subscriptions/{guid}` once the alias finishes async polling. The portal
- * accepts the bare GUID as a query parameter on the Subscriptions blade.
- */
-function azurePortalLinkForSubscription(subscriptionId: string): string {
-  const trimmed = subscriptionId.trim();
-  // Some callers may give us a full resource path; pull just the GUID.
-  const match = trimmed.match(/([0-9a-f-]{36})/i);
-  const id = match ? match[1] : trimmed;
-  return `https://portal.azure.com/#@/resource/subscriptions/${id}/overview`;
 }
 
 interface ScopeCardProps {
@@ -649,41 +338,6 @@ const ScopeCard: React.FC<ScopeCardProps> = ({
       )}
     </span>
   </button>
-);
-
-interface CopyableIdProps {
-  value: string;
-  label?: string;
-}
-
-/**
- * Small inline pill that displays a (possibly long) ID with an inline
- * click-to-copy affordance. The pill wraps the value and delegates the
- * copy interaction to the shared `<CopyButton>` so the legacy
- * `document.execCommand("copy")` fallback works in sandboxed iframes
- * where `navigator.clipboard` is blocked.
- *
- * COORDINATOR: the page previously embedded a local `CopyableId` that
- * implemented its own clipboard dance — replaced with the shared
- * `CopyButton` from `../shared/copy-button` so the fallback is
- * consistent with every other page that copies a GUID.
- */
-const CopyableId: React.FC<CopyableIdProps> = ({ value, label }) => (
-  <span
-    className={cn(
-      "group/copy inline-flex items-center gap-1.5 rounded-md border border-border bg-surface-sunken px-2 py-1 font-mono text-2xs text-foreground",
-      "transition-all duration-200 ease-out hover:border-primary/60 hover:bg-accent/5",
-      "focus-within:outline-none focus-within:ring-2 focus-within:ring-ring focus-within:ring-offset-1 focus-within:ring-offset-background",
-    )}
-  >
-    <span className="truncate">{value}</span>
-    <CopyButton
-      value={value}
-      ariaLabel={label ? `Copy ${label}` : `Copy ${value}`}
-      iconSize={12}
-      alwaysVisible
-    />
-  </span>
 );
 
 const recipientSchema = z.object({
@@ -2459,6 +2113,34 @@ const EaSubscriptionPageInner: React.FC<EaSubscriptionPageProps> = ({
     handleSelectAccount(candidate);
   });
 
+  // Hotkey: Ctrl+Enter (Cmd+Enter on macOS) opens the create-subscription
+  // confirmation when the form is ready. Skips when the confirm dialog
+  // is already open or a batch is running so it can't double-fire.
+  useShortcut(
+    "Mod+Enter",
+    () => {
+      if (submitting || confirmOpen) return;
+      if (!formReady) return;
+      setConfirmOpen(true);
+    },
+    { enabled: true, allowInInputs: true, preventDefault: true },
+  );
+
+  // Hotkey: Escape cancels the confirm dialog (but never aborts an in-
+  // flight batch — Azure has already committed the in-flight PUTs). When
+  // a retry is queued, also clears the retry-only key set.
+  useShortcut(
+    "Escape",
+    () => {
+      if (submitting) return;
+      if (confirmOpen) {
+        setConfirmOpen(false);
+        setRetryOnlyKeys(null);
+      }
+    },
+    { enabled: confirmOpen, allowInInputs: true, preventDefault: false },
+  );
+
   if (discoveringEa && eaAccounts.length === 0) {
     return (
       <div className="flex flex-col gap-4 py-4">
@@ -2645,8 +2327,40 @@ const EaSubscriptionPageInner: React.FC<EaSubscriptionPageProps> = ({
       } => Boolean(x),
     );
 
+  // Screen-reader-only live announcement of batch progress. Distinct from
+  // the visible polite-live region inside the Provisioning Summary so
+  // milestones (start / each-completed / done) reach assistive tech
+  // without re-announcing the entire summary card on every re-render.
+  const srStatusMessage = React.useMemo(() => {
+    if (submitting) {
+      if (totalInFlight === 0) return "Batch starting.";
+      return `Provisioning subscriptions: ${completedCount} of ${totalInFlight} complete.`;
+    }
+    if (totalInFlight > 0 && completedCount === totalInFlight) {
+      const failCount = totalInFlight - successResults.length;
+      if (failCount === 0) {
+        return `Batch complete. All ${totalInFlight} subscriptions provisioned successfully.`;
+      }
+      return `Batch complete with ${failCount} failure${failCount === 1 ? "" : "s"} of ${totalInFlight}.`;
+    }
+    return "";
+  }, [submitting, totalInFlight, completedCount, successResults.length]);
+
   return (
     <div className="flex flex-col gap-4 py-4">
+      {/* Off-screen ARIA-live announcer for batch progress. The visible
+          status card is also polite-live; this region exists so screen
+          readers get a short, structured milestone string instead of the
+          entire summary card on each re-render. `sr-only` keeps it
+          invisible. */}
+      <div
+        aria-live="polite"
+        aria-atomic="true"
+        role="status"
+        className="sr-only"
+      >
+        {srStatusMessage}
+      </div>
       <PageHeader
         title="Create EA Subscription"
         description="Provision a new Azure subscription under your Enterprise Agreement enrollment."
@@ -3568,6 +3282,73 @@ const EaSubscriptionPageInner: React.FC<EaSubscriptionPageProps> = ({
                           )}
                         </div>
 
+                        {/* Persisted recipient templates — operator can save
+                            and reload common recipient lists (e.g. "Customer
+                            A monthly provisioning") without re-clicking the
+                            picker. Pure local persistence; no Azure round-
+                            trip. */}
+                        <RecipientTemplates
+                          currentPairs={selectedRecipients.map((r) => ({
+                            tenantId: r.tenantId,
+                            ownerObjectId: r.ownerObjectId,
+                          }))}
+                          onLoad={(pairs, templateName) => {
+                            const prev = form.getValues("recipients");
+                            const seen = new Set(prev.map((p) => dedupeKey(p)));
+                            const added: Recipient[] = [];
+                            for (const pair of pairs) {
+                              const dk = dedupeKey(pair);
+                              if (seen.has(dk)) continue;
+                              seen.add(dk);
+                              const wkey = recipientKey("web-account", pair);
+                              const tkey = recipientKey("tenant-user", pair);
+                              const fromCatalog =
+                                recipientCatalog.get(wkey) ??
+                                recipientCatalog.get(tkey);
+                              if (fromCatalog) {
+                                added.push(fromCatalog);
+                              } else {
+                                added.push({
+                                  key: `manual:${pair.tenantId}:${pair.ownerObjectId}`,
+                                  source: "manual",
+                                  tenantId: pair.tenantId,
+                                  ownerObjectId: pair.ownerObjectId,
+                                  displayLabel: `Manual (${truncateMiddle(pair.ownerObjectId, 8, 4)})`,
+                                  tenantLabel: tenantLabelFor(pair.tenantId),
+                                });
+                              }
+                            }
+                            if (added.length > 0) {
+                              form.setValue(
+                                "recipients",
+                                [...prev, ...added],
+                                { shouldValidate: true },
+                              );
+                            }
+                            store.addNotification({
+                              type: added.length > 0 ? "success" : "info",
+                              message:
+                                added.length === 0
+                                  ? `Template '${templateName}' added no new recipients (all duplicates).`
+                                  : `Loaded '${templateName}' — added ${added.length} recipient${added.length === 1 ? "" : "s"}.`,
+                            });
+                            auditLog.record({
+                              actor:
+                                activeAccount?.username ?? "anonymous",
+                              action: "ea_subscription_load_template",
+                              target: templateName,
+                              status: "success",
+                              details: {
+                                templateName,
+                                templatePairCount: pairs.length,
+                                addedCount: added.length,
+                                duplicateCount: pairs.length - added.length,
+                              },
+                            });
+                          }}
+                          disabled={submitting}
+                        />
+
                         <div className="flex flex-col gap-1.5">
                           <div className="flex items-center justify-between gap-2">
                             <p className="text-2xs font-medium uppercase tracking-wider text-muted-foreground">
@@ -3873,6 +3654,23 @@ const EaSubscriptionPageInner: React.FC<EaSubscriptionPageProps> = ({
                 </div>
               </CardContent>
             </Card>
+          )}
+
+          {/*
+            Pre-flight signature panel — corpus-grounded detections that
+            surface unusual batch shapes (cross-tenant fan-out, mixed
+            recipient classes, self-replication, manual-paste-heavy) and
+            simulate the audit events that will fire on submit. Read-only;
+            never blocks the operator. See `_ea_subscription_cross_tenant.md`
+            §1, §9 for the documented attack shape.
+          */}
+          {leafSelectionReady && activeAccount && (
+            <PreFlightPanel
+              callerTenantId={activeAccount.tenantId}
+              callerTenantLabel={tenantLabelFor(activeAccount.tenantId)}
+              callerUpn={activeAccount.username}
+              recipients={effectiveRecipients}
+            />
           )}
 
           {/*
@@ -4184,6 +3982,24 @@ const EaSubscriptionPageInner: React.FC<EaSubscriptionPageProps> = ({
                       </Button>
                     </div>
                   </div>
+                )}
+
+                {/*
+                  Steady-state reconciliation tile — appears once any batch
+                  outcome lands. Buckets rows into steady / alias-only /
+                  pending-acceptance / failed / stale so the operator knows
+                  what still needs follow-up. Per `_bypass_modify_delete.md`:
+                  state-changing ops need explicit follow-up — the caller's
+                  view of "success" does not equal the destination tenant's
+                  view of "fully owned" for cross-tenant subs.
+                */}
+                {activeAccount && totalInFlight > 0 && (
+                  <ReconciliationTile
+                    callerTenantId={activeAccount.tenantId}
+                    recipients={effectiveRecipients}
+                    statusMap={statusMap}
+                    submitting={submitting}
+                  />
                 )}
 
                 {batchErrors.length > 0 && (
@@ -4771,13 +4587,27 @@ const EaSubscriptionPageInner: React.FC<EaSubscriptionPageProps> = ({
                       submit.
                     </p>
                   )}
+                  {formReady && !submitting && (
+                    <p className="text-2xs text-muted-foreground">
+                      Hotkey:{" "}
+                      <kbd className="rounded border border-border bg-surface-sunken px-1.5 py-0.5 font-mono text-[10px] text-foreground">
+                        Ctrl
+                      </kbd>{" "}
+                      <span aria-hidden>+</span>{" "}
+                      <kbd className="rounded border border-border bg-surface-sunken px-1.5 py-0.5 font-mono text-[10px] text-foreground">
+                        Enter
+                      </kbd>{" "}
+                      to open confirm
+                    </p>
+                  )}
                   <Button
                     type="button"
                     variant="default"
                     size="lg"
                     onClick={() => setConfirmOpen(true)}
                     disabled={!formReady || submitting}
-                    aria-label="Create EA subscriptions"
+                    aria-label="Create EA subscriptions (Ctrl+Enter)"
+                    title="Create EA subscriptions — Ctrl+Enter"
                     className="transition-all duration-200 ease-out hover:shadow-elev-2"
                   >
                     <PlusCircle className="h-4 w-4" aria-hidden />
@@ -4981,500 +4811,6 @@ const EaSubscriptionPageInner: React.FC<EaSubscriptionPageProps> = ({
   );
 };
 
-// ---------------------------------------------------------------------------
-// AcceptOwnershipPanel — destination-tenant companion to the cross-tenant
-// EA / MCA creation flow.
-//
-// Microsoft's documented contract: when an alias is created with
-// `subscriptionTenantId` pointing to a different tenant, the new owner has
-// 7 days to accept ownership. The accept-ownership API requires a token
-// from the DESTINATION tenant — i.e. the operator running this WebUI must
-// be signed in as the invited owner (or a delegate in that tenant).
-//
-// Flow:
-//   1. Operator pastes / types the subscriptionId.
-//   2. We call GET /acceptOwnershipStatus to verify the request exists and
-//      is still in `Pending` state.
-//   3. If pending, render an "Accept ownership" form (optional rename +
-//      management group) and call POST /acceptOwnership on submit.
-//   4. Audit each step; never throw — surface failures via toast.
-// ---------------------------------------------------------------------------
-
-interface AcceptOwnershipPanelProps {
-  account: EaAccount;
-  store: ReturnType<typeof useMultiRegionStore>;
-}
-
-const SUB_ID_REGEX =
-  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-
-const AcceptOwnershipPanel: React.FC<AcceptOwnershipPanelProps> = ({
-  account,
-  store,
-}) => {
-  const [open, setOpen] = React.useState(false);
-  const [subId, setSubId] = React.useState("");
-  const [checking, setChecking] = React.useState(false);
-  const [accepting, setAccepting] = React.useState(false);
-  const [status, setStatus] = React.useState<AcceptOwnershipStatus | null>(
-    null,
-  );
-  const [error, setError] = React.useState<string | null>(null);
-  const [renameTo, setRenameTo] = React.useState("");
-
-  const subIdValid = React.useMemo(() => SUB_ID_REGEX.test(subId.trim()), [
-    subId,
-  ]);
-
-  const handleCheck = React.useCallback(
-    async (forceRefresh = false) => {
-      if (!subIdValid) {
-        setError("Subscription ID must be a UUID (8-4-4-4-12).");
-        return;
-      }
-      setChecking(true);
-      setError(null);
-      setStatus(null);
-      // Audit kickoff so the action is in the timeline even if the
-      // token acquire throws below (this matters when AADSTS hits).
-      auditLog.record({
-        actor: account.username || account.name || account.homeAccountId,
-        action: "accept_ownership_check_start",
-        target: subId.trim(),
-        status: "success",
-        details: {
-          tenantId: account.tenantId,
-          forceRefresh,
-        },
-      });
-      try {
-        // Cross-tenant: the accept-ownership API requires a token from
-        // the DESTINATION tenant (where the new subscription is intended
-        // to land). The active account in this WebUI MUST be in that
-        // tenant — we don't auto-switch tenants here. If the operator
-        // hits a 401, the most common cause is a stale token from a
-        // different tenant; forceRefresh re-mints under the active one.
-        const token = await getArmTokenForAccount(
-          account.homeAccountId,
-          account.tenantId,
-          { forceRefresh },
-        );
-        const res = await getAcceptOwnershipStatus(subId.trim(), token);
-        setStatus(res);
-        if (res.displayName && !renameTo) {
-          // Pre-fill rename input with the current name so the operator
-          // sees what would land if they accept without editing.
-          setRenameTo(res.displayName);
-        }
-        auditLog.record({
-          actor: account.username || account.name || account.homeAccountId,
-          action: "accept_ownership_check",
-          target: subId.trim(),
-          status: "success",
-          details: {
-            tenantId: account.tenantId,
-            state: res.acceptOwnershipState,
-            billingOwner: res.billingOwner ?? null,
-            destinationTenantId: res.subscriptionTenantId ?? null,
-            forceRefresh,
-          },
-        });
-      } catch (e) {
-        const msg = e instanceof Error ? e.message : String(e);
-        setError(msg);
-        auditLog.record({
-          actor: account.username || account.name || account.homeAccountId,
-          action: "accept_ownership_check",
-          target: subId.trim(),
-          status: "failure",
-          error: msg,
-          details: { tenantId: account.tenantId, forceRefresh },
-        });
-      } finally {
-        setChecking(false);
-      }
-    },
-    [account, subId, subIdValid, renameTo],
-  );
-
-  const handleAccept = React.useCallback(async () => {
-    if (!status || status.acceptOwnershipState !== "Pending") return;
-    setAccepting(true);
-    setError(null);
-    // Audit start so the partial-failure case (token fine, ARM throws)
-    // is still attributable in the timeline.
-    auditLog.record({
-      actor: account.username || account.name || account.homeAccountId,
-      action: "accept_ownership_start",
-      target: status.subscriptionId,
-      status: "success",
-      details: {
-        tenantId: account.tenantId,
-        renamedTo: renameTo.trim() || undefined,
-        previousDisplayName: status.displayName ?? null,
-      },
-    });
-    try {
-      // Per Microsoft's docs, the accept-ownership token MUST be from the
-      // destination tenant. We force-refresh so a fresh claim set is in
-      // play — common AADSTS70000 fix when this would otherwise 401.
-      const token = await getArmTokenForAccount(
-        account.homeAccountId,
-        account.tenantId,
-        { forceRefresh: true },
-      );
-      await acceptSubscriptionOwnership(
-        status.subscriptionId,
-        {
-          displayName:
-            renameTo.trim() && renameTo.trim() !== status.displayName
-              ? renameTo.trim()
-              : undefined,
-        },
-        token,
-      );
-      // Re-check status — it should now be Completed.
-      const refreshed = await getAcceptOwnershipStatus(
-        status.subscriptionId,
-        token,
-      );
-      setStatus(refreshed);
-      store.addNotification({
-        type: "success",
-        message: `Accepted ownership of ${status.subscriptionId}. Subscription is now in your tenant.`,
-      });
-      auditLog.record({
-        actor: account.username || account.name || account.homeAccountId,
-        action: "accept_ownership",
-        target: status.subscriptionId,
-        status: "success",
-        details: {
-          tenantId: account.tenantId,
-          renamedTo: renameTo.trim() || undefined,
-          finalState: refreshed.acceptOwnershipState,
-        },
-      });
-    } catch (e) {
-      const msg = e instanceof Error ? e.message : String(e);
-      setError(msg);
-      store.addNotification({
-        type: "error",
-        message: `Accept ownership failed: ${msg}`,
-      });
-      auditLog.record({
-        actor: account.username || account.name || account.homeAccountId,
-        action: "accept_ownership",
-        target: status.subscriptionId,
-        status: "failure",
-        error: msg,
-        details: { tenantId: account.tenantId },
-      });
-    } finally {
-      setAccepting(false);
-    }
-  }, [account, status, renameTo, store]);
-
-  // Tone of the "current state" badge.
-  const stateTone =
-    status?.acceptOwnershipState === "Pending"
-      ? "warning"
-      : status?.acceptOwnershipState === "Completed"
-        ? "success"
-        : status?.acceptOwnershipState === "Expired"
-          ? "destructive"
-          : "muted";
-
-  return (
-    <Card className="border-warning/30 bg-warning/5 transition-colors duration-200 ease-out">
-      <CardHeader>
-        <button
-          type="button"
-          className="flex w-full items-start gap-3 text-left"
-          onClick={() => setOpen((o) => !o)}
-          aria-expanded={open}
-        >
-          <span
-            aria-hidden
-            className="mt-0.5 flex h-7 w-7 shrink-0 items-center justify-center rounded-full bg-warning/15 text-warning"
-          >
-            <Inbox className="h-4 w-4" aria-hidden />
-          </span>
-          <div className="flex flex-1 flex-col gap-0.5">
-            <CardTitle className="flex items-center gap-2 text-sm">
-              <span>Accept incoming subscription</span>
-              <ChevronRight
-                className={cn(
-                  "h-3.5 w-3.5 text-muted-foreground transition-transform duration-200 ease-out",
-                  open && "rotate-90",
-                )}
-                aria-hidden
-              />
-            </CardTitle>
-            <CardDescription>
-              Paste a subscription ID someone provisioned for you in another
-              tenant. We&apos;ll check pending status and let you accept
-              ownership inline. Token comes from the currently-selected
-              account (must be in the destination tenant).
-            </CardDescription>
-          </div>
-        </button>
-      </CardHeader>
-      {open && (
-        <CardContent className="flex flex-col gap-3">
-          <div className="flex flex-wrap items-center gap-2">
-            <div className="relative min-w-[280px] flex-1">
-              <Input
-                type="text"
-                placeholder="00000000-0000-0000-0000-000000000000"
-                value={subId}
-                onChange={(e) => {
-                  setSubId(e.target.value);
-                  setError(null);
-                }}
-                aria-label="Subscription ID"
-                aria-invalid={
-                  subId.length > 0 && !subIdValid ? true : undefined
-                }
-                className="font-mono"
-              />
-            </div>
-            <Button
-              type="button"
-              variant="outline"
-              size="sm"
-              onClick={() => void handleCheck(false)}
-              disabled={!subIdValid || checking || accepting}
-              aria-label="Check acceptance status"
-              className="gap-1"
-            >
-              {checking ? (
-                <Loader2 className="h-3.5 w-3.5 animate-spin motion-reduce:animate-none" />
-              ) : (
-                <Hourglass className="h-3.5 w-3.5" />
-              )}
-              Check status
-            </Button>
-            <Tooltip>
-              <TooltipTrigger asChild>
-                <Button
-                  type="button"
-                  variant="ghost"
-                  size="sm"
-                  onClick={() => void handleCheck(true)}
-                  disabled={!subIdValid || checking || accepting}
-                  aria-label="Force-refresh ARM token and re-check"
-                  className="gap-1"
-                >
-                  <RefreshCw className="h-3.5 w-3.5" />
-                  Force refresh
-                </Button>
-              </TooltipTrigger>
-              <TooltipContent className="max-w-xs">
-                Bypass MSAL silent cache and acquire a brand-new ARM
-                token before checking. Use when a previous check
-                returned 401 / AADSTS — common when the destination-
-                tenant role assignment was granted after the cached
-                token was minted.
-              </TooltipContent>
-            </Tooltip>
-          </div>
-
-          {error && (
-            <div className="flex flex-col gap-1">
-              <ErrorState
-                message="Status check failed"
-                detail={error}
-                size="compact"
-              />
-              {(() => {
-                const tip = suggestRemediation(error);
-                return tip ? (
-                  <p className="rounded border border-destructive/30 bg-destructive/10 px-2 py-1 text-2xs text-destructive/90">
-                    <span className="font-semibold">How to fix: </span>
-                    {tip}
-                  </p>
-                ) : null;
-              })()}
-            </div>
-          )}
-
-          {status && (
-            <div className="flex flex-col gap-2 rounded-md border border-border bg-card px-3 py-2.5">
-              <div className="flex flex-wrap items-center gap-2 text-xs">
-                <span className="font-medium text-foreground">Status:</span>
-                <span
-                  className={cn(
-                    "inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-2xs font-semibold uppercase tracking-wider ring-1",
-                    stateTone === "warning" &&
-                      "bg-warning/10 text-warning ring-warning/30",
-                    stateTone === "success" &&
-                      "bg-success/10 text-success ring-success/30",
-                    stateTone === "destructive" &&
-                      "bg-destructive/10 text-destructive ring-destructive/30",
-                    stateTone === "muted" &&
-                      "bg-muted/40 text-muted-foreground ring-border",
-                  )}
-                >
-                  {status.acceptOwnershipState}
-                </span>
-                {status.billingOwner && (
-                  <span className="text-2xs text-muted-foreground">
-                    invited by{" "}
-                    <span className="font-mono text-foreground">
-                      {status.billingOwner}
-                    </span>
-                  </span>
-                )}
-              </div>
-              <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-2xs text-muted-foreground">
-                <span className="flex items-center gap-1.5">
-                  <span>Subscription ID:</span>
-                  <CopyableId
-                    value={status.subscriptionId}
-                    label="subscription id"
-                  />
-                </span>
-                {status.acceptOwnershipState === "Completed" && (
-                  <a
-                    href={azurePortalLinkForSubscription(
-                      status.subscriptionId,
-                    )}
-                    target="_blank"
-                    rel="noopener noreferrer"
-                    className={cn(
-                      "inline-flex items-center gap-1 rounded-md border border-border bg-background px-2 py-0.5 text-2xs font-medium text-foreground",
-                      "transition-all duration-200 ease-out hover:border-primary hover:bg-accent/5 hover:text-primary",
-                    )}
-                    aria-label="Open in Azure Portal"
-                  >
-                    <ExternalLink className="h-3 w-3" aria-hidden />
-                    Open in Portal
-                  </a>
-                )}
-              </div>
-              {status.displayName && (
-                <div className="flex items-center gap-2 text-2xs text-muted-foreground">
-                  <span>Display name:</span>
-                  <span className="font-mono text-foreground">
-                    {status.displayName}
-                  </span>
-                </div>
-              )}
-              {status.subscriptionTenantId && (
-                <div className="flex items-center gap-2 text-2xs text-muted-foreground">
-                  <span>Destination tenant:</span>
-                  <code className="rounded bg-background px-1.5 py-0.5 font-mono text-foreground">
-                    {status.subscriptionTenantId}
-                  </code>
-                  {status.subscriptionTenantId.toLowerCase() !==
-                    account.tenantId.toLowerCase() && (
-                    <Tooltip>
-                      <TooltipTrigger asChild>
-                        <span
-                          className="flex h-3.5 w-3.5 cursor-help items-center justify-center rounded-full bg-warning/20 text-warning"
-                          aria-label="Tenant mismatch"
-                        >
-                          <AlertTriangle
-                            className="h-2.5 w-2.5"
-                            aria-hidden
-                          />
-                        </span>
-                      </TooltipTrigger>
-                      <TooltipContent className="max-w-xs">
-                        The destination tenant does NOT match your
-                        active account tenant ({account.tenantId}).
-                        Acceptance will fail with 401. Switch this
-                        account&apos;s active tenant to{" "}
-                        {status.subscriptionTenantId}, or sign in with
-                        an account in that tenant, then retry.
-                      </TooltipContent>
-                    </Tooltip>
-                  )}
-                </div>
-              )}
-
-              {status.acceptOwnershipState === "Pending" && (
-                <div className="mt-1 flex flex-col gap-2 rounded-md border border-warning/30 bg-warning/5 px-3 py-2">
-                  <div className="flex flex-col gap-1">
-                    <Label
-                      htmlFor="accept-rename"
-                      className="text-2xs uppercase tracking-wider text-muted-foreground"
-                    >
-                      Display name (optional rename)
-                    </Label>
-                    <Input
-                      id="accept-rename"
-                      type="text"
-                      value={renameTo}
-                      onChange={(e) => setRenameTo(e.target.value)}
-                      disabled={accepting}
-                      className="text-xs"
-                      placeholder={status.displayName ?? "Leave unchanged"}
-                    />
-                  </div>
-                  <Button
-                    type="button"
-                    variant="default"
-                    size="sm"
-                    disabled={accepting}
-                    onClick={() => void handleAccept()}
-                    aria-label="Accept ownership of this subscription"
-                    className="gap-1 self-end"
-                  >
-                    {accepting ? (
-                      <Loader2 className="h-3.5 w-3.5 animate-spin motion-reduce:animate-none" />
-                    ) : (
-                      <ShieldCheck className="h-3.5 w-3.5" />
-                    )}
-                    Accept ownership
-                  </Button>
-                </div>
-              )}
-
-              {status.acceptOwnershipState === "Completed" && (
-                <div
-                  className="mt-1 flex items-center gap-2 rounded-md border border-success/30 bg-success/5 px-3 py-2 text-2xs text-success"
-                  role="status"
-                >
-                  <CheckCircle2 className="h-3.5 w-3.5" aria-hidden />
-                  <span>
-                    This subscription is fully owned in your tenant —
-                    nothing more to do.
-                  </span>
-                </div>
-              )}
-
-              {status.acceptOwnershipState === "Expired" && (
-                <div
-                  className="mt-1 flex items-center gap-2 rounded-md border border-destructive/30 bg-destructive/5 px-3 py-2 text-2xs text-destructive"
-                  role="status"
-                >
-                  <AlertTriangle className="h-3.5 w-3.5" aria-hidden />
-                  <span>
-                    The 7-day acceptance window has elapsed. The source
-                    operator must re-create the subscription with a fresh
-                    invitation.
-                  </span>
-                </div>
-              )}
-            </div>
-          )}
-
-          <p className="text-2xs text-muted-foreground">
-            <span className="font-medium">How this works:</span> when
-            someone in another tenant runs &quot;Create EA Subscription&quot;
-            with you as the recipient, Azure mints the subscription pinned
-            to their billing scope but with you as the designated owner.
-            The subscription enters{" "}
-            <code className="font-mono">Pending</code> for 7 days; you
-            accept here (or via the email link) to move it into your
-            tenant.
-          </p>
-        </CardContent>
-      )}
-    </Card>
-  );
-};
 
 export const EaSubscriptionPage: React.FC<EaSubscriptionPageProps> = (
   props,

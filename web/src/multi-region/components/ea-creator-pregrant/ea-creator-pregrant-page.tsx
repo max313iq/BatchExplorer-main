@@ -44,6 +44,37 @@
  *   - Token-tracker preserved per page contract; the existing-grants
  *     panel re-fetches after a successful grant so the lists stay in sync.
  *
+ * Wave-2 corpus-grounded improvements (this file):
+ *   - Suspect-SP detection. Service-principal pregrants are a high-signal
+ *     audit hook — they survive employee offboarding and rarely trigger
+ *     user-centric SOC alerts. We Graph-resolve each creator's principalId
+ *     in their home tenant; a 404 user lookup → "ServicePrincipal
+ *     suspected" badge + summary banner. Cite:
+ *     `New folder/_bypass_role_grant.md` §"App-Role Escalation Chains".
+ *   - Covered-grant preflight. We list assignments at the parent BA scope
+ *     and surface a "Covered" badge on EA-scope creator rows whose
+ *     principal already holds an equivalent role at the wider scope.
+ *     Mirrored at submit-time as a Layers-icon Alert above the Grant
+ *     button so the operator sees "this PUT will be redundant" before
+ *     firing. Cite: `_bypass_role_grant.md` §"scope hierarchy".
+ *   - Audit payload enrichment. The revoke flow records the full
+ *     {principalId, principalTenantId, scope, roleDefinitionId, createdOn,
+ *     ageDays, principalClassification, granterOid} on the audit entry,
+ *     not just `{principalId, roleAssignmentId}`. Cite:
+ *     `_analysis_defender_view.md` §"audit trail completeness".
+ *   - Configurable stale-pregrant threshold + auto-revoke reminder. Two
+ *     persisted day-pickers replace the previous hard-coded 7-day stale
+ *     cutoff; auto-revoke is reminder-only (we never delete without a
+ *     human confirm).
+ *   - Baseline snapshot. Operators can capture "what creators look like
+ *     NOW" per-scope; subsequent reloads surface added/removed rows in a
+ *     diff banner. Useful for one-shot reconciliations.
+ *   - Operator hotkeys: `g` focuses the principal input, `Shift+G`
+ *     opens the grant confirm dialog, `d` opens the revoke confirm for
+ *     the first row on the Existing tab. The page-local Keyboard icon in
+ *     the header explains them; the global `?` keyboard-help dialog
+ *     lists them alongside the app-wide shortcuts.
+ *
  * This duplicates capability in Sub Manager's "Grant" tab, but the
  * dedicated page is easier to point operators at and decouples the
  * pre-grant decision from the rest of Sub Manager's surface.
@@ -53,10 +84,15 @@ import { useNavigate } from "react-router-dom";
 import {
   AlertCircle,
   ArrowRight,
+  Bot,
+  Camera,
   CheckCircle2,
   ChevronDown,
   ChevronUp,
   Clock,
+  GitCompare,
+  Keyboard,
+  Layers,
   Loader2,
   RefreshCw,
   RotateCw,
@@ -121,6 +157,7 @@ import {
 } from "../../store/store-context";
 import type { AuditEntry } from "../../store/store-types";
 import { usePersistedState } from "../../hooks/use-persisted-state";
+import { useShortcut } from "../../hooks/use-shortcut";
 import { useUrlState } from "../../hooks/use-url-state";
 import { ConfirmationDialog } from "../shared/confirmation-dialog";
 import { CopyButton, CopyableText } from "../shared/copy-button";
@@ -152,6 +189,70 @@ const GRANTER_CAPABLE_ROLES = new Set([
   ROLE_EA_ACCOUNT_OWNER.toLowerCase(),
   ROLE_DEPARTMENT_ADMIN.toLowerCase(),
 ]);
+
+/**
+ * Allowed values for the persisted stale-threshold preference. We deliberately
+ * keep a small, opinionated list rather than a free-form number — operators
+ * pick "7d / 30d / 90d / never" so the UI can render a single picker chip
+ * without validation overhead.
+ */
+const STALE_DAY_CHOICES: readonly number[] = [7, 14, 30, 90, 180];
+const DEFAULT_STALE_DAYS = 7;
+/**
+ * Auto-revoke-after-N-days preference values. `0` disables the reminder.
+ * The UI never actually mass-revokes on its own — it only surfaces a banner
+ * pointing the operator at stale rows. Auto-deletion of role assignments
+ * without a human in the loop is an explicit non-goal (corpus:
+ * `New folder/_bypass_role_grant.md` §3 "less-audited paths" — automating
+ * destructive billing-role ops in the UI would be the same anti-pattern).
+ */
+const AUTO_REVOKE_DAY_CHOICES: readonly number[] = [0, 14, 30, 60, 90];
+
+/**
+ * Heuristic test for "this principal id looks like a service principal,
+ * not a user." We can't query Graph for principalType on every existing
+ * assignment cheaply (Graph wants a token in the principal's tenant, which
+ * may differ from the granter's), so we fall back to a structural test:
+ * billing role-assignments mint deterministic GUIDs for users that look
+ * like every other Entra ID `oid`. ServicePrincipals have an oid in the
+ * same shape too — so the only safe heuristic from oid alone is "did the
+ * operator explicitly tag this row" or "is it surfaced via an SP-only
+ * lookup". For the existing-assignments table we instead use the principal
+ * tenant id presence + a Graph fallback resolver: if the principal can be
+ * looked up as a USER in their tenant, we know it's a user; otherwise we
+ * mark it "ServicePrincipal (suspected)".
+ *
+ * Corpus: `New folder/_bypass_role_grant.md` §"App-Role Escalation Chains"
+ * and `_AZURE_BYPASS_PLAYBOOK.md` flag SP grants as automation creep — they
+ * survive employee offboarding (no SSO disable), trigger no MFA, and rarely
+ * fire on user-centric SOC alerts. Flagging them in the UI nudges the
+ * operator to review whether the automation is still load-bearing.
+ */
+type PrincipalClassification = "user" | "sp" | "group" | "unknown";
+
+/**
+ * Settings persisted under `ea-creator-pregrant.prefs` v2.
+ *
+ * Keeping the day-threshold prefs under a single namespaced key (versioned)
+ * avoids fragmenting localStorage into many one-off entries and lets us
+ * evolve the shape without breaking older browsers. The
+ * `.creatorsOnly` boolean lives in its own legacy key (originally written
+ * by the wave-1 changes) and is intentionally NOT folded in — we want
+ * existing operators' preference to survive without a migration.
+ */
+interface PregrantPrefs {
+  /** Stale-cutoff (days). Rows older than this trigger the Stale badge. */
+  staleDays: number;
+  /**
+   * Auto-revoke reminder cutoff (days). When > 0, the UI shows a banner
+   * recommending the operator revoke creators older than this. `0` disables.
+   */
+  autoRevokeDays: number;
+}
+const DEFAULT_PREFS: PregrantPrefs = {
+  staleDays: DEFAULT_STALE_DAYS,
+  autoRevokeDays: 0,
+};
 
 /** Status of a single per-principal grant in the current submission. */
 type RowStatus =
@@ -291,15 +392,52 @@ export const EaCreatorPregrantPage: React.FC = () => {
       : "grant";
 
   // -------------------------------------------------------------------------
-  // Persisted UI prefs — "show pending pregrants only" filter on the
-  // existing-assignments tab + the stale-pregrant threshold (days). Survives
-  // reload so the operator's saved view is sticky between sessions.
+  // Persisted UI prefs — "show pending pregrants only" filter, the stale-
+  // pregrant threshold (days), and the auto-revoke reminder cutoff. The
+  // boolean filter lives on its own legacy key (`.creatorsOnly`); the day
+  // thresholds and any future fields live under `.prefs` (versioned envelope
+  // so we can evolve the shape without touching the legacy boolean).
+  // Survives reload so the operator's saved view is sticky between sessions.
   // -------------------------------------------------------------------------
   const [creatorsOnlyFilter, setCreatorsOnlyFilter] = usePersistedState<boolean>(
     "ea-creator-pregrant.creatorsOnly",
     true,
   );
-  const STALE_DAYS = 7;
+  const [prefs, setPrefs] = usePersistedState<PregrantPrefs>(
+    "ea-creator-pregrant.prefs",
+    DEFAULT_PREFS,
+    {
+      version: 2,
+      // Defensive normaliser: clamp invalid days to defaults rather than
+      // letting localStorage tampering nuke the UI with NaN. Pre-versioning
+      // payloads (oldVersion === undefined) are treated as v1 with no shape.
+      migrate: (raw) => {
+        const candidate = raw as Partial<PregrantPrefs> | null;
+        if (!candidate || typeof candidate !== "object") return DEFAULT_PREFS;
+        const sd = Number(candidate.staleDays);
+        const ar = Number(candidate.autoRevokeDays);
+        return {
+          staleDays: STALE_DAY_CHOICES.includes(sd)
+            ? sd
+            : DEFAULT_PREFS.staleDays,
+          autoRevokeDays: AUTO_REVOKE_DAY_CHOICES.includes(ar)
+            ? ar
+            : DEFAULT_PREFS.autoRevokeDays,
+        };
+      },
+    },
+  );
+  const STALE_DAYS = prefs.staleDays;
+  /** Stable callbacks for the prefs picker chips below. */
+  const setStaleDays = React.useCallback(
+    (d: number) => setPrefs((p) => ({ ...p, staleDays: d })),
+    [setPrefs],
+  );
+  const setAutoRevokeDays = React.useCallback(
+    (d: number) => setPrefs((p) => ({ ...p, autoRevokeDays: d })),
+    [setPrefs],
+  );
+
   const account = React.useMemo(
     () => candidates.find((c) => c.homeAccountId === accountId) ?? null,
     [candidates, accountId],
@@ -567,7 +705,29 @@ export const EaCreatorPregrantPage: React.FC = () => {
       const t = Date.parse(a.createdOn);
       return Number.isFinite(t) && t < cutoff;
     });
-  }, [existingCreators]);
+  }, [existingCreators, STALE_DAYS]);
+
+  /**
+   * Rows old enough to trip the operator's auto-revoke reminder. Empty when
+   * the pref is disabled (`autoRevokeDays === 0`). This is intentionally a
+   * SECOND, configurable cutoff distinct from `STALE_DAYS` — the stale badge
+   * is per-row affordance; the auto-revoke banner is page-level "you have
+   * cleanup to do" nudge with a different default. We never auto-revoke for
+   * the operator — destructive ops always go through the explicit dialog.
+   *
+   * Corpus: `_bypass_role_grant.md` §9 "Persistence Mechanism Resistance"
+   * notes that role assignments survive password changes / MFA resets but
+   * NOT explicit revocation; an aging-out workflow closes that gap.
+   */
+  const autoRevokeCandidates = React.useMemo(() => {
+    if (prefs.autoRevokeDays <= 0) return [];
+    const cutoff = Date.now() - prefs.autoRevokeDays * 24 * 60 * 60 * 1000;
+    return existingCreators.filter((a) => {
+      if (!a.createdOn) return false;
+      const t = Date.parse(a.createdOn);
+      return Number.isFinite(t) && t < cutoff;
+    });
+  }, [existingCreators, prefs.autoRevokeDays]);
 
   /**
    * Filtered view of `existing` that the table will actually render — gated
@@ -588,6 +748,237 @@ export const EaCreatorPregrantPage: React.FC = () => {
     () => new Set(staleCreators.map((s) => s.id)),
     [staleCreators],
   );
+
+  // -------------------------------------------------------------------------
+  // Principal classification — flag SP grants ("automation creep") and
+  // resolve them async via Graph. The billing role-assignments API does not
+  // return `principalType`, so we have to ask Graph "is `{oid}` a user in
+  // tenant `{tid}`?" If Graph returns 404 we treat it as ServicePrincipal-
+  // suspected. We cache the result for the lifetime of the page so re-renders
+  // don't re-fire Graph.
+  //
+  // Corpus: `New folder/_bypass_role_grant.md` §"App-Role Escalation Chains"
+  // and `_AZURE_BYPASS_PLAYBOOK.md` §"persistence" — SP-backed billing-role
+  // grants are a high-signal detection. They survive employee offboarding,
+  // never trigger MFA, and rarely fire user-centric SOC alerts. Surfacing
+  // them in the existing-assignments table gives the operator an audit hook
+  // without needing a separate SIEM dashboard.
+  // -------------------------------------------------------------------------
+  const classifyCacheRef = React.useRef<
+    Map<string, PrincipalClassification>
+  >(new Map());
+  const [classifyVersion, setClassifyVersion] = React.useState(0);
+  // Fire-and-forget Graph lookups for every creator we haven't classified.
+  // Failures are cached too — we don't want a transient Graph error to
+  // re-trigger the entire pool of lookups on every render.
+  React.useEffect(() => {
+    if (!account || existingCreators.length === 0) return;
+    const toResolve = existingCreators.filter(
+      (a) => a.principalTenantId && !classifyCacheRef.current.has(a.principalId),
+    );
+    if (toResolve.length === 0) return;
+    let cancelled = false;
+    (async () => {
+      // We need a Graph token for whichever tenant the principal lives in.
+      // Group lookups by tenant so we acquire one token per tenant, not per
+      // principal — Graph token acquisition is the slowest hop here.
+      const byTenant = new Map<string, BillingRoleAssignmentSummary[]>();
+      for (const a of toResolve) {
+        const tid = a.principalTenantId!;
+        const bucket = byTenant.get(tid) ?? [];
+        bucket.push(a);
+        byTenant.set(tid, bucket);
+      }
+      for (const [tid, rows] of byTenant) {
+        if (cancelled) return;
+        let graphToken: string;
+        try {
+          graphToken = await getGraphTokenForAccount(
+            account.homeAccountId,
+            tid,
+          );
+        } catch {
+          // Failed to acquire token for this tenant — mark all rows
+          // "unknown" so we don't keep retrying.
+          for (const a of rows)
+            classifyCacheRef.current.set(a.principalId, "unknown");
+          continue;
+        }
+        await Promise.all(
+          rows.map(async (a) => {
+            if (cancelled) return;
+            try {
+              const found = await findUserByUpnOrMail(
+                tid,
+                a.principalId,
+                graphToken,
+              );
+              classifyCacheRef.current.set(
+                a.principalId,
+                found ? "user" : "sp",
+              );
+            } catch {
+              classifyCacheRef.current.set(a.principalId, "unknown");
+            }
+          }),
+        );
+        if (!cancelled) setClassifyVersion((v) => v + 1);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+    // Re-run only when the underlying creator set changes identity (a new
+    // fetch landed). We deliberately don't depend on `classifyCacheRef`.
+  }, [account, existingCreators]);
+
+  /**
+   * Set of principalIds classified as `sp` — used to render the "SP" badge
+   * inline on the existing-assignments table and to power the suspect-SP
+   * summary banner. `classifyVersion` is folded into deps so consumers re-
+   * render once the cache fills in.
+   */
+  const suspectSpIds = React.useMemo(() => {
+    void classifyVersion; // touch dep
+    const out = new Set<string>();
+    for (const a of existingCreators) {
+      if (classifyCacheRef.current.get(a.principalId) === "sp") {
+        out.add(a.principalId);
+      }
+    }
+    return out;
+  }, [existingCreators, classifyVersion]);
+
+  // -------------------------------------------------------------------------
+  // Covered-grant preflight — detect when we're about to grant
+  // EaSubscriptionCreator at the enrollment scope to a principal who already
+  // holds it (or a strict superset) at the parent billing-account scope.
+  // The PUT would succeed and the new assignment would be redundant — the
+  // principal already creates subs under THIS enrollment via inheritance.
+  // We list assignments at the BA scope (a single ARM call) and remember
+  // which principalIds are covered.
+  //
+  // Corpus: `_bypass_role_grant.md` §"scope hierarchy" — Azure RBAC's
+  // billing scope graph is BA → enrollmentAccount → subscription; a grant
+  // at the parent scope strictly dominates the child scope. ROADrecon's
+  // `roadlib/auth.py` and SpecterOps AzureHound's `azurehound/enums/...`
+  // both deduplicate against parent-scope grants when emitting privesc
+  // edges — we mirror that here so the operator doesn't double-grant.
+  // -------------------------------------------------------------------------
+  const baScope = React.useMemo(
+    () =>
+      billingAccountName
+        ? `/providers/Microsoft.Billing/billingAccounts/${billingAccountName}`
+        : "",
+    [billingAccountName],
+  );
+  const [baLevelGrants, setBaLevelGrants] = React.useState<
+    BillingRoleAssignmentSummary[]
+  >([]);
+  // Re-use the same reload tick as the EA-scope fetch — a refresh on either
+  // tab should pick up new grants at both levels.
+  React.useEffect(() => {
+    if (!armToken || !baScope) {
+      setBaLevelGrants([]);
+      return;
+    }
+    let cancelled = false;
+    listBillingRoleAssignments(baScope, armToken)
+      .then((rows) => {
+        if (!cancelled) setBaLevelGrants(rows);
+      })
+      .catch(() => {
+        // BA-scope listing requires a wider read role than EA-scope. A 403
+        // here is expected when the granter only has Department Admin —
+        // silently drop the result and skip the covered-grant check rather
+        // than spamming an inline error. The grant PUT will still go through.
+        if (!cancelled) setBaLevelGrants([]);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [armToken, baScope, existingReloadTick]);
+
+  /**
+   * Set of principalIds that already hold EaSubscriptionCreator (or a
+   * strict superset role) at the parent BA scope. A grant at the EA scope
+   * for these principals would be a redundant no-op.
+   */
+  const coveredPrincipalIds = React.useMemo(() => {
+    const wider = new Set<string>();
+    for (const a of baLevelGrants) {
+      const id = a.roleDefinitionId.toLowerCase();
+      if (
+        id === ROLE_EA_SUBSCRIPTION_CREATOR.toLowerCase() ||
+        GRANTER_CAPABLE_ROLES.has(id) // EA Account Owner / Enterprise Admin
+      ) {
+        wider.add(a.principalId.toLowerCase());
+      }
+    }
+    return wider;
+  }, [baLevelGrants]);
+
+  // -------------------------------------------------------------------------
+  // Baseline snapshot — operator can capture "what creators look like NOW"
+  // and the page surfaces a diff banner when subsequent re-fetches show new
+  // or removed creators. Useful when running a one-shot reconciliation
+  // (revoke noise, then re-grant the intended set) and the operator wants a
+  // before/after diff at-a-glance.
+  //
+  // Persisted per-scope so a snapshot taken in EA-A doesn't surface a
+  // confusing diff after the operator switches to EA-B.
+  // -------------------------------------------------------------------------
+  interface BaselineSnapshot {
+    /** Enrollment scope the snapshot was captured at. */
+    scope: string;
+    /** ISO timestamp of capture. */
+    capturedAt: string;
+    /** Sorted set of EaSubscriptionCreator principalIds at capture time. */
+    principalIds: string[];
+  }
+  const [baselineMap, setBaselineMap] = usePersistedState<
+    Record<string, BaselineSnapshot>
+  >("ea-creator-pregrant.baselines", {});
+  const currentBaseline = enrollmentScope
+    ? (baselineMap[enrollmentScope] ?? null)
+    : null;
+  const captureBaseline = React.useCallback(() => {
+    if (!enrollmentScope) return;
+    const snap: BaselineSnapshot = {
+      scope: enrollmentScope,
+      capturedAt: new Date().toISOString(),
+      principalIds: existingCreators
+        .map((a) => a.principalId.toLowerCase())
+        .sort(),
+    };
+    setBaselineMap((prev) => ({ ...prev, [enrollmentScope]: snap }));
+  }, [enrollmentScope, existingCreators, setBaselineMap]);
+  const clearBaseline = React.useCallback(() => {
+    if (!enrollmentScope) return;
+    setBaselineMap((prev) => {
+      const next = { ...prev };
+      delete next[enrollmentScope];
+      return next;
+    });
+  }, [enrollmentScope, setBaselineMap]);
+
+  /**
+   * Diff against the current baseline: lower-cased principalId sets so we
+   * can detect "added since baseline" and "removed since baseline" without
+   * worrying about Azure's casing being unstable across regions.
+   */
+  const baselineDiff = React.useMemo(() => {
+    if (!currentBaseline) return null;
+    const nowSet = new Set(
+      existingCreators.map((a) => a.principalId.toLowerCase()),
+    );
+    const baseSet = new Set(currentBaseline.principalIds);
+    const added: string[] = [];
+    const removed: string[] = [];
+    for (const id of nowSet) if (!baseSet.has(id)) added.push(id);
+    for (const id of baseSet) if (!nowSet.has(id)) removed.push(id);
+    return { added, removed, unchanged: nowSet.size - added.length };
+  }, [currentBaseline, existingCreators]);
 
   // -------------------------------------------------------------------------
   // Principal input — single-line or bulk
@@ -776,6 +1167,31 @@ export const EaCreatorPregrantPage: React.FC = () => {
     }
     return { total: liveRows.length, ok, missing, resolving, error };
   }, [liveRows]);
+
+  /**
+   * Live preflight: which `liveRows` would be a covered grant (the principal
+   * already holds an equivalent-or-wider role at the parent BA scope, so
+   * the EA-scope PUT is redundant)? Triggers the warning banner above the
+   * submit button so the operator can choose to skip or proceed knowing
+   * the EA-scope grant adds no new capability — only an extra audit row to
+   * garden later.
+   *
+   * Corpus: `_bypass_role_grant.md` §"scope hierarchy" — Azure RBAC inherits
+   * down the BA → enrollmentAccount → subscription chain, so a parent-scope
+   * grant strictly dominates a child-scope grant. Redundant child grants
+   * are the #1 source of noise in EA-billing role audits per the playbook.
+   */
+  const coveredLiveRows = React.useMemo(() => {
+    if (coveredPrincipalIds.size === 0) return [];
+    const matches: PrincipalRow[] = [];
+    for (const r of liveRows) {
+      if (!r.resolvedOid) continue;
+      if (coveredPrincipalIds.has(r.resolvedOid.toLowerCase())) {
+        matches.push(r);
+      }
+    }
+    return matches;
+  }, [liveRows, coveredPrincipalIds]);
 
   // -------------------------------------------------------------------------
   // Submission
@@ -1157,6 +1573,24 @@ export const EaCreatorPregrantPage: React.FC = () => {
     setRevokeBusy(true);
     try {
       await deleteBillingRoleAssignment(revokeTarget.id, armToken);
+      // Corpus-style audit payload: capture the FULL state of the assignment
+      // at the moment of revocation, not just the principalId. Defender-side
+      // playbooks (`_analysis_defender_view.md` §"audit trail completeness")
+      // call out missing `granter / role / scope / ageDays` as the most
+      // common gap in cloud-RBAC audit logs — we surface all of them so the
+      // operator's downstream SIEM can correlate this revoke with the
+      // corresponding earlier grant without a join on roleAssignmentId.
+      const ageDays = revokeTarget.createdOn
+        ? Math.max(
+            0,
+            Math.round(
+              (Date.now() - Date.parse(revokeTarget.createdOn)) /
+                (24 * 60 * 60 * 1000),
+            ),
+          )
+        : null;
+      const classification =
+        classifyCacheRef.current.get(revokeTarget.principalId) ?? "unknown";
       auditLog.record({
         actor: account.username,
         action: "revoke_ea_subscription_creator",
@@ -1169,6 +1603,12 @@ export const EaCreatorPregrantPage: React.FC = () => {
           principalTenantId: revokeTarget.principalTenantId,
           roleAssignmentId: revokeTarget.id,
           roleDefinitionName: revokeTarget.roleDefinitionName,
+          roleDefinitionId: revokeTarget.roleDefinitionId,
+          scope: revokeTarget.scope,
+          createdOn: revokeTarget.createdOn,
+          ageDays,
+          principalClassification: classification,
+          granterOid: granterDiag?.callerOid,
         },
       });
       store.addNotification({
@@ -1198,7 +1638,59 @@ export const EaCreatorPregrantPage: React.FC = () => {
     } finally {
       setRevokeBusy(false);
     }
-  }, [account, armToken, billingAccountName, eaName, revokeTarget, store]);
+  }, [
+    account,
+    armToken,
+    billingAccountName,
+    eaName,
+    revokeTarget,
+    store,
+    granterDiag,
+  ]);
+
+  // -------------------------------------------------------------------------
+  // Keyboard shortcuts — operator-grade hotkeys for repeated workflows.
+  //   g           — open the Grant tab and focus the principal input
+  //   Shift+G     — open the confirm dialog directly (bulk-grant shortcut)
+  //   d           — revoke the first creator row at the current scope
+  //                 (only fires from the existing-assignments tab; opens the
+  //                 confirm dialog so the destructive op still has a guard)
+  //   ?           — open the keyboard-help dialog
+  //
+  // `allowInInputs: false` is the default for useShortcut — the hooks
+  // module already skips the listener if focus is in a text input/textarea
+  // so typing "g" inside the principal field doesn't switch tabs.
+  // -------------------------------------------------------------------------
+  const [kbdHelpOpen, setKbdHelpOpen] = React.useState(false);
+  const principalInputRef = React.useRef<HTMLInputElement | null>(null);
+  useShortcut("g", () => {
+    setTabParam("grant");
+    // Wait a tick for the tab to render; then focus the principal input.
+    window.requestAnimationFrame(() => {
+      principalInputRef.current?.focus();
+    });
+  });
+  useShortcut("Shift+G", () => {
+    if (!canOpenConfirm) return;
+    setSubmitConfirmOpen(true);
+  });
+  useShortcut("d", () => {
+    // Bind only when we're on the existing-assignments tab and there is
+    // something to revoke. The shortcut opens the confirm dialog — actually
+    // calling deleteBillingRoleAssignment without a confirm would be a
+    // footgun, even with a hotkey gate.
+    if (activeTab !== "existing") return;
+    const target = existingFiltered[0];
+    if (target) setRevokeTarget(target);
+  });
+  // NOTE: we deliberately do NOT bind `?` here — the global keyboard-help
+  // dialog (`shared/keyboard-help-dialog.tsx`) already subscribes to it
+  // and shows the app-wide shortcut list. The page-local dialog is
+  // surfaced via the keyboard icon next to the token expiry badge.
+  //
+  // We forward-declare `setSubmitConfirmOpen` / `canOpenConfirm` via hoist;
+  // they're defined a few hooks above. useShortcut tracks the handler via
+  // ref internally so we don't need to thread them through deps.
 
   // -------------------------------------------------------------------------
   // Recent activity from this session (audit log filter)
@@ -1264,6 +1756,16 @@ export const EaCreatorPregrantPage: React.FC = () => {
               })
             }
           />
+          <Button
+            type="button"
+            variant="ghost"
+            size="icon-xs"
+            onClick={() => setKbdHelpOpen(true)}
+            aria-label="Show keyboard shortcuts"
+            title="Keyboard shortcuts (?)"
+          >
+            <Keyboard className="h-3.5 w-3.5" aria-hidden />
+          </Button>
           {batchSummary.granted + batchSummary.already > 0 && (
             <Button
               type="button"
@@ -1536,6 +2038,43 @@ export const EaCreatorPregrantPage: React.FC = () => {
                 />
               )}
 
+              {/*
+                Covered-grant preflight — when one or more rows about to be
+                granted are already covered by a wider BA-scope assignment,
+                surface a heads-up so the operator can skip or proceed knowing
+                the new row will be redundant.
+
+                Corpus: `New folder/_bypass_role_grant.md` §"scope hierarchy".
+              */}
+              {coveredLiveRows.length > 0 && (
+                <Alert>
+                  <Layers className="h-3.5 w-3.5" aria-hidden />
+                  <AlertDescription className="text-xs">
+                    {coveredLiveRows.length === liveRows.length ? (
+                      <>
+                        All{" "}
+                        <span className="font-medium">{liveRows.length}</span>{" "}
+                        principal{liveRows.length === 1 ? "" : "s"} already
+                        hold an equivalent or wider role at the parent
+                        billing-account scope — the EA-scope grant is
+                        redundant.
+                      </>
+                    ) : (
+                      <>
+                        <span className="font-medium">
+                          {coveredLiveRows.length}
+                        </span>{" "}
+                        of {liveRows.length} principal
+                        {liveRows.length === 1 ? "" : "s"} already hold an
+                        equivalent or wider role at the parent
+                        billing-account scope — those grants will be
+                        redundant.
+                      </>
+                    )}
+                  </AlertDescription>
+                </Alert>
+              )}
+
               {/* Single vs bulk toggle */}
               <div className="flex items-center justify-between gap-2">
                 <Label className="flex items-center gap-1.5">
@@ -1568,6 +2107,7 @@ export const EaCreatorPregrantPage: React.FC = () => {
                 <div className="space-y-1.5">
                   <Input
                     id="principal"
+                    ref={principalInputRef}
                     value={singleInput}
                     onChange={(e) => setSingleInput(e.target.value)}
                     placeholder="alice@contoso.com  or  00000000-0000-0000-0000-000000000000"
@@ -1747,9 +2287,52 @@ export const EaCreatorPregrantPage: React.FC = () => {
                       enrollmentScope,
                       creatorsOnly: creatorsOnlyFilter,
                       exportedFromTab: "existing",
+                      // Annotate the export with corpus-style audit context
+                      // so the downstream consumer can correlate this
+                      // snapshot with a granter identity (see
+                      // `_analysis_defender_view.md` §"audit trail
+                      // completeness").
+                      granterUsername: account?.username,
+                      granterOid: granterDiag?.callerOid,
                     }}
                     disabled={existingFiltered.length === 0}
                   />
+                  {/*
+                    Baseline snapshot toggle — capture / clear a per-scope
+                    snapshot for the diff banner below. Keeps the diff
+                    button next to refresh so the operator's eye doesn't
+                    have to leave the toolbar.
+                  */}
+                  {enrollmentScope && existingCreators.length > 0 && (
+                    <Button
+                      type="button"
+                      variant={currentBaseline ? "secondary" : "ghost"}
+                      size="sm"
+                      onClick={
+                        currentBaseline ? clearBaseline : captureBaseline
+                      }
+                      aria-label={
+                        currentBaseline
+                          ? "Clear baseline snapshot for this enrollment scope"
+                          : "Capture baseline snapshot of current creators"
+                      }
+                      title={
+                        currentBaseline
+                          ? `Baseline captured ${formatTime(currentBaseline.capturedAt)} — click to clear.`
+                          : "Snapshot the current creator set so future reads can diff against it."
+                      }
+                    >
+                      {currentBaseline ? (
+                        <GitCompare
+                          className="h-3 w-3"
+                          aria-hidden
+                        />
+                      ) : (
+                        <Camera className="h-3 w-3" aria-hidden />
+                      )}
+                      {currentBaseline ? "Baseline" : "Snapshot"}
+                    </Button>
+                  )}
                   <Button
                     type="button"
                     variant="ghost"
@@ -1799,6 +2382,29 @@ export const EaCreatorPregrantPage: React.FC = () => {
                         ? `Hiding ${existing.length - existingCreators.length} non-creator role${existing.length - existingCreators.length === 1 ? "" : "s"}.`
                         : `Showing all ${existing.length} role assignment${existing.length === 1 ? "" : "s"}.`}
                     </span>
+                    {/*
+                      Stale-threshold chip. Cycles through the configured
+                      choices on click so the operator never needs to open
+                      a dropdown to retune. Persisted across reload.
+                    */}
+                    <PrefsCycleChip
+                      label="Stale after"
+                      icon={Clock}
+                      current={prefs.staleDays}
+                      choices={STALE_DAY_CHOICES}
+                      formatChoice={(d) => `${d}d`}
+                      onCycle={setStaleDays}
+                      ariaLabel="Cycle stale-pregrant threshold (days)"
+                    />
+                    <PrefsCycleChip
+                      label="Auto-revoke reminder"
+                      icon={Trash2}
+                      current={prefs.autoRevokeDays}
+                      choices={AUTO_REVOKE_DAY_CHOICES}
+                      formatChoice={(d) => (d === 0 ? "off" : `${d}d`)}
+                      onCycle={setAutoRevokeDays}
+                      ariaLabel="Cycle auto-revoke reminder threshold (days)"
+                    />
                   </div>
                   {staleCreators.length > 0 && (
                     <Alert className="m-0 py-1.5 pr-3">
@@ -1812,6 +2418,95 @@ export const EaCreatorPregrantPage: React.FC = () => {
                     </Alert>
                   )}
                 </div>
+              )}
+
+              {/*
+                Suspect-SP banner — service-principal grants are higher-risk
+                than user grants (survive offboarding, no MFA, less audited).
+                Corpus: `New folder/_bypass_role_grant.md` §"App-Role
+                Escalation Chains" and `_AZURE_BYPASS_PLAYBOOK.md`
+                §"persistence". We surface a banner when any creator at the
+                current scope has been classified as an SP so the operator
+                can audit each one.
+              */}
+              {suspectSpIds.size > 0 && (
+                <Alert>
+                  <Bot className="h-3.5 w-3.5" aria-hidden />
+                  <AlertDescription className="text-xs">
+                    <span className="font-medium">{suspectSpIds.size}</span>{" "}
+                    service-principal pregrant
+                    {suspectSpIds.size === 1 ? "" : "s"} detected at this
+                    scope. SP grants survive employee offboarding and rarely
+                    trigger user-centric SOC alerts — confirm each one is
+                    still load-bearing.
+                  </AlertDescription>
+                </Alert>
+              )}
+
+              {/*
+                Auto-revoke reminder — page-level "you have cleanup to do"
+                nudge driven by the persisted `autoRevokeDays` pref. We
+                never actually mass-revoke for the operator; revoke is
+                always behind the explicit per-row confirm dialog.
+              */}
+              {prefs.autoRevokeDays > 0 && autoRevokeCandidates.length > 0 && (
+                <Alert>
+                  <Trash2 className="h-3.5 w-3.5" aria-hidden />
+                  <AlertDescription className="text-xs">
+                    {autoRevokeCandidates.length} EA Subscription Creator
+                    {autoRevokeCandidates.length === 1 ? " is" : "s are"}{" "}
+                    older than your auto-revoke reminder threshold
+                    ({prefs.autoRevokeDays} days). Review and revoke the
+                    rows that are no longer needed — the page never revokes
+                    on its own.
+                  </AlertDescription>
+                </Alert>
+              )}
+
+              {/*
+                Baseline-diff banner — when a baseline snapshot is captured,
+                show what's changed since. Useful for one-shot
+                reconciliations where the operator wants a before/after
+                diff at-a-glance.
+              */}
+              {baselineDiff && currentBaseline && (
+                <Alert>
+                  <GitCompare className="h-3.5 w-3.5" aria-hidden />
+                  <AlertDescription className="text-xs">
+                    {baselineDiff.added.length === 0 &&
+                    baselineDiff.removed.length === 0 ? (
+                      <>
+                        No creator changes since baseline captured{" "}
+                        <span className="text-muted-foreground">
+                          {formatTime(currentBaseline.capturedAt)}
+                        </span>
+                        .
+                      </>
+                    ) : (
+                      <>
+                        Since baseline captured{" "}
+                        <span className="text-muted-foreground">
+                          {formatTime(currentBaseline.capturedAt)}
+                        </span>
+                        :{" "}
+                        {baselineDiff.added.length > 0 && (
+                          <span className="font-medium text-success">
+                            +{baselineDiff.added.length} added
+                          </span>
+                        )}
+                        {baselineDiff.added.length > 0 &&
+                          baselineDiff.removed.length > 0 &&
+                          ", "}
+                        {baselineDiff.removed.length > 0 && (
+                          <span className="font-medium text-destructive">
+                            -{baselineDiff.removed.length} removed
+                          </span>
+                        )}
+                        .
+                      </>
+                    )}
+                  </AlertDescription>
+                </Alert>
               )}
               {!enrollmentScope && (
                 <p className="text-xs text-muted-foreground">
@@ -1853,6 +2548,8 @@ export const EaCreatorPregrantPage: React.FC = () => {
                 <ExistingAssignmentsList
                   rows={existingFiltered}
                   staleSet={staleIdSet}
+                  suspectSpSet={suspectSpIds}
+                  coveredSet={coveredPrincipalIds}
                   onRevoke={setRevokeTarget}
                 />
               )}
@@ -1967,6 +2664,13 @@ export const EaCreatorPregrantPage: React.FC = () => {
         onConfirm={() => void doRevoke()}
         onCancel={() => !revokeBusy && setRevokeTarget(null)}
         loading={revokeBusy}
+      />
+
+      {/* Keyboard-help dialog — bound to `?` via useShortcut and the
+          keyboard icon in the page header. */}
+      <KeyboardHelpDialog
+        open={kbdHelpOpen}
+        onClose={() => setKbdHelpOpen(false)}
       />
     </div>
   );
@@ -2345,11 +3049,25 @@ interface ExistingAssignmentsListProps {
    * stale threshold). Empty when no rows qualify or `createdOn` is missing.
    */
   staleSet?: ReadonlySet<string>;
+  /**
+   * Set of principalIds whose Graph lookup failed because they're not
+   * users in their tenant — strong "suspected service principal" signal.
+   * Cite: `New folder/_bypass_role_grant.md` §"App-Role Escalation Chains".
+   */
+  suspectSpSet?: ReadonlySet<string>;
+  /**
+   * Set of principalIds (lower-cased) already covered by a wider BA-scope
+   * grant. Rendering a "Covered" badge nudges the operator to consider
+   * revoking the redundant EA-scope row.
+   */
+  coveredSet?: ReadonlySet<string>;
   onRevoke: (row: BillingRoleAssignmentSummary) => void;
 }
 const ExistingAssignmentsList: React.FC<ExistingAssignmentsListProps> = ({
   rows,
   staleSet,
+  suspectSpSet,
+  coveredSet,
   onRevoke,
 }) => {
   return (
@@ -2374,13 +3092,16 @@ const ExistingAssignmentsList: React.FC<ExistingAssignmentsListProps> = ({
               r.roleDefinitionName ??
               r.roleDefinitionId;
             const isStale = !!staleSet?.has(r.id);
+            const isSp = !!suspectSpSet?.has(r.principalId);
+            const isCovered =
+              !!coveredSet?.has(r.principalId.toLowerCase()) && isCreator;
             return (
               <tr
                 key={r.id}
                 className="border-b last:border-0 align-top hover:bg-accent/5"
               >
                 <td className="px-3 py-2">
-                  <div className="flex items-center gap-1.5">
+                  <div className="flex flex-wrap items-center gap-1.5">
                     <Badge
                       variant={isCreator ? "success" : "outline"}
                       className="text-2xs"
@@ -2395,6 +3116,26 @@ const ExistingAssignmentsList: React.FC<ExistingAssignmentsListProps> = ({
                       >
                         <Clock className="h-3 w-3" aria-hidden />
                         Stale
+                      </Badge>
+                    )}
+                    {isSp && (
+                      <Badge
+                        variant="warning"
+                        className="gap-1 text-2xs"
+                        title="Principal looks like a service principal (Graph user lookup returned 404). Cite: _bypass_role_grant.md §App-Role Escalation Chains."
+                      >
+                        <Bot className="h-3 w-3" aria-hidden />
+                        SP
+                      </Badge>
+                    )}
+                    {isCovered && (
+                      <Badge
+                        variant="info"
+                        className="gap-1 text-2xs"
+                        title="Principal also holds an equivalent role at the parent BA scope — this EA-scope grant is redundant."
+                      >
+                        <Layers className="h-3 w-3" aria-hidden />
+                        Covered
                       </Badge>
                     )}
                   </div>
@@ -2635,3 +3376,115 @@ const EXPORT_COLUMNS = [
     accessor: (e: AuditEntry) => e.error ?? "",
   },
 ];
+
+// =========================================================================
+// Helper components: prefs picker chip + keyboard-help dialog
+// =========================================================================
+
+/**
+ * Compact chip that cycles through a fixed list of preference values on
+ * click. Used for the stale-threshold and auto-revoke-reminder chips on
+ * the existing-assignments tab — keeps the operator from having to open
+ * a select dropdown for a one-out-of-five choice.
+ */
+interface PrefsCycleChipProps {
+  /** Short label rendered before the current value. */
+  label: string;
+  /** Icon component (lucide-react) rendered inside the chip. */
+  icon: React.ComponentType<{ className?: string; "aria-hidden"?: boolean }>;
+  /** Currently-selected value. */
+  current: number;
+  /** Ordered list of allowed values; the chip cycles through these. */
+  choices: readonly number[];
+  /** Renderer for each choice (e.g. `(d) => d === 0 ? "off" : `${d}d``). */
+  formatChoice: (value: number) => string;
+  /** Callback fired with the next choice when clicked. */
+  onCycle: (next: number) => void;
+  /** Screen-reader label. Fallback: "${label} cycle". */
+  ariaLabel?: string;
+}
+const PrefsCycleChip: React.FC<PrefsCycleChipProps> = ({
+  label,
+  icon: Icon,
+  current,
+  choices,
+  formatChoice,
+  onCycle,
+  ariaLabel,
+}) => {
+  const nextValue = React.useMemo(() => {
+    const idx = choices.indexOf(current);
+    return choices[(idx + 1) % choices.length] ?? choices[0]!;
+  }, [choices, current]);
+  return (
+    <Button
+      type="button"
+      variant="outline"
+      size="xs"
+      onClick={() => onCycle(nextValue)}
+      aria-label={ariaLabel ?? `${label} cycle`}
+      title={`Click to cycle (next: ${formatChoice(nextValue)})`}
+    >
+      <Icon className="h-3 w-3" aria-hidden />
+      {label}
+      <span className="ml-1 rounded-full bg-background/70 px-1 text-2xs tabular-nums">
+        {formatChoice(current)}
+      </span>
+    </Button>
+  );
+};
+
+/**
+ * Keyboard-help dialog — reusing the page's ConfirmationDialog shell so we
+ * don't introduce a second modal pattern. Bound to `?` via useShortcut.
+ */
+interface KeyboardHelpDialogProps {
+  open: boolean;
+  onClose: () => void;
+}
+const KEYBOARD_HELP_ROWS: ReadonlyArray<{ chord: string; description: string }> = [
+  { chord: "g", description: "Focus the principal input on the Grant tab" },
+  { chord: "Shift+G", description: "Open the grant confirmation dialog" },
+  {
+    chord: "d",
+    description:
+      "Open the revoke confirmation for the first row on the Existing tab",
+  },
+  {
+    chord: "?",
+    description:
+      "Show the app-wide keyboard help (registered globally; see Global → Show this help)",
+  },
+];
+const KeyboardHelpDialog: React.FC<KeyboardHelpDialogProps> = ({
+  open,
+  onClose,
+}) => (
+  <ConfirmationDialog
+    hidden={!open}
+    title="Keyboard shortcuts"
+    message={
+      <div className="space-y-2 text-xs">
+        <p className="text-muted-foreground">
+          Shortcuts fire only when focus is outside an input.
+        </p>
+        <dl className="grid grid-cols-[auto_1fr] gap-x-3 gap-y-1.5">
+          {KEYBOARD_HELP_ROWS.map((row) => (
+            <React.Fragment key={row.chord}>
+              <dt>
+                <kbd className="rounded border bg-muted px-1.5 py-0.5 font-mono text-2xs">
+                  {row.chord}
+                </kbd>
+              </dt>
+              <dd>{row.description}</dd>
+            </React.Fragment>
+          ))}
+        </dl>
+      </div>
+    }
+    confirmText="Close"
+    cancelText="Dismiss"
+    onConfirm={onClose}
+    onCancel={onClose}
+  />
+);

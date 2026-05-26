@@ -46,6 +46,7 @@ import {
   Copy,
   ExternalLink,
   Filter,
+  Globe,
   Info,
   Key,
   Loader2,
@@ -55,6 +56,7 @@ import {
   Plus,
   RefreshCw,
   Search,
+  ShieldAlert,
   ShieldCheck,
   Sparkles,
   Trash2,
@@ -194,6 +196,31 @@ const STORAGE_GRANT_OWNER = "invite-user:grant-owner";
  */
 const STORAGE_TEMPLATES = "invite-user:templates";
 const TEMPLATES_SCHEMA_VERSION = 1;
+
+/**
+ * localStorage key for the operator-curated "approved invitee domains"
+ * allowlist. When non-empty, recipients whose email domain is NOT in the
+ * list trigger an inline "out-of-allowlist" warning AND require the
+ * `relaxAllowlist` override toggle to be flipped before Submit enables.
+ *
+ * Corpus grounding: `_bypass_tenant_switch.md §2.3` notes that the default
+ * `authorizationPolicy.allowInvitesFrom = everyone` is a chain-of-invites
+ * primitive — any member or guest can invite further guests. A page-local
+ * allowlist gives the operator a stop-gap policy when the tenant-level
+ * policy hasn't been tightened yet. Stored locally per-operator (no
+ * server side enforcement — defenders should still tighten the tenant
+ * policy).
+ */
+const STORAGE_APPROVED_DOMAINS = "invite-user:approved-domains";
+const APPROVED_DOMAINS_SCHEMA_VERSION = 1;
+
+/**
+ * sessionStorage key for the explicit "relax allowlist" override. Lives
+ * in sessionStorage (NOT localStorage) on purpose: the operator must
+ * re-affirm the override per browser session so a long-lived tab doesn't
+ * silently keep the allowlist disabled across days.
+ */
+const STORAGE_RELAX_ALLOWLIST = "invite-user:relax-allowlist";
 
 /**
  * Saved invite template. Stored in localStorage via `usePersistedState`.
@@ -370,6 +397,113 @@ function writeSession(key: string, value: string): void {
 const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
 /**
+ * Consumer / free-mail / high-personal-risk domains. Recipients on these
+ * domains are typically tied to a single human's personal identity — if
+ * the operator grants them a directory role or subscription Owner, the
+ * compromise blast-radius equals "whoever controls the personal account".
+ *
+ * Corpus grounding:
+ *   - `_bypass_tenant_switch.md §2.1` — the canonical attacker example
+ *     literally uses `attacker@gmail.com` as `invitedUserEmailAddress`
+ *     because consumer-mail accounts are trivially registered by the
+ *     attacker.
+ *   - `_bypass_tenant_switch.md §2.4` — "Privileged stale guests":
+ *     personal account 18 months later gets compromised and the original
+ *     guest grant becomes a foothold. Consumer-mail guests are
+ *     disproportionately represented in this finding.
+ *   - `_bypass_role_grant.md §9` — "Stale guest with role" survives
+ *     password reset / MFA reset of the inviter; the guest principal
+ *     keeps its Azure RBAC assignment.
+ *
+ * The set is intentionally conservative — it covers the major free-mail
+ * providers that show up in real findings. NOT a block-list: an
+ * inline warning + (when Owner-grant is enabled) an elevated red banner
+ * flag the risk so the operator can decide.
+ */
+const HIGH_RISK_DOMAINS: ReadonlySet<string> = new Set<string>([
+  // Microsoft consumer
+  "outlook.com",
+  "hotmail.com",
+  "live.com",
+  "msn.com",
+  "passport.com",
+  // Google
+  "gmail.com",
+  "googlemail.com",
+  // Yahoo
+  "yahoo.com",
+  "yahoo.co.uk",
+  "yahoo.co.jp",
+  "ymail.com",
+  "rocketmail.com",
+  // Apple
+  "icloud.com",
+  "me.com",
+  "mac.com",
+  // Other major free-mail
+  "aol.com",
+  "gmx.com",
+  "gmx.de",
+  "mail.com",
+  "mail.ru",
+  "yandex.ru",
+  "yandex.com",
+  "proton.me",
+  "protonmail.com",
+  "tutanota.com",
+  "zoho.com",
+  // Disposable / temp-mail
+  "guerrillamail.com",
+  "10minutemail.com",
+  "mailinator.com",
+  "yopmail.com",
+  "temp-mail.org",
+  "tempmail.com",
+  "trashmail.com",
+  "throwawaymail.com",
+  "dispostable.com",
+  "fakeinbox.com",
+]);
+
+/** Disposable-mail subset of HIGH_RISK_DOMAINS — flagged at a higher
+ *  severity. A guest principal anchored to a disposable address is a
+ *  textbook "register then walk away" persistence primitive: the
+ *  attacker doesn't even need to keep the inbox. */
+const DISPOSABLE_DOMAINS: ReadonlySet<string> = new Set<string>([
+  "guerrillamail.com",
+  "10minutemail.com",
+  "mailinator.com",
+  "yopmail.com",
+  "temp-mail.org",
+  "tempmail.com",
+  "trashmail.com",
+  "throwawaymail.com",
+  "dispostable.com",
+  "fakeinbox.com",
+]);
+
+/** Lowercase domain part of an email — `null` if the address is
+ *  malformed and the split returns an empty string. */
+function domainOf(email: string): string | null {
+  const at = email.lastIndexOf("@");
+  if (at < 0 || at >= email.length - 1) return null;
+  const d = email.slice(at + 1).trim().toLowerCase();
+  return d.length > 0 ? d : null;
+}
+
+/** Categorise the risk of inviting an address as a guest. `disposable`
+ *  > `consumer` > `normal`. */
+function classifyInviteeDomain(
+  email: string,
+): "disposable" | "consumer" | "normal" {
+  const d = domainOf(email);
+  if (!d) return "normal";
+  if (DISPOSABLE_DOMAINS.has(d)) return "disposable";
+  if (HIGH_RISK_DOMAINS.has(d)) return "consumer";
+  return "normal";
+}
+
+/**
  * Optional "did the operator paste a tenant-internal address that
  * Microsoft will reject" heuristic. Returns a hint string (or null
  * if the address looks externally invitable).
@@ -408,9 +542,21 @@ function parseEmailList(raw: string): {
   const duplicateSet = new Set<string>();
   const valid: string[] = [];
   const invalid: string[] = [];
+  // Token separator: regular whitespace + comma/semicolon + non-breaking
+  // space (` `) which sneaks in when operators paste from Outlook /
+  // Word / a corporate intranet rendering. Per-token: strip BOM
+  // (`﻿`) and zero-width spaces (`​`) which Outlook adds
+  // around mailto: links — the address looks identical but EMAIL_REGEX
+  // would otherwise mis-flag it as invalid.
   const tokens = raw
-    .split(/[\s,;]+/)
-    .map((t) => t.trim())
+    .split(/[\s,; ]+/)
+    .map((t) =>
+      t
+        .replace(/[ ​﻿⁠]/g, "")
+        // strip angle-bracket wrappers from "Alice <alice@x>" style entries
+        .replace(/^<|>$/g, "")
+        .trim(),
+    )
     .filter((t) => t.length > 0);
   for (const t of tokens) {
     const lower = t.toLowerCase();
@@ -471,10 +617,17 @@ function parseCsvInvites(raw: string): {
   invalid: string[];
   duplicates: string[];
 } {
-  const trimmed = raw.trim();
+  // Strip leading UTF-8 BOM (`﻿`) — Excel "Save As CSV (UTF-8)" emits
+  // one, and without stripping the literal "email" header-cell match
+  // below silently fails (first cell becomes "﻿email"). Also
+  // accepts a bare `\r` line break (Classic-Mac line endings) for
+  // robustness on the rare hand-edited file.
+  const trimmed = raw.replace(/^﻿/, "").trim();
   if (!trimmed) return { rows: [], invalid: [], duplicates: [] };
 
-  const lines = trimmed.split(/\r?\n/).filter((l) => l.trim().length > 0);
+  const lines = trimmed
+    .split(/\r\n|\r|\n/)
+    .filter((l) => l.trim().length > 0);
   if (lines.length === 0) return { rows: [], invalid: [], duplicates: [] };
 
   // Separator detection — count `,` vs `;` in the first non-empty row,
@@ -1009,6 +1162,44 @@ export const InviteUserPage: React.FC = () => {
   );
 
   // -------------------------------------------------------------------------
+  // Approved-domain allowlist (corpus-grounded — see HIGH_RISK_DOMAINS docs
+  // and STORAGE_APPROVED_DOMAINS).
+  //
+  // The allowlist is a soft control: when populated, recipients on
+  // un-listed domains are flagged with a warning AND require the explicit
+  // `relaxAllowlist` toggle (session-scoped) before Submit enables. Empty
+  // list = no enforcement (default behaviour, back-compat).
+  // -------------------------------------------------------------------------
+  const [approvedDomains, setApprovedDomains] = usePersistedState<string[]>(
+    STORAGE_APPROVED_DOMAINS,
+    [],
+    {
+      version: APPROVED_DOMAINS_SCHEMA_VERSION,
+      syncAcrossTabs: true,
+    },
+  );
+  const [relaxAllowlist, setRelaxAllowlistState] = React.useState<boolean>(
+    () => readSession(STORAGE_RELAX_ALLOWLIST) === "1",
+  );
+  const setRelaxAllowlist = React.useCallback((v: boolean) => {
+    setRelaxAllowlistState(v);
+    writeSession(STORAGE_RELAX_ALLOWLIST, v ? "1" : "0");
+  }, []);
+  const [showAllowlistEditor, setShowAllowlistEditor] = React.useState(false);
+  const [allowlistDraft, setAllowlistDraft] = React.useState("");
+
+  /** Normalised lowercase set for O(1) membership checks. */
+  const approvedDomainSet = React.useMemo(
+    () =>
+      new Set(
+        approvedDomains
+          .map((d) => d.trim().toLowerCase())
+          .filter((d) => d.length > 0),
+      ),
+    [approvedDomains],
+  );
+
+  // -------------------------------------------------------------------------
   // Submit-side state
   // -------------------------------------------------------------------------
   const [submitting, setSubmitting] = React.useState(false);
@@ -1038,6 +1229,24 @@ export const InviteUserPage: React.FC = () => {
     },
     [],
   );
+
+  /**
+   * Live counters for the progress aria-live region. Re-evaluated from
+   * the outcomes array. Sliced out so the JSX stays readable.
+   */
+  const progressCounts = React.useMemo(() => {
+    let succeeded = 0;
+    let failed = 0;
+    let cancelled = 0;
+    let pending = 0;
+    for (const o of outcomes) {
+      if (o.invite.state === "success") succeeded += 1;
+      else if (o.invite.state === "failure") failed += 1;
+      else if (o.invite.state === "cancelled") cancelled += 1;
+      else pending += 1;
+    }
+    return { succeeded, failed, cancelled, pending, total: outcomes.length };
+  }, [outcomes]);
 
   // -------------------------------------------------------------------------
   // Derived values
@@ -1231,6 +1440,100 @@ export const InviteUserPage: React.FC = () => {
     }
     return warnings;
   }, [parsedEmails.activeValid]);
+
+  /**
+   * Per-recipient classification by domain risk. Computed once per
+   * recipient-list change and reused by the chip-list rendering, the
+   * high-risk summary banner, and the Owner-grant red-flag banner.
+   *
+   * Corpus: `_bypass_tenant_switch.md §2.1/§2.4` (consumer-mail B2B
+   * abuse), `_bypass_role_grant.md §9` (stale-guest persistence
+   * survives credential rotation).
+   */
+  const recipientRiskByEmail = React.useMemo(() => {
+    const map: Record<string, "disposable" | "consumer" | "normal"> = {};
+    for (const email of parsedEmails.activeValid) {
+      map[email.toLowerCase()] = classifyInviteeDomain(email);
+    }
+    return map;
+  }, [parsedEmails.activeValid]);
+
+  const highRiskRecipients = React.useMemo(() => {
+    const consumer: string[] = [];
+    const disposable: string[] = [];
+    for (const email of parsedEmails.activeValid) {
+      const k = recipientRiskByEmail[email.toLowerCase()];
+      if (k === "consumer") consumer.push(email);
+      else if (k === "disposable") disposable.push(email);
+    }
+    return { consumer, disposable, total: consumer.length + disposable.length };
+  }, [parsedEmails.activeValid, recipientRiskByEmail]);
+
+  /** Recipients whose domain is NOT in the operator's approved allowlist.
+   *  Empty list = allowlist disabled = nothing flagged. */
+  const unapprovedDomainRecipients = React.useMemo<string[]>(() => {
+    if (approvedDomainSet.size === 0) return [];
+    const out: string[] = [];
+    for (const email of parsedEmails.activeValid) {
+      const d = domainOf(email);
+      if (!d || !approvedDomainSet.has(d)) out.push(email);
+    }
+    return out;
+  }, [parsedEmails.activeValid, approvedDomainSet]);
+
+  const unapprovedDomainSet = React.useMemo(() => {
+    const out = new Set<string>();
+    for (const e of unapprovedDomainRecipients) {
+      const d = domainOf(e);
+      if (d) out.add(d);
+    }
+    return out;
+  }, [unapprovedDomainRecipients]);
+
+  /**
+   * Last-14-day invites-per-day series, sourced from the audit log's
+   * `invite_guest` success entries. Re-derives on every auditLog change
+   * via the `onChange` subscription — cheap (~O(N) over ~hundreds of
+   * entries). Used by the inline sparkline next to the form header so
+   * the operator can see "did anyone in this org already invite people
+   * in the last 2 weeks" before adding more.
+   *
+   * Bucketing is by local-day; the rightmost entry is "today".
+   */
+  const [auditHistoryVersion, setAuditHistoryVersion] = React.useState(0);
+  React.useEffect(() => {
+    // The unsubscribe returned by auditLog.onChange handles cleanup.
+    return auditLog.onChange(() => setAuditHistoryVersion((v) => v + 1));
+  }, []);
+  const invitesPerDay = React.useMemo<number[]>(() => {
+    const DAYS = 14;
+    const bins = new Array<number>(DAYS).fill(0);
+    const now = Date.now();
+    const todayMidnight = new Date();
+    todayMidnight.setHours(0, 0, 0, 0);
+    const todayStart = todayMidnight.getTime();
+    const earliest = todayStart - (DAYS - 1) * 86_400_000;
+    try {
+      for (const entry of auditLog.getEntries()) {
+        if (entry.action !== "invite_guest") continue;
+        if (entry.status !== "success") continue;
+        const t = Date.parse(entry.timestamp);
+        if (!Number.isFinite(t)) continue;
+        if (t < earliest || t > now + 86_400_000) continue;
+        const dayIdx = Math.floor((t - earliest) / 86_400_000);
+        if (dayIdx >= 0 && dayIdx < DAYS) bins[dayIdx]! += 1;
+      }
+    } catch {
+      /* defensive — audit log getEntries should never throw */
+    }
+    return bins;
+    // auditHistoryVersion is the React-visible re-render trigger.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [auditHistoryVersion]);
+  const totalInvitesLast14 = React.useMemo(
+    () => invitesPerDay.reduce((s, n) => s + n, 0),
+    [invitesPerDay],
+  );
 
   /**
    * Verified-domain pre-flight check for the destination tenant.
@@ -1467,13 +1770,27 @@ export const InviteUserPage: React.FC = () => {
     }
   }, [redirectUrl]);
 
+  /**
+   * Allowlist gate — when the operator has populated an approved-domain
+   * allowlist, and at least one active recipient is OUTSIDE that list,
+   * Submit is disabled until they flip the `relaxAllowlist` toggle. The
+   * goal is to make "I am inviting an out-of-policy domain" a deliberate
+   * acknowledgement instead of a silent default. Corpus: see
+   * STORAGE_APPROVED_DOMAINS doc and `_bypass_tenant_switch.md §2.3`.
+   */
+  const allowlistBlocks =
+    approvedDomainSet.size > 0 &&
+    unapprovedDomainRecipients.length > 0 &&
+    !relaxAllowlist;
+
   const canSubmit =
     !submitting &&
     !!selectedInviter &&
     parsedEmails.activeValid.length > 0 &&
     redirectUrl.trim().length > 0 &&
     redirectIsHttps &&
-    (!grantOwner || selectedSubscriptionId.length > 0);
+    (!grantOwner || selectedSubscriptionId.length > 0) &&
+    !allowlistBlocks;
 
   // -------------------------------------------------------------------------
   // Submit pipeline
@@ -1756,6 +2073,27 @@ export const InviteUserPage: React.FC = () => {
       subscriptionId: subId,
     };
 
+    // Risk classification snapshot (for the batch-started audit entry).
+    // Counted at submit-time so the audit log reflects what the
+    // operator actually approved — not what's on screen later.
+    // Cites HIGH_RISK_DOMAINS docs (`_bypass_tenant_switch.md §2.1/§2.4`).
+    const consumerEmails: string[] = [];
+    const disposableEmails: string[] = [];
+    const outsideAllowlistEmails: string[] = [];
+    for (const r of rows) {
+      const k = classifyInviteeDomain(r.email);
+      if (k === "consumer") consumerEmails.push(r.email);
+      else if (k === "disposable") disposableEmails.push(r.email);
+      if (approvedDomainSet.size > 0) {
+        const d = domainOf(r.email);
+        if (!d || !approvedDomainSet.has(d)) {
+          outsideAllowlistEmails.push(r.email);
+        }
+      }
+    }
+    const highRiskOwnerGrantFlag =
+      grantOwner && (consumerEmails.length > 0 || disposableEmails.length > 0);
+
     auditLog.record({
       actor: selectedInviter.username,
       action: "invite_guest_batch_started",
@@ -1772,6 +2110,25 @@ export const InviteUserPage: React.FC = () => {
         subscriptionId: grantOwner ? subId : undefined,
         sendInvitationMessage: sendEmail,
         concurrency,
+        // Risk-flag snapshot — see HIGH_RISK_DOMAINS / DISPOSABLE_DOMAINS
+        // and approvedDomainSet. These appear in the audit log so a
+        // defender reviewing later can see "this batch had N consumer
+        // addresses AND opted to grant Owner" without needing to
+        // re-classify after the fact.
+        consumerDomainCount: consumerEmails.length,
+        consumerDomainEmails:
+          consumerEmails.length > 0 ? consumerEmails : undefined,
+        disposableDomainCount: disposableEmails.length,
+        disposableDomainEmails:
+          disposableEmails.length > 0 ? disposableEmails : undefined,
+        outsideAllowlistCount: outsideAllowlistEmails.length,
+        outsideAllowlistEmails:
+          outsideAllowlistEmails.length > 0 ? outsideAllowlistEmails : undefined,
+        allowlistOverridden:
+          approvedDomainSet.size > 0 && outsideAllowlistEmails.length > 0
+            ? true
+            : undefined,
+        highRiskGuestPlusOwnerGrant: highRiskOwnerGrantFlag || undefined,
       },
     });
 
@@ -1852,6 +2209,7 @@ export const InviteUserPage: React.FC = () => {
     csvOverrides,
     processOneRow,
     store,
+    approvedDomainSet,
   ]);
 
   /**
@@ -2085,6 +2443,61 @@ export const InviteUserPage: React.FC = () => {
     selectedSubscriptionId,
     concurrency,
     updateRow,
+    store,
+  ]);
+
+  /**
+   * Page-scoped hotkeys.
+   *
+   *   Ctrl/Cmd + Enter — submit (skipping the confirmation dialog for the
+   *     common low-risk case; opens the dialog when send-email / Owner
+   *     grant / >=5 recipients are in play, mirroring the button's logic).
+   *   Esc            — cancel an in-flight batch.
+   *
+   * Bound at the document level (not the textarea) so the operator can
+   * trigger them while focused anywhere on the page. Skips when the
+   * active element is in another text input / textarea so it doesn't
+   * fight with normal text editing in other fields.
+   */
+  const submitInvitesRef = React.useRef(submitInvites);
+  React.useEffect(() => {
+    submitInvitesRef.current = submitInvites;
+  }, [submitInvites]);
+  React.useEffect(() => {
+    const onKey = (e: KeyboardEvent): void => {
+      // Ctrl/Cmd+Enter — submit. Allowed from inside our textareas so
+      // power users can type emails and hit it without re-focusing.
+      if ((e.ctrlKey || e.metaKey) && e.key === "Enter") {
+        if (!canSubmit) return;
+        e.preventDefault();
+        const needsConfirm =
+          sendEmail ||
+          grantOwner ||
+          parsedEmails.activeValid.length >= 5;
+        if (needsConfirm) {
+          setShowConfirm(true);
+        } else {
+          void submitInvitesRef.current();
+        }
+      }
+      // Esc — cancel a running batch. Ignored if the operator has a
+      // dialog open (the dialog handles Esc itself).
+      if (e.key === "Escape" && submitting) {
+        cancelledRef.current = true;
+        store.addNotification({
+          type: "warning",
+          message: "Cancellation requested (Esc) — in-flight invites will finish.",
+        });
+      }
+    };
+    document.addEventListener("keydown", onKey);
+    return () => document.removeEventListener("keydown", onKey);
+  }, [
+    canSubmit,
+    sendEmail,
+    grantOwner,
+    parsedEmails.activeValid.length,
+    submitting,
     store,
   ]);
 
@@ -2677,18 +3090,47 @@ export const InviteUserPage: React.FC = () => {
                   const hasOverride =
                     !!override &&
                     (!!override.displayName || !!override.customMessage);
+                  // Risk class — colours the chip border so high-risk
+                  // recipients are visible at a glance even when the
+                  // banner above is collapsed/scrolled out of view.
+                  const risk = recipientRiskByEmail[lower] ?? "normal";
+                  const domain = domainOf(email);
+                  const outsideAllowlist =
+                    approvedDomainSet.size > 0 &&
+                    (!domain || !approvedDomainSet.has(domain));
+                  const chipClass = isSuppressed
+                    ? "border-border bg-muted/50 text-muted-foreground line-through"
+                    : risk === "disposable"
+                      ? "border-destructive/50 bg-destructive/10 text-destructive"
+                      : risk === "consumer"
+                        ? "border-warning/40 bg-warning/10 text-warning"
+                        : outsideAllowlist
+                          ? "border-warning/40 bg-warning/5 text-warning"
+                          : "border-success/30 bg-success/10 text-success";
+                  const chipTitleBits: string[] = [];
+                  if (hasOverride) {
+                    chipTitleBits.push(
+                      `override${override.displayName ? ` · displayName="${override.displayName}"` : ""}${override.customMessage ? ` · customMessage set` : ""}`,
+                    );
+                  }
+                  if (risk === "disposable") {
+                    chipTitleBits.push(
+                      "Disposable / throwaway email domain",
+                    );
+                  } else if (risk === "consumer") {
+                    chipTitleBits.push("Consumer / free-mail domain");
+                  }
+                  if (outsideAllowlist) {
+                    chipTitleBits.push("Outside approved-domain allowlist");
+                  }
                   return (
                     <span
                       key={email}
                       role="listitem"
-                      className={`inline-flex max-w-full items-center gap-1 rounded-full border px-2 py-0.5 text-2xs font-medium transition-colors ${
-                        isSuppressed
-                          ? "border-border bg-muted/50 text-muted-foreground line-through"
-                          : "border-success/30 bg-success/10 text-success"
-                      }`}
+                      className={`inline-flex max-w-full items-center gap-1 rounded-full border px-2 py-0.5 text-2xs font-medium transition-colors ${chipClass}`}
                       title={
-                        hasOverride
-                          ? `Per-recipient override${override.displayName ? ` · displayName="${override.displayName}"` : ""}${override.customMessage ? ` · customMessage set` : ""}`
+                        chipTitleBits.length > 0
+                          ? chipTitleBits.join(" · ")
                           : undefined
                       }
                     >
@@ -2696,6 +3138,16 @@ export const InviteUserPage: React.FC = () => {
                       <code className="truncate font-mono text-2xs">
                         {email}
                       </code>
+                      {risk !== "normal" && !isSuppressed && (
+                        <ShieldAlert
+                          className="h-2.5 w-2.5 shrink-0"
+                          aria-label={
+                            risk === "disposable"
+                              ? "Disposable email domain"
+                              : "Consumer mail domain"
+                          }
+                        />
+                      )}
                       {hasOverride && !isSuppressed && (
                         <Pencil
                           className="h-2.5 w-2.5 shrink-0 text-primary"
@@ -2766,6 +3218,349 @@ export const InviteUserPage: React.FC = () => {
                 </AlertDescription>
               </Alert>
             )}
+
+            {/* Consumer / disposable-domain advisory.
+                Corpus: `_bypass_tenant_switch.md §2.1` — the canonical
+                exploit example literally uses `attacker@gmail.com` because
+                consumer-mail accounts are trivially registered by the
+                attacker. `§2.4` flags long-lived consumer-mail guests as
+                "privileged stale guest" — the dominant cloud privesc
+                finding. Warning-only (no block) so legitimate consumer-mail
+                guests can still be invited deliberately. */}
+            {(highRiskRecipients.consumer.length > 0 ||
+              highRiskRecipients.disposable.length > 0) && (
+              <Alert variant="warning">
+                <ShieldAlert className="h-4 w-4" aria-hidden />
+                <AlertDescription className="flex flex-col gap-1">
+                  <span className="text-2xs font-medium">
+                    {highRiskRecipients.total} consumer / personal-mail
+                    address{highRiskRecipients.total === 1 ? "" : "es"} in
+                    this batch
+                  </span>
+                  <span className="text-2xs">
+                    Consumer-mail guests are tied to an external personal
+                    identity — if that account is later compromised, the
+                    guest principal in your tenant becomes a foothold
+                    (the canonical &ldquo;stale guest&rdquo; finding).
+                    Consider inviting via the user&apos;s organisational
+                    address where possible.
+                  </span>
+                  {highRiskRecipients.consumer.length > 0 && (
+                    <details className="text-2xs">
+                      <summary className="cursor-pointer">
+                        {highRiskRecipients.consumer.length} consumer-mail
+                        address
+                        {highRiskRecipients.consumer.length === 1 ? "" : "es"}
+                      </summary>
+                      <ul className="mt-1 ml-4 list-disc space-y-0.5 font-mono">
+                        {highRiskRecipients.consumer.slice(0, 12).map((e) => (
+                          <li key={e}>{e}</li>
+                        ))}
+                        {highRiskRecipients.consumer.length > 12 && (
+                          <li className="italic">
+                            …and {highRiskRecipients.consumer.length - 12}{" "}
+                            more
+                          </li>
+                        )}
+                      </ul>
+                    </details>
+                  )}
+                  {highRiskRecipients.disposable.length > 0 && (
+                    <div className="rounded border border-destructive/40 bg-destructive/5 p-1.5">
+                      <span className="block text-2xs font-semibold text-destructive">
+                        {highRiskRecipients.disposable.length} disposable /
+                        throwaway address
+                        {highRiskRecipients.disposable.length === 1
+                          ? ""
+                          : "es"}
+                        :
+                      </span>
+                      <ul className="ml-3 list-disc text-2xs">
+                        {highRiskRecipients.disposable.slice(0, 6).map((e) => (
+                          <li key={e} className="font-mono">
+                            {e}
+                          </li>
+                        ))}
+                      </ul>
+                      <span className="block text-3xs text-destructive/80">
+                        A guest principal anchored to a disposable inbox is a
+                        textbook &ldquo;register then walk away&rdquo;
+                        persistence primitive. The attacker doesn&apos;t
+                        even need to keep the inbox.
+                      </span>
+                    </div>
+                  )}
+                </AlertDescription>
+              </Alert>
+            )}
+
+            {/* High-risk + Owner-grant escalation banner.
+                Corpus: `_bypass_role_grant.md §9` — "Stale guest with
+                role" persists through password/MFA resets of the inviter
+                because the guest principal owns its own credentials.
+                Combining a consumer-mail guest with Owner-on-subscription
+                creates the highest-yield persistence primitive in the
+                role-grant playbook. */}
+            {grantOwner &&
+              (highRiskRecipients.consumer.length > 0 ||
+                highRiskRecipients.disposable.length > 0) && (
+                <Alert variant="destructive" aria-live="polite">
+                  <ShieldAlert className="h-4 w-4" aria-hidden />
+                  <AlertDescription className="text-2xs">
+                    <strong>
+                      You are about to grant Owner on an Azure subscription
+                      to {highRiskRecipients.total} consumer / disposable
+                      mail address
+                      {highRiskRecipients.total === 1 ? "" : "es"}.
+                    </strong>{" "}
+                    This is the &ldquo;stale guest with role&rdquo;
+                    persistence pattern: the grant survives password
+                    rotation of the inviter, and the personal account
+                    behind the address is outside your security perimeter.
+                    Either un-check &ldquo;Grant Owner role&rdquo; above,
+                    invite an organisational address instead, or proceed
+                    knowing this assignment is now part of your blast
+                    radius until explicitly revoked.
+                  </AlertDescription>
+                </Alert>
+              )}
+
+            {/* Approved-domain allowlist gate. When non-empty, blocks
+                submit until either every recipient's domain is in the
+                allowlist OR the operator flips the explicit override
+                toggle. The list itself is operator-curated and persists
+                across sessions via localStorage. */}
+            {approvedDomainSet.size > 0 &&
+              unapprovedDomainRecipients.length > 0 && (
+                <Alert
+                  variant={relaxAllowlist ? "default" : "destructive"}
+                  className={
+                    relaxAllowlist
+                      ? "border-warning/40 bg-warning/5"
+                      : undefined
+                  }
+                >
+                  <Globe className="h-4 w-4" aria-hidden />
+                  <AlertDescription className="flex flex-col gap-1.5 text-2xs">
+                    <span className="font-medium">
+                      {unapprovedDomainRecipients.length} recipient
+                      {unapprovedDomainRecipients.length === 1
+                        ? ""
+                        : "s"}{" "}
+                      outside the approved-domain allowlist
+                    </span>
+                    <span>
+                      Unlisted domain
+                      {unapprovedDomainSet.size === 1 ? "" : "s"}:{" "}
+                      {Array.from(unapprovedDomainSet)
+                        .slice(0, 8)
+                        .map((d) => (
+                          <code
+                            key={d}
+                            className="ml-0.5 rounded bg-muted px-1 font-mono"
+                          >
+                            {d}
+                          </code>
+                        ))}
+                      {unapprovedDomainSet.size > 8 && (
+                        <span className="ml-1 italic">
+                          …and {unapprovedDomainSet.size - 8} more
+                        </span>
+                      )}
+                    </span>
+                    <label className="flex cursor-pointer items-center gap-2">
+                      <Checkbox
+                        id="invite-relax-allowlist"
+                        checked={relaxAllowlist}
+                        onCheckedChange={(v) =>
+                          setRelaxAllowlist(v === true)
+                        }
+                        disabled={submitting}
+                      />
+                      <span>
+                        Override allowlist for this session — I&apos;ve
+                        reviewed the unlisted domains and accept the
+                        invite anyway. (Logged in the audit batch entry.)
+                      </span>
+                    </label>
+                  </AlertDescription>
+                </Alert>
+              )}
+
+            {/* Allowlist editor — collapsible, lets the operator manage
+                the persisted approved-domain list inline. Decoupled from
+                the warning Alert above so it's reachable when the list
+                is empty (initial setup). */}
+            <div className="flex flex-col gap-1.5 rounded-md border border-border/60 bg-muted/20 p-2">
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <span className="flex items-center gap-1.5 text-2xs font-medium uppercase tracking-wide text-muted-foreground">
+                  <Globe className="h-3 w-3" aria-hidden />
+                  Approved invitee domains
+                  <InfoTooltip
+                    size={12}
+                    content="When this list is non-empty, recipients whose email domain is NOT listed will trigger an inline warning AND require an explicit override toggle before Submit enables. Stored in localStorage per-operator — applies across browser tabs. Empty list = no allowlist enforcement (default)."
+                    ariaLabel="About approved-domain allowlist"
+                  />
+                  {approvedDomainSet.size > 0 && (
+                    <Badge variant="outline" className="text-3xs">
+                      {approvedDomainSet.size} domain
+                      {approvedDomainSet.size === 1 ? "" : "s"}
+                    </Badge>
+                  )}
+                </span>
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="xs"
+                  className="h-6 text-2xs"
+                  onClick={() => {
+                    setAllowlistDraft(approvedDomains.join("\n"));
+                    setShowAllowlistEditor((v) => !v);
+                  }}
+                  aria-expanded={showAllowlistEditor}
+                  aria-controls="invite-allowlist-editor"
+                  aria-label={
+                    showAllowlistEditor
+                      ? "Hide allowlist editor"
+                      : "Edit approved invitee domains"
+                  }
+                >
+                  <Pencil />
+                  {showAllowlistEditor ? "Close" : "Edit"}
+                </Button>
+              </div>
+              {approvedDomainSet.size === 0 ? (
+                <p className="text-2xs text-muted-foreground">
+                  No allowlist configured. Add domains below to require
+                  a per-batch override for unlisted recipients.
+                </p>
+              ) : (
+                <p className="text-2xs text-muted-foreground">
+                  {Array.from(approvedDomainSet)
+                    .slice(0, 6)
+                    .map((d) => (
+                      <code
+                        key={d}
+                        className="mr-1 rounded bg-background px-1 font-mono"
+                      >
+                        {d}
+                      </code>
+                    ))}
+                  {approvedDomainSet.size > 6 && (
+                    <span className="italic">
+                      …+{approvedDomainSet.size - 6}
+                    </span>
+                  )}
+                </p>
+              )}
+              {showAllowlistEditor && (
+                <div
+                  id="invite-allowlist-editor"
+                  className="flex flex-col gap-2 rounded-md border border-border bg-background p-2"
+                >
+                  <Label
+                    htmlFor="invite-allowlist-input"
+                    className="text-2xs"
+                  >
+                    One domain per line — bare host only (e.g.{" "}
+                    <code className="font-mono">contoso.com</code>, not{" "}
+                    <code className="font-mono">@contoso.com</code> or{" "}
+                    <code className="font-mono">https://contoso.com</code>).
+                  </Label>
+                  <textarea
+                    id="invite-allowlist-input"
+                    value={allowlistDraft}
+                    onChange={(e) => setAllowlistDraft(e.target.value)}
+                    rows={4}
+                    spellCheck={false}
+                    placeholder={
+                      "contoso.com\nfabrikam.com\npartner.example.com"
+                    }
+                    className="min-h-[88px] w-full rounded-md border border-input bg-background px-2 py-1 font-mono text-2xs ring-offset-background placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2"
+                    aria-label="Approved invitee domains"
+                  />
+                  <div className="flex flex-wrap items-center gap-2">
+                    <Button
+                      type="button"
+                      size="sm"
+                      variant="default"
+                      className="h-7 text-2xs"
+                      onClick={() => {
+                        // Normalise: lowercase, strip leading `@` /
+                        // protocol, dedupe.
+                        const parsed = Array.from(
+                          new Set(
+                            allowlistDraft
+                              .split(/[\s,;]+/)
+                              .map((d) =>
+                                d
+                                  .trim()
+                                  .toLowerCase()
+                                  .replace(/^https?:\/\//, "")
+                                  .replace(/^@/, "")
+                                  .replace(/\/.*$/, ""),
+                              )
+                              .filter((d) => d.length > 0 && d.includes(".")),
+                          ),
+                        );
+                        setApprovedDomains(parsed);
+                        setShowAllowlistEditor(false);
+                        store.addNotification({
+                          type: "success",
+                          message:
+                            parsed.length === 0
+                              ? "Allowlist cleared — enforcement off."
+                              : `Allowlist saved (${parsed.length} domain${parsed.length === 1 ? "" : "s"}).`,
+                        });
+                        auditLog.record({
+                          actor:
+                            selectedInviter?.username ?? "(unknown)",
+                          action: "invite_allowlist_updated",
+                          target: "@allowlist",
+                          status: "success",
+                          details: {
+                            domainCount: parsed.length,
+                            domains: parsed,
+                          },
+                        });
+                      }}
+                    >
+                      <Check />
+                      Save allowlist
+                    </Button>
+                    <Button
+                      type="button"
+                      size="sm"
+                      variant="ghost"
+                      className="h-7 text-2xs"
+                      onClick={() => setShowAllowlistEditor(false)}
+                    >
+                      Cancel
+                    </Button>
+                    {approvedDomainSet.size > 0 && (
+                      <Button
+                        type="button"
+                        size="sm"
+                        variant="ghost"
+                        className="ml-auto h-7 text-2xs text-destructive"
+                        onClick={() => {
+                          setApprovedDomains([]);
+                          setAllowlistDraft("");
+                          setRelaxAllowlist(false);
+                          store.addNotification({
+                            type: "info",
+                            message: "Allowlist cleared — enforcement off.",
+                          });
+                        }}
+                      >
+                        <Trash2 />
+                        Clear allowlist
+                      </Button>
+                    )}
+                  </div>
+                </div>
+              )}
+            </div>
           </div>
 
           {/* ---------- Inviter selector ------------------------------- */}
@@ -3482,8 +4277,74 @@ export const InviteUserPage: React.FC = () => {
             </Alert>
           )}
 
+          {/* ---------- Invites-per-day sparkline (audit-history) -------
+              Pulls successful `invite_guest` audit entries from the
+              session-local audit log and renders a tiny SVG sparkline.
+              Helps an operator who's about to send a fresh batch see
+              "did anyone already invite a bunch of people today" at a
+              glance — useful when multiple operators share the page. */}
+          {totalInvitesLast14 > 0 && (() => {
+            const W = 140;
+            const H = 28;
+            const N = invitesPerDay.length;
+            const max = Math.max(1, ...invitesPerDay);
+            const step = W / Math.max(1, N - 1);
+            const pts = invitesPerDay
+              .map((v, i) => `${(i * step).toFixed(1)},${(H - (v / max) * (H - 2) - 1).toFixed(1)}`)
+              .join(" ");
+            const todayBin = invitesPerDay[N - 1] ?? 0;
+            return (
+              <div
+                className="flex items-center gap-2 rounded-md border border-border/60 bg-muted/20 px-2 py-1.5 text-2xs text-muted-foreground"
+                role="group"
+                aria-label="Invite-guest audit-log activity (last 14 days)"
+              >
+                <span className="font-medium">Recent invites:</span>
+                <svg
+                  width={W}
+                  height={H}
+                  viewBox={`0 0 ${W} ${H}`}
+                  role="img"
+                  aria-label={`Successful invite-guest audit entries per day for the last ${N} days, total ${totalInvitesLast14}`}
+                  className="text-primary"
+                >
+                  <polyline
+                    fill="none"
+                    stroke="currentColor"
+                    strokeWidth="1.25"
+                    points={pts}
+                  />
+                  {/* mark today */}
+                  <circle
+                    cx={(N - 1) * step}
+                    cy={H - (todayBin / max) * (H - 2) - 1}
+                    r="2"
+                    fill="currentColor"
+                  />
+                </svg>
+                <span>
+                  {totalInvitesLast14} invite
+                  {totalInvitesLast14 === 1 ? "" : "s"} in 14d · today:{" "}
+                  <span className="font-semibold text-foreground">
+                    {todayBin}
+                  </span>
+                </span>
+              </div>
+            );
+          })()}
+
           {/* ---------- Submit / cancel bar ---------------------------- */}
           <div className="flex flex-wrap items-center gap-2">
+            {/* Aria-live progress region for the submit / batch state.
+                Distinct from the results-card live region — that one is
+                for after-batch summary; this one announces submit-bar
+                state to screen readers without requiring focus to
+                travel down the page. */}
+            <span className="sr-only" aria-live="polite" aria-atomic="true">
+              {submitting
+                ? `Sending invites — ${progressCounts.succeeded} of ${progressCounts.total} succeeded, ${progressCounts.failed} failed, ${progressCounts.pending} pending.`
+                : ""}
+            </span>
             <Button
               type="button"
               onClick={() => {
@@ -3500,6 +4361,7 @@ export const InviteUserPage: React.FC = () => {
               disabled={!canSubmit}
               loading={submitting}
               aria-label={`Invite ${parsedEmails.activeValid.length || "users"}`}
+              title="Submit (Ctrl/Cmd+Enter)"
             >
               {!submitting && <UserPlus />}
               {submitting
@@ -3522,6 +4384,7 @@ export const InviteUserPage: React.FC = () => {
                   });
                 }}
                 aria-label="Cancel running batch"
+                title="Cancel (Esc)"
               >
                 <X />
                 Cancel batch
@@ -3547,7 +4410,9 @@ export const InviteUserPage: React.FC = () => {
                     ? "Redirect URL must be HTTPS."
                     : grantOwner && !selectedSubscriptionId
                       ? "Pick a subscription for the Owner grant."
-                      : ""}
+                      : allowlistBlocks
+                        ? `${unapprovedDomainRecipients.length} recipient${unapprovedDomainRecipients.length === 1 ? "" : "s"} outside the approved-domain allowlist — toggle "Override allowlist" to proceed.`
+                        : ""}
               </span>
             )}
           </div>
@@ -3928,6 +4793,85 @@ export const InviteUserPage: React.FC = () => {
                 subscription.
               </p>
             )}
+            {/* Audit-event preview — gives the operator an exact count
+                of audit entries that this batch will produce. Helpful
+                for compliance reviewers who reconcile "what did the
+                operator do" against the audit log later. */}
+            {(() => {
+              const N = parsedEmails.activeValid.length;
+              const events: Array<{ name: string; count: number }> = [];
+              events.push({
+                name: "invite_guest_batch_started",
+                count: 1,
+              });
+              events.push({ name: "invite_guest", count: N });
+              if (grantOwner) {
+                events.push({
+                  name: "assign_subscription_role",
+                  count: N,
+                });
+              }
+              const total = events.reduce((s, e) => s + e.count, 0);
+              return (
+                <div className="rounded border border-border/60 bg-muted/30 p-2">
+                  <p className="m-0 mb-1 text-2xs font-semibold uppercase tracking-wide text-muted-foreground">
+                    Audit trail preview ({total} event
+                    {total === 1 ? "" : "s"})
+                  </p>
+                  <ul className="m-0 ml-3 list-disc text-2xs">
+                    {events.map((e) => (
+                      <li key={e.name}>
+                        <code className="font-mono">{e.name}</code>
+                        {" × "}
+                        {e.count}
+                      </li>
+                    ))}
+                  </ul>
+                  <p className="m-0 mt-1 text-3xs text-muted-foreground">
+                    All entries are recorded under{" "}
+                    <code className="font-mono">
+                      {selectedInviter?.username ?? "(unknown)"}
+                    </code>{" "}
+                    in tenant{" "}
+                    <code className="font-mono">
+                      {selectedInviter?.tenantId ?? ""}
+                    </code>
+                    .
+                  </p>
+                </div>
+              );
+            })()}
+            {(highRiskRecipients.consumer.length > 0 ||
+              highRiskRecipients.disposable.length > 0) && (
+              <p className="rounded border border-warning/40 bg-warning/5 p-2 text-xs">
+                <ShieldAlert
+                  className="mr-1 inline h-3 w-3 -translate-y-px text-warning"
+                  aria-hidden
+                />
+                <strong className="text-warning">
+                  {highRiskRecipients.total} consumer / disposable address
+                  {highRiskRecipients.total === 1 ? "" : "es"}
+                </strong>{" "}
+                in this batch.{" "}
+                {grantOwner &&
+                  "Combined with the Owner grant, this is the canonical ‘stale guest with role’ persistence primitive — the assignment outlives password/MFA rotation of the inviter. "}
+                Flagged in the audit log entry.
+              </p>
+            )}
+            {approvedDomainSet.size > 0 &&
+              unapprovedDomainRecipients.length > 0 &&
+              relaxAllowlist && (
+                <p className="rounded border border-warning/40 bg-warning/5 p-2 text-xs text-warning">
+                  <Globe
+                    className="mr-1 inline h-3 w-3 -translate-y-px"
+                    aria-hidden
+                  />
+                  Allowlist override active —{" "}
+                  {unapprovedDomainRecipients.length} recipient
+                  {unapprovedDomainRecipients.length === 1 ? "" : "s"} on
+                  unlisted domains. Logged on the batch audit entry.
+                </p>
+              )}
             {recipientWarnings.length > 0 && (
               <p className="rounded border border-warning/40 bg-warning/5 p-2 text-xs text-warning">
                 <AlertCircle

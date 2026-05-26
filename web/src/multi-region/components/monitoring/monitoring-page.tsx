@@ -27,18 +27,24 @@ import {
   AlertTriangle,
   BarChart3,
   BellRing,
+  Bookmark,
   Bug,
   CheckCircle2,
   ChevronRight,
   Clock,
+  EyeOff,
   Filter as FilterIcon,
+  Flame,
   Globe,
   HeartPulse,
   Info as InfoIcon,
   Pause,
   Play,
   RefreshCcw,
+  Save,
   Search,
+  Shield,
+  Trash2,
   X,
   XCircle,
 } from "lucide-react";
@@ -97,6 +103,17 @@ import {
   Meteors,
   NumberTicker,
 } from "@/components/ui/effects";
+import {
+  detectBlindSpots,
+  detectRegionSpikes,
+  evaluateRegion,
+  extractRegion,
+  updateRegionBaseline,
+  type RegionBaselineMap,
+  type RegionBlindSpot,
+  type RegionSpike,
+} from "./detectors";
+import { RegionAgentHeatmap, type HeatmapCell } from "./region-agent-heatmap";
 
 /* ------------------------------------------------------------------ */
 /*  Types & constants                                                  */
@@ -239,6 +256,61 @@ const DEFAULT_ALERT_THRESHOLDS: AlertThresholds = {
   staleSec: 300,
 };
 const ALERT_THRESHOLDS_KEY = "monitoring.alertThresholds";
+
+/**
+ * Persisted alert subscriptions — the set of regions whose threshold-breach
+ * events the operator wants to be loudly announced (ARIA-live + visual pop).
+ * Empty array means "alert on every region" (subscribe-to-all). The
+ * subscription set is per-browser; alerts never leave the page (no toasts,
+ * no audio) — this is purely a focus aid.
+ *
+ * Stored under `monitoring.alertSubscriptions`.
+ */
+interface AlertSubscriptionsV1 {
+  regions: string[];
+  /** Subscribe-to-all sentinel — overrides the regions array when true. */
+  allRegions: boolean;
+  /** Per-severity filters; lets the operator silence "info" spike rows. */
+  minSeverity: "info" | "warning" | "critical";
+}
+const DEFAULT_ALERT_SUBS: AlertSubscriptionsV1 = {
+  regions: [],
+  allRegions: true,
+  minSeverity: "warning",
+};
+const ALERT_SUBS_KEY = "monitoring.alertSubscriptions";
+
+/**
+ * Persisted view presets — the operator saves the current filter combo
+ * (range + search + levels + agents + statuses + regions + live) under a
+ * name, then recalls it with one click. Stored under `monitoring.viewPresets`.
+ * Keys are limited to 32 ASCII chars (no slashes) so they're URL-clean.
+ */
+interface ViewPresetV1 {
+  name: string;
+  range: TimeRange;
+  q: string;
+  levels: string;
+  agents: string;
+  statuses: string;
+  region: string;
+  live: boolean;
+  createdAt: number;
+}
+const VIEW_PRESETS_KEY = "monitoring.viewPresets";
+const VIEW_PRESETS_MAX = 12;
+
+/**
+ * Persisted EMA baseline for the per-region anomaly detector. The baseline
+ * is updated on every refresh tick — see `detectors.updateRegionBaseline`.
+ * Stored under `monitoring.regionBaselines`. Cleared if a stale entry hasn't
+ * been touched in 24h (handled inside the updater).
+ */
+const REGION_BASELINE_KEY = "monitoring.regionBaselines";
+
+/** Spike-detection window matches the corpus literature on resource-plane
+ *  burst patterns (NetSPI MicroBurst-style chains complete in <5 min). */
+const SPIKE_WINDOW_MS = 5 * 60 * 1000;
 
 /* ------------------------------------------------------------------ */
 /*  Helpers                                                            */
@@ -561,6 +633,32 @@ const MonitoringPageInner: React.FC<MonitoringPageProps> = ({
     { version: 1, syncAcrossTabs: true },
   );
 
+  // Persisted alert subscriptions — which regions/severities the operator
+  // wants ARIA-announced when a threshold breach lands. See the type
+  // definition for shape semantics.
+  const [alertSubs, setAlertSubs] = usePersistedState<AlertSubscriptionsV1>(
+    ALERT_SUBS_KEY,
+    DEFAULT_ALERT_SUBS,
+    { version: 1, syncAcrossTabs: true },
+  );
+
+  // Persisted view presets — list keyed by name.
+  const [viewPresets, setViewPresets] = usePersistedState<ViewPresetV1[]>(
+    VIEW_PRESETS_KEY,
+    [],
+    { version: 1, syncAcrossTabs: true },
+  );
+
+  // Persisted per-region EMA baseline. Updated on each refresh tick by an
+  // effect below — `usePersistedState` round-trips the map across reloads
+  // so the anomaly detector survives page reloads. Schema versioning lets
+  // us evict stale shapes without crashing.
+  const [regionBaselines, setRegionBaselines] = usePersistedState<RegionBaselineMap>(
+    REGION_BASELINE_KEY,
+    {},
+    { version: 1, syncAcrossTabs: false },
+  );
+
   const [autoRefresh, setAutoRefresh] = React.useState(false);
   const [, setTick] = React.useState(0);
   const [paused, setPaused] = React.useState(
@@ -585,14 +683,22 @@ const MonitoringPageInner: React.FC<MonitoringPageProps> = ({
   // "Since-last-refresh" pointer powers the live-tail "new since last tick"
   // markers. We snapshot the previous refresh wall-time so newly-arrived
   // rows can be visually flagged without re-fetching anything.
+  //
+  // PREVIOUS IMPLEMENTATION BUG (now fixed): the old version used an
+  // effect-cleanup closure that captured the at-setup `lastRefreshedAt`,
+  // which meant the ref was always one tick behind — every other refresh
+  // mis-labeled the "new" rows. The two-ref shuffle below is React's
+  // canonical "previous prop/state" pattern: during render, if the value
+  // has changed since the last time we observed it, slide the old value
+  // into `prevRefreshAtRef` and record the new one. Render-time ref
+  // writes are safe here because the update is idempotent and depends
+  // only on the new tick value — no side effects fire from this.
   const prevRefreshAtRef = React.useRef<number>(lastRefreshedAt);
-  React.useEffect(() => {
-    // Capture the old value AFTER the render has consumed it, so the
-    // "new since" comparison uses the previous tick — not the current one.
-    return () => {
-      prevRefreshAtRef.current = lastRefreshedAt;
-    };
-  }, [lastRefreshedAt]);
+  const lastSeenRefreshRef = React.useRef<number>(lastRefreshedAt);
+  if (lastSeenRefreshRef.current !== lastRefreshedAt) {
+    prevRefreshAtRef.current = lastSeenRefreshRef.current;
+    lastSeenRefreshRef.current = lastRefreshedAt;
+  }
 
   // Search input — debounced into URL so typing does not flood history.
   const [searchInput, setSearchInput] = React.useState(searchQuery);
@@ -637,6 +743,14 @@ const MonitoringPageInner: React.FC<MonitoringPageProps> = ({
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
   }, []);
+
+  // Refs carry the *latest* selected-regions / known-regions lists so the
+  // 1-9 hotkey handler doesn't have to re-bind on every selection mutation.
+  // The actual write-into-the-ref effects live further down (after the
+  // memos that compute the values) — declaring the refs here keeps them
+  // available to the hotkey handler below.
+  const selectedRegionsRef = React.useRef<string[]>([]);
+  const knownRegionsRef = React.useRef<string[]>([]);
 
   // Pause/resume auto-refresh on tab visibility change. We only bump the
   // refresh timestamp on resume IF auto-refresh is on — otherwise the badge
@@ -820,6 +934,140 @@ const MonitoringPageInner: React.FC<MonitoringPageProps> = ({
     });
   }, [setAlertThresholds, orchestratorName]);
 
+  /* -------- Alert subscriptions ---------------------------------------- */
+
+  const handleSubsToggleAllRegions = React.useCallback(
+    (allRegions: boolean) => {
+      setAlertSubs((prev) => ({ ...prev, allRegions }));
+      auditLog.record({
+        actor: orchestratorName,
+        action: "monitoring.alert_subs_changed",
+        target: "subscriptions",
+        status: "success",
+        details: { field: "allRegions", value: allRegions },
+      });
+    },
+    [setAlertSubs, orchestratorName],
+  );
+
+  const handleSubsToggleRegion = React.useCallback(
+    (region: string) => {
+      setAlertSubs((prev) => {
+        const has = prev.regions.includes(region);
+        const next = has
+          ? prev.regions.filter((r) => r !== region)
+          : [...prev.regions, region];
+        return { ...prev, regions: next };
+      });
+      auditLog.record({
+        actor: orchestratorName,
+        action: "monitoring.alert_subs_region_toggled",
+        target: `region:${region}`,
+        status: "success",
+      });
+    },
+    [setAlertSubs, orchestratorName],
+  );
+
+  const handleSubsSeverityChange = React.useCallback(
+    (minSeverity: AlertSubscriptionsV1["minSeverity"]) => {
+      setAlertSubs((prev) => ({ ...prev, minSeverity }));
+      auditLog.record({
+        actor: orchestratorName,
+        action: "monitoring.alert_subs_severity_changed",
+        target: "subscriptions",
+        status: "success",
+        details: { minSeverity },
+      });
+    },
+    [setAlertSubs, orchestratorName],
+  );
+
+  /* -------- View presets ----------------------------------------------- */
+
+  /**
+   * Capture the current filter combo under a named preset. Trims + clamps
+   * the name; rejects duplicates (overwrite is intentional — same name
+   * replaces the prior entry); caps the list at VIEW_PRESETS_MAX so the
+   * localStorage blob can't grow unbounded.
+   */
+  const handleSavePreset = React.useCallback(
+    (rawName: string) => {
+      const name = (rawName || "").trim().slice(0, 32);
+      if (!name) return;
+      const entry: ViewPresetV1 = {
+        name,
+        range,
+        q: searchQuery,
+        levels: selectedLevels.join(","),
+        agents: selectedAgents.join(","),
+        statuses: selectedStatuses.join(","),
+        region: selectedRegions.join(","),
+        live: liveTail,
+        createdAt: Date.now(),
+      };
+      setViewPresets((prev) => {
+        const withoutDup = prev.filter((p) => p.name !== name);
+        const next = [entry, ...withoutDup].slice(0, VIEW_PRESETS_MAX);
+        return next;
+      });
+      auditLog.record({
+        actor: orchestratorName,
+        action: "monitoring.view_preset_saved",
+        target: `preset:${name}`,
+        status: "success",
+        details: { entry },
+      });
+    },
+    [
+      range,
+      searchQuery,
+      selectedLevels,
+      selectedAgents,
+      selectedStatuses,
+      selectedRegions,
+      liveTail,
+      setViewPresets,
+      orchestratorName,
+    ],
+  );
+
+  const handleApplyPreset = React.useCallback(
+    (name: string) => {
+      const p = viewPresets.find((x) => x.name === name);
+      if (!p) return;
+      setUrlState({
+        range: p.range,
+        q: p.q,
+        levels: p.levels,
+        agents: p.agents,
+        statuses: p.statuses,
+        region: p.region,
+        live: p.live ? "1" : "",
+      });
+      auditLog.record({
+        actor: orchestratorName,
+        action: "monitoring.view_preset_applied",
+        target: `preset:${name}`,
+        status: "success",
+      });
+    },
+    [viewPresets, setUrlState, orchestratorName],
+  );
+
+  const handleDeletePreset = React.useCallback(
+    (name: string) => {
+      setViewPresets((prev) => prev.filter((p) => p.name !== name));
+      auditLog.record({
+        actor: orchestratorName,
+        action: "monitoring.view_preset_deleted",
+        target: `preset:${name}`,
+        status: "success",
+      });
+    },
+    [setViewPresets, orchestratorName],
+  );
+
   // Time-range filter cutoff (ms epoch). `lastRefreshedAt` is a real dep so
   // the window slides forward on every refresh tick.
   const cutoff = React.useMemo(
@@ -860,6 +1108,72 @@ const MonitoringPageInner: React.FC<MonitoringPageProps> = ({
     () => regionHealth.map((r) => r.name),
     [regionHealth],
   );
+
+  // Mirror the latest known/selected region lists into their refs so the
+  // 1-9 hotkey handler (bound once on mount) can read them without
+  // re-binding. Two effects, two single-purpose dep arrays — keeps the
+  // intent obvious to whoever reads the source next.
+  React.useEffect(() => {
+    knownRegionsRef.current = knownRegions;
+  }, [knownRegions]);
+  React.useEffect(() => {
+    selectedRegionsRef.current = selectedRegions;
+  }, [selectedRegions]);
+
+  /**
+   * Keyboard 1-9 hotkeys toggle the first nine known regions in/out of the
+   * region-filter set. This makes single-keystroke region focus possible
+   * without leaving the keyboard — Splunk-style. Skipped while focus is
+   * inside an editable element, same rule as the `/` shortcut.
+   *
+   * The list of regions the digits map onto is the same alphabetically-
+   * sorted snapshot that the Region Health panel renders, so the digit's
+   * meaning is visible on-screen at all times. We read both lists via
+   * refs so the handler is bound exactly once and never tears down during
+   * rapid filter mutations.
+   */
+  React.useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.metaKey || e.ctrlKey || e.altKey) return;
+      // ASCII '1'..'9'
+      const code = e.key;
+      if (code < "1" || code > "9") return;
+      const target = e.target as HTMLElement | null;
+      if (target) {
+        const tag = target.tagName;
+        if (
+          tag === "INPUT" ||
+          tag === "TEXTAREA" ||
+          tag === "SELECT" ||
+          target.isContentEditable
+        ) {
+          return;
+        }
+      }
+      const idx = code.charCodeAt(0) - "1".charCodeAt(0); // 0..8
+      const regions = knownRegionsRef.current;
+      const target_region = regions[idx];
+      if (!target_region) return;
+      e.preventDefault();
+      // Inline the toggle so we don't depend on `toggleRegion` capturing
+      // stale `selectedRegions`. The setter takes a plain string list so
+      // URL state stays canonical.
+      const current = selectedRegionsRef.current;
+      const next = current.includes(target_region)
+        ? current.filter((r) => r !== target_region)
+        : [...current, target_region];
+      setUrlState({ region: next.join(",") });
+      auditLog.record({
+        actor: orchestratorName,
+        action: "monitoring.region_hotkey_toggled",
+        target: `region:${target_region}`,
+        status: "success",
+        details: { digit: idx + 1, next },
+      });
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [setUrlState, orchestratorName]);
 
   // ---- Filtered activities (time + status + search + region) --------------
   // Region is matched against the activity `target` string as a case-insensitive
@@ -1114,6 +1428,176 @@ const MonitoringPageInner: React.FC<MonitoringPageProps> = ({
     }
     return out;
   }, [state.agentLogs, cutoff, lastRefreshedAt]);
+
+  // ------------------------------------------------------------------
+  //  Corpus-grounded detectors
+  // ------------------------------------------------------------------
+  //
+  //  1. detectRegionSpikes (5-minute sliding window) — flags regions whose
+  //     recent activity has burst above their baseline. The pattern is
+  //     diagnostic of automated resource-plane abuse: see
+  //     `New folder\_analysis_netspi.md` §I "IMDS Variants" + §II "RunAs
+  //     Certificate Abuse" — both produce concentrated per-region bursts
+  //     of provision / token / pool activity within a few minutes.
+  //
+  //  2. detectBlindSpots — flags regions with provisioned accounts but no
+  //     log activity. See `New folder\_analysis_defender_view.md` —
+  //     Azucar / ScoutSuite / Prowler all probe diagnostic-settings
+  //     coverage because dark regions are the #1 visibility gap.
+
+  /** All accounts treated as in-scope for blind-spot detection. We avoid
+   *  filtering by region here because the WHOLE POINT of the detector is
+   *  to flag regions the operator hasn't focused on. */
+  const allAccounts = React.useMemo<ManagedAccount[]>(
+    () => state.accounts ?? [],
+    [state.accounts],
+  );
+
+  // Run the spike detector on the PRE-FILTER slice (state.activities /
+  // state.agentLogs). Filtering before the detector would let an operator
+  // accidentally hide the spike they were investigating. Time-bounded by
+  // the page's existing `cutoff` for fairness with the rest of the panel.
+  const allActivitiesInRange = React.useMemo<Activity[]>(() => {
+    const out: Activity[] = [];
+    for (const a of state.activities ?? []) {
+      const t = parseTimestamp(a.startedAt);
+      if (Number.isFinite(t) && t < cutoff) continue;
+      out.push(a);
+    }
+    return out;
+  }, [state.activities, cutoff]);
+
+  const allLogsInRange = React.useMemo<AgentLogEntry[]>(() => {
+    const out: AgentLogEntry[] = [];
+    for (const l of state.agentLogs ?? []) {
+      const t = parseTimestamp(l.timestamp);
+      if (Number.isFinite(t) && t < cutoff) continue;
+      out.push(l);
+    }
+    return out;
+  }, [state.agentLogs, cutoff]);
+
+  const regionSpikes = React.useMemo<RegionSpike[]>(
+    () =>
+      detectRegionSpikes(allActivitiesInRange, allLogsInRange, {
+        windowMs: SPIKE_WINDOW_MS,
+        now: lastRefreshedAt,
+      }),
+    [allActivitiesInRange, allLogsInRange, lastRefreshedAt],
+  );
+
+  const blindSpots = React.useMemo<RegionBlindSpot[]>(
+    () => detectBlindSpots(allAccounts, allLogsInRange, { cutoff }),
+    [allAccounts, allLogsInRange, cutoff],
+  );
+
+  // ---- Region × agent heatmap matrix --------------------------------------
+  // Each cell carries (count, errors). Operator-visible label uses
+  // alphabetical region order to match the Region Health panel + 1-9
+  // hotkey mapping for muscle-memory consistency.
+  const heatmapCells = React.useMemo<HeatmapCell[]>(() => {
+    const map = new Map<string, HeatmapCell>();
+    for (const l of allLogsInRange) {
+      const blob = `${l.message} ${JSON.stringify(l.details ?? {})}`;
+      const region = extractRegion(blob);
+      if (!region) continue;
+      const key = `${region}|${l.agent}`;
+      const cur = map.get(key) ?? {
+        region,
+        agent: l.agent,
+        count: 0,
+        errors: 0,
+      };
+      cur.count += 1;
+      if (l.level === "error") cur.errors += 1;
+      map.set(key, cur);
+    }
+    return [...map.values()];
+  }, [allLogsInRange]);
+
+  /** Regions to render across heatmap rows — alphabetical, deduplicated
+   *  across (known regions from accounts) ∪ (regions found in logs). */
+  const heatmapRegions = React.useMemo<string[]>(() => {
+    const set = new Set<string>(knownRegions);
+    for (const c of heatmapCells) set.add(c.region);
+    return [...set].sort((a, b) => a.localeCompare(b));
+  }, [knownRegions, heatmapCells]);
+
+  // ---- Persisted EMA baseline update --------------------------------------
+  // Each refresh tick, fold the recent spike-window counts into the
+  // persisted EMA. The detector is cheap; we run it inside an effect
+  // (not a memo) to avoid wedging render time on the localStorage write.
+  // Re-runs only when the refresh timestamp changes — i.e. on tick.
+  const lastBaselineTickRef = React.useRef<number>(0);
+  React.useEffect(() => {
+    if (lastBaselineTickRef.current === lastRefreshedAt) return;
+    lastBaselineTickRef.current = lastRefreshedAt;
+    const recentCutoff = lastRefreshedAt - SPIKE_WINDOW_MS;
+    const counts = new Map<string, number>();
+    for (const a of state.activities ?? []) {
+      const t = parseTimestamp(a.startedAt);
+      if (!Number.isFinite(t) || t < recentCutoff || t > lastRefreshedAt) {
+        continue;
+      }
+      const r = extractRegion(a.target);
+      if (!r) continue;
+      counts.set(r, (counts.get(r) ?? 0) + 1);
+    }
+    for (const l of state.agentLogs ?? []) {
+      const t = parseTimestamp(l.timestamp);
+      if (!Number.isFinite(t) || t < recentCutoff || t > lastRefreshedAt) {
+        continue;
+      }
+      const blob = `${l.message} ${JSON.stringify(l.details ?? {})}`;
+      const r = extractRegion(blob);
+      if (!r) continue;
+      counts.set(r, (counts.get(r) ?? 0) + 1);
+    }
+    if (counts.size === 0) return;
+    setRegionBaselines((prev) =>
+      updateRegionBaseline(prev, counts, { now: lastRefreshedAt }),
+    );
+  }, [lastRefreshedAt, state.activities, state.agentLogs, setRegionBaselines]);
+
+  // ---- ARIA-live announcement on threshold breach -------------------------
+  // We surface a polite live region whose text changes only when a NEW
+  // spike crosses the operator's `minSeverity` filter AND lands in a
+  // subscribed region. The previous-set ref kills repeat announcements so
+  // a screen-reader doesn't strobe on every tick.
+  const prevAnnouncedSpikesRef = React.useRef<Set<string>>(new Set());
+  const [liveAnnouncement, setLiveAnnouncement] = React.useState<string>("");
+  React.useEffect(() => {
+    const severityRank: Record<RegionSpike["severity"], number> = {
+      info: 0,
+      warning: 1,
+      critical: 2,
+    };
+    const minRank = severityRank[alertSubs.minSeverity] ?? 1;
+    const subscribed = (region: string) =>
+      alertSubs.allRegions || alertSubs.regions.includes(region);
+
+    const fresh: RegionSpike[] = [];
+    const seenThisTick = new Set<string>();
+    for (const s of regionSpikes) {
+      if (severityRank[s.severity] < minRank) continue;
+      if (!subscribed(s.region)) continue;
+      const key = `${s.region}|${s.severity}|${Math.round(s.ratio)}`;
+      seenThisTick.add(key);
+      if (!prevAnnouncedSpikesRef.current.has(key)) {
+        fresh.push(s);
+      }
+    }
+    prevAnnouncedSpikesRef.current = seenThisTick;
+    if (fresh.length === 0) return;
+    const top = fresh[0]!;
+    const extra =
+      fresh.length > 1 ? ` (+${fresh.length - 1} more)` : "";
+    setLiveAnnouncement(
+      `${top.severity === "critical" ? "Critical" : "Warning"}: ` +
+        `region ${top.region} spike — ${top.recentCount} events, ` +
+        `${top.ratio.toFixed(1)}× baseline${extra}.`,
+    );
+  }, [regionSpikes, alertSubs]);
 
   // Export accessors — separate ones for the two ExportMenus, each emitting
   // the columns + metadata an operator actually wants in the file.
@@ -2351,6 +2835,230 @@ const MonitoringPageInner: React.FC<MonitoringPageProps> = ({
         )}
       </section>
 
+      {/* Anomaly detectors — region-spike + blind-spot rows. The spike
+          detector cites `New folder\_analysis_netspi.md` §I (IMDS variants
+          and resource-plane abuse bursts). The blind-spot detector cites
+          `New folder\_analysis_defender_view.md` (diagnostic-settings
+          coverage gaps). Both run on the pre-filter slice so an active
+          filter set never accidentally hides an active spike. */}
+      <section className={sectionClass} aria-label="Anomaly detectors">
+        <div className="mb-3 flex items-baseline justify-between gap-2">
+          <div className="flex items-center gap-1">
+            <h2 className={cn(sectionHeadingClass, "mb-0")}>
+              <span className="inline-flex items-center gap-1.5">
+                <Flame className="h-4 w-4 text-warning" aria-hidden />
+                Anomaly Detectors
+              </span>
+            </h2>
+            <InfoTooltip
+              content={
+                <div className="space-y-1 text-xs">
+                  <p className="m-0 font-semibold">Two detectors, both client-side:</p>
+                  <ul className="m-0 ml-3 list-disc space-y-0.5">
+                    <li>
+                      <strong>Region spikes</strong> — 5-min sliding window over
+                      activities + logs; flags regions whose recent volume is
+                      &gt;3× the prior baseline. Corpus: <code>_analysis_netspi.md</code> §I.
+                    </li>
+                    <li>
+                      <strong>Blind spots</strong> — regions with provisioned
+                      accounts but no logs. Corpus: <code>_analysis_defender_view.md</code>.
+                    </li>
+                  </ul>
+                  <p className="m-0 text-muted-foreground">
+                    All thresholds are constants in <code>monitoring/detectors.ts</code>.
+                  </p>
+                </div>
+              }
+              ariaLabel="Anomaly detector help"
+            />
+          </div>
+          <div className="flex items-center gap-3 text-2xs text-muted-foreground">
+            <span className="inline-flex items-center gap-1">
+              <Flame className="h-3 w-3 text-warning" aria-hidden />
+              {regionSpikes.length} spike{regionSpikes.length === 1 ? "" : "s"}
+            </span>
+            <span className="inline-flex items-center gap-1">
+              <EyeOff className="h-3 w-3 text-destructive" aria-hidden />
+              {blindSpots.length} blind spot{blindSpots.length === 1 ? "" : "s"}
+            </span>
+          </div>
+        </div>
+
+        {/* aria-live region — strictly polite. Announces newly-crossed
+            spike thresholds for subscribed regions. Visually hidden so the
+            on-screen UI stays compact. */}
+        <p
+          role="status"
+          aria-live="polite"
+          aria-atomic="true"
+          className="sr-only"
+        >
+          {liveAnnouncement}
+        </p>
+
+        <div className="grid gap-3 lg:grid-cols-2">
+          {/* Spike rows */}
+          <div className="rounded-md border border-border bg-card/40 p-3">
+            <h3 className="mb-2 inline-flex items-center gap-1.5 text-xs font-semibold text-foreground">
+              <Flame className="h-3.5 w-3.5 text-warning" aria-hidden />
+              Region spikes ({Math.round(SPIKE_WINDOW_MS / 60_000)}m window)
+            </h3>
+            {regionSpikes.length === 0 ? (
+              <p className="text-2xs text-muted-foreground">
+                No regions exceeding baseline. Quiet across the fleet.
+              </p>
+            ) : (
+              <ul className="m-0 flex flex-col gap-1.5 p-0">
+                {regionSpikes.slice(0, 8).map((s) => {
+                  const baseline = regionBaselines[s.region];
+                  const verdict = evaluateRegion(s.region, s.recentCount, baseline);
+                  const tone =
+                    s.severity === "critical"
+                      ? "border-destructive/50 bg-destructive/10 text-destructive"
+                      : s.severity === "warning"
+                        ? "border-warning/50 bg-warning/10 text-warning"
+                        : "border-border bg-card/60 text-foreground/80";
+                  return (
+                    <li key={s.region} className="m-0 list-none">
+                      <button
+                        type="button"
+                        onClick={() => toggleRegion(s.region)}
+                        aria-pressed={selectedRegions.includes(s.region)}
+                        className={cn(
+                          "flex w-full items-center justify-between gap-2 rounded-sm border px-2 py-1 text-left text-2xs",
+                          "transition-colors hover:bg-card focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring",
+                          tone,
+                        )}
+                      >
+                        <span className="flex items-center gap-2">
+                          <span
+                            className={cn(
+                              "inline-block h-1.5 w-1.5 rounded-full",
+                              s.severity === "critical"
+                                ? "bg-destructive animate-pulse motion-reduce:animate-none"
+                                : s.severity === "warning"
+                                  ? "bg-warning"
+                                  : "bg-muted-foreground",
+                            )}
+                            aria-hidden
+                          />
+                          <strong className="font-semibold uppercase tracking-wide">
+                            {s.region}
+                          </strong>
+                          <span className="text-foreground/70">
+                            {s.recentCount} evt · {s.ratio.toFixed(1)}×
+                          </span>
+                        </span>
+                        <span className="text-[10px] uppercase text-muted-foreground">
+                          {verdict.status === "learning"
+                            ? "learning"
+                            : verdict.status}
+                        </span>
+                      </button>
+                      <p className="m-0 pl-4 pt-0.5 text-[10px] text-muted-foreground/80">
+                        {s.reason}
+                      </p>
+                    </li>
+                  );
+                })}
+              </ul>
+            )}
+          </div>
+
+          {/* Blind-spot rows */}
+          <div className="rounded-md border border-border bg-card/40 p-3">
+            <h3 className="mb-2 inline-flex items-center gap-1.5 text-xs font-semibold text-foreground">
+              <EyeOff className="h-3.5 w-3.5 text-destructive" aria-hidden />
+              Monitoring blind spots
+            </h3>
+            {blindSpots.length === 0 ? (
+              <p className="text-2xs text-muted-foreground">
+                Every region with accounts is emitting logs. Coverage looks complete.
+              </p>
+            ) : (
+              <ul className="m-0 flex flex-col gap-1.5 p-0">
+                {blindSpots.slice(0, 8).map((b) => {
+                  const tone = b.dark
+                    ? "border-destructive/50 bg-destructive/10 text-destructive"
+                    : "border-warning/50 bg-warning/10 text-warning";
+                  return (
+                    <li key={b.region} className="m-0 list-none">
+                      <button
+                        type="button"
+                        onClick={() => handleRegionDrillDown(b.region)}
+                        aria-label={`Drill into accounts for ${b.region}`}
+                        className={cn(
+                          "flex w-full items-center justify-between gap-2 rounded-sm border px-2 py-1 text-left text-2xs",
+                          "transition-colors hover:bg-card focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring",
+                          tone,
+                        )}
+                      >
+                        <span className="flex items-center gap-2">
+                          <EyeOff
+                            className={cn(
+                              "h-3 w-3",
+                              b.dark ? "text-destructive" : "text-warning",
+                            )}
+                            aria-hidden
+                          />
+                          <strong className="font-semibold uppercase tracking-wide">
+                            {b.region}
+                          </strong>
+                          <span className="text-foreground/70">
+                            {b.accountCount} acct · {b.logCount} log
+                            {b.logCount === 1 ? "" : "s"}
+                          </span>
+                        </span>
+                        <span className="text-[10px] uppercase text-muted-foreground">
+                          {b.dark ? "dark" : "thin"}
+                        </span>
+                      </button>
+                      <p className="m-0 pl-4 pt-0.5 text-[10px] text-muted-foreground/80">
+                        {b.reason}
+                      </p>
+                    </li>
+                  );
+                })}
+              </ul>
+            )}
+          </div>
+        </div>
+
+        {/* Region × agent heatmap — surfaces the (region, agent) hotspot
+            cross-section that the per-row spike list collapses. Click a
+            cell to filter both the region and agent simultaneously. */}
+        {heatmapRegions.length > 0 && (
+          <div className="mt-3 rounded-md border border-border bg-card/40 p-3">
+            <h3 className="mb-2 inline-flex items-center gap-1.5 text-xs font-semibold text-foreground">
+              <BarChart3 className="h-3.5 w-3.5 text-primary" aria-hidden />
+              Region × agent heatmap
+              <InfoTooltip
+                size={11}
+                content="Cell intensity = log lines for that (region, agent) pair in the visible window. Red shading = errors present. Click a cell to filter both."
+                ariaLabel="Heatmap help"
+              />
+            </h3>
+            <RegionAgentHeatmap
+              cells={heatmapCells}
+              regions={heatmapRegions}
+              agents={AGENT_NAMES as ReadonlyArray<string>}
+              selectedRegion={
+                selectedRegions.length === 1 ? selectedRegions[0]! : null
+              }
+              onCellClick={(region, agent) => {
+                if (!selectedRegions.includes(region)) {
+                  toggleRegion(region);
+                }
+                if (!selectedAgents.includes(agent as AgentName)) {
+                  toggleAgent(agent as AgentName);
+                }
+              }}
+            />
+          </div>
+        )}
+      </section>
+
       {/* Alert thresholds — persisted via usePersistedState; controls which
           StatCard flips to the destructive "alert" pill. Stored under
           `monitoring.alertThresholds` with cross-tab sync so two tabs of the
@@ -2403,6 +3111,133 @@ const MonitoringPageInner: React.FC<MonitoringPageProps> = ({
             min={10}
           />
         </div>
+      </section>
+
+      {/* Alert subscriptions — operator picks which regions / severities
+          trigger ARIA-live announcements when the spike detector fires.
+          Persisted via usePersistedState (cross-tab synced). */}
+      <section className={sectionClass} aria-label="Alert subscriptions">
+        <div className="mb-3 flex items-baseline justify-between gap-2">
+          <div className="flex items-center gap-1">
+            <h2 className={cn(sectionHeadingClass, "mb-0")}>
+              <span className="inline-flex items-center gap-1.5">
+                <Shield className="h-4 w-4 text-primary" aria-hidden />
+                Alert Subscriptions
+              </span>
+            </h2>
+            <InfoTooltip
+              content="Region-spike events that match these subscriptions are announced via an aria-live region for screen readers. Severity filter sets the minimum band that fires."
+              ariaLabel="Alert subscriptions help"
+            />
+          </div>
+          <span className="text-2xs text-muted-foreground">
+            {alertSubs.allRegions
+              ? "all regions"
+              : `${alertSubs.regions.length} subscribed`}
+            {" · min "}
+            {alertSubs.minSeverity}
+          </span>
+        </div>
+        <div className="flex flex-col gap-3">
+          <div className="flex flex-wrap items-center gap-3">
+            <label className="inline-flex items-center gap-2 text-xs">
+              <Switch
+                id="alert-subs-all"
+                checked={alertSubs.allRegions}
+                onCheckedChange={handleSubsToggleAllRegions}
+                aria-label="Subscribe to every region"
+              />
+              <span className="font-medium">Alert on every region</span>
+            </label>
+            <span className="text-2xs text-muted-foreground">
+              Off = only the explicitly-subscribed regions below trigger announcements.
+            </span>
+          </div>
+
+          <div className="flex flex-wrap items-center gap-1.5">
+            <span className="inline-flex items-center gap-1 text-2xs font-semibold uppercase tracking-wider text-muted-foreground">
+              <FilterIcon className="h-3 w-3" aria-hidden />
+              Min severity
+            </span>
+            {(["info", "warning", "critical"] as const).map((sev) => {
+              const active = alertSubs.minSeverity === sev;
+              const tone =
+                sev === "critical"
+                  ? "bg-destructive/15 text-destructive border-destructive/40"
+                  : sev === "warning"
+                    ? "bg-warning/15 text-warning border-warning/40"
+                    : "bg-primary/15 text-primary border-primary/40";
+              return (
+                <FilterChip
+                  key={sev}
+                  active={active}
+                  onToggle={() => handleSubsSeverityChange(sev)}
+                  label={sev}
+                  toneActive={tone}
+                  ariaLabel={`Set min severity to ${sev}`}
+                />
+              );
+            })}
+          </div>
+
+          {!alertSubs.allRegions && knownRegions.length > 0 && (
+            <div
+              className="flex flex-wrap items-center gap-1.5 border-t border-border pt-2"
+              role="group"
+              aria-label="Subscribed regions"
+            >
+              <span className="inline-flex items-center gap-1 text-2xs font-semibold uppercase tracking-wider text-muted-foreground">
+                <BellRing className="h-3 w-3" aria-hidden />
+                Subscribed regions
+              </span>
+              {knownRegions.map((r) => (
+                <FilterChip
+                  key={r}
+                  active={alertSubs.regions.includes(r)}
+                  onToggle={() => handleSubsToggleRegion(r)}
+                  label={r}
+                  ariaLabel={`${alertSubs.regions.includes(r) ? "Unsubscribe from" : "Subscribe to"} ${r}`}
+                />
+              ))}
+            </div>
+          )}
+        </div>
+      </section>
+
+      {/* View presets — save the current filter combo under a name so an
+          operator can flip between "noisy production" / "quiet weekend"
+          views in one click. Limited to 12 entries per browser. */}
+      <ViewPresetsSection
+        presets={viewPresets}
+        max={VIEW_PRESETS_MAX}
+        onSave={handleSavePreset}
+        onApply={handleApplyPreset}
+        onDelete={handleDeletePreset}
+      />
+
+      {/* Hotkey legend (collapsible, terse). Kept inline so operators see
+          the digits map alongside the regions they target. */}
+      <section className={sectionClass} aria-label="Keyboard shortcuts">
+        <details className="text-xs">
+          <summary className="cursor-pointer font-semibold text-muted-foreground">
+            Keyboard shortcuts
+          </summary>
+          <ul className="m-0 mt-2 grid grid-cols-1 gap-1 pl-2 sm:grid-cols-2">
+            <li className="text-2xs text-muted-foreground">
+              <kbd className="rounded border bg-muted/30 px-1 font-mono">/</kbd>{" "}
+              focus the search field
+            </li>
+            <li className="text-2xs text-muted-foreground">
+              <kbd className="rounded border bg-muted/30 px-1 font-mono">1</kbd>…
+              <kbd className="rounded border bg-muted/30 px-1 font-mono">9</kbd>{" "}
+              toggle the matching region filter
+            </li>
+            <li className="text-2xs text-muted-foreground">
+              Digits map to the first nine regions in the Region Health panel
+              (alphabetical).
+            </li>
+          </ul>
+        </details>
       </section>
 
       {/* Recent Activity */}
@@ -2572,6 +3407,126 @@ const ThresholdField: React.FC<ThresholdFieldProps> = ({
         {description}
       </span>
     </div>
+  );
+};
+
+/* ------------------------------------------------------------------ */
+/*  ViewPresetsSection — save / apply / delete persisted filter combos */
+/* ------------------------------------------------------------------ */
+
+interface ViewPresetsSectionProps {
+  presets: ReadonlyArray<ViewPresetV1>;
+  max: number;
+  onSave: (name: string) => void;
+  onApply: (name: string) => void;
+  onDelete: (name: string) => void;
+}
+
+const ViewPresetsSection: React.FC<ViewPresetsSectionProps> = ({
+  presets,
+  max,
+  onSave,
+  onApply,
+  onDelete,
+}) => {
+  const [name, setName] = React.useState<string>("");
+  const commit = React.useCallback(() => {
+    const trimmed = name.trim();
+    if (!trimmed) return;
+    onSave(trimmed);
+    setName("");
+  }, [name, onSave]);
+  const atCapacity = presets.length >= max;
+  return (
+    <section className={sectionClass} aria-label="View presets">
+      <div className="mb-3 flex items-baseline justify-between gap-2">
+        <div className="flex items-center gap-1">
+          <h2 className={cn(sectionHeadingClass, "mb-0")}>
+            <span className="inline-flex items-center gap-1.5">
+              <Bookmark className="h-4 w-4 text-primary" aria-hidden />
+              View Presets
+            </span>
+          </h2>
+          <InfoTooltip
+            content="Save the current filter combo (range + search + level/agent/status/region + live-tail) under a name. Capped at 12 entries per browser. Saving an existing name overwrites it."
+            ariaLabel="View presets help"
+          />
+        </div>
+        <span className="text-2xs text-muted-foreground">
+          {presets.length} / {max}
+        </span>
+      </div>
+      <div className="flex flex-col gap-3">
+        <div className="flex flex-wrap items-center gap-2">
+          <Input
+            type="text"
+            placeholder="Preset name (e.g. noisy-prod-eastus)"
+            value={name}
+            onChange={(e) => setName(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === "Enter") {
+                e.preventDefault();
+                commit();
+              } else if (e.key === "Escape") {
+                setName("");
+              }
+            }}
+            maxLength={32}
+            aria-label="Preset name"
+            className="h-9 max-w-xs"
+          />
+          <Button
+            type="button"
+            variant="default"
+            size="sm"
+            onClick={commit}
+            disabled={!name.trim() || atCapacity}
+            aria-label="Save current view as a preset"
+          >
+            <Save aria-hidden />
+            Save preset
+          </Button>
+          {atCapacity && (
+            <span className="text-2xs text-warning">
+              At capacity — delete a preset to make room.
+            </span>
+          )}
+        </div>
+        {presets.length === 0 ? (
+          <p className="text-2xs text-muted-foreground">
+            No presets saved yet. Set the filters you want to remember, give
+            it a name, click Save.
+          </p>
+        ) : (
+          <ul className="m-0 flex flex-wrap gap-1.5 p-0">
+            {presets.map((p) => (
+              <li
+                key={p.name}
+                className="m-0 inline-flex items-center gap-0.5 rounded-full border border-border bg-card/60 px-1.5 py-0.5 text-2xs"
+              >
+                <button
+                  type="button"
+                  onClick={() => onApply(p.name)}
+                  aria-label={`Apply preset ${p.name}`}
+                  title={`Apply preset · range=${p.range} q="${p.q}" levels=[${p.levels}] agents=[${p.agents}] statuses=[${p.statuses}] regions=[${p.region}] live=${p.live}`}
+                  className="rounded-full px-1.5 py-0.5 font-semibold uppercase tracking-wider text-foreground hover:bg-primary/15 hover:text-primary focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+                >
+                  {p.name}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => onDelete(p.name)}
+                  aria-label={`Delete preset ${p.name}`}
+                  className="inline-flex h-4 w-4 items-center justify-center rounded-full text-muted-foreground hover:bg-destructive/20 hover:text-destructive focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-destructive"
+                >
+                  <Trash2 className="h-2.5 w-2.5" aria-hidden />
+                </button>
+              </li>
+            ))}
+          </ul>
+        )}
+      </div>
+    </section>
   );
 };
 

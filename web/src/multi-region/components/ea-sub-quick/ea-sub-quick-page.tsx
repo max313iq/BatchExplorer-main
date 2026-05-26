@@ -28,6 +28,7 @@ import {
   AlertTriangle,
   ArrowRight,
   BadgeCheck,
+  Braces,
   Building2,
   Check,
   CheckCircle2,
@@ -35,18 +36,24 @@ import {
   ExternalLink,
   Eye,
   EyeOff,
+  FileText,
+  Globe,
   History,
   Info,
   Keyboard,
   Loader2,
   Plus,
   RefreshCw,
+  RotateCcw,
   Save,
   Server,
+  ShieldAlert,
   ShieldCheck,
+  Skull,
   Sparkles,
   Terminal,
   Trash2,
+  Users,
   XCircle,
 } from "lucide-react";
 
@@ -133,6 +140,21 @@ const STORAGE_PRESETS = "ea-sub-quick:display-name-presets";
  */
 const STORAGE_RECENT_CONFIGS = "ea-sub-quick:recent-configs";
 const RECENT_PRESETS_MAX = 5;
+
+/**
+ * Per-(tenant, EA) defaults override. When the operator submits successfully
+ * we capture the displayName-template + workload they ended up with for that
+ * exact (sourceTenantId, billingAccountName, enrollmentAccountName) combo —
+ * and the next time the same combo is selected, we pre-fill the form. This
+ * is distinct from {@link STORAGE_RECENT_CONFIGS}, which is a global ring
+ * buffer of N most-recent configs; the per-EA defaults are keyed on scope
+ * identity so a returning operator working a different EA doesn't get a
+ * stale template that doesn't fit.
+ *
+ * Schema: `{ [tenantId|baName|eaName]: { displayNameTemplate, workload, lastUsedAt } }`.
+ * Versioned so adding new fields later doesn't blow away the prior shape.
+ */
+const STORAGE_PER_EA_DEFAULTS = "ea-sub-quick:per-ea-defaults";
 
 const UUID_RE =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -310,6 +332,181 @@ function buildCurlSnippet(args: {
     `  -H "Content-Type: application/json" \\\n` +
     `  -d '${JSON.stringify(body)}'`
   );
+}
+
+/**
+ * Builds a pretty-printed, **sanitized** JSON preview of the alias-create
+ * PUT body — the same envelope the curl snippet would send minus all token
+ * material. Operators rely on this when diffing against the published MS
+ * docs example or against the {body} captured in their audit log; it MUST
+ * stay byte-identical to what `createEaSubscription` sends.
+ *
+ * Token material is never included (the alias-create endpoint takes the
+ * bearer in the Authorization header, not the body — but we still hold the
+ * line on principle: nothing token-shaped ever lands in a JSON preview the
+ * operator might screenshot / paste into a ticket).
+ */
+function buildJsonBodyPreview(args: {
+  displayName: string;
+  billingScope: string;
+  workload: string;
+  subscriptionTenantId?: string;
+  subscriptionOwnerId?: string;
+  tags?: Record<string, string>;
+}): string {
+  const additionalProperties: Record<string, unknown> = {};
+  if (args.subscriptionTenantId)
+    additionalProperties.subscriptionTenantId = args.subscriptionTenantId;
+  if (args.subscriptionOwnerId)
+    additionalProperties.subscriptionOwnerId = args.subscriptionOwnerId;
+  if (args.tags && Object.keys(args.tags).length > 0)
+    additionalProperties.tags = args.tags;
+  const body = {
+    properties: {
+      displayName: args.displayName,
+      billingScope: args.billingScope,
+      workload: args.workload,
+      ...(Object.keys(additionalProperties).length > 0
+        ? { additionalProperties }
+        : {}),
+    },
+  };
+  return JSON.stringify(body, null, 2);
+}
+
+/**
+ * Classifies the risk profile of the upcoming alias-create. Two axes:
+ *
+ *   - `crossTenant`     — landing the sub in a different tenant
+ *   - `privilegedCombo` — cross-tenant AND pre-granting a billing role,
+ *                          AND/OR Production workload to a destination
+ *                          that isn't the operator's home tenant
+ *
+ * The "privileged combo" detection is the one corpus-grounded gate that
+ * matters most: per
+ * `C:\Users\baimgprodsesa1\Desktop\New folder\_ea_subscription_cross_tenant.md`
+ * §6 ("AADInternals Functions You Can Directly Reuse") the
+ * delegated-admin pattern that underlies cross-tenant billing
+ * relationships defaults to granting **Global Administrator +
+ * Helpdesk Administrator** roles in the target tenant. Even when the
+ * alias-create itself doesn't grant GA, the chain of
+ * (a) bring a billing-role to bear on enrollment-account scope
+ * (b) drop a new subscription into a foreign tenant
+ * (c) name a destination owner in that foreign tenant
+ * is the *exact* sequence the offensive corpus tags as highest-risk
+ * (`_bypass_mixed_chains.md` Chain 7). Surfacing the combo to the
+ * operator pre-submit is the difference between an explicit
+ * authorized provisioning step and a quiet privilege transfer.
+ */
+function classifySubmissionRisk(args: {
+  crossTenantRequested: boolean;
+  crossTenantValid: boolean;
+  preGrantRole: boolean;
+  workload: "Production" | "DevTest";
+}): {
+  crossTenant: boolean;
+  privilegedCombo: boolean;
+  reasons: string[];
+} {
+  const reasons: string[] = [];
+  if (args.crossTenantRequested && args.crossTenantValid) {
+    reasons.push(
+      "subscriptionTenantId + subscriptionOwnerId set → sub lands in a foreign tenant",
+    );
+  }
+  const privilegedCombo =
+    args.crossTenantRequested && args.crossTenantValid && args.preGrantRole;
+  if (privilegedCombo) {
+    reasons.push(
+      "cross-tenant + pre-grant billing-role → matches `_bypass_mixed_chains.md` Chain 7 pattern",
+    );
+  }
+  if (
+    args.crossTenantRequested &&
+    args.crossTenantValid &&
+    args.workload === "Production"
+  ) {
+    reasons.push(
+      "Production-rate sub landing in a foreign tenant — billed against the EA, owned in the destination",
+    );
+  }
+  return {
+    crossTenant: args.crossTenantRequested && args.crossTenantValid,
+    privilegedCombo,
+    reasons,
+  };
+}
+
+/**
+ * Snapshot of the most-recent SUCCESSFUL submission's full config — used by
+ * the "Re-run with same config" affordance on the result panel and by the
+ * `r` hotkey. We capture the full form state (including cross-tenant ids
+ * and tags) at submit-success time so the operator can rehydrate everything
+ * verbatim. Lives only in memory — never persisted to localStorage because
+ * `subscriptionOwnerId` is operator-identifying.
+ */
+interface LastSubmittedSnapshot {
+  displayNameTemplate: string;
+  workload: "Production" | "DevTest";
+  billingAccountName: string;
+  enrollmentAccountName: string;
+  customScopeMode: boolean;
+  customBillingAccountName: string;
+  customEnrollmentAccountName: string;
+  customFullScope: string;
+  subscriptionTenantId: string;
+  subscriptionOwnerId: string;
+  tagPairs: Array<{ key: string; value: string }>;
+  preGrantRole: boolean;
+}
+
+/**
+ * Per-(tenant, EA) defaults map. Keyed on `${sourceTenantId}|${ba}|${ea}`
+ * so the same operator working multiple enrollment accounts gets the
+ * right template recalled for each. Custom-scope submissions land under
+ * `${sourceTenantId}|${customBa}|${customEa}|custom` to keep them
+ * distinguishable from picker submissions on the same names.
+ */
+interface PerEaDefault {
+  displayNameTemplate: string;
+  workload: "Production" | "DevTest";
+  lastUsedAt: string;
+}
+type PerEaDefaultsMap = Record<string, PerEaDefault>;
+
+function perEaDefaultsKey(args: {
+  sourceTenantId: string;
+  billingAccountName: string;
+  enrollmentAccountName: string;
+  customScopeMode: boolean;
+}): string {
+  return [
+    args.sourceTenantId,
+    args.billingAccountName,
+    args.enrollmentAccountName,
+    args.customScopeMode ? "custom" : "picker",
+  ].join("|");
+}
+
+function migratePerEaDefaults(raw: unknown): PerEaDefaultsMap | undefined {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return {};
+  const out: PerEaDefaultsMap = {};
+  for (const [k, v] of Object.entries(raw as Record<string, unknown>)) {
+    if (!v || typeof v !== "object") continue;
+    const cand = v as Partial<PerEaDefault>;
+    if (
+      typeof cand.displayNameTemplate === "string" &&
+      (cand.workload === "Production" || cand.workload === "DevTest") &&
+      typeof cand.lastUsedAt === "string"
+    ) {
+      out[k] = {
+        displayNameTemplate: cand.displayNameTemplate,
+        workload: cand.workload,
+        lastUsedAt: cand.lastUsedAt,
+      };
+    }
+  }
+  return out;
 }
 
 export interface EaSubQuickPageProps {
@@ -993,6 +1190,32 @@ export const EaSubQuickPage: React.FC<EaSubQuickPageProps> = ({
   >([]);
   const [counter, setCounter] = React.useState(1);
 
+  /**
+   * ARIA-live announcement channel. Screen-reader output for create-success
+   * and create-failure events; quiet by default so it doesn't echo every
+   * intermediate state. The "polite" politeness matches preflight elsewhere
+   * on the page — failures still come through but don't interrupt the
+   * operator mid-typing in the displayName field.
+   */
+  const [ariaAnnouncement, setAriaAnnouncement] = React.useState("");
+
+  /**
+   * Snapshot of the most-recent SUCCESSFUL submission's full config — used by
+   * the "Re-run with same config" affordance on the result panel and by the
+   * `r` hotkey. We capture this at submit-success time (not from
+   * `recentConfigs` / `submittedAliases`) so we keep the full form state
+   * including cross-tenant ids and tags, which aren't persisted to localStorage
+   * for privacy reasons. Lives only for this page mount.
+   */
+  const [lastSubmittedSnapshot, setLastSubmittedSnapshot] =
+    React.useState<LastSubmittedSnapshot | null>(null);
+
+  /** Toggle for the inline JSON-body preview panel. */
+  const [showJsonPreview, setShowJsonPreview] = React.useState(false);
+
+  /** Toggle: surface the post-create attack-surface enumeration card. */
+  const [showAttackSurface, setShowAttackSurface] = React.useState(true);
+
   /* ----- DisplayName presets ------------------------------------ */
   // Migrated to usePersistedState so we share the single localStorage
   // adapter the rest of the codebase already uses; the legacy callers
@@ -1071,6 +1294,103 @@ export const EaSubQuickPage: React.FC<EaSubQuickPageProps> = ({
     [setRecentConfigs],
   );
 
+  /* ----- Per-(tenant, EA) defaults ------------------------------ */
+  // Persisted map; on every successful submit we update the entry for the
+  // exact (sourceTenant, BA, EA) combo so the next time the same combo is
+  // selected the form pre-fills with what worked last. Distinct from the
+  // global recent-configs ring — operator working multiple EAs in parallel
+  // wants the right template recalled per EA, not whichever they used most
+  // recently overall.
+  const [perEaDefaults, setPerEaDefaults] = usePersistedState<PerEaDefaultsMap>(
+    STORAGE_PER_EA_DEFAULTS,
+    {},
+    {
+      version: 1,
+      migrate: (raw) => migratePerEaDefaults(raw),
+    },
+  );
+
+  // Auto-apply per-EA defaults when the scope identity changes (after
+  // billing/enrollment selection). We DON'T override what the operator
+  // already typed — only fill in when the displayName is still the
+  // factory default. This makes the UX feel "smart" without being
+  // surprising.
+  const factoryDefaultDisplayName = "My EA Subscription";
+  const currentScopeKey = React.useMemo(() => {
+    if (!account) return "";
+    if (customScopeMode) {
+      if (!customBillingAccountName.trim()) return "";
+      return perEaDefaultsKey({
+        sourceTenantId: account.tenantId,
+        billingAccountName: customBillingAccountName.trim(),
+        enrollmentAccountName: customEnrollmentAccountName.trim(),
+        customScopeMode: true,
+      });
+    }
+    if (!billingAccountName) return "";
+    if (accountIsEnterpriseAgreement && !enrollmentAccountName) return "";
+    return perEaDefaultsKey({
+      sourceTenantId: account.tenantId,
+      billingAccountName,
+      enrollmentAccountName,
+      customScopeMode: false,
+    });
+  }, [
+    account,
+    customScopeMode,
+    customBillingAccountName,
+    customEnrollmentAccountName,
+    billingAccountName,
+    enrollmentAccountName,
+    accountIsEnterpriseAgreement,
+  ]);
+  const lastAppliedScopeKeyRef = React.useRef("");
+  React.useEffect(() => {
+    if (!currentScopeKey) return;
+    if (lastAppliedScopeKeyRef.current === currentScopeKey) return;
+    const def = perEaDefaults[currentScopeKey];
+    lastAppliedScopeKeyRef.current = currentScopeKey;
+    if (!def) return;
+    // Only soft-apply: don't trample what the operator already typed.
+    if (displayName.trim() === factoryDefaultDisplayName) {
+      setDisplayName(def.displayNameTemplate);
+    }
+    // Workload is binary; soft-apply same way — only if still factory default.
+    if (workload === "Production" && def.workload === "DevTest") {
+      setWorkload("DevTest");
+    }
+    // We don't notify here; recall is silent. Audit-log entry on submit
+    // already records which template went out, which is sufficient.
+  }, [
+    currentScopeKey,
+    perEaDefaults,
+    displayName,
+    setDisplayName,
+    workload,
+    setWorkload,
+  ]);
+  const recordPerEaDefault = React.useCallback(
+    (args: {
+      sourceTenantId: string;
+      billingAccountName: string;
+      enrollmentAccountName: string;
+      customScopeMode: boolean;
+      displayNameTemplate: string;
+      workload: "Production" | "DevTest";
+    }) => {
+      const key = perEaDefaultsKey(args);
+      setPerEaDefaults((prev) => ({
+        ...prev,
+        [key]: {
+          displayNameTemplate: args.displayNameTemplate,
+          workload: args.workload,
+          lastUsedAt: new Date().toISOString(),
+        },
+      }));
+    },
+    [setPerEaDefaults],
+  );
+
   /**
    * Submission is allowed when:
    *   - For EA: billing + enrollment + valid scope
@@ -1087,6 +1407,77 @@ export const EaSubQuickPage: React.FC<EaSubQuickPageProps> = ({
     displayName.trim().length <= 64 &&
     !!aliasName &&
     crossTenantValid;
+
+  /**
+   * Risk classification — corpus-grounded summary of "what is the operator
+   * actually about to do here". Drives the in-flow warning Alert(s), the
+   * confirm-dialog risk band, and the audit-trail dry-run preview.
+   * Cited inline at each consumer; the helper itself cites the master
+   * cross-tenant playbook.
+   */
+  const risk = React.useMemo(
+    () =>
+      classifySubmissionRisk({
+        crossTenantRequested,
+        crossTenantValid,
+        preGrantRole,
+        workload,
+      }),
+    [crossTenantRequested, crossTenantValid, preGrantRole, workload],
+  );
+
+  /**
+   * Tenant boundary detection. When `subscriptionTenantId` is set AND it
+   * doesn't match the source account's tenant claim, the new subscription
+   * will land in a DIFFERENT tenant than the operator is signed in to.
+   * That's a billed-here / owned-there split that's only visible to the
+   * operator on the SOURCE tenant's billing UI — the destination tenant
+   * sees the new sub appear in their directory with a Reader RBAC default
+   * inherited from the assigned subscriptionOwnerId. See
+   * `C:\Users\baimgprodsesa1\Desktop\New folder\_ea_subscription_cross_tenant.md`
+   * §7 step 6 ("New subscription appears in Tenant B") + §1.2 (the
+   * Microsoft Billing SPN's `SubscriptionMigrator` role that authorizes
+   * this move).
+   */
+  const crossesTenantBoundary = React.useMemo(() => {
+    const desiredTid = subscriptionTenantId.trim().toLowerCase();
+    const sourceTid = (account?.tenantId ?? "").toLowerCase();
+    if (!desiredTid || !sourceTid) return false;
+    if (!UUID_RE.test(desiredTid)) return false;
+    return desiredTid !== sourceTid;
+  }, [subscriptionTenantId, account?.tenantId]);
+
+  /**
+   * Sanitized JSON body preview. Identical envelope to what
+   * `createEaSubscription` will PUT, minus any token material. Memoized
+   * on the same inputs as the curl snippet so the two never drift.
+   */
+  const jsonBodyPreview = React.useMemo(
+    () =>
+      billingScope
+        ? buildJsonBodyPreview({
+            displayName: applyDisplayNameTokens(displayName.trim(), {
+              counter,
+              username: account?.username,
+            }),
+            billingScope,
+            workload,
+            subscriptionTenantId: subscriptionTenantId.trim() || undefined,
+            subscriptionOwnerId: subscriptionOwnerId.trim() || undefined,
+            tags: tagsForBody,
+          })
+        : "",
+    [
+      billingScope,
+      displayName,
+      counter,
+      account?.username,
+      workload,
+      subscriptionTenantId,
+      subscriptionOwnerId,
+      tagsForBody,
+    ],
+  );
 
   /**
    * Preflight checklist — five fast-path checks the page can evaluate WITHOUT
@@ -1368,6 +1759,58 @@ export const EaSubQuickPage: React.FC<EaSubQuickPageProps> = ({
         enrollmentAccountName,
         customScopeMode,
       });
+      // Per-(tenant, EA) defaults. Distinct from the global ring above:
+      // here we record under the source-tenant + scope so the next time
+      // the same combo is selected the form auto-fills. Skipped for
+      // submissions where we can't derive a stable scope key (no account
+      // claim, or a custom scope with empty BA).
+      if (account?.tenantId) {
+        const effectiveBa = customScopeMode
+          ? customBillingAccountName.trim()
+          : billingAccountName;
+        const effectiveEa = customScopeMode
+          ? customEnrollmentAccountName.trim()
+          : enrollmentAccountName;
+        if (effectiveBa) {
+          recordPerEaDefault({
+            sourceTenantId: account.tenantId,
+            billingAccountName: effectiveBa,
+            enrollmentAccountName: effectiveEa,
+            customScopeMode,
+            displayNameTemplate: displayName.trim(),
+            workload,
+          });
+        }
+      }
+      // Capture the FULL form state (including cross-tenant ids + tags) so
+      // the "Re-run with same config" affordance can rehydrate everything,
+      // not just the recipe. Kept in memory only — never persisted to
+      // localStorage because subscriptionOwnerId is operator-identifying.
+      setLastSubmittedSnapshot({
+        displayNameTemplate: displayName.trim(),
+        workload,
+        billingAccountName,
+        enrollmentAccountName,
+        customScopeMode,
+        customBillingAccountName,
+        customEnrollmentAccountName,
+        customFullScope,
+        subscriptionTenantId,
+        subscriptionOwnerId,
+        // Deep-copy tag rows so subsequent add/remove on the live state
+        // can't mutate the snapshot (objects in the array are shared
+        // by reference otherwise — observed during testing).
+        tagPairs: tagPairs.map((p) => ({ key: p.key, value: p.value })),
+        preGrantRole,
+      });
+      // ARIA announcement for screen readers. Mention both the
+      // subscriptionId (when available) and provisioningState so the
+      // operator hears the actual outcome, not just "submitted".
+      setAriaAnnouncement(
+        r.provisioningState === "Succeeded"
+          ? `Subscription ${r.subscriptionId ?? r.aliasName} provisioned successfully.`
+          : `Subscription accepted with state ${r.provisioningState}. Polling continues.`,
+      );
       // Re-roll alias on success so the next submit doesn't 409 on
       // the same name — operators almost always want a fresh one and
       // we already keep the previous in history.
@@ -1433,6 +1876,14 @@ export const EaSubQuickPage: React.FC<EaSubQuickPageProps> = ({
           msg.includes("401"));
       if (isPassthroughToken) setPassthroughToken(true);
       else if (isMissingRole) setMissingRole(true);
+      // ARIA: be terse but specific so the SR user knows which fix to chase.
+      setAriaAnnouncement(
+        isPassthroughToken
+          ? "Subscription create failed: passthrough token. Re-acquire ARM token."
+          : isMissingRole
+            ? "Subscription create failed: missing EA Subscription Creator role."
+            : `Subscription create failed: ${msg}`,
+      );
       auditLog.record({
         actor: account?.username ?? "",
         action: "create_alias_subscription",
@@ -1469,15 +1920,21 @@ export const EaSubQuickPage: React.FC<EaSubQuickPageProps> = ({
     subscriptionTenantId,
     subscriptionOwnerId,
     tagsForBody,
+    tagPairs,
     billingAccountName,
     enrollmentAccountName,
     customScopeMode,
+    customBillingAccountName,
+    customEnrollmentAccountName,
+    customFullScope,
     account?.username,
+    account?.tenantId,
     armTokenClaims,
     preGrantRole,
     store,
     counter,
     recordRecentConfig,
+    recordPerEaDefault,
   ]);
 
   const regenAlias = React.useCallback(() => {
@@ -1529,6 +1986,11 @@ export const EaSubQuickPage: React.FC<EaSubQuickPageProps> = ({
         setCustomScopeMode(true);
         setCustomBillingAccountName(cfg.billingAccountName);
         setCustomEnrollmentAccountName(cfg.enrollmentAccountName);
+        // The persisted RecentConfig doesn't carry customFullScope (we
+        // store only the segment names so the recipe stays portable);
+        // clear it so a stale paste from a prior toggle doesn't override
+        // the BA/EA segments the operator just rehydrated.
+        setCustomFullScope("");
       } else {
         setCustomScopeMode(false);
         if (cfg.billingAccountName) {
@@ -1565,6 +2027,85 @@ export const EaSubQuickPage: React.FC<EaSubQuickPageProps> = ({
       setRecentConfigs((prev) => prev.filter((r) => r.key !== key));
     },
     [setRecentConfigs],
+  );
+
+  /**
+   * "Re-run with same config" — rehydrate the FULL form (including
+   * cross-tenant + tags) from the most-recent successful submit's
+   * in-memory snapshot. Distinct from `handleApplyRecentConfig` which
+   * only rehydrates the persisted recipe. Caller is expected to roll
+   * a fresh alias name (the snapshot's alias is the one that already
+   * shipped — re-using it would 409).
+   */
+  const handleRerunLastConfig = React.useCallback(() => {
+    const snap = lastSubmittedSnapshot;
+    if (!snap) return;
+    setDisplayName(snap.displayNameTemplate);
+    setWorkload(snap.workload);
+    if (snap.customScopeMode) {
+      setCustomScopeMode(true);
+      setCustomBillingAccountName(snap.customBillingAccountName);
+      setCustomEnrollmentAccountName(snap.customEnrollmentAccountName);
+      setCustomFullScope(snap.customFullScope);
+    } else {
+      setCustomScopeMode(false);
+      if (snap.billingAccountName) setBillingAccountName(snap.billingAccountName);
+      if (snap.enrollmentAccountName)
+        setEnrollmentAccountName(snap.enrollmentAccountName);
+    }
+    setSubscriptionTenantId(snap.subscriptionTenantId);
+    setSubscriptionOwnerId(snap.subscriptionOwnerId);
+    // Deep-copy on restore too — pair the deep-copy at capture so the
+    // operator can re-run multiple times and edit tags freely between
+    // re-runs without rewriting the snapshot.
+    setTagPairs(snap.tagPairs.map((p) => ({ key: p.key, value: p.value })));
+    setPreGrantRole(snap.preGrantRole);
+    setAliasName(generateAliasName());
+    // Clear the prior result so the operator sees a clean slate.
+    setResult(null);
+    setSubmitError(null);
+    setMissingRole(false);
+    setPassthroughToken(false);
+    setPreGrantStatus("idle");
+    setPreGrantError(null);
+    setAriaAnnouncement("Form rehydrated from last successful submit.");
+    auditLog.record({
+      actor: account?.username ?? "",
+      action: "rerun_last_config",
+      target: snap.billingAccountName || snap.customBillingAccountName,
+      status: "success",
+      details: {
+        page: "ea-sub-quick",
+        workload: snap.workload,
+        customScopeMode: snap.customScopeMode,
+        crossTenant: !!snap.subscriptionTenantId,
+      },
+    });
+  }, [
+    lastSubmittedSnapshot,
+    account?.username,
+    setBillingAccountName,
+    setEnrollmentAccountName,
+    setDisplayName,
+    setWorkload,
+    setSubscriptionTenantId,
+    setSubscriptionOwnerId,
+  ]);
+
+  // `r` — recall the most-recent successful config. Intentionally NOT
+  // `allowInInputs: true` because plain `r` is a high-collision key
+  // (operator typing into displayName / alias would trigger every time).
+  // Pressing `r` while focus is outside any input swaps the form back
+  // to whatever shipped last. No-op if there's no snapshot yet. Declared
+  // AFTER `handleRerunLastConfig` to avoid block-scoped TDZ binding —
+  // useShortcut's callback closes over the live binding but the linter
+  // and TS strict-mode both flag a pre-declaration reference.
+  useShortcut(
+    "r",
+    () => {
+      if (lastSubmittedSnapshot) handleRerunLastConfig();
+    },
+    { allowInInputs: false, preventDefault: true },
   );
 
   const handleNavigateSubManager = React.useCallback(() => {
@@ -1685,6 +2226,17 @@ export const EaSubQuickPage: React.FC<EaSubQuickPageProps> = ({
 
   return (
     <div className="flex flex-col gap-4 py-2">
+      {/* ARIA live channel — quiet by default, announces create-success
+          and create-failure events for screen-reader operators. Kept
+          off-screen but in the accessibility tree (sr-only). */}
+      <div
+        role="status"
+        aria-live="polite"
+        aria-atomic="true"
+        className="sr-only"
+      >
+        {ariaAnnouncement}
+      </div>
       <div className="flex flex-wrap items-start justify-between gap-2">
         <PageHeader
           title="Create EA Sub (alias API)"
@@ -2529,6 +3081,125 @@ export const EaSubQuickPage: React.FC<EaSubQuickPageProps> = ({
                 </div>
               </details>
 
+              {/* Cross-tenant boundary warning. Surfaces the moment the
+                  operator types a `subscriptionTenantId` that doesn't
+                  match the source account's tenant claim. Two-tone:
+                  - WARNING (yellow) for the bare boundary cross (billing
+                    in source tenant, sub lands in destination tenant) —
+                    the operator may not realize the sub is invisible to
+                    them on the destination tenant's directory until
+                    they sign in there.
+                  - DESTRUCTIVE (red) when paired with pre-grant or
+                    Production workload — matches the
+                    `_bypass_mixed_chains.md` Chain 7 pattern (billed
+                    here, privileged there).
+
+                  Corpus reference:
+                    `C:\Users\baimgprodsesa1\Desktop\New folder\
+                       _ea_subscription_cross_tenant.md` §7 step 6 (sub
+                       appears in destination directory) + §6 (default
+                       roles in delegated-admin pattern). */}
+              {crossesTenantBoundary && (
+                <Alert
+                  variant={risk.privilegedCombo ? "destructive" : "warning"}
+                >
+                  {risk.privilegedCombo ? (
+                    <Skull className="h-3.5 w-3.5" />
+                  ) : (
+                    <Globe className="h-3.5 w-3.5" />
+                  )}
+                  <AlertDescription className="flex flex-col gap-1.5 text-2xs">
+                    <span>
+                      <strong>
+                        {risk.privilegedCombo
+                          ? "High-risk cross-tenant subscription with privileged role grant"
+                          : "Cross-tenant subscription landing"}
+                      </strong>
+                    </span>
+                    <span>
+                      The new subscription will be{" "}
+                      <em>billed in your tenant</em>{" "}
+                      <code className="font-mono">
+                        {account?.tenantId.slice(0, 8) ?? ""}…
+                      </code>{" "}
+                      but <em>owned in destination tenant</em>{" "}
+                      <code className="font-mono">
+                        {subscriptionTenantId.trim().slice(0, 8)}…
+                      </code>
+                      . The audit log row lands on YOUR tenant only — but
+                      the destination tenant's directory immediately sees
+                      a new Microsoft.Resources/subscriptions item with{" "}
+                      <code className="font-mono">
+                        {subscriptionOwnerId.trim().slice(0, 8) || "?"}
+                      </code>{" "}
+                      as Owner.
+                    </span>
+                    {risk.privilegedCombo && (
+                      <span>
+                        <strong>Privileged combination detected.</strong>{" "}
+                        You're pre-granting a billing role on the source
+                        enrollment AND landing the sub in a foreign tenant.
+                        This is the kill-chain step documented in{" "}
+                        <code className="font-mono">
+                          _bypass_mixed_chains.md
+                        </code>{" "}
+                        Chain 7 (cross-tenant subscription drop with
+                        owner grant). Confirm this is an authorized
+                        provisioning step.
+                      </span>
+                    )}
+                    <span className="text-[10px]">
+                      Reference:{" "}
+                      <code className="font-mono">
+                        _ea_subscription_cross_tenant.md §7 step 6
+                      </code>
+                      ; the new sub appears in destination tenant via{" "}
+                      <code className="font-mono">
+                        az account list --query
+                        "[?tenantId=='{subscriptionTenantId.trim().slice(0, 8)}…']"
+                      </code>{" "}
+                      as a signed-in user there.
+                    </span>
+                  </AlertDescription>
+                </Alert>
+              )}
+
+              {/* Inline JSON preview of the upcoming alias-create PUT body.
+                  Read-only, sanitized — token material is never included
+                  (the bearer rides in the Authorization header, not the
+                  body, but we still gate any token-shaped string from
+                  the preview on principle). Lets the operator diff against
+                  the MS docs example before submitting. */}
+              <details
+                className="rounded-md border border-border/60 bg-muted/20 px-2 py-1.5"
+                onToggle={(e) =>
+                  setShowJsonPreview((e.target as HTMLDetailsElement).open)
+                }
+              >
+                <summary className="flex cursor-pointer items-center gap-1.5 text-2xs font-medium uppercase tracking-wide text-muted-foreground">
+                  <Braces className="h-3 w-3" /> Show JSON body preview
+                  <InfoTooltip
+                    variant="help"
+                    ariaLabel="What is the JSON body preview"
+                    content="Pretty-printed copy of the JSON body the alias-create PUT will send. Identical envelope, no token material. Use it to diff against the published Microsoft docs example or the body captured in the audit log."
+                  />
+                </summary>
+                {showJsonPreview && jsonBodyPreview && (
+                  <div className="group/copy mt-2 flex flex-col gap-1.5">
+                    <pre className="max-h-72 overflow-auto rounded bg-background/80 p-2 font-mono text-[10px] leading-relaxed">
+                      {jsonBodyPreview}
+                    </pre>
+                    <div className="flex justify-end">
+                      <CopyButton
+                        value={jsonBodyPreview}
+                        ariaLabel="Copy JSON body preview"
+                        alwaysVisible
+                      />
+                    </div>
+                  </div>
+                )}
+              </details>
+
               {/* Curl-reproduction snippet. Operators routinely want to
                   diff what we're sending against what the docs sample
                   shows, share with another admin, or paste into a
@@ -3018,18 +3689,203 @@ export const EaSubQuickPage: React.FC<EaSubQuickPageProps> = ({
                     </a>
                   </div>
                 )}
+                <div className="flex flex-wrap items-center gap-2">
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="sm"
+                    onClick={() => {
+                      setResult(null);
+                      setAliasName(generateAliasName());
+                    }}
+                  >
+                    <Plus className="h-3.5 w-3.5" /> Create another
+                  </Button>
+                  {lastSubmittedSnapshot && (
+                    <Button
+                      type="button"
+                      variant="outline"
+                      size="sm"
+                      onClick={handleRerunLastConfig}
+                      aria-label="Re-run with same config (press r anywhere)"
+                      title={`Re-run with same config (press "r" anywhere on the page)`}
+                    >
+                      <RotateCcw className="h-3.5 w-3.5" /> Re-run same config
+                      <kbd className="ml-1 hidden rounded border border-border/60 bg-muted/40 px-1 font-mono text-[10px] sm:inline">
+                        r
+                      </kbd>
+                    </Button>
+                  )}
+                </div>
+              </CardContent>
+            </Card>
+          )}
+
+          {/* ----- Post-create attack-surface enumeration -------------
+              Surfaced only after a successful create that produced a
+              subscriptionId. Tells the operator EXACTLY what they've
+              just exposed — the new sub inherits a default Reader
+              visibility for the destination tenant (per
+                `_ea_subscription_cross_tenant.md` §7 step 6:
+                "New subscription appears in Tenant B"),
+              and any tenant-wide Reader / Directory Reader role member
+              in that tenant can now see the resource by ID.
+
+              Two corpus-grounded callouts the operator should know:
+                1. The Owner GUID `subscriptionOwnerId` is the principal
+                   that holds the Owner RBAC on the new sub. Any RBAC
+                   visibility audit of the destination tenant will
+                   show this.
+                2. The source tenant retains the BILLING relationship
+                   only (charge against the EA enrollment account).
+                   No source-tenant principal has RBAC on the new sub
+                   by default — that means a billing-only admin can
+                   create subs they cannot then access. */}
+          {result && result.subscriptionId && showAttackSurface && (
+            <Card className="border-info/30 bg-info/5">
+              <CardHeader className="pb-2 flex flex-row items-start justify-between gap-2">
+                <div>
+                  <CardTitle className="flex items-center gap-2 text-sm">
+                    <ShieldAlert className="h-4 w-4 text-info" />
+                    What this subscription now exposes
+                  </CardTitle>
+                  <CardDescription className="text-2xs">
+                    Read-only summary of the RBAC / visibility surface the
+                    new sub created. Cross-tenant landings expose more
+                    than same-tenant ones — see the destination-tenant
+                    row. Source: corpus{" "}
+                    <code className="font-mono">
+                      _ea_subscription_cross_tenant.md §7 step 6
+                    </code>
+                    .
+                  </CardDescription>
+                </div>
                 <Button
                   type="button"
-                  variant="outline"
+                  variant="ghost"
                   size="sm"
-                  className="self-start"
-                  onClick={() => {
-                    setResult(null);
-                    setAliasName(generateAliasName());
-                  }}
+                  className="h-6 w-6 p-0"
+                  onClick={() => setShowAttackSurface(false)}
+                  aria-label="Dismiss attack-surface card"
+                  title="Dismiss"
                 >
-                  <Plus className="h-3.5 w-3.5" /> Create another
+                  <XCircle className="h-3.5 w-3.5" />
                 </Button>
+              </CardHeader>
+              <CardContent className="flex flex-col gap-2 text-2xs">
+                <div className="flex items-start gap-2">
+                  <Users className="mt-0.5 h-3 w-3 shrink-0 text-info" />
+                  <div className="flex min-w-0 flex-col">
+                    <span className="font-medium text-foreground">
+                      Owner (Owner RBAC, full control)
+                    </span>
+                    <span className="break-all">
+                      {subscriptionOwnerId.trim() ? (
+                        <>
+                          principal{" "}
+                          <code className="font-mono">
+                            {subscriptionOwnerId.trim()}
+                          </code>{" "}
+                          in tenant{" "}
+                          <code className="font-mono">
+                            {subscriptionTenantId.trim() ||
+                              account?.tenantId ||
+                              "(source)"}
+                          </code>
+                        </>
+                      ) : (
+                        <>
+                          calling principal{" "}
+                          <code className="font-mono">
+                            {armTokenClaims?.upn || account?.username || "?"}
+                          </code>{" "}
+                          in source tenant — alias-create makes the caller
+                          the default Owner when no override is set.
+                        </>
+                      )}
+                    </span>
+                  </div>
+                </div>
+                <div className="flex items-start gap-2">
+                  <FileText className="mt-0.5 h-3 w-3 shrink-0 text-info" />
+                  <div className="flex min-w-0 flex-col">
+                    <span className="font-medium text-foreground">
+                      Billing scope (source-tenant audit row)
+                    </span>
+                    <span className="break-all">
+                      Charges flow to{" "}
+                      <code className="font-mono">{billingScope}</code>. Your
+                      source tenant{" "}
+                      <code className="font-mono">
+                        {account?.tenantId || "?"}
+                      </code>{" "}
+                      shows the alias-create event in audit; the destination
+                      does not see WHO ordered the sub, only the resulting
+                      Owner.
+                    </span>
+                  </div>
+                </div>
+                {crossesTenantBoundary && (
+                  <>
+                    <div className="flex items-start gap-2">
+                      <Globe className="mt-0.5 h-3 w-3 shrink-0 text-warning" />
+                      <div className="flex min-w-0 flex-col">
+                        <span className="font-medium text-foreground">
+                          Destination tenant directory now shows this sub
+                        </span>
+                        <span>
+                          Any Reader / Directory Reader / Global Reader in
+                          tenant{" "}
+                          <code className="font-mono">
+                            {subscriptionTenantId.trim()}
+                          </code>{" "}
+                          can enumerate{" "}
+                          <code className="font-mono">
+                            /subscriptions/{result.subscriptionId}
+                          </code>{" "}
+                          via{" "}
+                          <code className="font-mono">
+                            az account list --refresh --query
+                            "[?id=='{result.subscriptionId}']"
+                          </code>
+                          .
+                        </span>
+                      </div>
+                    </div>
+                    <div className="flex items-start gap-2">
+                      <AlertTriangle className="mt-0.5 h-3 w-3 shrink-0 text-warning" />
+                      <div className="flex min-w-0 flex-col">
+                        <span className="font-medium text-foreground">
+                          Source-tenant RBAC: NONE by default
+                        </span>
+                        <span>
+                          You (the billing creator) do not get Owner RBAC
+                          on a sub that landed in a foreign tenant — the
+                          destination Owner does. To regain admin access
+                          from the source tenant later, you'd need a
+                          tenant transfer or a B2B guest invite into the
+                          destination tenant first. See{" "}
+                          <code className="font-mono">
+                            _ea_subscription_cross_tenant.md §2
+                          </code>
+                          .
+                        </span>
+                      </div>
+                    </div>
+                  </>
+                )}
+                <div className="mt-1 flex flex-wrap items-center gap-1.5 text-[10px] text-muted-foreground">
+                  <Badge variant="outline" className="text-[9px]">
+                    informational
+                  </Badge>
+                  <span>
+                    This card is local-only enumeration of what we already
+                    know from the form; it does NOT query the destination
+                    tenant. The audit-log row{" "}
+                    <code className="font-mono">create_alias_subscription</code>{" "}
+                    has the canonical record.
+                  </span>
+                </div>
               </CardContent>
             </Card>
           )}
@@ -3206,6 +4062,101 @@ export const EaSubQuickPage: React.FC<EaSubQuickPageProps> = ({
                 About to PUT one new EA subscription against{" "}
                 <code className="break-all font-mono">{billingScope}</code>.
               </p>
+              {/* Audit-trail dry-run preview. Tells the operator exactly
+                  what's about to land in EACH tenant's audit log — the
+                  source tenant always gets the alias-create row, the
+                  destination tenant (if any) gets a subscription-creation
+                  event keyed on the destination Owner. Corpus reference:
+                    `_ea_subscription_cross_tenant.md §7 step 6` — the new
+                    sub appears in destination tenant's directory and is
+                    enumerable by Reader-grade roles there. */}
+              <div className="rounded-md border border-info/30 bg-info/5 p-2 text-2xs">
+                <div className="mb-1 flex items-center gap-1.5 font-medium uppercase tracking-wide text-info">
+                  <FileText className="h-3 w-3" /> Audit-trail dry-run
+                </div>
+                <ul className="ml-3 flex list-disc flex-col gap-1">
+                  <li>
+                    <strong>Source tenant</strong>{" "}
+                    <code className="font-mono">
+                      {account?.tenantId || "?"}
+                    </code>
+                    : audit log row{" "}
+                    <code className="font-mono">
+                      create_alias_subscription
+                    </code>{" "}
+                    by{" "}
+                    <code className="font-mono">
+                      {armTokenClaims?.upn || account?.username || "?"}
+                    </code>{" "}
+                    against{" "}
+                    <code className="font-mono">
+                      Microsoft.Subscription/aliases/{aliasName}
+                    </code>
+                    .
+                  </li>
+                  {preGrantRole && (
+                    <li>
+                      <strong>Source tenant</strong> (billing): audit log row{" "}
+                      <code className="font-mono">
+                        create_billing_role_assignment
+                      </code>{" "}
+                      pre-grants{" "}
+                      <code className="font-mono">EA Subscription Creator</code>{" "}
+                      at{" "}
+                      <code className="font-mono">
+                        {billingAccountName}/{enrollmentAccountName}
+                      </code>{" "}
+                      to{" "}
+                      <code className="font-mono">
+                        {armTokenClaims?.oid?.slice(0, 8) || "?"}…
+                      </code>
+                      .
+                    </li>
+                  )}
+                  {crossesTenantBoundary && (
+                    <li>
+                      <strong>Destination tenant</strong>{" "}
+                      <code className="font-mono">
+                        {subscriptionTenantId.trim()}
+                      </code>
+                      : a new{" "}
+                      <code className="font-mono">
+                        Microsoft.Resources/subscriptions
+                      </code>{" "}
+                      item appears in its directory; principal{" "}
+                      <code className="font-mono">
+                        {subscriptionOwnerId.trim()}
+                      </code>{" "}
+                      receives Owner RBAC. Source-tenant identity is{" "}
+                      <em>not</em> recorded on the destination side — only
+                      the resulting Owner is.
+                    </li>
+                  )}
+                  {!crossesTenantBoundary && (
+                    <li>
+                      <strong>Destination tenant</strong>: same as source
+                      (subscription lands in your home directory).
+                    </li>
+                  )}
+                </ul>
+              </div>
+              {risk.privilegedCombo && (
+                <div className="flex items-start gap-2 rounded-md border border-destructive/40 bg-destructive/10 p-2 text-2xs">
+                  <Skull className="mt-0.5 h-3.5 w-3.5 shrink-0 text-destructive" />
+                  <div>
+                    <strong className="text-destructive">
+                      High-risk combination
+                    </strong>
+                    : cross-tenant landing + billing-role pre-grant.
+                    Matches{" "}
+                    <code className="font-mono">
+                      _bypass_mixed_chains.md
+                    </code>{" "}
+                    Chain 7. Confirm this is authorized provisioning, not
+                    silent privilege transfer.
+                  </div>
+                </div>
+              )}
               <ul className="ml-4 flex list-disc flex-col gap-0.5">
                 <li>
                   Alias name: <code className="font-mono">{aliasName}</code>

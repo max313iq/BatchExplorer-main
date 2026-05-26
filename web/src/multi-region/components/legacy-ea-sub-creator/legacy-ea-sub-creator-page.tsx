@@ -35,18 +35,22 @@ import {
   Crown,
   Eraser,
   ExternalLink,
+  Eye,
   History,
   Info,
+  Keyboard,
   Loader2,
   Plus,
   RefreshCw,
   RotateCcw,
   Save,
+  Shield,
   Sparkles,
   Terminal,
   Trash2,
   User,
   XCircle,
+  Zap,
 } from "lucide-react";
 
 import { Alert, AlertDescription } from "@/components/ui/alert";
@@ -332,6 +336,118 @@ function buildAzRestCommand(
   // PowerShell / bash without escaping headaches.
   const json = JSON.stringify(payload);
   return `az rest --method POST --uri "${url}" --headers "Content-Type=application/json" --body '${json}'`;
+}
+
+/**
+ * Build a raw `curl` command mirroring the create call. Useful for ops
+ * environments that don't have the az CLI installed (or for capturing
+ * the legitimate flow for replay, as the cross-tenant playbook §5.1
+ * recommends — see `_ea_subscription_cross_tenant.md`). The token is
+ * intentionally rendered as `$ARM_TOKEN` so we never leak a live bearer
+ * into a clipboard / screenshot; operators substitute it at run time.
+ */
+function buildCurlCommand(
+  enrollmentAccountId: string,
+  body: { displayName?: string; offerType: string; owners?: string[] },
+): string {
+  const url =
+    `https://management.azure.com/providers/Microsoft.Billing/enrollmentAccounts/` +
+    `${enrollmentAccountId}/providers/Microsoft.Subscription/createSubscription` +
+    `?api-version=2018-03-01-preview`;
+  const payload: Record<string, unknown> = { offerType: body.offerType };
+  if (body.displayName?.trim()) payload.displayName = body.displayName.trim();
+  if (body.owners && body.owners.length > 0) {
+    payload.owners = body.owners.map((o) => ({ objectId: o }));
+  }
+  const json = JSON.stringify(payload);
+  return (
+    `curl -sS -X POST "${url}" ` +
+    `-H "Authorization: Bearer $ARM_TOKEN" ` +
+    `-H "Content-Type: application/json" ` +
+    `-d '${json}'`
+  );
+}
+
+/**
+ * Map a legacy EA offer type onto the modern alias-API `workload` field.
+ * The 2018-03-01-preview endpoint encodes Production/DevTest implicitly
+ * in the offer code; the 2021-10-01 alias API exposes it as an explicit
+ * `workload` enum. Cf. `_ea_subscription_cross_tenant.md` §4 — the
+ * "Field-by-field origin" table treats workload as a Tenant-A-side
+ * billing-scope decision, which is preserved here.
+ */
+function offerTypeToWorkload(
+  offer: "MS-AZR-0017P" | "MS-AZR-0148P",
+): "Production" | "DevTest" {
+  return offer === "MS-AZR-0148P" ? "DevTest" : "Production";
+}
+
+/**
+ * Operator-anomaly classifier. The corpus playbook
+ * `_ea_subscription_cross_tenant.md` (legacy-vs-modern, §§ summary +
+ * `BillingAccountReadFailed` row of §8) explains that every EA
+ * enrollment registered after ~2022 lacks a commerce-account record under
+ * the legacy namespace. Repeated successful or even attempted submissions
+ * against this page therefore fall into one of two patterns:
+ *
+ *  (a) A pinned legacy automation that has a specific reason to target
+ *      the 2018-03-01-preview shape (rare, but legitimate).
+ *  (b) Reconnaissance / stealth-persistence: an operator deliberately
+ *      using a deprecated path either because it logs less verbosely
+ *      than the modern one, or because their tooling pre-dates the
+ *      alias API and they haven't migrated.
+ *
+ * We don't claim certainty either way; we surface a banner so a human can
+ * review. The thresholds are intentionally permissive (>=3 legacy
+ * submissions in-session, OR the operator hit "Commerce Account Is Null"
+ * once and continued submitting anyway) so noise stays low.
+ *
+ * @param entries  the in-memory session history for this page
+ * @returns        anomaly flags + reasoning to render
+ */
+function classifyOperatorPattern(entries: SessionEntry[]): {
+  anomalous: boolean;
+  reasons: string[];
+  legacyCount: number;
+  cainAfterCount: number;
+} {
+  const legacyCount = entries.length;
+  let cainAfterCount = 0;
+  let sawCain = false;
+  for (const e of entries) {
+    if (sawCain) cainAfterCount++;
+    if (
+      e.outcome === "failure" &&
+      e.error &&
+      /commerce account is null/i.test(e.error)
+    ) {
+      sawCain = true;
+    }
+  }
+  const reasons: string[] = [];
+  if (legacyCount >= 3) {
+    reasons.push(
+      `${legacyCount} legacy submissions this session — the modern alias ` +
+        `API supports the same EA scope plus cross-tenant landing and ` +
+        `dev/test workload. Repeated legacy use without a pinned-runbook ` +
+        `reason is unusual.`,
+    );
+  }
+  if (cainAfterCount > 0) {
+    reasons.push(
+      `Continued submitting after a "Commerce Account Is Null" response ` +
+        `(the deprecation signal for newer EA enrollments). ` +
+        `${cainAfterCount} subsequent attempt${
+          cainAfterCount === 1 ? "" : "s"
+        } recorded.`,
+    );
+  }
+  return {
+    anomalous: reasons.length > 0,
+    reasons,
+    legacyCount,
+    cainAfterCount,
+  };
 }
 
 /** Suggest a timestamp-suffixed display name when the field is empty. */
@@ -870,6 +986,24 @@ export const LegacyEaSubCreatorPage: React.FC = () => {
       offerType,
       owners: owners.slice(),
     };
+    // Audit enrichment — these stay on every submission (success or fail)
+    // so an incident reviewer can reconstruct the exact context the call
+    // was made in. Per CLAUDE.md "audit payload enhancement" and the
+    // corpus reasoning that legacy use itself is a defender-visible
+    // signal worth recording (`_ea_subscription_cross_tenant.md`).
+    const submissionStartedAt = Date.now();
+    const auditContext = {
+      apiVersion: "2018-03-01-preview",
+      manualMode,
+      draftRestored: isDraftMeaningful(draftOnMountRef.current),
+      deprecationAcknowledged: deprecationAck,
+      submitInvocation: mySubmitId,
+      // Window origin so cross-tab session-correlation is possible when
+      // the audit log is exported and merged with other operator-touch
+      // events from other tabs.
+      windowOriginHost:
+        typeof window !== "undefined" ? window.location?.host ?? "" : "",
+    };
     try {
       const r = await createLegacyEaSubscription(
         snapshot.enrollmentAccountId,
@@ -888,12 +1022,15 @@ export const LegacyEaSubCreatorPage: React.FC = () => {
         target: snapshot.displayName,
         status: "success",
         details: {
+          ...auditContext,
           enrollmentAccountObjectId: snapshot.enrollmentAccountId,
           enrollmentAccountOwner: snapshot.enrollmentAccountOwner,
           offerType: snapshot.offerType,
+          workloadEquivalent: offerTypeToWorkload(snapshot.offerType),
           ownerCount: snapshot.owners.length,
           subscriptionId: r.subscriptionId,
           httpStatus: r.status,
+          submissionLatencyMs: Date.now() - submissionStartedAt,
         },
       });
       setSessionHistory((prev) => [
@@ -929,9 +1066,16 @@ export const LegacyEaSubCreatorPage: React.FC = () => {
         status: "failure",
         error: msg,
         details: {
+          ...auditContext,
           enrollmentAccountObjectId: snapshot.enrollmentAccountId,
+          enrollmentAccountOwner: snapshot.enrollmentAccountOwner,
           offerType: snapshot.offerType,
+          workloadEquivalent: offerTypeToWorkload(snapshot.offerType),
           ownerCount: snapshot.owners.length,
+          submissionLatencyMs: Date.now() - submissionStartedAt,
+          // Pre-classify the error so log-analytics queries can group
+          // CAIN / 403 / 429 patterns without re-parsing the raw msg.
+          errorClassification: classifyError(msg),
         },
       });
       setSessionHistory((prev) => [
@@ -1021,9 +1165,82 @@ export const LegacyEaSubCreatorPage: React.FC = () => {
     } catch {
       /* sessionStorage unavailable — non-fatal */
     }
+    // Context-preserving redirect: forward the in-progress draft into the
+    // modern page's URL-state keys (name / wl / so) so the operator
+    // doesn't re-type the displayName + workload + first owner. The
+    // modern page hydrates from `useUrlState({ name, wl, st, so })` —
+    // see ea-sub-quick-page.tsx:940.
+    //
+    // We deliberately do NOT pass `st` (subscriptionTenantId) — the legacy
+    // page has no notion of a target tenant; in the cross-tenant playbook
+    // this is exactly the Tenant-B GUID the operator must pick on the
+    // modern page anyway (`_ea_subscription_cross_tenant.md` §4 "Field-by-
+    // field origin"). Passing a blind value would be misleading.
+    const params = new URLSearchParams();
+    const trimmedName = draft.displayName.trim();
+    if (trimmedName) params.set("name", trimmedName);
+    params.set("wl", offerTypeToWorkload(draft.offerType));
+    if (draft.owners.length > 0 && draft.owners[0]) {
+      params.set("so", draft.owners[0]);
+    }
+    const qs = params.toString();
+    // Audit the navigation so an incident reviewer can replay the chain
+    // (legacy → modern after CAIN, or operator-initiated migration).
+    try {
+      auditLog.record({
+        actor: account?.username ?? "",
+        action: "legacy_to_modern_redirect",
+        target: selectedEa?.name ?? "(none)",
+        status: "success",
+        details: {
+          fromPage: "legacy-ea-sub-creator",
+          toPage: "ea-sub-quick",
+          carriedDisplayName: !!trimmedName,
+          workload: offerTypeToWorkload(draft.offerType),
+          ownerCount: draft.owners.length,
+          // If we have a known CAIN-after pattern in this session,
+          // tag the redirect so SOC dashboards can correlate
+          // recovery flows. Cheap to compute since session history
+          // is in-state.
+          cainTriggered: errorClass.deprecated,
+        },
+      });
+    } catch {
+      /* audit logger is best-effort */
+    }
     // COORDINATOR: path-based nav via outlet context (NOT useNavigate).
-    navigateToPage("/ea-sub-quick");
-  }, [account?.homeAccountId, selectedEa, navigateToPage]);
+    navigateToPage(qs ? `/ea-sub-quick?${qs}` : "/ea-sub-quick");
+  }, [
+    account?.homeAccountId,
+    account?.username,
+    selectedEa,
+    draft.displayName,
+    draft.offerType,
+    draft.owners,
+    errorClass.deprecated,
+    navigateToPage,
+  ]);
+
+  // Ctrl+M / Cmd+M — jump to the modern flow with current state. Mirrors
+  // the deprecation banner button; saves a click for ops who live on the
+  // keyboard. We only register the listener when the page is mounted, and
+  // we skip while focus is inside an editable element so the shortcut
+  // doesn't fire mid-typing in case a textarea ever lands here.
+  React.useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (!(e.ctrlKey || e.metaKey)) return;
+      if (e.key !== "m" && e.key !== "M") return;
+      // Skip when focus is in a contentEditable region (we tolerate
+      // typing in <input> / <select> because legacy-page operators
+      // routinely want the shortcut mid-fill).
+      const t = e.target as HTMLElement | null;
+      if (t && t.isContentEditable) return;
+      e.preventDefault();
+      jumpToModernPage();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [jumpToModernPage]);
 
   /**
    * CAIN auto-pivot countdown. When the legacy endpoint returns
@@ -1078,6 +1295,29 @@ export const LegacyEaSubCreatorPage: React.FC = () => {
       owners,
     });
   }, [selectedEa, displayNameTrimmed, offerType, owners]);
+
+  // Raw cURL — for environments without the az CLI, and for replay-
+  // capture flows (`_ea_subscription_cross_tenant.md` §5.1) where the
+  // operator wants to paste an exact reproducible call into a runbook.
+  // The bearer is rendered as `$ARM_TOKEN`; we never embed the live
+  // token in clipboard contents.
+  const curlCommandPreview = React.useMemo(() => {
+    if (!selectedEa) return "";
+    return buildCurlCommand(selectedEa.name, {
+      displayName: displayNameTrimmed,
+      offerType,
+      owners,
+    });
+  }, [selectedEa, displayNameTrimmed, offerType, owners]);
+
+  // Operator-anomaly classification — see `classifyOperatorPattern` for
+  // the corpus-grounded rationale. Cheap to recompute on every history
+  // change; memoize anyway so downstream effects don't re-fire on
+  // unrelated re-renders.
+  const operatorAnomaly = React.useMemo(
+    () => classifyOperatorPattern(sessionHistory),
+    [sessionHistory],
+  );
 
   // JSON payload preview (kept identical to what the service layer
   // POSTs). Renders inside the confirmation dialog and a collapsible
@@ -1207,9 +1447,13 @@ export const LegacyEaSubCreatorPage: React.FC = () => {
       {/* Strong, persistent deprecation banner pointing at the modern
           alias-API page. Renders ABOVE the form so operators see it
           before any keystrokes. The acknowledgement checkbox is what
-          actually gates the submit button below. */}
-      <Alert variant="warning">
-        <AlertTriangle className="h-3.5 w-3.5" />
+          actually gates the submit button below.
+          role="region" + aria-label for screen readers so the
+          deprecation context is announced separately from the page
+          title. NOT role="alert" — that would re-announce on every
+          dependency tick; this is persistent context, not breaking news. */}
+      <Alert variant="warning" role="region" aria-label="API deprecation notice">
+        <AlertTriangle className="h-3.5 w-3.5" aria-hidden />
         <AlertDescription className="flex flex-col gap-2 text-2xs">
           <span>
             <strong>Deprecated path.</strong> The 2018-03-01-preview
@@ -1231,10 +1475,17 @@ export const LegacyEaSubCreatorPage: React.FC = () => {
               variant="default"
               className="h-7 text-2xs"
               onClick={jumpToModernPage}
-              aria-label="Open the modern EA Sub Quick page (alias API)"
+              aria-label="Open the modern EA Sub Quick page (alias API) and carry over the current draft"
+              title="Carries your current display name, workload (Production/DevTest), and first owner. Hotkey: Ctrl+M / Cmd+M."
             >
-              <BadgeCheck className="h-3.5 w-3.5" /> Open EA Sub Quick
+              <BadgeCheck className="h-3.5 w-3.5" aria-hidden /> Open EA Sub Quick
               (modern)
+              <span
+                className="ml-1 rounded border border-current/30 bg-background/40 px-1 text-[10px] opacity-80"
+                aria-hidden
+              >
+                Ctrl+M
+              </span>
             </Button>
             <InfoTooltip
               ariaLabel="Difference between legacy and modern alias API"
@@ -1319,6 +1570,79 @@ export const LegacyEaSubCreatorPage: React.FC = () => {
           </span>
         </AlertDescription>
       </Alert>
+
+      {/* Operator-pattern anomaly banner. Surfaces ONLY when the
+          in-session legacy-flow usage pattern matches one of the
+          heuristics in `classifyOperatorPattern` — repeated legacy
+          submissions OR submissions continuing after a Commerce-
+          Account-Is-Null response. The corpus reference
+          `_ea_subscription_cross_tenant.md` (legacy-vs-modern,
+          §BillingAccountReadFailed) explains why these patterns are
+          worth a human review: every post-2022 EA enrollment lacks a
+          commerce-account record under the legacy namespace, so
+          insistent legacy use without a pinned-runbook reason is
+          either (a) an old automation, or (b) a defender-visible
+          anomaly worth investigating.
+
+          role="alert" so screen readers DO announce this — unlike the
+          persistent deprecation context above, this is a state change
+          that warrants attention. aria-live="assertive" because the
+          banner only appears AFTER several submits, so by the time it
+          shows the operator is mid-task and should pause. */}
+      {operatorAnomaly.anomalous && (
+        <Alert
+          variant="warning"
+          role="alert"
+          aria-live="assertive"
+          aria-label="Operator pattern anomaly"
+        >
+          <Shield className="h-3.5 w-3.5" aria-hidden />
+          <AlertDescription className="flex flex-col gap-1.5 text-2xs">
+            <span>
+              <strong>Operator pattern anomaly.</strong> This page wraps a
+              deprecated API; in-session usage pattern is worth reviewing
+              before continuing.
+            </span>
+            <ul className="ml-4 list-disc">
+              {operatorAnomaly.reasons.map((r, i) => (
+                <li key={i}>{r}</li>
+              ))}
+            </ul>
+            <span className="opacity-80">
+              Reference:{" "}
+              <code className="font-mono">
+                _ea_subscription_cross_tenant.md
+              </code>{" "}
+              — newer EA enrollments lack a commerce-account record under
+              the legacy 2018-03-01-preview namespace, so repeated legacy
+              use is either pinned-runbook automation or a defender-visible
+              signal worth a second look.
+            </span>
+            <div className="flex flex-wrap items-center gap-2 pt-1">
+              <Button
+                type="button"
+                size="sm"
+                variant="default"
+                className="h-7 text-2xs"
+                onClick={jumpToModernPage}
+                aria-label="Switch to the modern EA Sub Quick flow"
+              >
+                <Zap className="h-3.5 w-3.5" aria-hidden /> Switch to modern
+                flow now
+              </Button>
+              <span
+                className="inline-flex items-center gap-1 text-2xs text-muted-foreground"
+                aria-hidden
+              >
+                <Keyboard className="h-3 w-3" /> Ctrl+M
+              </span>
+              <span className="ml-auto text-2xs text-muted-foreground">
+                Logged to audit trail.
+              </span>
+            </div>
+          </AlertDescription>
+        </Alert>
+      )}
 
       {/* Draft-restored banner — only renders when a meaningful draft was
           loaded from localStorage on mount and the operator hasn't yet
@@ -1902,7 +2226,12 @@ export const LegacyEaSubCreatorPage: React.FC = () => {
                       etc.).
                     </span>
                     {autoPivotSec !== null && (
-                      <span className="rounded-md border border-warning/40 bg-warning/15 px-2 py-1 text-2xs text-warning-foreground">
+                      <span
+                        className="rounded-md border border-warning/40 bg-warning/15 px-2 py-1 text-2xs text-warning-foreground"
+                        role="status"
+                        aria-live="polite"
+                        aria-atomic="true"
+                      >
                         Auto-pivoting to EA Sub Quick in{" "}
                         <strong>{autoPivotSec}s</strong>… Press
                         <em> Stay here</em> to keep this page open (e.g.
@@ -2226,6 +2555,34 @@ export const LegacyEaSubCreatorPage: React.FC = () => {
                   identity that has Owner on the enrollment account.
                 </p>
               </div>
+              <div className="flex flex-col gap-1">
+                <Label className="text-2xs uppercase tracking-wider text-muted-foreground">
+                  Raw cURL (no az CLI required)
+                </Label>
+                <div className="group/copy relative">
+                  <pre className="max-h-32 overflow-auto rounded-md bg-muted/40 p-2 font-mono text-2xs">
+                    {curlCommandPreview}
+                  </pre>
+                  <span className="absolute right-1 top-1">
+                    <CopyButton
+                      value={curlCommandPreview}
+                      alwaysVisible
+                      ariaLabel="Copy raw cURL command"
+                    />
+                  </span>
+                </div>
+                <p className="text-2xs text-muted-foreground">
+                  Token placeholder rendered as{" "}
+                  <code className="font-mono">$ARM_TOKEN</code> — substitute
+                  a live bearer at runtime (e.g.{" "}
+                  <code className="font-mono">
+                    ARM_TOKEN=$(az account get-access-token --query
+                    accessToken -o tsv)
+                  </code>
+                  ). Matches the replay-capture pattern described in the
+                  cross-tenant playbook.
+                </p>
+              </div>
             </div>
           </details>
 
@@ -2420,11 +2777,37 @@ export const LegacyEaSubCreatorPage: React.FC = () => {
             <CardTitle className="flex items-center gap-2 text-sm">
               <History className="h-4 w-4 text-primary" />
               Recent submissions ({sessionHistory.length})
+              {operatorAnomaly.anomalous && (
+                <Badge
+                  variant="warning"
+                  className="ml-2 gap-1 text-2xs"
+                  title="Operator-pattern anomaly detected — see banner above"
+                >
+                  <Eye className="h-3 w-3" aria-hidden /> review
+                </Badge>
+              )}
             </CardTitle>
-            <CardDescription className="text-2xs">
-              Session-scoped — full list survives navigation within this
-              tab but is wiped by a full reload. Export above for a
-              permanent record.
+            <CardDescription className="flex flex-col gap-1 text-2xs">
+              <span>
+                Session-scoped — full list survives navigation within
+                this tab but is wiped by a full reload. Export above for
+                a permanent record.
+              </span>
+              <span className="text-muted-foreground">
+                Operator:{" "}
+                <code className="font-mono">
+                  {account?.username ?? "(unknown)"}
+                </code>{" "}
+                · {successCount} succeeded, {failureCount} failed
+                {operatorAnomaly.cainAfterCount > 0 && (
+                  <>
+                    {" · "}
+                    <span className="text-warning">
+                      {operatorAnomaly.cainAfterCount} after CAIN
+                    </span>
+                  </>
+                )}
+              </span>
             </CardDescription>
           </CardHeader>
           <CardContent className="flex flex-col gap-1.5">

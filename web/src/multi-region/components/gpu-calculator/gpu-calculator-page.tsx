@@ -14,8 +14,14 @@
  *     clipboard.
  *   - RECOMMENDATION card highlights the cheapest VM that hits a target
  *     speed and the cheapest VM-per-GPU-count combo.
- *   - Side-by-side compare now shows DELTAS (Δ speed, Δ $, Δ %) between A
- *     and B.
+ *   - Side-by-side compare supports up to THREE scenarios (A/B/C) with
+ *     DELTAS (Δ speed, Δ $, Δ %) measured against scenario A.
+ *   - HOTKEYS: `c` copies the formatted summary, `s` saves scenario A,
+ *     `1` enables 1-way (A only), `2` adds B, `3` adds C. The shortcuts
+ *     ignore key presses fired from inside an input / select / textarea so
+ *     typing a count of "2" never trips the compare hotkey.
+ *   - JSON IMPORT: paste a previously-exported scenario list back into the
+ *     saved-scenarios dropdown to round-trip via clipboard.
  *   - Cost breakdown panel exposes the FORMULA used so the number is
  *     auditable.
  *   - InfoTooltips on every non-obvious metric, plus a "What is Mnos/s?"
@@ -37,15 +43,19 @@ import {
   BookmarkPlus,
   Calculator,
   Check,
+  ClipboardPaste,
   Cpu,
   Eye,
   EyeOff,
   Gauge,
   Globe,
+  Keyboard,
   Library,
   Link as LinkIcon,
+  Plus,
   RotateCcw,
   Server,
+  ShieldAlert,
   Star,
   Target,
   Trash2,
@@ -88,6 +98,7 @@ import {
 import { cn, formatNumber, pluralize } from "@/lib/utils";
 
 import { usePersistedState } from "../../hooks/use-persisted-state";
+import { useShortcut } from "../../hooks/use-shortcut";
 import { useUrlState } from "../../hooks/use-url-state";
 import { useMultiRegionState } from "../../store/store-context";
 import { PoolInfo } from "../../store/store-types";
@@ -145,6 +156,29 @@ const SECTIONS_PREF_KEY = "azbm:gpu-calculator:sections:v1";
 // Types
 // ---------------------------------------------------------------------------
 type ScenarioPriority = "dedicated" | "lowpriority";
+
+/**
+ * URL-encoded compare mode.
+ *  - "off" — only Scenario A is rendered.
+ *  - "ab"  — A + B side by side. Legacy URLs using compare=1 normalise here.
+ *  - "abc" — A + B + C side by side.
+ */
+type CompareMode = "off" | "ab" | "abc";
+
+type ScenarioSlot = "a" | "b" | "c";
+
+const COMPARE_SLOTS: Record<CompareMode, ScenarioSlot[]> = {
+  off: ["a"],
+  ab: ["a", "b"],
+  abc: ["a", "b", "c"],
+};
+
+function parseCompareMode(raw: string): CompareMode {
+  if (raw === "abc") return "abc";
+  // Legacy form (compare=1) and the canonical "ab" both mean 2-way compare.
+  if (raw === "ab" || raw === "1") return "ab";
+  return "off";
+}
 
 interface ScenarioState {
   gpu: string;
@@ -647,6 +681,8 @@ StatCard.displayName = "StatCard";
 // Scenario form + result card (used for both A and B scenarios)
 // ---------------------------------------------------------------------------
 
+type ScenarioTone = "primary" | "info" | "success";
+
 interface ScenarioFormProps {
   label: string;
   scenario: Scenario;
@@ -654,9 +690,13 @@ interface ScenarioFormProps {
   gpuOptions: string[];
   onChange: (patch: Partial<ScenarioState>) => void;
   onRemove?: () => void;
-  tone: "primary" | "info";
+  tone: ScenarioTone;
   /** Optional comparison source for delta annotations next to each metric. */
   compareTo?: ScenarioResult;
+  /** Marks the form as the currently-focused scenario (1/2/3 hotkey target). */
+  focused?: boolean;
+  /** Optional DOM id on the wrapping card — used by hotkey focus(). */
+  cardId?: string;
 }
 
 // Number-input debounce in ms. Long enough that typing "10000" doesn't
@@ -742,14 +782,22 @@ const DebouncedNumberInput: React.FC<DebouncedNumberInputProps> = ({
   );
 };
 
-const SCENARIO_TONE_BORDER: Record<ScenarioFormProps["tone"], string> = {
+const SCENARIO_TONE_BORDER: Record<ScenarioTone, string> = {
   primary: "border-t-4 border-t-primary",
   info: "border-t-4 border-t-info",
+  success: "border-t-4 border-t-success",
 };
 
-const SCENARIO_TONE_TEXT: Record<ScenarioFormProps["tone"], string> = {
+const SCENARIO_TONE_TEXT: Record<ScenarioTone, string> = {
   primary: "text-primary",
   info: "text-info",
+  success: "text-success",
+};
+
+const SCENARIO_TONE_FOCUS_RING: Record<ScenarioTone, string> = {
+  primary: "ring-2 ring-primary/40",
+  info: "ring-2 ring-info/40",
+  success: "ring-2 ring-success/40",
 };
 
 const ScenarioForm: React.FC<ScenarioFormProps> = ({
@@ -761,6 +809,8 @@ const ScenarioForm: React.FC<ScenarioFormProps> = ({
   onRemove,
   tone,
   compareTo,
+  focused,
+  cardId,
 }) => {
   const idPrefix = `scenario-${label.toLowerCase()}`;
   const regionWarn =
@@ -769,9 +819,13 @@ const ScenarioForm: React.FC<ScenarioFormProps> = ({
       : null;
   return (
     <Card
+      id={cardId}
+      data-scenario-slot={label.toLowerCase()}
+      tabIndex={-1}
       className={cn(
-        "flex-1 border-border bg-card shadow-sm transition-all duration-200 ease-out hover:shadow-md motion-reduce:transition-none",
+        "flex-1 scroll-mt-4 border-border bg-card shadow-sm transition-all duration-200 ease-out hover:shadow-md focus-visible:outline-none motion-reduce:transition-none",
         SCENARIO_TONE_BORDER[tone],
+        focused && SCENARIO_TONE_FOCUS_RING[tone],
       )}
     >
       <CardHeader className="flex flex-row items-center justify-between gap-2 space-y-0 px-4 py-3">
@@ -802,8 +856,34 @@ const ScenarioForm: React.FC<ScenarioFormProps> = ({
       <CardContent className="flex flex-col gap-3 pt-0">
         <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-5">
           <div className="flex flex-col gap-1">
-            <Label htmlFor={`${idPrefix}-gpu`} className="text-xs">
+            <Label
+              htmlFor={`${idPrefix}-gpu`}
+              className="flex items-center gap-1 text-xs"
+            >
               GPU type
+              <InfoTooltip
+                ariaLabel="GPU type — security note"
+                variant="help"
+                size={11}
+                content={
+                  <span className="block max-w-[260px] text-left">
+                    <span className="inline-flex items-center gap-1 font-semibold text-warning">
+                      <ShieldAlert className="h-3 w-3" aria-hidden />
+                      High-value compute target
+                    </span>
+                    <span className="mt-1 block text-2xs leading-relaxed">
+                      H100 / V100 nodes are routinely targeted for crypto
+                      mining and unattributed model inference. Lock down
+                      egress, deny outbound to public model registries from
+                      pool subnets, and watch IMDS (169.254.169.254) for
+                      token-theft signatures.
+                    </span>
+                    <span className="mt-1 block text-2xs italic text-muted-foreground">
+                      Ref: New folder/_analysis_netspi.md §I (IMDS variants)
+                    </span>
+                  </span>
+                }
+              />
             </Label>
             <Select
               value={scenario.gpu}
@@ -1864,11 +1944,27 @@ const GpuCalculatorPageInner: React.FC = () => {
     "b.region": DEFAULT_REGION,
     "b.hours": String(DEFAULT_HOURS),
     "b.priority": DEFAULT_PRIORITY,
+    "c.gpu": "",
+    "c.count": String(DEFAULT_COUNT),
+    "c.region": DEFAULT_REGION,
+    "c.hours": String(DEFAULT_HOURS),
+    "c.priority": DEFAULT_PRIORITY,
     compare: "",
     target: "", // Gnos target for the reverse-calc card
+    /** Which slot the 1/2/3 hotkey last focused. Purely a UI hint. */
+    focus: "a",
   });
 
-  const compareOn = asStr(urlState.compare) === "1";
+  const compareMode: CompareMode = React.useMemo(
+    () => parseCompareMode(asStr(urlState.compare)),
+    [urlState.compare],
+  );
+  const compareOn = compareMode !== "off";
+  const focusedSlot: ScenarioSlot = React.useMemo(() => {
+    const raw = asStr(urlState.focus);
+    if (raw === "b" || raw === "c") return raw;
+    return "a";
+  }, [urlState.focus]);
 
   // Memoize the raw scenario records so downstream useMemo dependencies (e.g.
   // recommendation cards keyed on `scenario`) don't re-fire every render just
@@ -1905,10 +2001,26 @@ const GpuCalculatorPageInner: React.FC = () => {
       urlState["b.priority"],
     ],
   );
+  const rawC = React.useMemo<ScenarioState>(
+    () => ({
+      gpu: asStr(urlState["c.gpu"]),
+      count: asStr(urlState["c.count"]) || String(DEFAULT_COUNT),
+      region: asStr(urlState["c.region"]) || DEFAULT_REGION,
+      hours: asStr(urlState["c.hours"]) || String(DEFAULT_HOURS),
+      priority: asStr(urlState["c.priority"]) || DEFAULT_PRIORITY,
+    }),
+    [
+      urlState["c.gpu"],
+      urlState["c.count"],
+      urlState["c.region"],
+      urlState["c.hours"],
+      urlState["c.priority"],
+    ],
+  );
   const targetGnos = asStr(urlState["target"]);
 
   const updateScenario = React.useCallback(
-    (group: "a" | "b", patch: Partial<ScenarioState>) => {
+    (group: ScenarioSlot, patch: Partial<ScenarioState>) => {
       const next: Partial<Record<string, string>> = {};
       for (const key of Object.keys(patch) as Array<keyof ScenarioState>) {
         const raw = patch[key];
@@ -1928,6 +2040,10 @@ const GpuCalculatorPageInner: React.FC = () => {
     (patch: Partial<ScenarioState>) => updateScenario("b", patch),
     [updateScenario],
   );
+  const updateScenarioC = React.useCallback(
+    (patch: Partial<ScenarioState>) => updateScenario("c", patch),
+    [updateScenario],
+  );
 
   const setTargetGnos = React.useCallback(
     (v: string) => {
@@ -1940,12 +2056,13 @@ const GpuCalculatorPageInner: React.FC = () => {
     // When opening compare, seed B from A so the user starts from a sensible
     // delta and can edit one knob at a time.
     setUrlState({
-      compare: "1",
+      compare: "ab",
       "b.gpu": rawA.gpu || DEFAULT_GPU_TYPE,
       "b.count": rawA.count,
       "b.region": rawA.region,
       "b.hours": rawA.hours,
       "b.priority": rawA.priority,
+      focus: "b",
     });
   }, [setUrlState, rawA.gpu, rawA.count, rawA.region, rawA.hours, rawA.priority]);
 
@@ -1957,8 +2074,105 @@ const GpuCalculatorPageInner: React.FC = () => {
       "b.region": DEFAULT_REGION,
       "b.hours": String(DEFAULT_HOURS),
       "b.priority": DEFAULT_PRIORITY,
+      "c.gpu": "",
+      "c.count": String(DEFAULT_COUNT),
+      "c.region": DEFAULT_REGION,
+      "c.hours": String(DEFAULT_HOURS),
+      "c.priority": DEFAULT_PRIORITY,
+      focus: "",
     });
   }, [setUrlState]);
+
+  const addScenarioC = React.useCallback(() => {
+    // Seed C from B (or A if B is empty) so the new column starts close to
+    // the user's most-recent thinking and they can adjust one parameter.
+    const seed = rawB.gpu ? rawB : rawA;
+    setUrlState({
+      compare: "abc",
+      "c.gpu": seed.gpu || DEFAULT_GPU_TYPE,
+      "c.count": seed.count,
+      "c.region": seed.region,
+      "c.hours": seed.hours,
+      "c.priority": seed.priority,
+      focus: "c",
+    });
+  }, [
+    setUrlState,
+    rawA.gpu,
+    rawA.count,
+    rawA.region,
+    rawA.hours,
+    rawA.priority,
+    rawB.gpu,
+    rawB.count,
+    rawB.region,
+    rawB.hours,
+    rawB.priority,
+  ]);
+
+  const removeScenarioB = React.useCallback(() => {
+    // Drop B but keep C if it exists — collapse C into B so the URL stays
+    // contiguous (compare=ab with the former-C values).
+    if (compareMode === "abc") {
+      setUrlState({
+        compare: "ab",
+        "b.gpu": rawC.gpu,
+        "b.count": rawC.count,
+        "b.region": rawC.region,
+        "b.hours": rawC.hours,
+        "b.priority": rawC.priority,
+        "c.gpu": "",
+        "c.count": String(DEFAULT_COUNT),
+        "c.region": DEFAULT_REGION,
+        "c.hours": String(DEFAULT_HOURS),
+        "c.priority": DEFAULT_PRIORITY,
+        focus: "b",
+      });
+    } else {
+      disableCompare();
+    }
+  }, [
+    compareMode,
+    setUrlState,
+    disableCompare,
+    rawC.gpu,
+    rawC.count,
+    rawC.region,
+    rawC.hours,
+    rawC.priority,
+  ]);
+
+  const removeScenarioC = React.useCallback(() => {
+    setUrlState({
+      compare: "ab",
+      "c.gpu": "",
+      "c.count": String(DEFAULT_COUNT),
+      "c.region": DEFAULT_REGION,
+      "c.hours": String(DEFAULT_HOURS),
+      "c.priority": DEFAULT_PRIORITY,
+      focus: "b",
+    });
+  }, [setUrlState]);
+
+  const setFocusedSlot = React.useCallback(
+    (slot: ScenarioSlot) => {
+      // Strip `focus=a` from the URL when collapsing back to A so a freshly
+      // shared link does not carry a redundant default. Non-A values stay
+      // in the URL so a link that opens with B/C focused round-trips.
+      setUrlState({ focus: slot === "a" ? "" : slot });
+      if (typeof document === "undefined") return;
+      // Defer the focus() until React has had a chance to render the new
+      // scenario card (some hotkeys also widen the compare mode).
+      requestAnimationFrame(() => {
+        const el = document.getElementById(`scenario-card-${slot}`);
+        if (el) {
+          el.focus({ preventScroll: false });
+          el.scrollIntoView({ behavior: "smooth", block: "nearest" });
+        }
+      });
+    },
+    [setUrlState],
+  );
 
   const pickDefaultGpu = React.useCallback(() => {
     setUrlState({ "a.gpu": DEFAULT_GPU_TYPE });
@@ -2006,8 +2220,14 @@ const GpuCalculatorPageInner: React.FC = () => {
       "b.region": DEFAULT_REGION,
       "b.hours": String(DEFAULT_HOURS),
       "b.priority": DEFAULT_PRIORITY,
+      "c.gpu": "",
+      "c.count": String(DEFAULT_COUNT),
+      "c.region": DEFAULT_REGION,
+      "c.hours": String(DEFAULT_HOURS),
+      "c.priority": DEFAULT_PRIORITY,
       compare: "",
       target: "",
+      focus: "",
     });
   }, [setUrlState]);
 
@@ -2136,6 +2356,116 @@ const GpuCalculatorPageInner: React.FC = () => {
     [setSavedScenarios],
   );
 
+  // Memoised newest-first ordering. Pulling this out of the dropdown's JSX
+  // avoids re-sorting on every parent render (the unmemoised
+  // `[...savedScenarios].sort(...)` was a small but real hotspot when the
+  // recommendation table recomputed).
+  const sortedSavedScenarios = React.useMemo<SavedScenario[]>(
+    () =>
+      [...savedScenarios].sort((a, b) =>
+        (b.savedAt ?? "").localeCompare(a.savedAt ?? ""),
+      ),
+    [savedScenarios],
+  );
+
+  // ---- JSON round-trip for saved scenarios --------------------------------
+  // Serialises the current saved-scenarios list as JSON so the operator can
+  // copy it to another tab / share it / archive it. Import accepts both the
+  // list shape and our jsonMetadata export shape (where a single scenario
+  // sits under `scenarioA`).
+  const savedScenariosJson = React.useMemo<string>(
+    () => JSON.stringify(savedScenarios, null, 2),
+    [savedScenarios],
+  );
+
+  const [importDraft, setImportDraft] = React.useState<string | null>(null);
+  const [importError, setImportError] = React.useState<string | null>(null);
+  const beginImport = React.useCallback(() => {
+    setImportDraft("");
+    setImportError(null);
+  }, []);
+  const cancelImport = React.useCallback(() => {
+    setImportDraft(null);
+    setImportError(null);
+  }, []);
+  const commitImport = React.useCallback(() => {
+    if (importDraft == null) return;
+    const trimmed = importDraft.trim();
+    if (!trimmed) {
+      setImportError("Paste a JSON payload to import.");
+      return;
+    }
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(trimmed);
+    } catch (err) {
+      setImportError(
+        `Could not parse JSON: ${err instanceof Error ? err.message : String(err)}`,
+      );
+      return;
+    }
+    // Accept either: a plain array of SavedScenario, OR an object with a
+    // `savedScenarios` key, OR our ExportMenu jsonMetadata shape (single
+    // scenarioA/scenarioB/scenarioC — wrap them on the fly).
+    let candidate: unknown = parsed;
+    if (
+      parsed &&
+      typeof parsed === "object" &&
+      !Array.isArray(parsed) &&
+      "savedScenarios" in (parsed as Record<string, unknown>)
+    ) {
+      candidate = (parsed as { savedScenarios: unknown }).savedScenarios;
+    } else if (
+      parsed &&
+      typeof parsed === "object" &&
+      !Array.isArray(parsed) &&
+      ("scenarioA" in (parsed as Record<string, unknown>) ||
+        "scenarioB" in (parsed as Record<string, unknown>) ||
+        "scenarioC" in (parsed as Record<string, unknown>))
+    ) {
+      const obj = parsed as {
+        scenarioA?: Scenario | null;
+        scenarioB?: Scenario | null;
+        scenarioC?: Scenario | null;
+      };
+      const wrapped: SavedScenario[] = [];
+      const stamp = new Date().toISOString();
+      const wrapOne = (s: Scenario | null | undefined, suffix: string) => {
+        if (!s || typeof s !== "object") return;
+        wrapped.push({
+          name: `Imported ${suffix} ${stamp.slice(0, 16)}`,
+          scenario: {
+            gpu: s.gpu ?? "",
+            count: String(s.count ?? DEFAULT_COUNT),
+            region: s.region ?? DEFAULT_REGION,
+            hours: String(s.hours ?? DEFAULT_HOURS),
+            priority: s.priority ?? DEFAULT_PRIORITY,
+          },
+          savedAt: stamp,
+        });
+      };
+      wrapOne(obj.scenarioA, "A");
+      wrapOne(obj.scenarioB, "B");
+      wrapOne(obj.scenarioC, "C");
+      candidate = wrapped;
+    }
+    const sanitised = sanitizeSavedScenarios(candidate);
+    if (sanitised.length === 0) {
+      setImportError(
+        "No valid scenarios found in JSON. Expected an array of {name, scenario, savedAt}.",
+      );
+      return;
+    }
+    // Merge: imported scenarios win on name collision.
+    setSavedScenarios((prev) => {
+      const byName = new Map(prev.map((s) => [s.name, s] as const));
+      for (const s of sanitised) byName.set(s.name, s);
+      return Array.from(byName.values()).slice(0, 50);
+    });
+    setImportDraft(null);
+    setImportError(null);
+  }, [importDraft, setSavedScenarios]);
+
   // ----- Section visibility prefs ------------------------------------------
   const [sectionPrefs, setSectionPrefs] = usePersistedState<SectionPrefs>(
     SECTIONS_PREF_KEY,
@@ -2189,8 +2519,15 @@ const GpuCalculatorPageInner: React.FC = () => {
   // toggle) doesn't churn the recommendation table's expensive useMemo.
   const scenarioA = React.useMemo(() => resolveScenario(rawA), [rawA]);
   const scenarioB = React.useMemo(
-    () => (compareOn ? resolveScenario(rawB) : null),
-    [compareOn, rawB],
+    () =>
+      compareMode === "ab" || compareMode === "abc"
+        ? resolveScenario(rawB)
+        : null,
+    [compareMode, rawB],
+  );
+  const scenarioC = React.useMemo(
+    () => (compareMode === "abc" ? resolveScenario(rawC) : null),
+    [compareMode, rawC],
   );
   const resultA = React.useMemo(
     () => (scenarioA ? computeScenarioResult(scenarioA, speeds) : null),
@@ -2199,6 +2536,10 @@ const GpuCalculatorPageInner: React.FC = () => {
   const resultB = React.useMemo(
     () => (scenarioB ? computeScenarioResult(scenarioB, speeds) : null),
     [scenarioB, speeds],
+  );
+  const resultC = React.useMemo(
+    () => (scenarioC ? computeScenarioResult(scenarioC, speeds) : null),
+    [scenarioC, speeds],
   );
 
   // ----- Share link + formatted-result clipboard payloads ------------------
@@ -2228,8 +2569,18 @@ const GpuCalculatorPageInner: React.FC = () => {
         `  Total cost:   ${formatCurrency(resultB.totalCost)}`,
       );
     }
+    if (scenarioC && resultC) {
+      lines.push(
+        ``,
+        `Scenario C`,
+        `  ${scenarioC.gpu} ×${scenarioC.count} @ ${scenarioC.region} (${scenarioC.priority}, ${scenarioC.hours}h)`,
+        `  Speed:        ${formatSpeed(resultC.totalSpeedMnos)}`,
+        `  Hourly rate:  ${formatCurrency(resultC.hourlyRate)}`,
+        `  Total cost:   ${formatCurrency(resultC.totalCost)}`,
+      );
+    }
     return lines.join("\n");
-  }, [scenarioA, resultA, scenarioB, resultB]);
+  }, [scenarioA, resultA, scenarioB, resultB, scenarioC, resultC]);
 
   // ----- Export rows -------------------------------------------------------
   // Two flat row-shapes — one for the scenario card, one for the per-region
@@ -2278,6 +2629,21 @@ const GpuCalculatorPageInner: React.FC = () => {
         hourlyRateUsd: resultB.hourlyRate,
         totalCostUsd: resultB.totalCost,
         notes: `${scenarioB.priority}, ${scenarioB.hours}h`,
+      });
+    }
+    if (scenarioC && resultC) {
+      rows.push({
+        kind: "scenario",
+        name: "Scenario C",
+        gpuType: scenarioC.gpu,
+        region: scenarioC.region,
+        vmSize: "",
+        nodes: 0,
+        gpus: scenarioC.count,
+        speedMnos: resultC.totalSpeedMnos,
+        hourlyRateUsd: resultC.hourlyRate,
+        totalCostUsd: resultC.totalCost,
+        notes: `${scenarioC.priority}, ${scenarioC.hours}h`,
       });
     }
     for (const r of regionSummaries) {
@@ -2335,6 +2701,89 @@ const GpuCalculatorPageInner: React.FC = () => {
       });
     },
     [scenarioA, speeds, setUrlState],
+  );
+
+  // ----- Hotkeys -----------------------------------------------------------
+  // Hotkey-help overlay. Toggled with `?` so a discoverable, keyboard-only
+  // user can find every chord without spelunking the source.
+  const [showHotkeyHelp, setShowHotkeyHelp] = React.useState(false);
+
+  // The shortcuts must not duplicate each other's logic; pull each into a
+  // useCallback so the hook re-binds only when its own deps change.
+  const hotkeyCopySummary = React.useCallback(async () => {
+    if (!formattedSummary) return;
+    try {
+      if (
+        typeof navigator !== "undefined" &&
+        navigator.clipboard &&
+        navigator.clipboard.writeText
+      ) {
+        await navigator.clipboard.writeText(formattedSummary);
+      }
+    } catch {
+      // Silent failure — the visible CopyButton has its own fallback.
+    }
+  }, [formattedSummary]);
+
+  const hotkeySaveScenarioA = React.useCallback(() => {
+    if (!rawA.gpu) return;
+    beginSaveScenario();
+  }, [rawA.gpu, beginSaveScenario]);
+
+  // `1` — focus Scenario A (also collapses compare so the single-scenario
+  // view is reachable in one keystroke).
+  const hotkeyFocusA = React.useCallback(() => {
+    if (compareMode !== "off") disableCompare();
+    setFocusedSlot("a");
+  }, [compareMode, disableCompare, setFocusedSlot]);
+
+  // `2` — focus Scenario B; if compare is off, open A+B compare.
+  const hotkeyFocusB = React.useCallback(() => {
+    if (compareMode === "off") {
+      enableCompare();
+      return;
+    }
+    setFocusedSlot("b");
+  }, [compareMode, enableCompare, setFocusedSlot]);
+
+  // `3` — focus Scenario C; if A+B exists, widen to A+B+C; if neither, open
+  // both at once so a single keypress gets you to a full 3-way comparison.
+  const hotkeyFocusC = React.useCallback(() => {
+    if (compareMode === "off") {
+      enableCompare();
+      // The `enableCompare` setState is queued; widen on the next frame so
+      // both URL writes coalesce into a single history entry.
+      requestAnimationFrame(() => addScenarioC());
+      return;
+    }
+    if (compareMode === "ab") {
+      addScenarioC();
+      return;
+    }
+    setFocusedSlot("c");
+  }, [compareMode, enableCompare, addScenarioC, setFocusedSlot]);
+
+  // Bind chords. `allowInInputs` stays false so typing a count of "2" inside
+  // the GPU-count <Input /> never trips the compare hotkey — only chords
+  // outside text fields fire.
+  useShortcut("c", hotkeyCopySummary, { enabled: !!scenarioA });
+  useShortcut("s", hotkeySaveScenarioA, { enabled: !!scenarioA });
+  useShortcut("1", hotkeyFocusA, { enabled: !!scenarioA });
+  useShortcut("2", hotkeyFocusB, { enabled: !!scenarioA });
+  useShortcut("3", hotkeyFocusC, { enabled: !!scenarioA });
+  // Note: Chrome/Firefox fire `event.key === "?"` + `event.shiftKey === true`
+  // for the typical US-layout shift+/ press, so the canonical chord is
+  // `"shift+?"`. We also register bare `"?"` for layouts (or virtual
+  // keyboards) that emit the question mark without an asserted shift.
+  useShortcut(
+    ["shift+?", "?"],
+    () => setShowHotkeyHelp((prev) => !prev),
+    { enabled: !!scenarioA },
+  );
+  useShortcut(
+    "escape",
+    () => setShowHotkeyHelp(false),
+    { enabled: showHotkeyHelp },
   );
 
   if (isLoading) {
@@ -2396,6 +2845,18 @@ const GpuCalculatorPageInner: React.FC = () => {
               <BookmarkPlus aria-hidden />
               Save
             </Button>
+            {savedScenarios.length === 0 && (
+              <Button
+                type="button"
+                variant="ghost"
+                size="sm"
+                onClick={beginImport}
+                aria-label="Import saved scenarios from JSON"
+              >
+                <ClipboardPaste aria-hidden />
+                Import JSON
+              </Button>
+            )}
             {savedScenarios.length > 0 && (
               <DropdownMenu>
                 <DropdownMenuTrigger asChild>
@@ -2414,11 +2875,7 @@ const GpuCalculatorPageInner: React.FC = () => {
                     Saved scenarios
                   </DropdownMenuLabel>
                   <DropdownMenuSeparator />
-                  {[...savedScenarios]
-                    .sort((a, b) =>
-                      (b.savedAt ?? "").localeCompare(a.savedAt ?? ""),
-                    )
-                    .map((s) => (
+                  {sortedSavedScenarios.map((s) => (
                     <DropdownMenuItem
                       key={s.name}
                       onSelect={() => applySavedScenario(s)}
@@ -2457,6 +2914,30 @@ const GpuCalculatorPageInner: React.FC = () => {
                       </button>
                     </DropdownMenuItem>
                   ))}
+                  <DropdownMenuSeparator />
+                  <div className="flex items-center justify-between gap-2 px-2 py-1.5">
+                    <span className="inline-flex items-center gap-1 text-2xs font-medium text-muted-foreground">
+                      <ClipboardPaste className="h-3 w-3" aria-hidden />
+                      JSON
+                    </span>
+                    <span className="inline-flex items-center gap-1">
+                      <CopyButton
+                        value={savedScenariosJson}
+                        ariaLabel="Copy all saved scenarios as JSON"
+                        alwaysVisible
+                        iconSize={12}
+                      />
+                      <button
+                        type="button"
+                        onClick={beginImport}
+                        onPointerDown={(e) => e.stopPropagation()}
+                        aria-label="Paste JSON to import scenarios"
+                        className="rounded px-2 py-0.5 text-2xs font-medium text-muted-foreground hover:bg-surface-overlay hover:text-foreground"
+                      >
+                        Import…
+                      </button>
+                    </span>
+                  </div>
                 </DropdownMenuContent>
               </DropdownMenu>
             )}
@@ -2467,7 +2948,9 @@ const GpuCalculatorPageInner: React.FC = () => {
               jsonMetadata={{
                 scenarioA: scenarioA,
                 scenarioB: scenarioB ?? null,
+                scenarioC: scenarioC ?? null,
                 speeds: Object.fromEntries(speeds),
+                compareMode,
               }}
             />
             {compareOn ? (
@@ -2493,6 +2976,17 @@ const GpuCalculatorPageInner: React.FC = () => {
                 Compare
               </Button>
             )}
+            <Button
+              type="button"
+              variant="ghost"
+              size="icon-sm"
+              onClick={() => setShowHotkeyHelp((p) => !p)}
+              aria-label="Show keyboard shortcuts"
+              aria-pressed={showHotkeyHelp}
+              title="Keyboard shortcuts (?)"
+            >
+              <Keyboard aria-hidden />
+            </Button>
             <Button
               type="button"
               variant="ghost"
@@ -2624,6 +3118,146 @@ const GpuCalculatorPageInner: React.FC = () => {
         </Card>
       )}
 
+      {/* Inline JSON-import prompt for saved scenarios. Accepts both raw
+          {name, scenario, savedAt}[] payloads and the ExportMenu metadata
+          shape (scenarioA/B/C wrapped on import). */}
+      {importDraft != null && (
+        <Card
+          role="dialog"
+          aria-label="Import scenarios from JSON"
+          className="border-info/30 bg-card shadow-sm"
+        >
+          <CardContent className="flex flex-col gap-2 p-4">
+            <div className="flex items-center gap-2">
+              <ClipboardPaste className="h-4 w-4 text-info" aria-hidden />
+              <Label
+                htmlFor="import-json-textarea"
+                className="text-xs font-semibold"
+              >
+                Paste saved-scenarios JSON
+              </Label>
+              <span className="text-2xs text-muted-foreground">
+                accepts array, {`{savedScenarios:[]}`}, or exported
+                jsonMetadata
+              </span>
+            </div>
+            <textarea
+              id="import-json-textarea"
+              autoFocus
+              spellCheck={false}
+              rows={6}
+              value={importDraft}
+              onChange={(e) => {
+                setImportDraft(e.target.value);
+                if (importError) setImportError(null);
+              }}
+              onKeyDown={(e) => {
+                if (e.key === "Escape") {
+                  e.preventDefault();
+                  cancelImport();
+                } else if (
+                  (e.key === "Enter" && (e.metaKey || e.ctrlKey))
+                ) {
+                  e.preventDefault();
+                  commitImport();
+                }
+              }}
+              placeholder='[{"name":"H100 ×8","scenario":{"gpu":"H100","count":"8","region":"westus3","hours":"8","priority":"dedicated"},"savedAt":"2026-01-01T00:00:00Z"}]'
+              aria-label="JSON payload to import"
+              className="w-full resize-y rounded-md border border-border bg-surface-overlay px-2 py-1 font-mono text-2xs leading-relaxed text-foreground transition-colors duration-150 ease-out focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-info/40 motion-reduce:transition-none"
+            />
+            {importError && (
+              <Alert variant="warning" role="alert">
+                <TriangleAlert className="h-4 w-4" aria-hidden />
+                <AlertDescription>{importError}</AlertDescription>
+              </Alert>
+            )}
+            <div className="flex flex-wrap items-center gap-2">
+              <Button
+                type="button"
+                size="sm"
+                onClick={commitImport}
+                disabled={!importDraft.trim()}
+                aria-label="Import scenarios from JSON"
+              >
+                <Check aria-hidden /> Import
+              </Button>
+              <Button
+                type="button"
+                variant="ghost"
+                size="sm"
+                onClick={cancelImport}
+                aria-label="Cancel import"
+              >
+                <X aria-hidden /> Cancel
+              </Button>
+              <span className="ml-auto text-2xs text-muted-foreground">
+                Press Ctrl/Cmd+Enter to commit, Esc to cancel
+              </span>
+            </div>
+          </CardContent>
+        </Card>
+      )}
+
+      {/* Keyboard-shortcut help overlay. Surfaced via `?` or the toolbar
+          button so users have a discoverable reference for every chord. */}
+      {showHotkeyHelp && (
+        <Card
+          role="dialog"
+          aria-label="Keyboard shortcuts"
+          className="border-primary/30 bg-card shadow-sm"
+        >
+          <CardHeader className="flex flex-row items-center justify-between gap-2 space-y-0 pb-2">
+            <CardTitle className="flex items-center gap-2 text-sm font-semibold text-foreground">
+              <Keyboard className="h-4 w-4 text-primary" aria-hidden />
+              Keyboard shortcuts
+            </CardTitle>
+            <Button
+              type="button"
+              variant="ghost"
+              size="icon-sm"
+              onClick={() => setShowHotkeyHelp(false)}
+              aria-label="Close keyboard-shortcut help"
+            >
+              <X aria-hidden />
+            </Button>
+          </CardHeader>
+          <CardContent className="grid grid-cols-1 gap-1.5 pt-0 text-xs sm:grid-cols-2">
+            {[
+              { keys: ["1"], label: "Focus Scenario A (collapse compare)" },
+              { keys: ["2"], label: "Focus Scenario B (open compare if off)" },
+              { keys: ["3"], label: "Focus Scenario C (widen to 3-way)" },
+              { keys: ["c"], label: "Copy formatted summary" },
+              { keys: ["s"], label: "Save Scenario A" },
+              { keys: ["?"], label: "Toggle this help overlay" },
+              { keys: ["Esc"], label: "Dismiss this help overlay" },
+            ].map((row) => (
+              <div
+                key={row.label}
+                className="flex items-center justify-between gap-3 rounded-md bg-surface-overlay px-3 py-1.5"
+              >
+                <span className="text-muted-foreground">{row.label}</span>
+                <span className="flex items-center gap-1">
+                  {row.keys.map((k) => (
+                    <kbd
+                      key={k}
+                      className="rounded border border-border bg-card px-1.5 py-0.5 font-mono text-2xs font-bold text-foreground"
+                    >
+                      {k}
+                    </kbd>
+                  ))}
+                </span>
+              </div>
+            ))}
+            <p className="sm:col-span-2 mt-1 text-2xs leading-relaxed text-muted-foreground">
+              Shortcuts ignore key presses inside text fields and dropdowns,
+              so typing &quot;2&quot; into the GPU-count input does not flip
+              the compare mode.
+            </p>
+          </CardContent>
+        </Card>
+      )}
+
       {/* Workload presets --------------------------------------------------- */}
       <PresetChipRow onPick={applyPreset} activeId={activePresetId} />
 
@@ -2648,24 +3282,54 @@ const GpuCalculatorPageInner: React.FC = () => {
         >
           <ScenarioForm
             label="A"
+            cardId="scenario-card-a"
             scenario={scenarioA}
             result={resultA!}
             gpuOptions={gpuOptions}
             onChange={updateScenarioA}
             tone="primary"
+            focused={focusedSlot === "a" && compareOn}
             compareTo={compareOn && resultB ? resultB : undefined}
           />
           {compareOn && scenarioB && (
             <ScenarioForm
               label="B"
+              cardId="scenario-card-b"
               scenario={scenarioB}
               result={resultB!}
               gpuOptions={gpuOptions}
               onChange={updateScenarioB}
-              onRemove={disableCompare}
+              onRemove={removeScenarioB}
               tone="info"
+              focused={focusedSlot === "b"}
               compareTo={resultA ?? undefined}
             />
+          )}
+          {compareMode === "abc" && scenarioC && (
+            <ScenarioForm
+              label="C"
+              cardId="scenario-card-c"
+              scenario={scenarioC}
+              result={resultC!}
+              gpuOptions={gpuOptions}
+              onChange={updateScenarioC}
+              onRemove={removeScenarioC}
+              tone="success"
+              focused={focusedSlot === "c"}
+              compareTo={resultA ?? undefined}
+            />
+          )}
+          {compareMode === "ab" && scenarioA && (
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              onClick={addScenarioC}
+              aria-label="Add scenario C for three-way comparison"
+              className="self-start lg:self-stretch"
+            >
+              <Plus aria-hidden /> Add C
+            </Button>
           )}
         </div>
       )}
