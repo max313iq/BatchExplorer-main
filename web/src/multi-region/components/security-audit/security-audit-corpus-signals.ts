@@ -714,3 +714,299 @@ export type CorpusRuleId = (typeof CORPUS_RULE_IDS)[number];
 export function isCorpusFinding(f: Finding): boolean {
   return (CORPUS_RULE_IDS as readonly string[]).includes(f.ruleId);
 }
+
+// --------------------------------------------------------------------------
+// Tier-0 protection score (wave 8 — composite defender signal)
+// --------------------------------------------------------------------------
+//
+// What we compute: across all KEY VAULTS scanned (we treat KV as the
+// canonical Tier-0 resource — they hold bearer credentials), what
+// fraction has BOTH (a) a diagnostic setting present + auditing AND
+// (b) no high/critical KV-config finding (no-purge-protection,
+// no-soft-delete, publicly-reachable). The output is a 0..100 score —
+// the operator sees the integer % in the summary strip, with hover
+// detail showing the numerator/denominator and the worst contributing
+// rules.
+//
+// Why a single score: defenders need one quick "are we worse off than
+// last week" number for executive reporting. Detailed findings live in
+// the table; the score is the elevator-pitch summary.
+//
+// citation: New folder\_analysis_defender_view.md §1
+//   The Azucar/ScoutSuite/Prowler family all surface an aggregate
+//   posture score because that's what makes a posture tool legible to
+//   a non-operator stakeholder. This is our local equivalent, scoped
+//   to the Tier-0 surface the corpus playbook §"Critical Defender
+//   Audit Surface" calls out as the audit priority.
+// citation: New folder\_AZURE_BYPASS_PLAYBOOK.md §"Critical Defender
+//   Audit Surface" items 8 + 10 (diagnostic-setting + subscription
+//   cancellation — the two signals weighted into this score).
+
+export interface TierZeroProtectionScore {
+  /** Integer 0..100. 100 means every Tier-0 resource is fully protected. */
+  score: number;
+  /** Resources that pass the full Tier-0 check. */
+  protectedCount: number;
+  /** Total Tier-0 resources evaluated (denominator). */
+  totalCount: number;
+  /** Top 3 rule-ids dragging the score down (descending offender count). */
+  topOffenders: ReadonlyArray<{ ruleId: string; count: number }>;
+}
+
+/**
+ * High/critical KV rule-ids that disqualify a vault from "protected"
+ * status. Kept narrow — we don't want an info-level large-policy
+ * finding to drop the score.
+ */
+const KV_DISQUALIFYING_RULES: ReadonlySet<string> = new Set([
+  "keyvault.no-purge-protection",
+  "keyvault.no-soft-delete",
+  "keyvault.publicly-reachable",
+  // Diagnostic absence on a tier-0 resource is the §5.14 sentinel.
+  "diag.absent",
+  "diag.audit-disabled",
+]);
+
+export interface TierZeroScoreInput {
+  /** All findings from the scan (any severity / resource type). */
+  findings: readonly Finding[];
+  /** Total Key Vaults scanned (denominator for Tier-0 count). */
+  vaultsScanned: number;
+}
+
+export function computeTierZeroProtectionScore(
+  input: TierZeroScoreInput,
+): TierZeroProtectionScore {
+  const { findings, vaultsScanned } = input;
+  if (vaultsScanned <= 0) {
+    return { score: 0, protectedCount: 0, totalCount: 0, topOffenders: [] };
+  }
+  // Group disqualifying findings by their parent KV ARM id. A KV with
+  // multiple disqualifying rules still counts as ONE unprotected
+  // resource (we don't double-penalize the same vault).
+  const unprotectedVaults = new Set<string>();
+  const offenderCounts = new Map<string, number>();
+  for (const f of findings) {
+    if (f.resourceType !== "keyvault" && f.resourceType !== "diagnostic-setting") {
+      continue;
+    }
+    if (!KV_DISQUALIFYING_RULES.has(f.ruleId)) continue;
+    // For diag findings the resourceId is the KV's own ARM id only when
+    // the target was a vault. Filter to the KV-targeted diag rows by
+    // checking the ARM id segments.
+    if (f.resourceType === "diagnostic-setting") {
+      const lower = f.resourceId.toLowerCase();
+      if (!lower.includes("/microsoft.keyvault/vaults/")) continue;
+    }
+    // Use the KV-portion of the ARM id (strip any trailing diag-name
+    // segment) so a KV with a diag finding + a config finding still
+    // counts as one unprotected vault.
+    const kvIdMatch = f.resourceId.match(
+      /^(\/subscriptions\/[^/]+\/resourceGroups\/[^/]+\/providers\/Microsoft\.KeyVault\/vaults\/[^/]+)/i,
+    );
+    const kvKey = (kvIdMatch?.[1] ?? f.resourceId).toLowerCase();
+    unprotectedVaults.add(kvKey);
+    offenderCounts.set(
+      f.ruleId,
+      (offenderCounts.get(f.ruleId) ?? 0) + 1,
+    );
+  }
+  const protectedCount = Math.max(
+    0,
+    vaultsScanned - unprotectedVaults.size,
+  );
+  const score = Math.round((protectedCount / vaultsScanned) * 100);
+  const topOffenders = Array.from(offenderCounts.entries())
+    .map(([ruleId, count]) => ({ ruleId, count }))
+    .sort((a, b) => b.count - a.count)
+    .slice(0, 3);
+  return {
+    score,
+    protectedCount,
+    totalCount: vaultsScanned,
+    topOffenders,
+  };
+}
+
+// --------------------------------------------------------------------------
+// Posture-trend snapshot (wave 8 — compliance score over time)
+// --------------------------------------------------------------------------
+//
+// What we persist: a small ring buffer of per-scan snapshots so the
+// operator can see the posture trend across runs without us hitting
+// any backend. The snapshot is intentionally lean — just the summary
+// counters needed to render a sparkline + delta vs. previous.
+//
+// citation: New folder\_analysis_defender_view.md §1
+//   ScoutSuite ships an HTML report keyed off snapshots taken across
+//   audit runs — we mirror that pattern in-page so a returning operator
+//   sees movement without having to manually diff JSON exports.
+
+export interface PostureSnapshot {
+  /** ISO timestamp of the scan that produced this snapshot. */
+  iso: string;
+  /** Total finding count. */
+  total: number;
+  critical: number;
+  high: number;
+  medium: number;
+  info: number;
+  /** Composite Tier-0 score 0..100 (see above). */
+  tierZeroScore: number;
+  /** Subscriptions in scope at the time. */
+  subscriptionsInScope: number;
+}
+
+/** Cap on persisted snapshots — older entries fall off the end. */
+export const POSTURE_TREND_MAX = 30;
+
+/**
+ * Append a new snapshot to a snapshot ring buffer. Newest first.
+ * Drops the oldest entry once the cap is reached. PURE — does no IO.
+ */
+export function appendPostureSnapshot(
+  prev: readonly PostureSnapshot[],
+  next: PostureSnapshot,
+): PostureSnapshot[] {
+  const out = [next, ...prev];
+  if (out.length > POSTURE_TREND_MAX) out.length = POSTURE_TREND_MAX;
+  return out;
+}
+
+/**
+ * Compute the delta between the most recent snapshot and the prior one.
+ * Returns null when there are fewer than two snapshots to compare.
+ * Negative deltas mean fewer findings (improvement).
+ */
+export interface PostureTrendDelta {
+  totalDelta: number;
+  criticalDelta: number;
+  highDelta: number;
+  tierZeroDelta: number;
+}
+
+export function computePostureTrendDelta(
+  snapshots: readonly PostureSnapshot[],
+): PostureTrendDelta | null {
+  if (snapshots.length < 2) return null;
+  const a = snapshots[0]!;
+  const b = snapshots[1]!;
+  return {
+    totalDelta: a.total - b.total,
+    criticalDelta: a.critical - b.critical,
+    highDelta: a.high - b.high,
+    tierZeroDelta: a.tierZeroScore - b.tierZeroScore,
+  };
+}
+
+// --------------------------------------------------------------------------
+// Dormant SP credential-rotation anomaly (wave 8 — stub helper)
+// --------------------------------------------------------------------------
+//
+// What we detect: a Service Principal that has been DORMANT (no
+// sign-ins, no credential additions) for N days suddenly receives a
+// new credential (`addKey` / `addPassword`). This is one of the highest
+// signal moves in the corpus playbook because it is the first ARM-side
+// shadow of a token-theft → persistence chain — the attacker who lifted
+// a PRT cookie and minted a Graph token uses addKey to mint a long-life
+// secret on a low-noise SP.
+//
+// citation: New folder\_bypass_role_grant.md §addKey + §servicePrincipal
+//   credential rotation (the offensive primitive)
+// citation: New folder\dirkjanm\ROADtools (the operator-grade tooling
+//   that automates this credential lift)
+//
+// This evaluator is PURE — it scores a list of "SP dormancy + cred
+// addition" tuples that some upstream collector has built (e.g. by
+// joining Graph signIns / appRoleAssignedTo with directory audit logs).
+// THIS PAGE DOES NOT WIRE THE COLLECTOR — that lives in another page
+// (role-graph / privileged-audit). The helper lives here so we have a
+// single place for the rule set and the page can opt-in without a
+// dependency cycle.
+
+export interface DormantSpCredentialEvent {
+  servicePrincipalObjectId: string;
+  servicePrincipalDisplayName: string;
+  appId: string;
+  /** ISO timestamp of the credential addition we're scoring. */
+  credentialAddedIso: string;
+  /** ISO timestamp of the LAST observed sign-in BEFORE the cred event. */
+  lastSignInBeforeIso: string | null;
+  /** ISO timestamp of the LAST observed credential rotation BEFORE the event. */
+  lastCredRotationBeforeIso: string | null;
+  /** Tenant id (for portal links / context). */
+  tenantId: string;
+  /**
+   * tierZero=true means the SP holds a directory role assignment that
+   * elevates the addKey from "anomalous" to "active persistence".
+   */
+  tierZero: boolean;
+}
+
+interface DormantSpContext {
+  /** Dormancy threshold; below this is "active", at/above is "dormant". */
+  dormantThresholdDays?: number;
+  nowMs?: number;
+}
+
+/** Default dormancy threshold (90 days mirrors the corpus playbook's
+ *  Tier-0 review cadence). */
+export const DORMANT_SP_DEFAULT_DAYS = 90;
+
+export function evaluateDormantSpCredentialRotation(
+  events: readonly DormantSpCredentialEvent[],
+  ctx: DormantSpContext = {},
+): Finding[] {
+  const now = ctx.nowMs ?? Date.now();
+  const thresholdDays = Math.max(
+    7,
+    Math.min(365, ctx.dormantThresholdDays ?? DORMANT_SP_DEFAULT_DAYS),
+  );
+  const out: Finding[] = [];
+  for (const ev of events) {
+    const credMs = Date.parse(ev.credentialAddedIso);
+    if (!Number.isFinite(credMs)) continue;
+    // Determine the most recent activity BEFORE the credential event.
+    const signInMs = ev.lastSignInBeforeIso
+      ? Date.parse(ev.lastSignInBeforeIso)
+      : NaN;
+    const credPrevMs = ev.lastCredRotationBeforeIso
+      ? Date.parse(ev.lastCredRotationBeforeIso)
+      : NaN;
+    const candidates: number[] = [];
+    if (Number.isFinite(signInMs)) candidates.push(signInMs);
+    if (Number.isFinite(credPrevMs)) candidates.push(credPrevMs);
+    const lastActivityMs = candidates.length > 0 ? Math.max(...candidates) : null;
+    const dormantDays =
+      lastActivityMs == null
+        ? Number.POSITIVE_INFINITY
+        : Math.floor((credMs - lastActivityMs) / (24 * 60 * 60 * 1000));
+    if (dormantDays < thresholdDays) continue;
+    const severity: Severity = ev.tierZero ? "critical" : "high";
+    const days = Number.isFinite(dormantDays)
+      ? String(dormantDays)
+      : "indefinitely";
+    const ageDays = Math.floor((now - credMs) / (24 * 60 * 60 * 1000));
+    out.push({
+      id: `sp::${ev.servicePrincipalObjectId}::${credMs}::dormant-credrotate`,
+      resourceType: "subscription" as ResourceType,
+      resourceId: `/servicePrincipals/${ev.servicePrincipalObjectId}`,
+      resourceName: ev.servicePrincipalDisplayName,
+      resourceGroup: "",
+      region: "",
+      subscriptionId: ev.tenantId,
+      subscriptionName: ev.tenantId,
+      ruleId: "sp.dormant-credrotate",
+      title: ev.tierZero
+        ? `Dormant Tier-0 SP rotated credential after ${days} days`
+        : `Dormant SP rotated credential after ${days} days`,
+      description: `SP "${ev.servicePrincipalDisplayName}" was dormant ${days} days then a new credential was added ${ageDays} day(s) ago.`,
+      whyItMatters:
+        "Dormant → suddenly-rotated is the classic shadow of an addKey persistence chain (corpus: _bypass_role_grant.md §addKey). An attacker who lifted a PRT cookie + minted a Graph token uses addKey to mint a long-life secret on the lowest-noise SP they can find — usually one nobody has touched for months. The corpus dirkjanm/ROADtools documents the wire-level call. Defender baseline: alert any credential rotation on a SP idle longer than the team's review cadence (corpus default 90 days).",
+      remediation:
+        "Inspect directory audit logs for the originating principal of the credential add (Microsoft.DirectoryManagement, operationName=Update application/Add service principal credentials). If the rotation isn't expected, revoke the new credential, force a sign-in event, and audit role/group memberships for this SP. Consider applying a Conditional Access app-policy that requires managed identity for this SP going forward.",
+      severity,
+    });
+  }
+  return out;
+}

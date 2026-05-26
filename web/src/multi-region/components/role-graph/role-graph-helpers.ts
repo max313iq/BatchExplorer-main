@@ -1444,3 +1444,444 @@ export function computeDefenderSignalScore(
   return { score, label };
 }
 
+// ---------------------------------------------------------------------------
+// Multi-hop path finder (BFS over principal → group → role → scope)
+//
+// Corpus citation:
+//   - `_bypass_role_grant.md` §5.3 (group ownership = membership management)
+//   - `_bypass_role_grant.md` §5.4 (nested groups; defenders auditing only the
+//     parent miss the inherited path)
+//   - `_bypass_role_grant.md` §10  (Role-Graph Privesc Map — chain reference)
+//   - `_analysis_specterops.md` (AzureHound's MATCH ... ALLOWED_TO_ACT_AS
+//     path queries — what we recreate here without Cypher)
+//   - `_bypass_mixed_chains.md`   (12 end-to-end kill chains composing all
+//     primitives — this BFS is the explainability layer)
+//
+// Defensive analogs:
+//   - SpecterOps/AzureHound — `MATCH p=shortestPath((u:AZUser)-[*1..5]->(s))`
+//     style queries; we approximate one BFS sweep from the start user.
+//   - nccgroup/PMapper        — similar `find_path` traversal in AWS IAM.
+//
+// Why BFS instead of substring overlay: substring matching highlights the
+// LEAF principal but doesn't show the GROUP / NESTED-GROUP hops the operator
+// has to revoke to break the chain. BFS surfaces every hop including
+// group-mediated and nested-group transitions, so the operator can target
+// the cheapest revoke point (e.g. a single group-membership edit).
+// ---------------------------------------------------------------------------
+
+/** One hop on a discovered path. The first hop is always the start principal. */
+export interface PathHop {
+  /** Hop kind — drives the rendered icon + verb. */
+  kind: "principal" | "group" | "role" | "scope";
+  /** Stable id for the hop entity (principal id, group id, role guid, scope). */
+  id: string;
+  /** Friendly label for the hop. */
+  label: string;
+  /** Optional secondary detail (e.g. role tier, scope level). */
+  detail?: string;
+  /** When kind === "principal" this is the principal type. */
+  principalType?: string;
+  /** When kind === "role" this is the privilege tier of the role. */
+  tier?: PrivilegeTier;
+  /** When kind === "scope" this is the scope level for the chip. */
+  scopeLevel?: ScopeLevel;
+}
+
+/** One full path found by `findShortestPath`. */
+export interface FoundPath {
+  /** Ordered hops, starting at the matched principal, ending at the scope. */
+  hops: PathHop[];
+  /** Number of edges traversed (= `hops.length - 1`). */
+  hopCount: number;
+  /** True when this path includes at least one group-mediated edge. */
+  viaGroup: boolean;
+  /** True when this path includes a nested-group edge (group ⊂ group). */
+  viaNestedGroup: boolean;
+  /** Highest tier reached on the path (the role hop's tier). */
+  highestTier: PrivilegeTier;
+}
+
+/** Inputs for the BFS path-finder. */
+export interface FindPathInputs {
+  /** Free-text principal hint — matched against id / displayName / signInName. */
+  principalQuery: string;
+  /** Free-text scope hint — substring matched against assignment.scope. */
+  scopeQuery: string;
+  /** All summaries from the current probe (post-filter or full). */
+  summaries: ReadonlyArray<PrincipalSummary>;
+  /** Optional Map<groupId, members[]> from the transitive-members probe. */
+  groupMembersByGroupId?: ReadonlyMap<string, ReadonlyArray<ResolvedGroupMember>>;
+  /** Hard cap on returned paths (UI render budget). */
+  maxPaths?: number;
+}
+
+/**
+ * BFS shortest-path search from every matched start principal to every
+ * assignment whose scope contains `scopeQuery`. Returns ALL shortest paths
+ * (one per matched start principal / scope tuple), de-duped.
+ *
+ * Edges modelled:
+ *   - principal --member-of--> group  (when this principal appears in the
+ *     group's transitiveMembers list)
+ *   - group     --member-of--> group  (nested group; transitive-members can
+ *     contain group entries)
+ *   - principal --holds-role--> role  (direct assignment)
+ *   - role      --at-scope--> scope   (the role-assignment scope)
+ *
+ * Hop budget capped at 5 to keep BFS bounded. Real attack chains stop
+ * mattering past 4-5 hops because operators can't reason about them anyway.
+ */
+export function findShortestPath(inputs: FindPathInputs): FoundPath[] {
+  const {
+    principalQuery,
+    scopeQuery,
+    summaries,
+    groupMembersByGroupId,
+    maxPaths = 25,
+  } = inputs;
+  const pq = principalQuery.trim().toLowerCase();
+  const sq = scopeQuery.trim().toLowerCase();
+  if (!pq && !sq) return [];
+
+  // Build adjacency:
+  //   summaries: principalId -> PrincipalSummary
+  //   groupMembers: groupId -> Set<memberId>     (forward edge)
+  //   memberOfGroups: principalId -> Set<groupId> (reverse edge — what we need
+  //     during BFS to "promote" a user up to a group they belong to).
+  const summaryById = new Map<string, PrincipalSummary>();
+  for (const s of summaries) summaryById.set(s.principalId.toLowerCase(), s);
+
+  const memberOfGroups = new Map<string, Set<string>>();
+  const groupMembersLower = new Map<string, Set<string>>();
+  if (groupMembersByGroupId) {
+    for (const [gid, members] of groupMembersByGroupId.entries()) {
+      const gidL = gid.toLowerCase();
+      const setM = new Set<string>();
+      groupMembersLower.set(gidL, setM);
+      for (const m of members) {
+        const mid = m.id.toLowerCase();
+        setM.add(mid);
+        const arr = memberOfGroups.get(mid) ?? new Set<string>();
+        arr.add(gidL);
+        memberOfGroups.set(mid, arr);
+      }
+    }
+  }
+
+  // 1) Pick start principals — any summary matching `principalQuery`. If the
+  //    query is empty, every principal that has a scope-matching assignment is
+  //    its own start.
+  const startSummaries: PrincipalSummary[] = [];
+  for (const s of summaries) {
+    const match = pq
+      ? s.principalId.toLowerCase().includes(pq) ||
+        s.displayName.toLowerCase().includes(pq) ||
+        (s.signInName ?? "").toLowerCase().includes(pq)
+      : true;
+    if (match) startSummaries.push(s);
+  }
+  if (startSummaries.length === 0) return [];
+
+  // 2) BFS from each start; collect shortest path(s) to a scope-matching
+  //    assignment. Per-start BFS is bounded so we never spiral.
+  const HOP_BUDGET = 5;
+  const paths: FoundPath[] = [];
+  for (const start of startSummaries) {
+    if (paths.length >= maxPaths) break;
+    type QState = {
+      principalId: string; // lowercased
+      hops: PathHop[];     // path so far (ends at this principal)
+      viaGroup: boolean;
+      viaNestedGroup: boolean;
+    };
+    const startHop: PathHop = {
+      kind: "principal",
+      id: start.principalId,
+      label: start.displayName,
+      principalType: start.principalType,
+      detail: start.signInName,
+    };
+    const visited = new Set<string>([start.principalId.toLowerCase()]);
+    const queue: QState[] = [
+      {
+        principalId: start.principalId.toLowerCase(),
+        hops: [startHop],
+        viaGroup: false,
+        viaNestedGroup: false,
+      },
+    ];
+    while (queue.length > 0 && paths.length < maxPaths) {
+      const cur = queue.shift()!;
+      // Terminal check: does THIS principal hold an assignment to a matching
+      // scope? If so, materialize the role + scope hops and record the path.
+      const curSummary = summaryById.get(cur.principalId);
+      if (curSummary) {
+        for (const a of curSummary.assignments) {
+          if (sq && !a.scope.toLowerCase().includes(sq)) continue;
+          // Skip if no scope query AND principal query already matched — caller
+          // wanted any-scope path; in that case we still need at least one role
+          // to be on the path so we just take the first assignment.
+          const roleHop: PathHop = {
+            kind: "role",
+            id: a.roleDefinitionId,
+            label: a.roleName,
+            tier: a.tier,
+            detail: PRIVILEGE_TIER_META[a.tier].label,
+          };
+          const scopeHop: PathHop = {
+            kind: "scope",
+            id: a.scope,
+            label: describeScope(a.scope),
+            scopeLevel: a.scopeLevel,
+            detail: a.scope,
+          };
+          paths.push({
+            hops: [...cur.hops, roleHop, scopeHop],
+            hopCount: cur.hops.length + 1,
+            viaGroup: cur.viaGroup,
+            viaNestedGroup: cur.viaNestedGroup,
+            highestTier: a.tier,
+          });
+          if (paths.length >= maxPaths) break;
+          // Don't break — record EVERY scope-matching assignment for this
+          // principal so the operator sees all path variants.
+        }
+      }
+      // Expand: walk up to groups this principal is a member of.
+      if (cur.hops.length >= HOP_BUDGET) continue;
+      const groups = memberOfGroups.get(cur.principalId);
+      if (!groups) continue;
+      for (const gid of groups) {
+        if (visited.has(gid)) continue;
+        visited.add(gid);
+        // Look up the group's summary for a friendly label.
+        const gSummary = summaryById.get(gid);
+        // Detect nested-group transition: previous hop was already a group.
+        const prevWasGroup =
+          cur.hops[cur.hops.length - 1]!.kind === "group";
+        const groupHop: PathHop = {
+          kind: "group",
+          id: gid,
+          label: gSummary?.displayName ?? `Group ${gid.substring(0, 8)}…`,
+          detail: prevWasGroup ? "nested" : "member-of",
+        };
+        queue.push({
+          principalId: gid,
+          hops: [...cur.hops, groupHop],
+          viaGroup: true,
+          viaNestedGroup: cur.viaNestedGroup || prevWasGroup,
+        });
+      }
+    }
+  }
+  // Sort: shortest first, then most-dangerous tier first.
+  paths.sort((a, b) => {
+    if (a.hopCount !== b.hopCount) return a.hopCount - b.hopCount;
+    const oa = PRIVILEGE_TIER_META[a.highestTier].order;
+    const ob = PRIVILEGE_TIER_META[b.highestTier].order;
+    return oa - ob;
+  });
+  return paths.slice(0, maxPaths);
+}
+
+// ---------------------------------------------------------------------------
+// Transitive-ownership chain detector
+//
+// Corpus citation:
+//   - `_bypass_role_grant.md` §5.3 (group ownership = membership management)
+//   - `_bypass_role_grant.md` §5.4 (nested groups)
+//   - `_AZURE_BYPASS_PLAYBOOK.md` Top-30 item 26 (role-assignable group owners)
+//
+// Pattern: principal A owns group G1; G1 has member group G2; G2 holds a
+// privileged role. A inherits the role via two hops (own → member → role)
+// with no role-grant audit event firing on either edge. This is the
+// "stealth GA via nested ownership" primitive — substring overlay can't see
+// it because A holds NO direct role assignment.
+//
+// Inputs:
+//   - groups   — the same role-assignable-group enumeration used for Signal B.
+//   - summaries — the page's grouped summaries (for tier-lookup on G2).
+//   - groupMembersByGroupId — transitive members map (so we can see G2 ⊂ G1).
+// ---------------------------------------------------------------------------
+
+/** One transitive-ownership chain finding. */
+export interface OwnershipChainFinding {
+  /** The originating principal (the owner of G1). */
+  ownerId: string;
+  ownerDisplayName: string;
+  ownerType: string;
+  isGuest: boolean;
+  /** First group in the chain (the one A directly owns). */
+  rootGroupId: string;
+  rootGroupDisplayName: string;
+  /** All intermediate groups on the chain (G2, G3, ...). */
+  intermediateGroupIds: string[];
+  /** Final group that holds the role (= last entry in groups path). */
+  terminalGroupId: string;
+  terminalGroupDisplayName: string;
+  /** The role(s) the terminal group currently holds in the audited subs. */
+  terminalRoles: string[];
+  terminalTier: PrivilegeTier;
+  /** Number of group hops (= ownership chain depth, min 1). */
+  depth: number;
+  severity: SignalSeverity;
+}
+
+/** Inputs for `detectOwnershipChains`. */
+export interface OwnershipChainInputs {
+  /** Output of Signal B fetch: groups + their owners. */
+  groups: ReadonlyArray<{
+    id: string;
+    displayName: string;
+    owners: ReadonlyArray<{
+      id: string;
+      displayName: string;
+      type: string;
+      signInName?: string;
+    }>;
+  }>;
+  /** Summaries — to look up what role each terminal group holds. */
+  summaries: ReadonlyArray<PrincipalSummary>;
+  /** Transitive-members map keyed by group id. */
+  groupMembersByGroupId?: ReadonlyMap<string, ReadonlyArray<ResolvedGroupMember>>;
+}
+
+/**
+ * Detect ownership chains where an owner of group G1 transitively reaches a
+ * group G2 (via membership) that holds a privileged role.
+ *
+ * Algorithm: for every group G1 we know about (= every Signal B row), walk
+ * the transitive-members graph and find every group reachable from G1. If
+ * any such group has a `critical` or `privileged` tier assignment, emit one
+ * finding per (owner-of-G1, terminal-group) pair.
+ *
+ * Depth budget: 4 (same as BFS — `_bypass_role_grant.md` §5.4 calls out 2-3
+ * nesting levels as the common case; 4 gives us headroom).
+ */
+export function detectOwnershipChains(
+  inputs: OwnershipChainInputs,
+): OwnershipChainFinding[] {
+  const { groups, summaries, groupMembersByGroupId } = inputs;
+  if (groups.length === 0) return [];
+
+  // Build forward members map (lowercased) — group → set of member ids.
+  const members = new Map<string, Set<string>>();
+  if (groupMembersByGroupId) {
+    for (const [gid, m] of groupMembersByGroupId.entries()) {
+      const set = new Set<string>();
+      for (const x of m) set.add(x.id.toLowerCase());
+      members.set(gid.toLowerCase(), set);
+    }
+  }
+  // Build summary lookup keyed by lowercased principal id.
+  const summaryById = new Map<string, PrincipalSummary>();
+  for (const s of summaries) summaryById.set(s.principalId.toLowerCase(), s);
+  // Pre-resolve which groups are "interesting terminals" — i.e. they hold a
+  // privileged-or-higher role.
+  function tierOf(gid: string): PrivilegeTier | undefined {
+    const s = summaryById.get(gid);
+    if (!s) return undefined;
+    if (s.highestTier === "critical" || s.highestTier === "privileged") {
+      return s.highestTier;
+    }
+    return undefined;
+  }
+  function rolesOf(gid: string): string[] {
+    const s = summaryById.get(gid);
+    if (!s) return [];
+    return Array.from(new Set(s.assignments.map((a) => a.roleName)));
+  }
+
+  const out: OwnershipChainFinding[] = [];
+  const HOP_BUDGET = 4;
+
+  for (const g of groups) {
+    const rootGid = g.id.toLowerCase();
+    // BFS from rootGid through `members` map.
+    type Q = { gid: string; path: string[]; depth: number };
+    const visited = new Set<string>([rootGid]);
+    const queue: Q[] = [{ gid: rootGid, path: [], depth: 0 }];
+    // Collect EVERY terminal we reach, not just the first.
+    const terminals: Array<{ gid: string; path: string[]; depth: number }> = [];
+    while (queue.length > 0) {
+      const cur = queue.shift()!;
+      if (cur.depth > 0) {
+        const tier = tierOf(cur.gid);
+        if (tier) {
+          terminals.push({ gid: cur.gid, path: cur.path, depth: cur.depth });
+        }
+      }
+      if (cur.depth >= HOP_BUDGET) continue;
+      const m = members.get(cur.gid);
+      if (!m) continue;
+      for (const child of m) {
+        if (visited.has(child)) continue;
+        // Only expand into entities that are themselves groups in our member
+        // map (otherwise we'd traverse user/SP leaves, which is irrelevant
+        // for ownership chains). A group is "knowable" when we have a members
+        // entry for it — we can't enumerate further without it anyway.
+        visited.add(child);
+        // Walk further only if `child` is itself a group key in `members`.
+        if (members.has(child)) {
+          queue.push({
+            gid: child,
+            path: [...cur.path, child],
+            depth: cur.depth + 1,
+          });
+        } else {
+          // `child` is a leaf — but it could still be a role-holding group we
+          // haven't enumerated members for. Check tier and emit if so.
+          const tier = tierOf(child);
+          if (tier) {
+            terminals.push({
+              gid: child,
+              path: [...cur.path, child],
+              depth: cur.depth + 1,
+            });
+          }
+        }
+      }
+    }
+    // Emit one finding per (owner, terminal) pair.
+    for (const owner of g.owners) {
+      for (const t of terminals) {
+        const terminalSummary = summaryById.get(t.gid);
+        if (!terminalSummary) continue;
+        const tier = terminalSummary.highestTier;
+        let severity: SignalSeverity = "info";
+        if (tier === "critical") severity = "critical";
+        else if (tier === "privileged") severity = "high";
+        out.push({
+          ownerId: owner.id,
+          ownerDisplayName: owner.displayName,
+          ownerType: owner.type,
+          isGuest: isGuestUpn(owner.signInName),
+          rootGroupId: g.id,
+          rootGroupDisplayName: g.displayName,
+          intermediateGroupIds: t.path.slice(0, -1),
+          terminalGroupId: t.gid,
+          terminalGroupDisplayName: terminalSummary.displayName,
+          terminalRoles: rolesOf(t.gid),
+          terminalTier: tier,
+          depth: t.depth,
+          severity,
+        });
+      }
+    }
+  }
+  // De-dupe: same owner + same terminal — keep the shortest chain.
+  const dedup = new Map<string, OwnershipChainFinding>();
+  for (const f of out) {
+    const key = `${f.ownerId.toLowerCase()}|${f.terminalGroupId.toLowerCase()}`;
+    const prev = dedup.get(key);
+    if (!prev || f.depth < prev.depth) dedup.set(key, f);
+  }
+  return Array.from(dedup.values()).sort((a, b) => {
+    const oa = SIGNAL_SEVERITY_META[a.severity].order;
+    const ob = SIGNAL_SEVERITY_META[b.severity].order;
+    if (oa !== ob) return oa - ob;
+    if (a.depth !== b.depth) return a.depth - b.depth;
+    return a.ownerDisplayName.localeCompare(b.ownerDisplayName);
+  });
+}
+

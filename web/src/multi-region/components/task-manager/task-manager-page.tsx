@@ -92,7 +92,10 @@ import {
   taskRuntime,
 } from "../../store/task-runtime";
 
+import { BulkActionsBar } from "./bulk-actions-bar";
 import { ConfirmationDialog } from "./confirmation-dialog";
+import { DestructiveHeatmap } from "./destructive-heatmap";
+import { FilterPresets, type FilterPreset } from "./filter-presets";
 import { formatDuration } from "./task-formatting";
 import { TaskRow } from "./task-row";
 
@@ -159,6 +162,15 @@ const getTaskRuntimeSnapshot = (): TaskRecord[] => {
  * returning the same cached reference.
  *
  * Guarded so it only attaches once even with HMR.
+ *
+ * Intentional non-unsubscribe: this listener lives for the lifetime of
+ * the module (which equals the app lifetime). taskRuntime is a singleton
+ * pinned to the same lifetime. Storing the unsub handle would only let
+ * us "leak" it later — the listener cannot be safely removed without
+ * also tearing down every TaskManagerPage and resume-prompt subscriber.
+ * If hot-module-reload re-imports this file, the `_snapshotInvalidatorAttached`
+ * latch guards against double-attach (the previous module instance is
+ * GC'd and its closure leaks one listener — acceptable HMR cost).
  */
 let _snapshotInvalidatorAttached = false;
 function ensureSnapshotInvalidator(): void {
@@ -434,10 +446,15 @@ interface SectionProps {
   helpText?: string;
   /** Bulk actions surfaced in the section header for non-empty sections. */
   headerActions?: React.ReactNode;
-  /** Currently-selected task id (single-select). */
-  selectedId?: string | null;
-  /** Selection setter — invoked when a row body is clicked. */
-  onSelect?: (id: string) => void;
+  /** Currently-selected task ids (multi-select). */
+  selectedIds?: Set<string>;
+  /** Anchor id used to drive shift-click range selection highlighting. */
+  anchorId?: string | null;
+  /** Selection handler — invoked on bare/cmd/ctrl/shift click. */
+  onSelect?: (
+    id: string,
+    modifiers?: { shift: boolean; meta: boolean; ctrl: boolean },
+  ) => void;
   /** Show the inline raw-JSON expander on each row. */
   enableJsonExpander?: boolean;
 }
@@ -452,7 +469,8 @@ const Section: React.FC<SectionProps> = ({
   defaultOpen = true,
   helpText,
   headerActions,
-  selectedId,
+  selectedIds,
+  anchorId,
   onSelect,
   enableJsonExpander,
 }) => {
@@ -526,7 +544,11 @@ const Section: React.FC<SectionProps> = ({
                   task={t}
                   actions={actions}
                   nowTick={nowTick}
-                  selected={selectedId === t.id}
+                  // Highlight every row that's in the multi-select set; the
+                  // anchor is the "focus" row that keyboard shortcuts target.
+                  selected={
+                    selectedIds ? selectedIds.has(t.id) : anchorId === t.id
+                  }
                   onSelect={onSelect}
                   enableJsonExpander={enableJsonExpander}
                 />
@@ -597,16 +619,50 @@ export const TaskManagerPage: React.FC = () => {
   const [copiedIdsSection, setCopiedIdsSection] = React.useState<string | null>(
     null,
   );
+  /**
+   * Confirmation dialog state.
+   *
+   * The original 3 kinds (clear-finished, discard-interrupted, remove-history)
+   * are header-driven; the new bulk-* kinds are selection-driven and carry
+   * an explicit id list so the dialog can show the affected count and the
+   * onConfirm handler doesn't need to re-derive eligibility (the selection
+   * may have changed between opening the dialog and the user confirming).
+   */
   const [confirmState, setConfirmState] = React.useState<{
-    kind: "clear-finished" | "discard-interrupted" | "remove-history" | null;
+    kind:
+      | "clear-finished"
+      | "discard-interrupted"
+      | "remove-history"
+      | "bulk-cancel"
+      | "bulk-remove"
+      | "bulk-resume"
+      | "bulk-pause"
+      | null;
+    /** Frozen target ids for bulk-* kinds (snapshotted when the dialog opens). */
+    ids?: string[];
   }>({ kind: null });
 
   /**
-   * Single-select id used by keyboard shortcuts (`c` to cancel, `r` to
-   * resume/retry). Clicking a row sets this; clicking buttons inside the
-   * row does NOT (the buttons stopPropagation). Null = nothing selected.
+   * Multi-select id set used by keyboard shortcuts AND the bulk-actions bar.
+   *   - `selectedIds.size === 1` keeps the original single-select behaviour
+   *     (the lone id is the keyboard-shortcut target).
+   *   - `selectedIds.size > 1` enables the bulk-actions bar; the keyboard
+   *     shortcuts operate on the "anchor" id (the most-recently clicked
+   *     row).
+   *   - Clicking a row sets {anchor} (replace). Cmd/Ctrl+click toggles a
+   *     single id. Shift+click selects the range from anchor → clicked
+   *     within the current filtered list order.
    */
-  const [selectedId, setSelectedId] = React.useState<string | null>(null);
+  const [selectedIds, setSelectedIds] = React.useState<Set<string>>(
+    () => new Set(),
+  );
+  const [anchorId, setAnchorId] = React.useState<string | null>(null);
+  /**
+   * Backwards-compat alias for the keyboard-shortcut "focused" id.
+   * The `c` / `r` / `p` hotkeys still operate on a single task — the anchor.
+   * Multi-select extends this without changing the per-row hotkey semantics.
+   */
+  const selectedId = anchorId;
 
   /**
    * Tail-mode: auto-scroll to the newest task row whenever the underlying
@@ -632,6 +688,47 @@ export const TaskManagerPage: React.FC = () => {
     false,
     { version: 1 },
   );
+
+  /**
+   * ARIA-live announcer for state transitions. Screen-readers cannot see
+   * the visual status pill changing, so this off-screen polite-live
+   * region narrates "Task <label> moved to <status>" whenever a task we
+   * track flips its status. Coalesces to a single sentence per render
+   * with the most-recent transition wins.
+   *
+   * Implementation: track previous tasks list in a ref and diff on every
+   * render. Cap announcement string to keep TTS bursts short.
+   */
+  const prevTasksRef = React.useRef<Map<string, TaskStatus>>(new Map());
+  const [ariaAnnounce, setAriaAnnounce] = React.useState<string>("");
+  React.useEffect(() => {
+    const prev = prevTasksRef.current;
+    const next = new Map<string, TaskStatus>();
+    const transitions: { label: string; from: TaskStatus; to: TaskStatus }[] = [];
+    for (const t of tasks) {
+      next.set(t.id, t.status);
+      const before = prev.get(t.id);
+      if (before !== undefined && before !== t.status) {
+        transitions.push({ label: t.label, from: before, to: t.status });
+      }
+    }
+    prevTasksRef.current = next;
+    if (transitions.length === 0) return;
+    // Most-recent transition wins. For 2+ transitions, summarize.
+    if (transitions.length === 1) {
+      const x = transitions[0];
+      setAriaAnnounce(`Task ${x.label} moved from ${x.from} to ${x.to}.`);
+    } else {
+      const last = transitions[transitions.length - 1];
+      setAriaAnnounce(
+        `${transitions.length} tasks changed status. Most recent: ${last.label} is now ${last.to}.`,
+      );
+    }
+    // Clear the announcer after a delay so the same transition can fire
+    // again later (screen-readers ignore identical successive strings).
+    const t = window.setTimeout(() => setAriaAnnounce(""), 2000);
+    return () => window.clearTimeout(t);
+  }, [tasks]);
 
   /**
    * Hotkey toast — a transient banner shown when a shortcut fires so the
@@ -737,6 +834,60 @@ export const TaskManagerPage: React.FC = () => {
       );
     });
   }, [tasks, filter, activeChips, failed24h, nowMs]);
+
+  /**
+   * Modifier-aware row-select handler.
+   *
+   *   - bare click     → single-select, replace.
+   *   - cmd/ctrl+click → toggle the clicked id in the set, leaving anchor.
+   *   - shift+click    → range-select from anchor → clicked within `filtered`
+   *                      list order, additive (union with existing set).
+   *
+   * Range-select uses the FILTERED list order so the operator's mental
+   * "this row to that row" matches what they see. The order across sections
+   * isn't well defined (running vs attention vs terminal) but the filtered
+   * array preserves the createdAt-desc order from task-runtime.list().
+   */
+  const handleRowSelect = React.useCallback(
+    (
+      id: string,
+      modifiers?: { shift: boolean; meta: boolean; ctrl: boolean },
+    ) => {
+      const mod = modifiers ?? { shift: false, meta: false, ctrl: false };
+      if (mod.shift && anchorId) {
+        // Range-select within the current filtered list.
+        const ids = filtered.map((t) => t.id);
+        const aIdx = ids.indexOf(anchorId);
+        const bIdx = ids.indexOf(id);
+        if (aIdx >= 0 && bIdx >= 0) {
+          const [lo, hi] = aIdx <= bIdx ? [aIdx, bIdx] : [bIdx, aIdx];
+          setSelectedIds((prev) => {
+            const next = new Set(prev);
+            for (let i = lo; i <= hi; i++) next.add(ids[i]);
+            return next;
+          });
+          // Anchor doesn't move on shift-click — the operator can extend
+          // the range further in either direction.
+          return;
+        }
+        // Fallback: treat as bare click if either id is no longer visible.
+      }
+      if (mod.meta || mod.ctrl) {
+        setSelectedIds((prev) => {
+          const next = new Set(prev);
+          if (next.has(id)) next.delete(id);
+          else next.add(id);
+          return next;
+        });
+        setAnchorId(id);
+        return;
+      }
+      // Bare click → single-select replace.
+      setSelectedIds(new Set([id]));
+      setAnchorId(id);
+    },
+    [anchorId, filtered],
+  );
 
   /**
    * Stuck-running tasks are surfaced under attention so the user sees
@@ -1024,8 +1175,47 @@ export const TaskManagerPage: React.FC = () => {
     showHotkeyHint(`Cannot retry a ${rec.status} task.`);
   }, [actions, selectedId, showHotkeyHint]);
 
+  /**
+   * Hotkey: `p` pauses the selected (single-select) running task.
+   * Defensive — does nothing on non-running statuses so the operator's
+   * muscle memory can't accidentally do something destructive.
+   */
+  const onHotkeyPause = React.useCallback(() => {
+    if (!selectedId) {
+      showHotkeyHint("No task selected — click a row first.");
+      return;
+    }
+    const rec = taskRuntime.get(selectedId);
+    if (!rec) return;
+    if (rec.status !== "running") {
+      showHotkeyHint(`Cannot pause a ${rec.status} task.`);
+      return;
+    }
+    actions.onPause(selectedId);
+    showHotkeyHint(`Paused "${rec.label}"`);
+  }, [actions, selectedId, showHotkeyHint]);
+
+  /**
+   * Hotkey: `Escape` clears multi-select (or single-select). If nothing is
+   * selected, no-ops silently.
+   */
+  const onHotkeyEscape = React.useCallback(() => {
+    if (selectedIds.size === 0 && anchorId === null) return;
+    setSelectedIds(new Set());
+    setAnchorId(null);
+    showHotkeyHint("Selection cleared.");
+  }, [selectedIds, anchorId, showHotkeyHint]);
+
   useShortcut("c", onHotkeyCancel, { allowInInputs: false });
   useShortcut("r", onHotkeyRetry, { allowInInputs: false });
+  useShortcut("p", onHotkeyPause, { allowInInputs: false });
+  // Escape doesn't preventDefault — we don't want to block native dialog
+  // dismissals (the Radix dialog has its own Esc handler that fires first
+  // since the dialog manages focus).
+  useShortcut("Escape", onHotkeyEscape, {
+    allowInInputs: false,
+    preventDefault: false,
+  });
 
   /**
    * Tail-mode: when on, scroll the page to the running section after every
@@ -1044,17 +1234,30 @@ export const TaskManagerPage: React.FC = () => {
   }, [tailMode, tasks.length]);
 
   /**
-   * Clear dangling selection when the selected task disappears (e.g. user
+   * Clear dangling selection when selected tasks disappear (e.g. user
    * pressed `c`, the task was cancelled & cleared, the id no longer exists).
-   * Cheap O(n) check; the alternative is a stale id forever sticking
-   * around in state.
+   * Cheap O(n) check; the alternative is stale ids forever sticking around
+   * in state, which would also stale-out the BulkActionsBar.
+   *
+   * Two-phase: prune missing ids from the Set, and re-anchor if the
+   * anchor was the missing one (pick the first remaining selected id, or
+   * null if the set is now empty).
    */
   React.useEffect(() => {
-    if (selectedId === null) return;
-    if (!tasks.some((t) => t.id === selectedId)) {
-      setSelectedId(null);
+    if (selectedIds.size === 0 && anchorId === null) return;
+    const liveIds = new Set(tasks.map((t) => t.id));
+    let mutated = false;
+    const nextSet = new Set<string>();
+    for (const id of selectedIds) {
+      if (liveIds.has(id)) nextSet.add(id);
+      else mutated = true;
     }
-  }, [tasks, selectedId]);
+    if (mutated) setSelectedIds(nextSet);
+    if (anchorId !== null && !liveIds.has(anchorId)) {
+      const replacement = nextSet.values().next().value ?? null;
+      setAnchorId(replacement);
+    }
+  }, [tasks, selectedIds, anchorId]);
 
   const popOut = React.useCallback(() => {
     // Open the same route in a borderless window. The shell still mounts
@@ -1131,6 +1334,77 @@ export const TaskManagerPage: React.FC = () => {
     [filtered, tasks, store],
   );
 
+  /**
+   * BulkActionsBar wiring. Confirmation flows through the existing
+   * ConfirmationDialog state machine — bulk-* kinds carry their target id
+   * list so confirm is decoupled from the live selection (which the user
+   * might mutate between opening the dialog and clicking confirm).
+   *
+   * Export-selected is fire-and-forget — no confirmation needed, it's a
+   * read-only download. It piggybacks on the existing `tasksToJson` helper.
+   */
+  const onBulkCancel = React.useCallback(
+    (ids: string[]) => openBulkConfirm("bulk-cancel", ids),
+    [openBulkConfirm],
+  );
+  const onBulkRemove = React.useCallback(
+    (ids: string[]) => openBulkConfirm("bulk-remove", ids),
+    [openBulkConfirm],
+  );
+  const onBulkResume = React.useCallback(
+    (ids: string[]) => openBulkConfirm("bulk-resume", ids),
+    [openBulkConfirm],
+  );
+  const onBulkPause = React.useCallback(
+    (ids: string[]) => openBulkConfirm("bulk-pause", ids),
+    [openBulkConfirm],
+  );
+  const onBulkExport = React.useCallback(
+    (ids: string[]) => {
+      if (ids.length === 0) return;
+      const set = new Set(ids);
+      const subset = tasks.filter((t) => set.has(t.id));
+      if (subset.length === 0) {
+        store.addNotification({
+          type: "warning",
+          message: "Selected tasks are no longer present — nothing to export.",
+          autoDismissMs: 2500,
+        });
+        return;
+      }
+      const ts = new Date().toISOString().replace(/[:.]/g, "-");
+      downloadBlob(`task-manager-selected-${ts}.json`, tasksToJson(subset));
+      store.addNotification({
+        type: "success",
+        message: `Exported ${subset.length} selected task${subset.length === 1 ? "" : "s"} (JSON).`,
+        autoDismissMs: 2500,
+      });
+    },
+    [tasks, store],
+  );
+  const onClearSelection = React.useCallback(() => {
+    setSelectedIds(new Set());
+    setAnchorId(null);
+  }, []);
+
+  /**
+   * Filter-preset apply: takes a stored FilterPreset and replays it onto
+   * the live filter state (search box, chip set, failed24h toggle). This
+   * is the only place that mutates all three at once — everywhere else
+   * the toolbar drives them individually.
+   */
+  const onApplyPreset = React.useCallback(
+    (p: FilterPreset) => {
+      setFilter(p.search);
+      setActiveChips(new Set(p.chips));
+      setFailed24h(p.failed24h);
+      // The preset application itself doesn't change selection, but a
+      // re-filter may shrink/expand the visible list. The dangling-
+      // selection effect will reconcile if needed.
+    },
+    [setFailed24h],
+  );
+
   // Auto-resume banner — read once on mount. The auto-resumer (mounted in
   // dashboard-shell) writes the count just before dispatching; we surface it
   // here as an animated info banner that auto-dismisses or can be closed.
@@ -1165,10 +1439,24 @@ export const TaskManagerPage: React.FC = () => {
   /**
    * Confirmation dialog handlers — wired to a single state machine so we
    * never end up with two dialogs simultaneously.
+   *
+   * Two openers: one for the header-driven kinds (no ids), one for the
+   * bulk-* kinds (with a frozen id snapshot so dialog confirmation
+   * operates on the selection at open-time, not at confirm-time).
    */
   const openConfirm = React.useCallback(
     (kind: "clear-finished" | "discard-interrupted" | "remove-history") => {
       setConfirmState({ kind });
+    },
+    [],
+  );
+  const openBulkConfirm = React.useCallback(
+    (
+      kind: "bulk-cancel" | "bulk-remove" | "bulk-resume" | "bulk-pause",
+      ids: string[],
+    ) => {
+      if (ids.length === 0) return;
+      setConfirmState({ kind, ids: ids.slice() });
     },
     [],
   );
@@ -1243,9 +1531,114 @@ export const TaskManagerPage: React.FC = () => {
         message: `Removed ${count} historical task${count === 1 ? "" : "s"}.`,
         autoDismissMs: 2500,
       });
+    } else if (confirmState.kind === "bulk-cancel") {
+      const ids = confirmState.ids ?? [];
+      let applied = 0;
+      for (const id of ids) {
+        const rec = taskRuntime.get(id);
+        if (!rec || (rec.status !== "running" && rec.status !== "paused")) continue;
+        actions.onCancel(id);
+        applied++;
+      }
+      auditLog.record({
+        actor: "ui",
+        action: "task_bulk_cancel",
+        target: "task-manager",
+        status: "success",
+        details: { requested: ids.length, applied },
+      });
+      store.addNotification({
+        type: "info",
+        message: `Cancelled ${applied} task${applied === 1 ? "" : "s"}.`,
+        autoDismissMs: 2500,
+      });
+    } else if (confirmState.kind === "bulk-remove") {
+      const ids = confirmState.ids ?? [];
+      let applied = 0;
+      for (const id of ids) {
+        const rec = taskRuntime.get(id);
+        if (!rec) continue;
+        actions.onRemove(id);
+        applied++;
+      }
+      auditLog.record({
+        actor: "ui",
+        action: "task_bulk_remove",
+        target: "task-manager",
+        status: "success",
+        details: { requested: ids.length, applied },
+      });
+      store.addNotification({
+        type: "info",
+        message: `Removed ${applied} task${applied === 1 ? "" : "s"}.`,
+        autoDismissMs: 2500,
+      });
+      // Clear selection after a bulk remove — the ids no longer exist.
+      setSelectedIds(new Set());
+      setAnchorId(null);
+    } else if (confirmState.kind === "bulk-resume") {
+      const ids = confirmState.ids ?? [];
+      let applied = 0;
+      // Serial dispatch — orchestrator concurrency / rate-limit guards
+      // see them in order. Errors land on each task record.
+      void (async () => {
+        for (const id of ids) {
+          const rec = taskRuntime.get(id);
+          if (!rec) continue;
+          if (
+            rec.status !== "interrupted" &&
+            rec.status !== "paused" &&
+            rec.status !== "failed"
+          )
+            continue;
+          try {
+            if (rec.status === "paused") {
+              await actions.onStart(id);
+            } else {
+              await actions.onResume(id);
+            }
+            applied++;
+          } catch {
+            /* per-task errors are recorded on the task record itself */
+          }
+        }
+        auditLog.record({
+          actor: "ui",
+          action: "task_bulk_resume",
+          target: "task-manager",
+          status: "success",
+          details: { requested: ids.length, applied },
+        });
+        store.addNotification({
+          type: "info",
+          message: `Resumed ${applied} task${applied === 1 ? "" : "s"}.`,
+          autoDismissMs: 2500,
+        });
+      })();
+    } else if (confirmState.kind === "bulk-pause") {
+      const ids = confirmState.ids ?? [];
+      let applied = 0;
+      for (const id of ids) {
+        const rec = taskRuntime.get(id);
+        if (!rec || rec.status !== "running") continue;
+        actions.onPause(id);
+        applied++;
+      }
+      auditLog.record({
+        actor: "ui",
+        action: "task_bulk_pause",
+        target: "task-manager",
+        status: "success",
+        details: { requested: ids.length, applied },
+      });
+      store.addNotification({
+        type: "info",
+        message: `Paused ${applied} task${applied === 1 ? "" : "s"}.`,
+        autoDismissMs: 2500,
+      });
     }
     closeConfirm();
-  }, [confirmState, closeConfirm, finishedTasks.length, historyTasks, store]);
+  }, [confirmState, closeConfirm, finishedTasks.length, historyTasks, store, actions]);
 
   // Initial-loading skeleton: only render skeletons before the runtime has
   // bootstrapped. taskRuntime.list() returns synchronously after bootstrap,
@@ -1296,8 +1689,67 @@ export const TaskManagerPage: React.FC = () => {
         details: <ConfirmDetailsList tasks={historyTasks.slice(0, 8)} more={Math.max(0, historyTasks.length - 8)} />,
       };
     }
+    // Bulk-* kinds: resolve the frozen id snapshot back to TaskRecord objects
+    // for the details list. Stale ids (task removed between dialog open and
+    // confirm) silently drop out of the displayed list — the action handler
+    // also re-validates on confirm so we never operate on stale ids.
+    if (
+      confirmState.kind === "bulk-cancel" ||
+      confirmState.kind === "bulk-remove" ||
+      confirmState.kind === "bulk-resume" ||
+      confirmState.kind === "bulk-pause"
+    ) {
+      const ids = confirmState.ids ?? [];
+      const targets: TaskRecord[] = [];
+      for (const id of ids) {
+        const t = taskRuntime.get(id);
+        if (t) targets.push(t);
+      }
+      const n = targets.length;
+      const noun = n === 1 ? "task" : "tasks";
+      if (confirmState.kind === "bulk-cancel") {
+        return {
+          title: `Cancel ${n} ${noun}?`,
+          description:
+            "Stops running/paused tasks after the current step. Already-provisioned Azure resources are NOT removed.",
+          confirmLabel: `Cancel ${n} ${noun}`,
+          tone: "warning" as const,
+          details: <ConfirmDetailsList tasks={targets.slice(0, 8)} more={Math.max(0, n - 8)} />,
+        };
+      }
+      if (confirmState.kind === "bulk-remove") {
+        return {
+          title: `Remove ${n} ${noun} from the list?`,
+          description:
+            "Permanently deletes the selected tasks. Cannot be undone. Does not touch Azure resources.",
+          confirmLabel: `Remove ${n} ${noun}`,
+          tone: "destructive" as const,
+          details: <ConfirmDetailsList tasks={targets.slice(0, 8)} more={Math.max(0, n - 8)} />,
+        };
+      }
+      if (confirmState.kind === "bulk-resume") {
+        return {
+          title: `Resume ${n} ${noun}?`,
+          description:
+            "Re-dispatches each task with its original input. Idempotent operations skip already-done work on the Azure side.",
+          confirmLabel: `Resume ${n} ${noun}`,
+          tone: "warning" as const,
+          details: <ConfirmDetailsList tasks={targets.slice(0, 8)} more={Math.max(0, n - 8)} />,
+        };
+      }
+      if (confirmState.kind === "bulk-pause") {
+        return {
+          title: `Pause ${n} ${noun}?`,
+          description:
+            "Cooperative pause — each task stops after its current iteration. Resume any time from this page.",
+          confirmLabel: `Pause ${n} ${noun}`,
+          tone: "warning" as const,
+          details: <ConfirmDetailsList tasks={targets.slice(0, 8)} more={Math.max(0, n - 8)} />,
+        };
+      }
+    }
     return null;
-  }, [confirmState.kind, finishedTasks, interruptedTasks, historyTasks]);
+  }, [confirmState.kind, confirmState.ids, finishedTasks, interruptedTasks, historyTasks]);
 
   return (
     <div className="flex flex-col gap-5 py-2">
@@ -1503,6 +1955,26 @@ export const TaskManagerPage: React.FC = () => {
         </div>
       )}
 
+      {/* Destructive-op heatmap — corpus-grounded operator self-check.
+          See destructive-heatmap.tsx for the rationale (Azure bypass
+          playbook items 8-10: subscription cancel, hard-delete user,
+          delete diagnostic setting). Self-hides when there's nothing
+          to show AND no anomalous burst was detected. */}
+      <DestructiveHeatmap hideWhenEmpty />
+
+      {/* ARIA-live region: announces task status transitions for screen
+          readers. Off-screen but polite — narrates "Task <label> moved
+          from <from> to <to>" so non-visual users get the same realtime
+          feedback as the live-glow row treatment. */}
+      <div
+        role="status"
+        aria-live="polite"
+        aria-atomic="true"
+        className="sr-only"
+      >
+        {ariaAnnounce}
+      </div>
+
       {/* Toolbar — search + status chips. The chip row replaces the
           old single-purpose "Active only" toggle with multi-select
           predicates: combinations like "Failed + Interrupted" let the
@@ -1616,12 +2088,18 @@ export const TaskManagerPage: React.FC = () => {
                 <kbd className="rounded bg-muted/40 px-1 font-mono">c</kbd>
                 /
                 <kbd className="rounded bg-muted/40 px-1 font-mono">r</kbd>
+                /
+                <kbd className="rounded bg-muted/40 px-1 font-mono">p</kbd>
+                /
+                <kbd className="rounded bg-muted/40 px-1 font-mono">Esc</kbd>
               </span>
             </TooltipTrigger>
             <TooltipContent className="max-w-xs">
               Click a row to select it, then press <strong>c</strong> to
-              cancel a running/paused task or <strong>r</strong> to
-              resume/retry an interrupted, paused, or failed task.
+              cancel,&nbsp;<strong>r</strong> to resume/retry,&nbsp;
+              <strong>p</strong> to pause, or <strong>Esc</strong> to clear
+              the selection. Shift-click extends the selection; Cmd/Ctrl-click
+              toggles a row.
             </TooltipContent>
           </Tooltip>
         </div>
@@ -1636,6 +2114,13 @@ export const TaskManagerPage: React.FC = () => {
             />
           ))}
         </div>
+        {/* Saved filter presets — persisted across reloads. Empty on first
+            session; the "Save preset" button appears as a dashed pill the
+            operator can use to snapshot the current filter combo. */}
+        <FilterPresets
+          current={{ search: filter, chips: activeChips, failed24h }}
+          onApply={onApplyPreset}
+        />
       </div>
 
       {/* Hotkey hint banner — momentary feedback for `c` / `r` actions. */}
@@ -1648,6 +2133,22 @@ export const TaskManagerPage: React.FC = () => {
           {hotkeyHint}
         </div>
       )}
+
+      {/* Bulk-actions bar — sticky floating chip-row, only visible when
+          ≥2 tasks are selected. Single-select keeps the existing
+          c/r/p hotkey ergonomics; multi-select unlocks Pause/Resume/
+          Cancel/Remove/Export across the whole selection in one click,
+          all gated by ConfirmationDialog. */}
+      <BulkActionsBar
+        selectedIds={selectedIds}
+        getTask={(id) => taskRuntime.get(id)}
+        onClear={onClearSelection}
+        onBulkCancel={onBulkCancel}
+        onBulkResume={onBulkResume}
+        onBulkPause={onBulkPause}
+        onBulkRemove={onBulkRemove}
+        onBulkExport={onBulkExport}
+      />
 
       {/* Tail-mode anchor — scrollIntoView target when tail-mode is on. */}
       <div ref={tailAnchorRef} aria-hidden="true" />
@@ -1666,8 +2167,9 @@ export const TaskManagerPage: React.FC = () => {
             accent="primary"
             actions={actions}
             nowTick={nowTick}
-            selectedId={selectedId}
-            onSelect={setSelectedId}
+            selectedIds={selectedIds}
+            anchorId={anchorId}
+            onSelect={handleRowSelect}
             enableJsonExpander
             helpText="Tasks executing now or paused mid-flight. Pause is cooperative — the orchestrator finishes the current iteration before stopping."
             headerActions={
@@ -1694,8 +2196,9 @@ export const TaskManagerPage: React.FC = () => {
             accent="warning"
             actions={actions}
             nowTick={nowTick}
-            selectedId={selectedId}
-            onSelect={setSelectedId}
+            selectedIds={selectedIds}
+            anchorId={anchorId}
+            onSelect={handleRowSelect}
             enableJsonExpander
             helpText="Interrupted, failed, partial, or stuck tasks. Stuck tasks have no heartbeat for over a minute — consider cancelling and resuming."
             headerActions={
@@ -1741,8 +2244,9 @@ export const TaskManagerPage: React.FC = () => {
             tasks={grouped.terminal}
             actions={actions}
             nowTick={nowTick}
-            selectedId={selectedId}
-            onSelect={setSelectedId}
+            selectedIds={selectedIds}
+            anchorId={anchorId}
+            onSelect={handleRowSelect}
             enableJsonExpander
             defaultOpen={false}
             helpText="Completed and cancelled tasks. Use 'Clear finished' or 'Remove history' to clean up."

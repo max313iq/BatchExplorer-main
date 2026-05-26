@@ -37,10 +37,13 @@ import {
   ChevronRight,
   Crown,
   Filter,
+  Keyboard,
   Key,
   Loader2,
   Network,
   RefreshCw,
+  Rows3,
+  Rows4,
   Save,
   Search,
   Shield,
@@ -113,6 +116,8 @@ import {
   describeScope,
   detectAppAdminEscalation,
   detectCustomRoleWritePrivesc,
+  detectOwnershipChains,
+  findShortestPath,
   groupByPrincipal,
   PRIVILEGE_TIER_META,
   summarizeCredentialSurface,
@@ -121,6 +126,8 @@ import {
   type CustomRolePrivescFinding,
   type EscalationCategory,
   type EscalationFinding,
+  type FoundPath,
+  type OwnershipChainFinding,
   type PrincipalAssignment,
   type PrincipalSummary,
   type PrivilegeTier,
@@ -131,6 +138,7 @@ import {
   type SpCredentialSummary,
 } from "./role-graph-helpers";
 import { DefenderSignalsPanel } from "./defender-signals-panel";
+import { PathFinderPanel } from "./path-finder-panel";
 
 const ARM_BASE = "https://management.azure.com";
 const GRAPH_BASE = "https://graph.microsoft.com/v1.0";
@@ -862,7 +870,16 @@ const EscalationRow: React.FC<{
 // Single principal "node" — collapsible header + expanded assignment list.
 // ---------------------------------------------------------------------------
 
-const PrincipalNode: React.FC<{
+/**
+ * One principal "node" in the tree.
+ *
+ * Memoized with React.memo because on large tenants the principal list can
+ * be in the hundreds of rows; without memo, every toggle of one row's
+ * `expanded` state would re-render every other row (the parent re-renders
+ * all children, but each PrincipalNode's inputs are stable shallow-equal
+ * across toggles that don't affect it).
+ */
+const PrincipalNodeBase: React.FC<{
   summary: PrincipalSummary;
   expanded: boolean;
   onToggle: () => void;
@@ -872,7 +889,21 @@ const PrincipalNode: React.FC<{
    *  Renders an inline credential-recency badge when present.
    *  Citation: _bypass_role_grant.md §4.1, §4.2. */
   credentialFinding?: CredentialSurfaceFinding;
-}> = ({ summary, expanded, onToggle, isPathHighlight, credentialFinding }) => {
+  /** Compact density removes ancillary detail to fit more rows on screen. */
+  compact?: boolean;
+  /** Multi-select state — undefined means "no multi-select mode". */
+  selected?: boolean;
+  onSelectToggle?: () => void;
+}> = ({
+  summary,
+  expanded,
+  onToggle,
+  isPathHighlight,
+  credentialFinding,
+  compact,
+  selected,
+  onSelectToggle,
+}) => {
   const Icon = principalIcon(summary.principalType);
   const meta = PRIVILEGE_TIER_META[summary.highestTier];
   const accentTint = isPathHighlight
@@ -886,12 +917,30 @@ const PrincipalNode: React.FC<{
           : "border-border bg-card";
 
   return (
-    <div className={cn("overflow-hidden rounded-md border", accentTint)}>
+    <div
+      className={cn(
+        "overflow-hidden rounded-md border",
+        accentTint,
+        selected && "ring-2 ring-primary",
+      )}
+    >
       <div className="group/copy relative flex items-center">
+        {onSelectToggle && (
+          <span className="pl-2">
+            <Checkbox
+              checked={!!selected}
+              onCheckedChange={() => onSelectToggle()}
+              aria-label={`Select ${summary.displayName}`}
+            />
+          </span>
+        )}
         <button
           type="button"
           onClick={onToggle}
-          className="flex w-full flex-wrap items-center gap-2 px-3 py-2 text-left text-xs transition-colors hover:bg-accent/30 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+          className={cn(
+            "flex w-full flex-wrap items-center gap-2 text-left text-xs transition-colors hover:bg-accent/30 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring",
+            compact ? "px-2 py-1" : "px-3 py-2",
+          )}
           aria-expanded={expanded}
           aria-controls={`principal-body-${summary.principalId}`}
         >
@@ -1036,6 +1085,11 @@ const PrincipalNode: React.FC<{
     </div>
   );
 };
+
+// React.memo wraps the body — re-renders only when one of the inputs changes.
+// summary identity is stable across unrelated toggles (it's keyed in the
+// parent's summaries memo by principalId).
+const PrincipalNode = React.memo(PrincipalNodeBase);
 
 const AssignmentRow: React.FC<{ assignment: PrincipalAssignment }> = ({
   assignment,
@@ -1850,21 +1904,42 @@ export const RoleGraphPage: React.FC<RoleGraphPageProps> = ({ onNavigate }) => {
   }, [subResults, principalLookup]);
 
   // ----- Signal B: role-assignable groups + owners (load-on-demand) -----
+  //
+  // Each signal owns its OWN abort controller — a shared controller used to
+  // cancel B's in-flight fetch when the operator clicked C, dropping B's
+  // progress on the floor. Per-signal refs let all three signals load
+  // concurrently when the operator wants the full picture.
   const [roleAssignableGroupFindings, setRoleAssignableGroupFindings] =
     React.useState<RoleAssignableGroupFinding[] | null>(null);
   const [roleAssignableGroupsLoading, setRoleAssignableGroupsLoading] =
     React.useState(false);
   const [roleAssignableGroupsWarning, setRoleAssignableGroupsWarning] =
     React.useState<string | null>(null);
-  const signalsAbortRef = React.useRef<AbortController | null>(null);
+  const signalBAbortRef = React.useRef<AbortController | null>(null);
+  const signalCAbortRef = React.useRef<AbortController | null>(null);
+  const signalDAbortRef = React.useRef<AbortController | null>(null);
+  // Raw role-assignable groups + owners — also feeds the ownership-chain
+  // detector below (which lives in helpers, not the page).
+  const [rawRoleAssignableGroups, setRawRoleAssignableGroups] = React.useState<
+    Array<{
+      id: string;
+      displayName: string;
+      owners: Array<{
+        id: string;
+        displayName: string;
+        type: string;
+        signInName?: string;
+      }>;
+    }>
+  >([]);
 
   const loadRoleAssignableGroups = React.useCallback(async () => {
     if (!account || subResults.length === 0) return;
     const firstTenant = subResults[0]?.tenantId;
     if (!firstTenant) return;
-    signalsAbortRef.current?.abort();
+    signalBAbortRef.current?.abort();
     const ctrl = new AbortController();
-    signalsAbortRef.current = ctrl;
+    signalBAbortRef.current = ctrl;
     setRoleAssignableGroupsLoading(true);
     setRoleAssignableGroupsWarning(null);
     try {
@@ -1877,6 +1952,9 @@ export const RoleGraphPage: React.FC<RoleGraphPageProps> = ({ onNavigate }) => {
         ctrl.signal,
       );
       if (ctrl.signal.aborted) return;
+      // Stash the raw groups so the ownership-chain detector can run without
+      // a second fetch.
+      setRawRoleAssignableGroups(groups);
       const findings = auditRoleAssignableGroups({ groups, summaries });
       setRoleAssignableGroupFindings(findings);
     } catch (err) {
@@ -1907,9 +1985,9 @@ export const RoleGraphPage: React.FC<RoleGraphPageProps> = ({ onNavigate }) => {
     if (!account || subResults.length === 0) return;
     const firstTenant = subResults[0]?.tenantId;
     if (!firstTenant) return;
-    signalsAbortRef.current?.abort();
+    signalCAbortRef.current?.abort();
     const ctrl = new AbortController();
-    signalsAbortRef.current = ctrl;
+    signalCAbortRef.current = ctrl;
     setAppAdminLoading(true);
     setAppAdminWarning(null);
     try {
@@ -1947,9 +2025,9 @@ export const RoleGraphPage: React.FC<RoleGraphPageProps> = ({ onNavigate }) => {
     if (!account || subResults.length === 0) return;
     const firstTenant = subResults[0]?.tenantId;
     if (!firstTenant) return;
-    signalsAbortRef.current?.abort();
+    signalDAbortRef.current?.abort();
     const ctrl = new AbortController();
-    signalsAbortRef.current = ctrl;
+    signalDAbortRef.current = ctrl;
     setCredentialSurfaceLoading(true);
     setCredentialSurfaceWarning(null);
     try {
@@ -1991,11 +2069,14 @@ export const RoleGraphPage: React.FC<RoleGraphPageProps> = ({ onNavigate }) => {
     }
   }, [account, subResults, highPrivSpIds]);
 
-  // Cancel in-flight signal fetches when the page unmounts or the probe
-  // restarts (we explicitly clear stale findings on a fresh probe).
+  // Cancel in-flight signal fetches when the page unmounts. Per-signal abort
+  // refs so loaders don't cancel each other when the operator clicks more
+  // than one Enumerate button.
   React.useEffect(() => {
     return () => {
-      signalsAbortRef.current?.abort();
+      signalBAbortRef.current?.abort();
+      signalCAbortRef.current?.abort();
+      signalDAbortRef.current?.abort();
     };
   }, []);
 
@@ -2004,6 +2085,7 @@ export const RoleGraphPage: React.FC<RoleGraphPageProps> = ({ onNavigate }) => {
   React.useEffect(() => {
     setRoleAssignableGroupFindings(null);
     setRoleAssignableGroupsWarning(null);
+    setRawRoleAssignableGroups([]);
     setAppAdminFindings(null);
     setAppAdminWarning(null);
     setHighPrivSpIds(new Set());
@@ -2061,6 +2143,142 @@ export const RoleGraphPage: React.FC<RoleGraphPageProps> = ({ onNavigate }) => {
       },
     };
   }, [credentialSurfaceFindings]);
+
+  // -------- BFS path finder + transitive ownership chain --------
+  //
+  // The path-finder runs entirely client-side from the data the probe
+  // already produced — no extra Graph reads. It surfaces every group/role
+  // hop between a hint principal and a hint scope, including nested groups
+  // (corpus: _bypass_role_grant.md §5.3, §5.4 + §10 chain map).
+  //
+  // The ownership-chain detector runs over whatever Signal B raw data is
+  // present + the existing transitive-members map. When Signal B hasn't been
+  // loaded, the detector silently returns []. The result feeds the
+  // PathFinderPanel below.
+  const armedPathFinder =
+    (urlState.focusPrincipal?.length ?? 0) > 0 ||
+    (urlState.focusScope?.length ?? 0) > 0;
+  const foundPaths: FoundPath[] = React.useMemo(() => {
+    if (!armedPathFinder) return [];
+    return findShortestPath({
+      principalQuery: urlState.focusPrincipal ?? "",
+      scopeQuery: urlState.focusScope ?? "",
+      summaries,
+      groupMembersByGroupId: groupMembers,
+      maxPaths: 25,
+    });
+  }, [
+    armedPathFinder,
+    urlState.focusPrincipal,
+    urlState.focusScope,
+    summaries,
+    groupMembers,
+  ]);
+  const ownershipChains: OwnershipChainFinding[] = React.useMemo(() => {
+    if (rawRoleAssignableGroups.length === 0) return [];
+    return detectOwnershipChains({
+      groups: rawRoleAssignableGroups,
+      summaries,
+      groupMembersByGroupId: groupMembers,
+    });
+  }, [rawRoleAssignableGroups, summaries, groupMembers]);
+
+  // -------- Density toggle (compact/comfy) — persisted across reloads --------
+  const [densityCompact, setDensityCompact] = usePersistedState<boolean>(
+    "role-graph:density-compact",
+    false,
+    { version: 1 },
+  );
+
+  // -------- Multi-select for batch export / pivot --------
+  const [multiSelectMode, setMultiSelectMode] = React.useState(false);
+  const [selectedPrincipals, setSelectedPrincipals] = React.useState<
+    Set<string>
+  >(() => new Set());
+  const toggleSelectPrincipal = React.useCallback((id: string) => {
+    setSelectedPrincipals((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  }, []);
+  const clearSelection = React.useCallback(() => {
+    setSelectedPrincipals(new Set());
+  }, []);
+  // Clear selection when we leave multi-select mode.
+  React.useEffect(() => {
+    if (!multiSelectMode) clearSelection();
+  }, [multiSelectMode, clearSelection]);
+
+  // -------- Hotkeys: `f` focuses path finder, `c` collapses all --------
+  const pathFinderInputRef = React.useRef<HTMLInputElement | null>(null);
+  React.useEffect(() => {
+    function onKey(e: KeyboardEvent) {
+      // Ignore when typing in a field — never steal `f` from a search box.
+      const t = e.target as HTMLElement | null;
+      if (
+        t &&
+        (t.tagName === "INPUT" ||
+          t.tagName === "TEXTAREA" ||
+          t.tagName === "SELECT" ||
+          t.isContentEditable)
+      ) {
+        return;
+      }
+      if (e.metaKey || e.ctrlKey || e.altKey) return;
+      if (e.key === "f" || e.key === "F") {
+        e.preventDefault();
+        pathFinderInputRef.current?.focus();
+      } else if (e.key === "c" || e.key === "C") {
+        e.preventDefault();
+        setExpanded(new Set());
+      }
+    }
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, []);
+
+  // -------- Path-finder text-input debouncing --------
+  //
+  // The URL search params are the source of truth (so a link/share is the
+  // exact view), but rewriting search params on EVERY keystroke caused
+  // visible jank when the operator typed quickly. We mirror to a local
+  // shadow value and push to the URL after 250ms idle.
+  const [pathPrincipalDraft, setPathPrincipalDraft] = React.useState(
+    urlState.focusPrincipal ?? "",
+  );
+  const [pathScopeDraft, setPathScopeDraft] = React.useState(
+    urlState.focusScope ?? "",
+  );
+  // Sync drafts when URL changes externally (preset load / clear).
+  React.useEffect(() => {
+    setPathPrincipalDraft(urlState.focusPrincipal ?? "");
+  }, [urlState.focusPrincipal]);
+  React.useEffect(() => {
+    setPathScopeDraft(urlState.focusScope ?? "");
+  }, [urlState.focusScope]);
+  const pathDebounceRef = React.useRef<ReturnType<typeof setTimeout> | null>(
+    null,
+  );
+  const commitPathDraft = React.useCallback(
+    (which: "principal" | "scope", value: string) => {
+      if (pathDebounceRef.current) clearTimeout(pathDebounceRef.current);
+      pathDebounceRef.current = setTimeout(() => {
+        setUrlState(
+          which === "principal"
+            ? { focusPrincipal: value }
+            : { focusScope: value },
+        );
+      }, 250);
+    },
+    [setUrlState],
+  );
+  React.useEffect(() => {
+    return () => {
+      if (pathDebounceRef.current) clearTimeout(pathDebounceRef.current);
+    };
+  }, []);
 
   // -------- Export columns --------
   const exportRows = React.useMemo(() => {
@@ -2547,22 +2765,25 @@ export const RoleGraphPage: React.FC<RoleGraphPageProps> = ({ onNavigate }) => {
                   Path finder
                 </span>
                 <Input
-                  value={urlState.focusPrincipal ?? ""}
+                  ref={pathFinderInputRef}
+                  value={pathPrincipalDraft}
                   onChange={(e) => {
-                    setUrlState({ focusPrincipal: e.target.value });
+                    setPathPrincipalDraft(e.target.value);
+                    commitPathDraft("principal", e.target.value);
                   }}
                   onBlur={(e) =>
                     e.target.value &&
                     recordFilterMutation("focusPrincipal", e.target.value)
                   }
-                  placeholder="Principal id / name / UPN…"
+                  placeholder="Principal id / name / UPN…   (press f)"
                   className="h-8 max-w-[260px] text-xs"
-                  aria-label="Path-finder principal hint"
+                  aria-label="Path-finder principal hint (hotkey f)"
                 />
                 <Input
-                  value={urlState.focusScope ?? ""}
+                  value={pathScopeDraft}
                   onChange={(e) => {
-                    setUrlState({ focusScope: e.target.value });
+                    setPathScopeDraft(e.target.value);
+                    commitPathDraft("scope", e.target.value);
                   }}
                   onBlur={(e) =>
                     e.target.value &&
@@ -2578,11 +2799,19 @@ export const RoleGraphPage: React.FC<RoleGraphPageProps> = ({ onNavigate }) => {
                       {pathHighlightIds.size}{" "}
                       {pathHighlightIds.size === 1 ? "match" : "matches"}
                     </Badge>
+                    {foundPaths.length > 0 && (
+                      <Badge variant="outline" className="text-2xs">
+                        {foundPaths.length}{" "}
+                        {foundPaths.length === 1 ? "path" : "paths"}
+                      </Badge>
+                    )}
                     <Button
                       type="button"
                       variant="ghost"
                       size="sm"
                       onClick={() => {
+                        setPathPrincipalDraft("");
+                        setPathScopeDraft("");
                         setUrlState({
                           focusPrincipal: "",
                           focusScope: "",
@@ -2597,6 +2826,20 @@ export const RoleGraphPage: React.FC<RoleGraphPageProps> = ({ onNavigate }) => {
                     </Button>
                   </>
                 )}
+                <span
+                  className="ml-1 hidden items-center gap-1 text-3xs text-muted-foreground md:inline-flex"
+                  title="Hotkey: press f to focus this input, c to collapse all"
+                >
+                  <Keyboard className="h-3 w-3" aria-hidden />
+                  <kbd className="rounded border border-border bg-muted px-1 font-mono text-3xs">
+                    f
+                  </kbd>
+                  focus,
+                  <kbd className="rounded border border-border bg-muted px-1 font-mono text-3xs">
+                    c
+                  </kbd>
+                  collapse
+                </span>
               </div>
               <div className="flex flex-wrap items-center gap-2">
                 <span className="flex items-center gap-1 text-2xs font-medium uppercase tracking-wider text-muted-foreground">
@@ -2755,14 +2998,126 @@ export const RoleGraphPage: React.FC<RoleGraphPageProps> = ({ onNavigate }) => {
         />
       )}
 
+      {/* Path-finder panel — renders only when armed OR ownership chains found */}
+      {probedAt && summaries.length > 0 &&
+        (armedPathFinder || ownershipChains.length > 0) && (
+          <PathFinderPanel
+            armed={armedPathFinder}
+            paths={foundPaths}
+            ownershipChains={ownershipChains}
+            totalMatched={foundPaths.length}
+            onFocusPrincipal={(id) => {
+              setPathPrincipalDraft(id);
+              setUrlState({ focusPrincipal: id });
+              // Auto-expand the matched principal so the operator can see the
+              // direct assignments without an extra click.
+              setExpanded((prev) => {
+                const next = new Set(prev);
+                next.add(id);
+                return next;
+              });
+              recordFilterMutation("pathFocus", id);
+            }}
+            onFocusGroup={(id) => {
+              setPathPrincipalDraft(id);
+              setUrlState({ focusPrincipal: id });
+              recordFilterMutation("pathFocusGroup", id);
+            }}
+          />
+        )}
+
       {/* Tree of principals */}
       {filteredSummaries.length > 0 && (
         <div className="flex flex-col gap-2">
-          <div className="flex items-center justify-between gap-2">
+          <div className="flex flex-wrap items-center justify-between gap-2">
             <h2 className="text-sm font-semibold">
               Principals ({formatNumber(filteredSummaries.length)})
+              {multiSelectMode && selectedPrincipals.size > 0 && (
+                <Badge variant="secondary" className="ml-2 text-2xs">
+                  {selectedPrincipals.size} selected
+                </Badge>
+              )}
             </h2>
-            <div className="flex gap-1">
+            <div className="flex flex-wrap gap-1" role="toolbar" aria-label="Principal-tree controls">
+              <Button
+                type="button"
+                variant="ghost"
+                size="sm"
+                className="h-7 px-2 text-2xs"
+                onClick={() => setDensityCompact(!densityCompact)}
+                aria-pressed={densityCompact}
+                title={`Switch to ${densityCompact ? "comfy" : "compact"} density`}
+              >
+                {densityCompact ? (
+                  <Rows4 className="h-3.5 w-3.5" aria-hidden />
+                ) : (
+                  <Rows3 className="h-3.5 w-3.5" aria-hidden />
+                )}
+                {densityCompact ? "Comfy" : "Compact"}
+              </Button>
+              <Button
+                type="button"
+                variant={multiSelectMode ? "default" : "ghost"}
+                size="sm"
+                className="h-7 px-2 text-2xs"
+                onClick={() => setMultiSelectMode((v) => !v)}
+                aria-pressed={multiSelectMode}
+                title="Toggle multi-select for batch export / pivot"
+              >
+                Multi-select
+              </Button>
+              {multiSelectMode && selectedPrincipals.size > 0 && (
+                <>
+                  <ExportMenu
+                    rows={exportRows.filter((r) =>
+                      selectedPrincipals.has(r.principalId),
+                    )}
+                    columns={exportColumns}
+                    filename={`role-graph-selection-${selectedPrincipals.size}`}
+                    jsonMetadata={{
+                      ...exportMetadata,
+                      selection: Array.from(selectedPrincipals),
+                    }}
+                    label={`Export ${selectedPrincipals.size}`}
+                  />
+                  {onNavigate && (
+                    <Button
+                      type="button"
+                      variant="outline"
+                      size="sm"
+                      className="h-7 px-2 text-2xs"
+                      onClick={() => {
+                        // Pivot to the privileged-audit page — the parent
+                        // page-router doesn't currently accept selection state,
+                        // so the cross-page handoff is just a navigate. The
+                        // selection itself is preserved in the page state if
+                        // the operator navigates back.
+                        // COORDINATOR: when the page-router accepts a query
+                        // string for selection, replace this with a path that
+                        // carries the selected principal ids so privileged-audit
+                        // can hydrate to the same set.
+                        onNavigate("privileged-audit");
+                        recordFilterMutation(
+                          "pivotPrivilegedAudit",
+                          selectedPrincipals.size,
+                        );
+                      }}
+                      title="Open privileged-audit page (selection is kept here)"
+                    >
+                      Pivot to privileged-audit
+                    </Button>
+                  )}
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="sm"
+                    className="h-7 px-2 text-2xs"
+                    onClick={clearSelection}
+                  >
+                    Clear ({selectedPrincipals.size})
+                  </Button>
+                </>
+              )}
               <Button
                 type="button"
                 variant="ghost"
@@ -2782,6 +3137,7 @@ export const RoleGraphPage: React.FC<RoleGraphPageProps> = ({ onNavigate }) => {
                 size="sm"
                 className="h-7 px-2 text-2xs"
                 onClick={() => setExpanded(new Set())}
+                aria-keyshortcuts="c"
               >
                 Collapse all
               </Button>
@@ -2798,6 +3154,15 @@ export const RoleGraphPage: React.FC<RoleGraphPageProps> = ({ onNavigate }) => {
                 credentialFinding={credentialFindingsByPrincipalId.get(
                   s.principalId,
                 )}
+                compact={densityCompact}
+                selected={
+                  multiSelectMode ? selectedPrincipals.has(s.principalId) : undefined
+                }
+                onSelectToggle={
+                  multiSelectMode
+                    ? () => toggleSelectPrincipal(s.principalId)
+                    : undefined
+                }
               />
             ))}
           </div>

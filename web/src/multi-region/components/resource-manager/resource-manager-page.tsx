@@ -43,6 +43,7 @@ import {
   ExternalLink,
   FolderTree,
   Ghost,
+  Keyboard,
   Layers,
   ListChecks,
   Loader2,
@@ -53,6 +54,7 @@ import {
   Server,
   ShieldCheck,
   Sparkles,
+  Tag,
   Trash2,
   Wand2,
   X,
@@ -87,6 +89,7 @@ import {
 import { resolveActiveTenantId } from "../../auth/perform-tenant-switch";
 import { useArmToken } from "../../auth/use-arm-token";
 import { usePersistedState } from "../../hooks/use-persisted-state";
+import { useShortcut } from "../../hooks/use-shortcut";
 import { useTenantChange } from "../../hooks/use-tenant-change";
 import { auditLog } from "../../services/audit-log";
 import {
@@ -118,6 +121,11 @@ import { SkeletonLoader } from "../shared/skeleton-loader";
 import { StatusBadge } from "../shared/status-badge";
 import { SummaryStatItem } from "../shared/summary-stat-item";
 import { TokenExpiryBadge } from "../shared/token-expiry-badge";
+
+import {
+  PreMoveAttackSurfacePreview,
+  SecuritySignalsBanner,
+} from "./security-signals";
 
 const STORAGE_ACCOUNT = "resource-manager:account";
 const STORAGE_SRC_SUB = "resource-manager:src-sub";
@@ -779,6 +787,50 @@ export const ResourceManagerPage: React.FC = () => {
     React.useState(false);
 
   /**
+   * Planned tags — operator-supplied key/value pairs to attach to every
+   * destination resource group at creation time. Stored separately from
+   * `planOverrides` because they apply uniformly across all rows (the
+   * common case for migration projects: a single "project=…" /
+   * "owner=…" / "migrated-on=…" set).
+   *
+   * COORDINATOR NOTE: `createResourceGroup` in services/arm-service.ts
+   * currently only forwards `location` (not `tags`). To wire these
+   * through to ARM the service layer needs a small change. Until then
+   * the values are surfaced in the plan-export JSON / CSV and shown in
+   * the UI so the operator has a paper trail and can apply them via az
+   * cli post-move, OR the next services iteration can pick them up via
+   * the same prop shape.
+   */
+  const [planTags, setPlanTags] = React.useState<{ key: string; value: string }[]>(
+    [],
+  );
+  const [draftTagKey, setDraftTagKey] = React.useState("");
+  const [draftTagValue, setDraftTagValue] = React.useState("");
+
+  /**
+   * Persisted "recent tag keys" memory — every key the operator
+   * commits via the multi-tag toolbar gets remembered (last 12,
+   * MRU-ordered). Powers a tiny datalist autocomplete so frequent
+   * key names like "project", "owner", "cost-center", "migrated-on"
+   * resurface without retyping. Persisted via usePersistedState with a
+   * schema version so the shape can evolve cleanly.
+   */
+  const [recentTagKeys, setRecentTagKeys] = usePersistedState<string[]>(
+    "resource-manager:recent-tag-keys",
+    [],
+    {
+      syncAcrossTabs: true,
+      version: 1,
+      migrate: (raw) => (Array.isArray(raw) ? (raw as string[]) : []),
+    },
+  );
+
+  /** First-row RG-name input ref — hotkey `r` focuses it. */
+  const firstRgNameInputRef = React.useRef<HTMLInputElement | null>(null);
+  /** First-row location input ref — hotkey `m` focuses it. */
+  const firstRgLocationInputRef = React.useRef<HTMLInputElement | null>(null);
+
+  /**
    * Bulk-rename template applied to every row that doesn't have an
    * explicit `destRgName` override. Persisted across reloads so an
    * operator who prefers `mig-{name}` doesn't have to re-set it every
@@ -915,6 +967,57 @@ export const ResourceManagerPage: React.FC = () => {
   );
 
   /**
+   * Commit the draft tag key/value into the plan tag set. De-duplicates
+   * by key (case-insensitive) — re-entering an existing key updates its
+   * value. Also pushes the key into the MRU recent-keys memory so the
+   * autocomplete surfaces it next time. No-op when key or value are
+   * empty after trim.
+   */
+  const commitTag = React.useCallback(() => {
+    const key = draftTagKey.trim();
+    const value = draftTagValue.trim();
+    if (!key || !value) return;
+    // Azure tag limits: max 50 tag pairs per resource, key <= 512 chars,
+    // value <= 256 chars. Enforce so the operator can't silently
+    // accumulate an invalid tag bag that ARM would reject downstream.
+    if (key.length > 512 || value.length > 256) {
+      store.addNotification({
+        type: "error",
+        message: "Tag key must be ≤512 chars and value ≤256 chars (Azure limits).",
+      });
+      return;
+    }
+    setPlanTags((prev) => {
+      const idx = prev.findIndex(
+        (t) => t.key.toLowerCase() === key.toLowerCase(),
+      );
+      if (idx >= 0) {
+        const next = [...prev];
+        next[idx] = { key, value };
+        return next;
+      }
+      if (prev.length >= 50) {
+        store.addNotification({
+          type: "error",
+          message: "Max 50 tag pairs per resource (Azure limit).",
+        });
+        return prev;
+      }
+      return [...prev, { key, value }];
+    });
+    setRecentTagKeys((prev) => {
+      const next = [key, ...prev.filter((k) => k.toLowerCase() !== key.toLowerCase())];
+      return next.slice(0, 12);
+    });
+    setDraftTagKey("");
+    setDraftTagValue("");
+  }, [draftTagKey, draftTagValue, store, setRecentTagKeys]);
+
+  const removeTag = React.useCallback((key: string) => {
+    setPlanTags((prev) => prev.filter((t) => t.key !== key));
+  }, []);
+
+  /**
    * Bulk-action: remove EVERY selected account from the plan. Gated by
    * a confirmation dialog because losing a 30-row plan to a stray
    * click is a multi-minute setback for the operator.
@@ -929,6 +1032,10 @@ export const ResourceManagerPage: React.FC = () => {
       for (const id of removedIds) delete next[id];
       return next;
     });
+    // Tags applied uniformly belong to the (now-dropped) plan — clear
+    // them too so a fresh selection doesn't inherit yesterday's
+    // "owner=…" by accident.
+    setPlanTags([]);
     auditLog.record({
       actor: account?.username ?? accountId,
       action: "bulk_remove_plan_rows",
@@ -984,6 +1091,24 @@ export const ResourceManagerPage: React.FC = () => {
       !!(srcSub && dstSub && srcSub.tenantId && dstSub.tenantId &&
         srcSub.tenantId.toLowerCase() !== dstSub.tenantId.toLowerCase()),
     [srcSub, dstSub],
+  );
+
+  /* ----- Security signals ----------------------------------------- *
+   * Heuristic warnings sourced from the offensive-tooling corpus —
+   * see security-signals.tsx for the rubric. These DO NOT block the
+   * action; they surface anti-patterns (bulk cross-RG ops, rename+move
+   * sequences, cross-sub fan-out) the same way SOC tooling would. */
+  const rowsWithRenameOverride = React.useMemo(
+    () =>
+      planRows.reduce((acc, row) => {
+        const ov = planOverrides[row.resourceId]?.destRgName?.trim();
+        return ov ? acc + 1 : acc;
+      }, 0),
+    [planRows, planOverrides],
+  );
+  const distinctDestLocations = React.useMemo(
+    () => new Set(planRows.map((r) => r.destLocation.trim().toLowerCase())).size,
+    [planRows],
   );
 
   /* ----- Move execution ------------------------------------------ */
@@ -1565,8 +1690,17 @@ export const ResourceManagerPage: React.FC = () => {
             ? `/subscriptions/${dstSub.subscriptionId}/resourceGroups/${r.destRgName}/providers/Microsoft.Batch/batchAccounts/${r.name}`
             : "",
       },
+      // Tags rendered as `key=value;key=value` so they fit into a single
+      // CSV cell without needing a separate per-tag-pair column.
+      {
+        header: "Planned tags (key=value;…)",
+        accessor: () =>
+          planTags.length === 0
+            ? ""
+            : planTags.map((t) => `${t.key}=${t.value}`).join(";"),
+      },
     ],
-    [srcSub?.subscriptionId, dstSub],
+    [srcSub?.subscriptionId, dstSub, planTags],
   );
   const resultsExportColumns: ExportColumn<RgPlanRow>[] = React.useMemo(
     () => [
@@ -1633,6 +1767,40 @@ export const ResourceManagerPage: React.FC = () => {
     if (accountId === candidate) return;
     setAccountId(candidate);
   });
+
+  /* ----- Hotkeys -------------------------------------------------- *
+   * `r` — focus the first planned row's destination RG name input
+   *       (rename). Most common bulk action after selection.
+   * `m` — focus the first planned row's destination location input
+   *       (move target region pick).
+   * Backspace / Delete (when not in an input) — open the bulk-remove
+   *       confirmation dialog so the operator can drop the plan with
+   *       one keypress + one confirm. Double-gated by ConfirmationDialog
+   *       to avoid destructive-on-keystroke regrets. */
+  useShortcut("r", () => {
+    const el = firstRgNameInputRef.current;
+    if (el) {
+      el.focus();
+      el.select();
+    }
+  }, { enabled: planRows.length > 0 && running === null });
+
+  useShortcut("m", () => {
+    const el = firstRgLocationInputRef.current;
+    if (el) {
+      el.focus();
+      el.select();
+    }
+  }, { enabled: planRows.length > 0 && running === null });
+
+  useShortcut(
+    ["Delete", "Backspace"],
+    () => {
+      if (planRows.length === 0 || running !== null) return;
+      setConfirmBulkRemoveOpen(true);
+    },
+    { enabled: planRows.length > 0 && running === null },
+  );
 
   /* ----- Render --------------------------------------------------- */
 
@@ -2370,6 +2538,29 @@ export const ResourceManagerPage: React.FC = () => {
                           ([rg, count]) => ({ resourceGroup: rg, accountCount: count }),
                         ),
                         rgTemplate,
+                        // Tags are plan-only today (services-layer change
+                        // required to forward into RG create). Surface them
+                        // in the export so the operator can `az tag update`
+                        // post-move from the same JSON they exported.
+                        plannedTags: planTags.length === 0
+                          ? undefined
+                          : Object.fromEntries(
+                              planTags.map((t) => [t.key, t.value]),
+                            ),
+                        // Snapshot of the security-signal heuristic
+                        // outcomes at export time — gives reviewers a
+                        // paper trail of what the operator was warned
+                        // about before kicking off the move.
+                        securitySignals: {
+                          planRowCount: planRows.length,
+                          distinctSourceRgs: sourceRgSummary.length,
+                          distinctDestLocations,
+                          rowsWithRenameOverride,
+                          crossSubscription:
+                            srcSub?.subscriptionId !==
+                            dstSub?.subscriptionId,
+                          crossTenant,
+                        },
                       }}
                     />
                   </span>
@@ -2539,6 +2730,29 @@ export const ResourceManagerPage: React.FC = () => {
                     </div>
                   </div>
                   <div className="ml-auto flex flex-col gap-1">
+                    <Label className="text-2xs text-muted-foreground inline-flex items-center gap-1">
+                      <Keyboard className="h-2.5 w-2.5" aria-hidden />
+                      Hotkeys
+                    </Label>
+                    <div
+                      className="flex flex-wrap items-center gap-1 text-2xs text-muted-foreground"
+                      aria-label="Keyboard shortcuts for the plan"
+                    >
+                      <kbd className="rounded border border-border bg-muted px-1 font-mono text-[10px]">
+                        r
+                      </kbd>
+                      <span>rename</span>
+                      <kbd className="rounded border border-border bg-muted px-1 font-mono text-[10px]">
+                        m
+                      </kbd>
+                      <span>move-region</span>
+                      <kbd className="rounded border border-border bg-muted px-1 font-mono text-[10px]">
+                        Del
+                      </kbd>
+                      <span>drop</span>
+                    </div>
+                  </div>
+                  <div className="flex flex-col gap-1">
                     <Label className="text-2xs text-muted-foreground">
                       Bulk remove
                     </Label>
@@ -2549,12 +2763,123 @@ export const ResourceManagerPage: React.FC = () => {
                       onClick={() => setConfirmBulkRemoveOpen(true)}
                       disabled={running !== null || planRows.length === 0}
                       aria-label={`Remove all ${planRows.length} rows from the plan`}
-                      title="Drop every planned row from the selection (no Azure side-effects). Confirmation required."
+                      title="Drop every planned row from the selection (no Azure side-effects). Confirmation required. Hotkey: Del."
                     >
                       <Trash2 className="h-3 w-3" aria-hidden />
                       Drop {planRows.length} row{planRows.length === 1 ? "" : "s"}
                     </Button>
                   </div>
+                </div>
+
+                {/* ---- Bulk multi-tag editor ------------------------
+                    Plan-time tag bag — every destination RG gets the
+                    same key/value pairs. Surfaced in the plan export
+                    and (once services-layer adds tag support to
+                    createResourceGroup) forwarded into the actual
+                    PUT body. Datalist autocomplete sources its
+                    options from the persisted recent-tag-keys MRU so
+                    common org-wide schemas (project, owner, …)
+                    resurface without retyping. */}
+                <div
+                  className="flex flex-wrap items-end gap-2 rounded-md border border-dashed border-border bg-muted/10 p-2"
+                  role="group"
+                  aria-label="Plan-time tags applied to every destination resource group"
+                >
+                  <div className="flex flex-col gap-1">
+                    <Label
+                      htmlFor="rm-tag-key"
+                      className="text-2xs text-muted-foreground inline-flex items-center gap-1"
+                    >
+                      <Tag className="h-3 w-3" aria-hidden />
+                      Tag key
+                    </Label>
+                    <Input
+                      id="rm-tag-key"
+                      list="rm-tag-key-suggestions"
+                      value={draftTagKey}
+                      onChange={(e) => setDraftTagKey(e.target.value)}
+                      onKeyDown={(e) => {
+                        if (e.key === "Enter") {
+                          e.preventDefault();
+                          commitTag();
+                        }
+                      }}
+                      placeholder="project, owner, cost-center…"
+                      className="h-7 w-40 font-mono text-2xs"
+                      disabled={running !== null}
+                      aria-label="Tag key to apply to every destination RG"
+                    />
+                    {recentTagKeys.length > 0 && (
+                      <datalist id="rm-tag-key-suggestions">
+                        {recentTagKeys.map((k) => (
+                          <option key={k} value={k} />
+                        ))}
+                      </datalist>
+                    )}
+                  </div>
+                  <div className="flex flex-col gap-1">
+                    <Label
+                      htmlFor="rm-tag-value"
+                      className="text-2xs text-muted-foreground"
+                    >
+                      Tag value
+                    </Label>
+                    <Input
+                      id="rm-tag-value"
+                      value={draftTagValue}
+                      onChange={(e) => setDraftTagValue(e.target.value)}
+                      onKeyDown={(e) => {
+                        if (e.key === "Enter") {
+                          e.preventDefault();
+                          commitTag();
+                        }
+                      }}
+                      placeholder="value"
+                      className="h-7 w-40 font-mono text-2xs"
+                      disabled={running !== null}
+                      aria-label="Tag value to apply to every destination RG"
+                    />
+                  </div>
+                  <Button
+                    type="button"
+                    size="xs"
+                    variant="outline"
+                    onClick={commitTag}
+                    disabled={
+                      running !== null ||
+                      !draftTagKey.trim() ||
+                      !draftTagValue.trim()
+                    }
+                    aria-label="Add tag to plan"
+                  >
+                    Add tag
+                  </Button>
+                  {planTags.length > 0 && (
+                    <div
+                      className="flex flex-wrap items-center gap-1"
+                      aria-label={`${planTags.length} planned tag pair${planTags.length === 1 ? "" : "s"}`}
+                    >
+                      {planTags.map((t) => (
+                        <Badge
+                          key={t.key}
+                          variant="secondary"
+                          className="gap-1 font-mono text-2xs"
+                          title={`Will apply ${t.key}=${t.value} to every destination RG`}
+                        >
+                          {t.key}={t.value}
+                          <button
+                            type="button"
+                            onClick={() => removeTag(t.key)}
+                            disabled={running !== null}
+                            className="inline-flex h-3.5 w-3.5 items-center justify-center rounded hover:bg-destructive/20 hover:text-destructive focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring disabled:cursor-not-allowed disabled:opacity-40"
+                            aria-label={`Remove tag ${t.key}`}
+                          >
+                            <X className="h-2.5 w-2.5" />
+                          </button>
+                        </Badge>
+                      ))}
+                    </div>
+                  )}
                 </div>
 
                 <div className="overflow-x-auto">
@@ -2592,7 +2917,7 @@ export const ResourceManagerPage: React.FC = () => {
                       </tr>
                     </thead>
                     <tbody>
-                      {planRows.map((row) => {
+                      {planRows.map((row, rowIdx) => {
                         const rowErrors = planErrors.filter(
                           (e) => e.resourceId === row.resourceId,
                         );
@@ -2602,6 +2927,7 @@ export const ResourceManagerPage: React.FC = () => {
                         const hasOverride =
                           !!planOverrides[row.resourceId]?.destRgName ||
                           !!planOverrides[row.resourceId]?.destLocation;
+                        const isFirstRow = rowIdx === 0;
                         return (
                           <tr
                             key={row.resourceId}
@@ -2616,7 +2942,17 @@ export const ResourceManagerPage: React.FC = () => {
                           >
                             <td className="px-2 py-1">
                               <div className="flex flex-col">
-                                <span className="font-medium">{row.name}</span>
+                                <span
+                                  className="inline-flex items-center gap-1 font-medium"
+                                  title="Click the icon to copy the full source ARM id"
+                                >
+                                  {row.name}
+                                  <CopyButton
+                                    value={row.resourceId}
+                                    ariaLabel={`Copy ARM resource id for ${row.name}`}
+                                    alwaysVisible
+                                  />
+                                </span>
                                 <span className="text-[10px] text-muted-foreground">
                                   source location:{" "}
                                   <span className="font-mono">{row.destLocation}</span>
@@ -2629,6 +2965,11 @@ export const ResourceManagerPage: React.FC = () => {
                             <td className="px-2 py-1">
                               <div className="flex items-center gap-1">
                                 <Input
+                                  ref={
+                                    isFirstRow
+                                      ? firstRgNameInputRef
+                                      : undefined
+                                  }
                                   value={row.destRgName}
                                   onChange={(e) =>
                                     setPlanOverrides((prev) => ({
@@ -2663,6 +3004,11 @@ export const ResourceManagerPage: React.FC = () => {
                             </td>
                             <td className="px-2 py-1">
                               <Input
+                                ref={
+                                  isFirstRow
+                                    ? firstRgLocationInputRef
+                                    : undefined
+                                }
                                 value={row.destLocation}
                                 onChange={(e) =>
                                   setPlanOverrides((prev) => ({
@@ -2734,6 +3080,32 @@ export const ResourceManagerPage: React.FC = () => {
                     </AlertDescription>
                   </Alert>
                 )}
+
+                {/* ---- Pre-move attack-surface preview --------------
+                    Static reference card listing what ARM
+                    `moveResources` does and doesn't carry across so
+                    the operator doesn't get caught out by RBAC /
+                    policy / diagnostic-setting gaps at the
+                    destination. Cited in security-signals.tsx. */}
+                <PreMoveAttackSurfacePreview />
+
+                {/* ---- Corpus-grounded security signals ------------
+                    Heuristic warnings sourced from the offensive-
+                    tooling corpus (bypass_modify_delete §4.10 bulk
+                    ops rubric, role_grant scoping, etc.). Renders
+                    nothing when no signal is active. Advisory — does
+                    NOT block the action. */}
+                <SecuritySignalsBanner
+                  planRowCount={planRows.length}
+                  distinctSourceRgs={sourceRgSummary.length}
+                  distinctDestLocations={distinctDestLocations}
+                  sourceSubscriptionId={srcSub?.subscriptionId ?? null}
+                  destinationSubscriptionId={dstSub?.subscriptionId ?? null}
+                  sourceTenantId={srcSub?.tenantId ?? null}
+                  destinationTenantId={dstSub?.tenantId ?? null}
+                  rowsWithRenameOverride={rowsWithRenameOverride}
+                />
+
                 <div className="flex flex-wrap items-center gap-2">
                   <Button
                     type="button"
@@ -2889,6 +3261,25 @@ export const ResourceManagerPage: React.FC = () => {
                 </CardDescription>
               </CardHeader>
               <CardContent className="flex flex-col gap-1">
+                {/* ARIA-live progress summary — screen readers
+                    announce moves/failures as they land. `polite` so
+                    the announcement queues behind whatever the user
+                    is reading; the actual per-row state changes are
+                    visually indicated by the badge colours. */}
+                <div
+                  role="status"
+                  aria-live="polite"
+                  aria-atomic="true"
+                  className="sr-only"
+                >
+                  {running !== null
+                    ? `${stats.inFlight} in flight, ${stats.moved} moved, ${stats.failed} failed.`
+                    : `Pipeline finished: ${stats.moved} moved, ${stats.failed} failed${
+                        stats.cancelled > 0
+                          ? `, ${stats.cancelled} cancelled`
+                          : ""
+                      }.`}
+                </div>
                 {results.map((r) => {
                   const elapsedMs =
                     r.startedAt && r.finishedAt

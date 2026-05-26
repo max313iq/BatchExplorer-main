@@ -636,6 +636,18 @@ export function scoreDefaultUserPermissions(
   }
   const perms = policy.defaultUserRolePermissions ?? {};
   const findings: string[] = [];
+  // allowedToCreateApps is the consent-phishing accelerator: any member
+  // can register a multi-tenant app and silently OAuth-consent on their
+  // own behalf. Detection inspired by:
+  //   New folder/_bypass_login.md §"Illicit Consent Grant" (default-flow
+  //     exploitation via app self-registration).
+  //   New folder/_AZURE_LOGIN_METHODS.md (app registration is part of the
+  //     default user surface — every member is an attacker primitive).
+  //   New folder/_bypass_role_grant.md (app-role chains start from
+  //     `allowedToCreateApps=true`).
+  if (perms.allowedToCreateApps === true) {
+    findings.push("can register applications (consent-phishing accelerator)");
+  }
   if (perms.allowedToCreateSecurityGroups === true) {
     findings.push("can create security groups");
   }
@@ -656,13 +668,25 @@ export function scoreDefaultUserPermissions(
       raw: policy,
     };
   }
-  // Multiple permissive flags raise the severity to "medium".
+  // Severity routing:
+  //   - allowedToCreateApps OR allowedToCreateTenants present → high
+  //     (both are documented consent / tenant-pivot accelerators)
+  //   - allowedToCreateSecurityGroups alone → medium
+  //   - only allowedToReadOtherUsers → low
   const hasOnlyReadOthers =
     findings.length === 1 && perms.allowedToReadOtherUsers === true;
+  const hasAppOrTenantCreation =
+    perms.allowedToCreateApps === true ||
+    perms.allowedToCreateTenants === true;
+  const severity: BaselineSeverity = hasOnlyReadOthers
+    ? "low"
+    : hasAppOrTenantCreation
+      ? "high"
+      : "medium";
   return {
     id: "default-user-permissions",
     name: base,
-    severity: hasOnlyReadOthers ? "low" : "medium",
+    severity,
     summary: `Non-admin members ${findings.join("; ")}`,
     whyItMatters: why,
     remediation,
@@ -1429,13 +1453,22 @@ export interface BaselineSnapshot {
   >;
 }
 
-/** "Compared to last saved snapshot" status for a single check. */
+/** "Compared to last saved snapshot" status for a single check.
+ *
+ * The deep-pass added `"new-check-introduced"`: an explicit signal that
+ * the snapshot pre-dates this check id. Without it, schema additions
+ * (e.g. when we added `federation-backdoor-drift`) silently looked like
+ * "no-baseline" — indistinguishable from "you never saved a baseline" —
+ * leading operators to ignore real new signal. Distinguishing the two
+ * cases lets the page render a clearer pill on the affected card.
+ */
 export type FindingDriftStatus =
   | "no-baseline"
   | "match"
   | "improved"
   | "regressed"
-  | "summary-changed";
+  | "summary-changed"
+  | "new-check-introduced";
 
 /** Per-check drift result. */
 export interface FindingDrift {
@@ -1469,8 +1502,23 @@ export function diffAgainstSnapshot(
   for (const f of findings) {
     const prev = snapshot.findings[f.id];
     if (!prev) {
+      // The snapshot envelope was captured before this check id existed
+      // (or it was an unknown-severity placeholder we never overwrote).
+      // Treat that as a *distinct* drift signal — operators reviewing a
+      // diff against an older approved baseline should see "this is new"
+      // rather than the ambiguous "no baseline".
       out.set(f.id, {
-        status: "no-baseline",
+        status: "new-check-introduced",
+        baselineSeverity: null,
+        baselineSummary: null,
+      });
+      continue;
+    }
+    // Synthetic empty-summary entries created by buildSnapshot() for any
+    // check that wasn't present at snapshot time get the same treatment.
+    if (prev.summary === "" && prev.severity === "unknown") {
+      out.set(f.id, {
+        status: "new-check-introduced",
         baselineSeverity: null,
         baselineSummary: null,
       });
@@ -1716,4 +1764,281 @@ export function classifyIssuer(
     return { environment: "AzureCommercial", label: "Azure Commercial" };
   }
   return { environment: "Unknown", label: "Unknown cloud" };
+}
+
+// ---------------------------------------------------------------------------
+// Deep-pass enhancements — drift-history timeline + compliance evidence hash
+// ---------------------------------------------------------------------------
+
+/**
+ * Aggregate per-finding drift result into a small summary the page banners
+ * + audit-log entries consume. Pure for testability.
+ *
+ * The "newly-introduced" count is the schema-evolution signal explained
+ * on FindingDriftStatus — it is distinct from "regressed" so an operator
+ * comparing against an old approved baseline can see at a glance whether
+ * the deltas are *real* drift or just the auditor growing new checks.
+ */
+export interface DriftSummary {
+  regressed: number;
+  improved: number;
+  changed: number;
+  /** New check id absent from the saved baseline envelope. */
+  newlyIntroduced: number;
+  /** True when there is at least one regressed item. Convenience flag. */
+  hasRegressions: boolean;
+}
+
+export function summarizeDrift(
+  driftMap: ReadonlyMap<BaselineCheckId, FindingDrift>,
+): DriftSummary {
+  let regressed = 0;
+  let improved = 0;
+  let changed = 0;
+  let newlyIntroduced = 0;
+  for (const d of driftMap.values()) {
+    if (d.status === "regressed") regressed += 1;
+    else if (d.status === "improved") improved += 1;
+    else if (d.status === "summary-changed") changed += 1;
+    else if (d.status === "new-check-introduced") newlyIntroduced += 1;
+  }
+  return {
+    regressed,
+    improved,
+    changed,
+    newlyIntroduced,
+    hasRegressions: regressed > 0,
+  };
+}
+
+/**
+ * Lightweight history-timeline entry. We keep a small ring of these per
+ * tenant so a defender can answer "did our posture get worse between
+ * Tuesday and Friday?" without the auditor needing a backend.
+ *
+ * Detection inspired by:
+ *   New folder/_AZURE_BYPASS_PLAYBOOK.md "Critical Defender Audit Surface"
+ *   — drift on `Set domain authentication` + `Update conditional access
+ *   policy` is the dominant attacker signal; a longitudinal local record
+ *   makes catching slow-moving drift practical.
+ */
+export interface BaselineHistoryEntry {
+  /** ISO timestamp when this baseline run completed. */
+  capturedAt: string;
+  /** Severity tally at run time (a compact heat-map). */
+  tally: Record<BaselineSeverity, number>;
+  /** Per-check severity at run time (omits raw / summary to keep small). */
+  perCheck: Record<BaselineCheckId, BaselineSeverity>;
+  /** Whether this entry was the approved baseline at the time of capture. */
+  wasApproved: boolean;
+}
+
+/** Cap on the in-localStorage history ring buffer. ~10 KB max per tenant. */
+export const BASELINE_HISTORY_LIMIT = 25;
+
+/**
+ * Append a new entry to the history ring buffer, dropping the oldest entry
+ * once the cap is reached. Returns a *new* array — never mutates input.
+ */
+export function pushHistoryEntry(
+  history: ReadonlyArray<BaselineHistoryEntry>,
+  entry: BaselineHistoryEntry,
+  limit: number = BASELINE_HISTORY_LIMIT,
+): BaselineHistoryEntry[] {
+  const next = history.slice();
+  next.push(entry);
+  while (next.length > limit) next.shift();
+  return next;
+}
+
+/**
+ * Build a compact per-tenant history entry from the current findings.
+ * Strips raw payloads so the ring buffer stays tiny.
+ */
+export function buildHistoryEntry(
+  findings: BaselineFinding[],
+  wasApproved: boolean = false,
+): BaselineHistoryEntry {
+  const perCheck: Record<BaselineCheckId, BaselineSeverity> = {
+    "security-defaults": "unknown",
+    "guest-invite-policy": "unknown",
+    "default-user-permissions": "unknown",
+    "domains-federation": "unknown",
+    "federation-backdoor-drift": "unknown",
+    "ca-policy-drift": "unknown",
+    "onprem-sync": "unknown",
+    "password-protection": "unknown",
+  };
+  for (const f of findings) perCheck[f.id] = f.severity;
+  return {
+    capturedAt: new Date().toISOString(),
+    tally: tallySeverities(findings),
+    perCheck,
+    wasApproved,
+  };
+}
+
+/**
+ * Compute the difference in severity-rank weight between two history
+ * entries. Positive = posture worsened; negative = posture improved.
+ * Used by the timeline component to render arrows / colour the segments.
+ */
+export function compareHistoryEntries(
+  prev: BaselineHistoryEntry,
+  next: BaselineHistoryEntry,
+): { regressed: BaselineCheckId[]; improved: BaselineCheckId[]; delta: number } {
+  const regressed: BaselineCheckId[] = [];
+  const improved: BaselineCheckId[] = [];
+  let delta = 0;
+  const ids = Object.keys(next.perCheck) as BaselineCheckId[];
+  for (const id of ids) {
+    const a = prev.perCheck[id] ?? "unknown";
+    const b = next.perCheck[id];
+    const d = SEVERITY_RANK[b] - SEVERITY_RANK[a];
+    delta += d;
+    if (d > 0) regressed.push(id);
+    else if (d < 0) improved.push(id);
+  }
+  return { regressed, improved, delta };
+}
+
+/**
+ * Compliance-evidence export envelope. The page's standard ExportMenu
+ * dumps the findings table; this envelope adds the metadata an auditor's
+ * "chain of custody" requires — tenant id, actor, capture timestamp,
+ * tool version, and a cryptographic hash over the canonical payload.
+ *
+ * `evidenceHash` is computed over `canonicalizeFindingsForHash(findings)`
+ * so the same findings always produce the same hash regardless of object
+ * key ordering. The hash is intentionally NOT signed — local-only WebUI
+ * has no signing key — but a hash committed alongside the export still
+ * lets an auditor detect post-hoc tampering: any change to the JSON file
+ * shifts the hash, and the operator can re-run the audit + recompute.
+ */
+export interface ComplianceEvidence {
+  /** Stable envelope schema version — bump when shape changes. */
+  schemaVersion: 1;
+  /** Tenant scope captured at run time. */
+  tenantId: string;
+  tenantDisplayName: string;
+  /** Person / account who triggered the export. */
+  actor: string;
+  /** ISO timestamp when the export was created. */
+  capturedAt: string;
+  /** Cloud env (commercial / gov / china / germany / unknown). */
+  cloudEnvironment: AzureCloudEnvironment;
+  /** Severity tally at export time. */
+  summary: Record<BaselineSeverity, number>;
+  /** Drift counters vs the approved baseline (zeros if none saved). */
+  drift: DriftSummary;
+  /**
+   * Hex-encoded SHA-256 of `canonicalizeFindingsForHash(findings)` —
+   * audit chain-of-custody anchor.
+   */
+  evidenceHash: string;
+  /** Algorithm identifier kept verbatim in the envelope. */
+  evidenceHashAlgorithm: "SHA-256";
+  /** Findings (id, name, severity, summary — stripped raw payload). */
+  findings: ReadonlyArray<{
+    id: BaselineCheckId;
+    name: string;
+    severity: BaselineSeverity;
+    summary: string;
+    error?: string;
+  }>;
+}
+
+/**
+ * Produce a stable canonical JSON string suitable for hashing. We sort
+ * findings by `id` and emit only the four scoring fields so the hash is
+ * insensitive to React-internal ordering and to the heavy `raw` payload
+ * (which is non-deterministic across tenants).
+ *
+ * The function is deliberately deterministic across browsers: it does
+ * NOT rely on `JSON.stringify` key ordering for nested objects (we build
+ * the canonical record explicitly). This means two runs against the
+ * same posture produce byte-identical strings.
+ */
+export function canonicalizeFindingsForHash(
+  findings: ReadonlyArray<BaselineFinding>,
+): string {
+  const sorted = findings
+    .slice()
+    .sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
+  const compact = sorted.map((f) => ({
+    id: f.id,
+    name: f.name,
+    severity: f.severity,
+    summary: f.summary,
+    // Include error if present so a probe-failure baseline still hashes
+    // distinctly from a clean baseline.
+    error: f.error ?? "",
+  }));
+  return JSON.stringify(compact);
+}
+
+/**
+ * Compute SHA-256 hex digest of an arbitrary string using the WebCrypto
+ * SubtleCrypto API. Returns `null` when SubtleCrypto is unavailable
+ * (very old browsers / non-secure contexts) so callers can fall back to
+ * an export-without-hash. We never throw from this helper.
+ *
+ * Browser-built-in API — no install required. Listed in MDN since 2014.
+ */
+export async function computeSha256Hex(input: string): Promise<string | null> {
+  try {
+    if (typeof crypto === "undefined" || !crypto.subtle) return null;
+    const enc = new TextEncoder();
+    const buf = await crypto.subtle.digest("SHA-256", enc.encode(input));
+    const bytes = new Uint8Array(buf);
+    let hex = "";
+    for (let i = 0; i < bytes.length; i += 1) {
+      const b = bytes[i] as number;
+      hex += b.toString(16).padStart(2, "0");
+    }
+    return hex;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Build the compliance-evidence envelope. Caller supplies the surrounding
+ * context (tenant scope, actor, cloud env, drift counters); we compute
+ * the canonical findings JSON + SHA-256 hash and stitch the envelope
+ * together. Marked async because the hash is async.
+ */
+export async function buildComplianceEvidence(input: {
+  tenantId: string;
+  tenantDisplayName: string;
+  actor: string;
+  cloudEnvironment: AzureCloudEnvironment;
+  findings: ReadonlyArray<BaselineFinding>;
+  drift: DriftSummary;
+}): Promise<ComplianceEvidence> {
+  const canonical = canonicalizeFindingsForHash(input.findings);
+  const hash = (await computeSha256Hex(canonical)) ?? "sha256-unavailable";
+  const tally: Record<BaselineSeverity, number> = tallySeverities(
+    input.findings,
+  );
+  const compactFindings = input.findings.map((f) => ({
+    id: f.id,
+    name: f.name,
+    severity: f.severity,
+    summary: f.summary,
+    ...(f.error ? { error: f.error } : {}),
+  }));
+  return {
+    schemaVersion: 1,
+    tenantId: input.tenantId,
+    tenantDisplayName: input.tenantDisplayName,
+    actor: input.actor,
+    capturedAt: new Date().toISOString(),
+    cloudEnvironment: input.cloudEnvironment,
+    summary: tally,
+    drift: input.drift,
+    evidenceHash: hash,
+    evidenceHashAlgorithm: "SHA-256",
+    findings: compactFindings,
+  };
 }

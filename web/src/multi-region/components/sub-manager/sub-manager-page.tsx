@@ -231,7 +231,16 @@ interface AssignmentRowProps {
   hideRoleBadge?: boolean;
 }
 
-const AssignmentRow: React.FC<AssignmentRowProps> = ({
+/**
+ * Memoized to short-circuit re-renders when an unrelated row mutates
+ * state (selection toggle, filter change). With 100+ assignments and an
+ * `onToggleSelect` that gets a fresh closure per render, the un-memoized
+ * version paid for a full subtree reconcile on every keystroke in the
+ * search box. Equality compares the row identity (principalId +
+ * roleDefinitionId + assignment.id + principal.displayName since the
+ * Graph resolve mutates that lazily) plus the per-row toggle inputs.
+ */
+const AssignmentRowImpl: React.FC<AssignmentRowProps> = ({
   row: r,
   isSelf,
   isChecked,
@@ -360,6 +369,21 @@ const AssignmentRow: React.FC<AssignmentRowProps> = ({
   );
 };
 
+const AssignmentRow = React.memo(
+  AssignmentRowImpl,
+  (prev, next) =>
+    prev.row.assignment.id === next.row.assignment.id &&
+    prev.row.principal?.displayName === next.row.principal?.displayName &&
+    prev.row.principal?.signInName === next.row.principal?.signInName &&
+    prev.row.roleName === next.row.roleName &&
+    prev.isSelf === next.isSelf &&
+    prev.isChecked === next.isChecked &&
+    prev.deleting === next.deleting &&
+    prev.isCustomRole === next.isCustomRole &&
+    prev.hideRoleBadge === next.hideRoleBadge &&
+    prev.onToggleSelect === next.onToggleSelect,
+);
+
 /**
  * Tiny variant of the copy-button — single icon, no inline text. Used
  * at the end of each row so the operator can grab the role assignment
@@ -407,7 +431,12 @@ interface GroupedAssignmentsListProps {
   rows: JoinedRow[];
   selfPrincipalId: string | null;
   selected: Set<string>;
-  onToggleSelect: (id: string) => void;
+  /**
+   * Returns a STABLE callback for the given id (same fn ref across
+   * renders, keyed off the assignment id). Required so the memoized
+   * AssignmentRow doesn't get a fresh closure each render and re-render.
+   */
+  getToggleSelect: (id: string) => () => void;
   collapsedGroups: Set<string>;
   onToggleGroup: (roleId: string) => void;
   deleting: boolean;
@@ -418,7 +447,7 @@ const GroupedAssignmentsList: React.FC<GroupedAssignmentsListProps> = ({
   rows,
   selfPrincipalId,
   selected,
-  onToggleSelect,
+  getToggleSelect,
   collapsedGroups,
   onToggleGroup,
   deleting,
@@ -511,7 +540,7 @@ const GroupedAssignmentsList: React.FC<GroupedAssignmentsListProps> = ({
                       r.assignment.principalId === selfPrincipalId
                     }
                     isChecked={selected.has(r.assignment.id)}
-                    onToggleSelect={() => onToggleSelect(r.assignment.id)}
+                    onToggleSelect={getToggleSelect(r.assignment.id)}
                     deleting={deleting}
                     isCustomRole={group.isCustom}
                     hideRoleBadge
@@ -1174,6 +1203,105 @@ export const SubManagerPage: React.FC = () => {
     );
   }, [joined]);
 
+  /* ----- Corpus-grounded risk insights -----------------------------
+   * Defender-side pattern matching against techniques documented in the
+   * offensive-tooling corpus. Each insight is a small read-only signal
+   * — no automated remediation. The categories implemented here:
+   *
+   *  (A) Cross-tenant scope mismatch. When the sub's tenantId differs
+   *      from the source account's home tenant, the operator is acting
+   *      cross-tenant — exactly the EA / Subscription-Migrator pivot
+   *      surface documented in `_ea_subscription_cross_tenant.md`.
+   *      Not inherently malicious, but worth flagging because all
+   *      destructive operations (cancel / rename / billing-scope
+   *      change) on a foreign-tenant sub leave audit fingerprints in
+   *      a tenant the operator may not control.
+   *
+   *  (B) Recent Owner grants. Role assignments at Owner role with
+   *      createdOn within the last 24 hours. Mapped to corpus pattern
+   *      "rapid escalation before pivot" — the dafthack TeamFiltration
+   *      and AzureHound playbooks both call out same-day Owner adds as
+   *      the loudest single signal of a hands-on-keyboard takeover.
+   *
+   *  (C) Deceptive-name principals. Resolved User principals whose
+   *      displayName matches naming patterns the corpus documents
+   *      attackers use to blend in (see `_bypass_modify_delete.md`
+   *      §4.1 — backdoor user with pre-assigned role). We only flag
+   *      Users (not SPNs/Groups) because legitimate SPNs frequently
+   *      have these prefixes.
+   *
+   *  (D) Unresolved high-privilege principals. Owners that Graph
+   *      couldn't expand to a display name — common stealth-persistence
+   *      remnant when a backdoor user / SPN was deleted but the role
+   *      assignment was not. Surface these as the highest-confidence
+   *      cleanup candidates.
+   *
+   * Anchored against the corpus to avoid re-inventing thresholds from
+   * memory — every category cites a specific playbook file.
+   */
+  const riskInsights = React.useMemo(() => {
+    const now = Date.now();
+    const dayMs = 24 * 60 * 60 * 1000;
+    /** Cross-tenant flag: sub.tenantId differs from account.tenantId. */
+    const crossTenant =
+      !!selectedSub &&
+      !!account &&
+      !!selectedSub.tenantId &&
+      selectedSub.tenantId.toLowerCase() !== account.tenantId.toLowerCase();
+    /** Recent Owner adds (within 24h). */
+    const recentOwners: JoinedRow[] = [];
+    /** Unresolved Owners (no displayName in `principals`). */
+    const unresolvedOwners: JoinedRow[] = [];
+    /** Deceptive-name principals (Users with svc-/_sync_/admin-/backup/sync hints). */
+    const deceptivePrincipals: JoinedRow[] = [];
+    // Patterns drawn from `_bypass_modify_delete.md` §4.1. Case-insensitive
+    // substring match; anchored prefixes hit first to keep false positives
+    // down. `backup` / `sync` are matched anywhere because the corpus
+    // notes attackers also use those as suffixes ("dba-sync", "_backup").
+    const DECEPTIVE_PREFIXES = ["svc-", "_sync_", "admin-", "adm-", "svc_"];
+    const DECEPTIVE_SUBSTR = ["backup", "sync"];
+    for (const r of joined) {
+      const isOwner = r.assignment.roleDefinitionId === AZURE_ROLE_OWNER;
+      if (isOwner) {
+        const createdMs = r.assignment.createdOn
+          ? Date.parse(r.assignment.createdOn)
+          : NaN;
+        if (
+          Number.isFinite(createdMs) &&
+          now - createdMs >= 0 &&
+          now - createdMs <= dayMs
+        ) {
+          recentOwners.push(r);
+        }
+        if (!r.principal?.displayName) unresolvedOwners.push(r);
+      }
+      if (r.assignment.principalType === "User") {
+        const dn = (r.principal?.displayName ?? "").toLowerCase();
+        const sn = (r.principal?.signInName ?? "").toLowerCase();
+        const haystack = `${dn} ${sn}`;
+        const hit =
+          (!!dn || !!sn) &&
+          (DECEPTIVE_PREFIXES.some(
+            (p) => dn.startsWith(p) || sn.startsWith(p),
+          ) ||
+            DECEPTIVE_SUBSTR.some((s) => haystack.includes(s)));
+        if (hit) deceptivePrincipals.push(r);
+      }
+    }
+    const count =
+      (crossTenant ? 1 : 0) +
+      (recentOwners.length > 0 ? 1 : 0) +
+      (unresolvedOwners.length > 0 ? 1 : 0) +
+      (deceptivePrincipals.length > 0 ? 1 : 0);
+    return {
+      crossTenant,
+      recentOwners,
+      unresolvedOwners,
+      deceptivePrincipals,
+      count,
+    };
+  }, [joined, selectedSub, account]);
+
   /* ----- Selection for bulk delete --------------------------------- */
   const [selected, setSelected] = React.useState<Set<string>>(new Set());
   const toggleSelect = React.useCallback((id: string) => {
@@ -1184,6 +1312,35 @@ export const SubManagerPage: React.FC = () => {
       return next;
     });
   }, []);
+  /**
+   * Stable per-id toggle callback cache. Without this, AssignmentRow's
+   * `() => toggleSelect(r.assignment.id)` allocates a fresh closure each
+   * render, defeating React.memo on the row component. The cache is held
+   * in a ref so reassigning entries doesn't trigger a re-render of the
+   * parent; entries are reaped lazily when assignments turn over (sub
+   * switch / reload) by the effect a few lines below. */
+  const toggleSelectByIdCacheRef = React.useRef<Map<string, () => void>>(
+    new Map(),
+  );
+  const getToggleSelect = React.useCallback(
+    (id: string): (() => void) => {
+      let fn = toggleSelectByIdCacheRef.current.get(id);
+      if (!fn) {
+        fn = () => toggleSelect(id);
+        toggleSelectByIdCacheRef.current.set(id, fn);
+      }
+      return fn;
+    },
+    [toggleSelect],
+  );
+  // Reap stale entries whenever the assignment set turns over (sub switch
+  // or refresh). Keeps the cache bounded; otherwise it grows linearly
+  // with the number of unique assignment ids the operator has ever seen.
+  React.useEffect(() => {
+    const live = new Set(assignments.map((a) => a.id));
+    const cache = toggleSelectByIdCacheRef.current;
+    for (const k of cache.keys()) if (!live.has(k)) cache.delete(k);
+  }, [assignments]);
   const selectAllDeletable = React.useCallback(() => {
     setSelected(
       new Set(
@@ -1199,9 +1356,39 @@ export const SubManagerPage: React.FC = () => {
     setSelected(new Set());
   }, [subscriptionId, reloadTick]);
 
+  /* ----- ARIA-live announcer (declared first so dependents close over it).
+   *  See full doc below. */
+  // (announce + liveMessage defined immediately after this comment.)
+  /* ----- ARIA-live announcer --------------------------------------
+   * Polite live region. We pipe filter changes and bulk-delete results
+   * through `announce()` so screen-reader users get the same context
+   * sighted operators get from the row-count badge updating. The
+   * "polite" politeness setting queues messages instead of preempting
+   * the user's current screen-reader speech (assistive-tech best
+   * practice for non-emergency updates). */
+  const [liveMessage, setLiveMessage] = React.useState("");
+  const liveTimeoutRef = React.useRef<number | null>(null);
+  const announce = React.useCallback((msg: string) => {
+    // Clear-then-set so identical-text messages still trigger SR readouts.
+    setLiveMessage("");
+    if (liveTimeoutRef.current) window.clearTimeout(liveTimeoutRef.current);
+    liveTimeoutRef.current = window.setTimeout(() => {
+      setLiveMessage(msg);
+    }, 40);
+  }, []);
+  React.useEffect(() => {
+    return () => {
+      if (liveTimeoutRef.current) window.clearTimeout(liveTimeoutRef.current);
+    };
+  }, []);
+
   /* ----- Keyboard shortcuts ---------------------------------------
    * `/`  → focus the search box (skipped if a form field already has focus).
-   * `Esc` → clear current selection.
+   * `Esc` → clear current selection / clear search.
+   * `g`  → toggle flat / grouped view.
+   * `o`  → quick toggle: filter to Owners only (re-press to clear).
+   * `u`  → quick toggle: filter to Unresolved principals (re-press to clear).
+   * `c`  → clear all active filters.
    * Only active while the RBAC tab is the visible one. */
   React.useEffect(() => {
     if (tab !== "subscription-rbac") return;
@@ -1212,18 +1399,67 @@ export const SubManagerPage: React.FC = () => {
         (target.tagName === "INPUT" ||
           target.tagName === "TEXTAREA" ||
           target.isContentEditable);
+      // Skip when any modifier is held — leaves the browser's native
+      // Ctrl/Cmd shortcuts unmolested.
+      if (e.ctrlKey || e.metaKey || e.altKey) return;
       if (e.key === "/" && !isTyping) {
         e.preventDefault();
         searchRef.current?.focus();
         searchRef.current?.select();
-      } else if (e.key === "Escape" && !isTyping && selected.size > 0) {
+      } else if (e.key === "Escape" && !isTyping) {
+        if (selected.size > 0) {
+          e.preventDefault();
+          clearSelection();
+          announce(`Cleared ${selected.size} selection${selected.size === 1 ? "" : "s"}.`);
+        } else if (search) {
+          e.preventDefault();
+          setSearch("");
+          announce("Cleared search.");
+        }
+      } else if (e.key === "g" && !isTyping) {
         e.preventDefault();
-        clearSelection();
+        const next = viewMode === "flat" ? "grouped" : "flat";
+        changeViewMode(next);
+        announce(`Switched to ${next === "grouped" ? "grouped" : "flat"} view.`);
+      } else if (e.key === "o" && !isTyping) {
+        e.preventDefault();
+        if (roleFilter === AZURE_ROLE_OWNER) {
+          setRoleFilter("all");
+          announce("Cleared Owners filter.");
+        } else {
+          setRoleFilter(AZURE_ROLE_OWNER);
+          announce("Filtered to Owners.");
+        }
+      } else if (e.key === "u" && !isTyping) {
+        e.preventDefault();
+        if (stalenessFilter === "unresolved") {
+          setStalenessFilter("all");
+          announce("Cleared unresolved filter.");
+        } else {
+          setStalenessFilter("unresolved");
+          announce("Filtered to unresolved principals.");
+        }
+      } else if (e.key === "c" && !isTyping && hasActiveFilters) {
+        e.preventDefault();
+        clearAllFilters();
+        announce("Cleared all filters.");
       }
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [tab, selected.size, clearSelection]);
+  }, [
+    tab,
+    selected.size,
+    clearSelection,
+    viewMode,
+    changeViewMode,
+    roleFilter,
+    stalenessFilter,
+    hasActiveFilters,
+    clearAllFilters,
+    search,
+    announce,
+  ]);
 
   /* ----- Self-protection diagnostics ------------------------------- */
   // Narrow to `string | null` (previous shape leaked `SourceAccount | string |
@@ -1324,15 +1560,19 @@ export const SubManagerPage: React.FC = () => {
     setDeleting(false);
     setConfirmOpen(false);
     setSelected(new Set());
+    const summaryMessage =
+      failed > 0
+        ? `Removed ${succeeded}, failed ${failed}. ${failures.slice(0, 2).join(" · ")}${failures.length > 2 ? "…" : ""}`
+        : `Removed ${succeeded} role assignment${succeeded === 1 ? "" : "s"}.`;
     store.addNotification({
       type: failed > 0 ? (succeeded > 0 ? "warning" : "error") : "success",
-      message:
-        failed > 0
-          ? `Removed ${succeeded}, failed ${failed}. ${failures.slice(0, 2).join(" · ")}${failures.length > 2 ? "…" : ""}`
-          : `Removed ${succeeded} role assignment${succeeded === 1 ? "" : "s"}.`,
+      message: summaryMessage,
     });
+    // Mirror to ARIA-live so screen-reader users hear the same outcome
+    // sighted operators see in the toast — toasts aren't always picked up.
+    announce(summaryMessage);
     reload();
-  }, [account, selectedRowsObjects, subscriptionId, store, reload]);
+  }, [account, selectedRowsObjects, subscriptionId, store, reload, announce]);
 
   /* ----- "Remove me" shortcut -------------------------------------- */
   const myRows = React.useMemo(() => {
@@ -1355,6 +1595,38 @@ export const SubManagerPage: React.FC = () => {
   const [addRoleId, setAddRoleId] = React.useState<string>("");
   const [adding, setAdding] = React.useState(false);
   const [addError, setAddError] = React.useState<string | null>(null);
+  /**
+   * Reveals the sanitized ARM PUT body that `assignSubscriptionRole`
+   * will send. Lets the operator (or a reviewer over their shoulder)
+   * eyeball the exact wire payload before committing — useful when
+   * pasting into az-cli, when running the request through a proxy,
+   * or when documenting a change ticket. No token / no headers shown;
+   * we only render what's safe to leak to a screenshot. */
+  const [showArmPreview, setShowArmPreview] = React.useState(false);
+  /**
+   * Sanitized ARM PUT body preview. Matches the shape
+   * `assignSubscriptionRole` produces — see services/role-assignments.ts.
+   * The role-assignment id is a fresh GUID; ARM expects a client-
+   * generated id at the PUT URL segment, so the preview generates one
+   * deterministically from the principal+role pair for display only
+   * (the real service generates its own at submit time). */
+  const armPutPreview = React.useMemo(() => {
+    const raw = addPrincipalInput.trim();
+    if (!subscriptionId || !addRoleId || !raw) return null;
+    const guidRe =
+      /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+    const principalObjectId = guidRe.test(raw) ? raw : `<resolved-from "${raw}">`;
+    return {
+      url: `PUT https://management.azure.com/subscriptions/${subscriptionId}/providers/Microsoft.Authorization/roleAssignments/<new-guid>?api-version=2022-04-01`,
+      body: {
+        properties: {
+          roleDefinitionId: `/subscriptions/${subscriptionId}/providers/Microsoft.Authorization/roleDefinitions/${addRoleId}`,
+          principalId: principalObjectId,
+          principalType: addPrincipalType,
+        },
+      },
+    };
+  }, [subscriptionId, addRoleId, addPrincipalInput, addPrincipalType]);
 
   // Seed default role when role defs load. Preference: last role used on
   // this page (per session), then Owner, then nothing. Drops a stored
@@ -1556,6 +1828,19 @@ export const SubManagerPage: React.FC = () => {
 
   return (
     <div className="flex flex-col gap-4 py-2">
+      {/* Polite ARIA live region — sr-only visually, but screen readers
+        * announce its contents when they change. Used for filter-toggle
+        * and delete-result announcements so SR users get the same
+        * feedback as sighted operators. The empty leading state lets us
+        * clear-then-set without spurious announcements on first mount. */}
+      <div
+        role="status"
+        aria-live="polite"
+        aria-atomic="true"
+        className="sr-only"
+      >
+        {liveMessage}
+      </div>
       <PageHeader
         title="Sub Manager"
         description="Subscription RBAC, EA departments, and EA Subscription Creator grants in one place."
@@ -1584,7 +1869,23 @@ export const SubManagerPage: React.FC = () => {
                     </span>
                     <span>
                       <kbd className="rounded border px-1">Esc</kbd> clear
-                      selection
+                      selection / search
+                    </span>
+                    <span>
+                      <kbd className="rounded border px-1">g</kbd> toggle
+                      flat / grouped
+                    </span>
+                    <span>
+                      <kbd className="rounded border px-1">o</kbd> filter to
+                      Owners
+                    </span>
+                    <span>
+                      <kbd className="rounded border px-1">u</kbd> filter to
+                      Unresolved
+                    </span>
+                    <span>
+                      <kbd className="rounded border px-1">c</kbd> clear all
+                      filters
                     </span>
                   </div>
                 }
@@ -1751,7 +2052,7 @@ export const SubManagerPage: React.FC = () => {
           * the rest of the dashboard. */}
         {subscriptions.length > 0 && (
           <CardContent className="border-t border-border pt-3">
-            <div className="grid grid-cols-2 gap-2 sm:grid-cols-5">
+            <div className="grid grid-cols-2 gap-2 sm:grid-cols-6">
               <SummaryStatItem
                 label="Total"
                 value={subStateStats.total}
@@ -1785,6 +2086,21 @@ export const SubManagerPage: React.FC = () => {
                 tone={subStateStats.deleted > 0 ? "destructive" : "muted"}
                 compact
                 ariaLabel={`${subStateStats.deleted} subscriptions deleted`}
+              />
+              {/* "Stuck" — subscriptions whose state isn't one of the four
+                * well-known terminal states (Enabled / Disabled / Warned /
+                * Deleted). In practice these are subs in a transient state
+                * (PastDue, Expired, Transferred mid-flight) that have sat
+                * there long enough to be worth investigating. The tone
+                * mirrors Warned because the actual remediation path is the
+                * same — open the Portal billing blade. */}
+              <SummaryStatItem
+                label="Stuck"
+                value={subStateStats.other}
+                tone={subStateStats.other > 0 ? "warning" : "muted"}
+                compact
+                hint={subStateStats.other > 0 ? "transient" : undefined}
+                ariaLabel={`${subStateStats.other} subscriptions in non-standard state`}
               />
             </div>
             <div className="mt-2 flex flex-wrap items-center gap-2">
@@ -1937,6 +2253,52 @@ export const SubManagerPage: React.FC = () => {
                   </Select>
                 </div>
               </div>
+              {/* ARM PUT preview — sanitized wire-payload of the upcoming
+                * mutation. Renders only when the form has enough data to
+                * produce a useful preview. Hidden by default to keep the
+                * card uncluttered; revealed on demand. Useful for change
+                * tickets, az-cli paste-ins, and quick sanity checks
+                * before clicking Grant. */}
+              {armPutPreview && (
+                <div className="flex flex-col gap-1">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      size="sm"
+                      className="h-7 text-2xs"
+                      onClick={() => setShowArmPreview((v) => !v)}
+                      aria-expanded={showArmPreview}
+                      aria-controls="sm-arm-put-preview"
+                    >
+                      {showArmPreview ? (
+                        <ChevronDown className="h-3 w-3" />
+                      ) : (
+                        <ChevronRight className="h-3 w-3" />
+                      )}
+                      {showArmPreview ? "Hide" : "Show"} ARM PUT preview
+                      (sanitized)
+                    </Button>
+                    {showArmPreview && (
+                      <CopyButtonSmall
+                        value={JSON.stringify(armPutPreview, null, 2)}
+                        ariaLabel="Copy ARM PUT preview JSON"
+                        title="Copy preview JSON"
+                      />
+                    )}
+                  </div>
+                  {showArmPreview && (
+                    <pre
+                      id="sm-arm-put-preview"
+                      className="overflow-x-auto rounded-md border border-border bg-muted/30 p-2 text-2xs font-mono leading-snug"
+                    >
+                      {armPutPreview.url}
+                      {"\n\n"}
+                      {JSON.stringify(armPutPreview.body, null, 2)}
+                    </pre>
+                  )}
+                </div>
+              )}
               {existingMatchForAdd && (
                 <Alert variant="warning">
                   <AlertTriangle className="h-3.5 w-3.5" />
@@ -2115,6 +2477,196 @@ export const SubManagerPage: React.FC = () => {
             <Alert variant="warning">
               <AlertDescription>{principalResolveWarning}</AlertDescription>
             </Alert>
+          )}
+
+          {/* ----- Corpus-grounded Risk Insights ---------------------
+            * Pattern-matches the visible role assignments against
+            * techniques documented in the offensive-tooling corpus.
+            * Each card cites the playbook it draws from. Read-only;
+            * intent is to surface, not auto-remediate. Renders only
+            * when at least one insight has hits, so the page stays
+            * uncluttered on a healthy sub. */}
+          {riskInsights.count > 0 && (
+            <Card className="border-warning/30 bg-warning/5">
+              <CardHeader className="pb-2">
+                <CardTitle className="flex items-center gap-2 text-sm">
+                  <ShieldAlert className="h-4 w-4 text-warning" />
+                  Risk insights
+                  <Badge variant="warning" className="text-2xs">
+                    {riskInsights.count}
+                  </Badge>
+                </CardTitle>
+                <CardDescription className="text-xs">
+                  Defender-side pattern matches drawn from the
+                  offensive-tooling corpus. Not necessarily malicious —
+                  cross-reference each finding with your change-management
+                  log before acting.
+                </CardDescription>
+              </CardHeader>
+              <CardContent className="flex flex-col gap-2 text-xs">
+                {riskInsights.crossTenant && selectedSub && account && (
+                  <div className="rounded-md border border-warning/40 bg-background p-2">
+                    <div className="flex flex-wrap items-center gap-2">
+                      <Badge variant="warning" className="text-2xs">
+                        Cross-tenant
+                      </Badge>
+                      <span className="font-medium">
+                        Subscription lives in a different tenant than the
+                        source account.
+                      </span>
+                    </div>
+                    <div className="mt-1 text-2xs text-muted-foreground">
+                      Sub tenant{" "}
+                      <code className="font-mono">
+                        {selectedSub.tenantId.slice(0, 8)}…
+                      </code>{" "}
+                      vs source-account tenant{" "}
+                      <code className="font-mono">
+                        {account.tenantId.slice(0, 8)}…
+                      </code>
+                      . Every mutation here is logged in the sub's tenant
+                      audit, not yours. Reference:{" "}
+                      <code className="font-mono">
+                        _ea_subscription_cross_tenant.md
+                      </code>{" "}
+                      §1.2 (Microsoft Billing first-party SPN) +{" "}
+                      <code className="font-mono">_bypass_tenant_switch.md</code>.
+                    </div>
+                  </div>
+                )}
+                {riskInsights.recentOwners.length > 0 && (
+                  <div className="rounded-md border border-warning/40 bg-background p-2">
+                    <div className="flex flex-wrap items-center gap-2">
+                      <Badge variant="warning" className="text-2xs">
+                        {riskInsights.recentOwners.length} recent Owner
+                        {riskInsights.recentOwners.length === 1 ? "" : "s"}
+                      </Badge>
+                      <span className="font-medium">
+                        Owner role granted in the last 24 hours.
+                      </span>
+                    </div>
+                    <ul className="ml-4 mt-1 list-disc text-2xs text-muted-foreground">
+                      {riskInsights.recentOwners.slice(0, 3).map((r) => (
+                        <li key={r.assignment.id}>
+                          {r.principal?.displayName ?? r.assignment.principalId}{" "}
+                          ·{" "}
+                          {r.assignment.createdOn
+                            ? fmtDate(r.assignment.createdOn)
+                            : "no createdOn"}
+                        </li>
+                      ))}
+                      {riskInsights.recentOwners.length > 3 && (
+                        <li>
+                          … and {riskInsights.recentOwners.length - 3} more
+                        </li>
+                      )}
+                    </ul>
+                    <div className="mt-1 text-2xs text-muted-foreground">
+                      Reference:{" "}
+                      <code className="font-mono">_bypass_role_grant.md</code>{" "}
+                      (rapid escalation pattern).
+                    </div>
+                  </div>
+                )}
+                {riskInsights.unresolvedOwners.length > 0 && (
+                  <div className="rounded-md border border-destructive/40 bg-background p-2">
+                    <div className="flex flex-wrap items-center gap-2">
+                      <Badge variant="destructive" className="text-2xs">
+                        {riskInsights.unresolvedOwners.length} unresolved
+                        Owner
+                        {riskInsights.unresolvedOwners.length === 1 ? "" : "s"}
+                      </Badge>
+                      <span className="font-medium">
+                        High-privilege role tied to a principal Graph can't
+                        resolve.
+                      </span>
+                    </div>
+                    <ul className="ml-4 mt-1 list-disc text-2xs text-muted-foreground">
+                      {riskInsights.unresolvedOwners.slice(0, 3).map((r) => (
+                        <li
+                          key={r.assignment.id}
+                          className="font-mono break-all"
+                        >
+                          {r.assignment.principalId} ·{" "}
+                          {r.assignment.principalType}
+                        </li>
+                      ))}
+                      {riskInsights.unresolvedOwners.length > 3 && (
+                        <li>
+                          … and {riskInsights.unresolvedOwners.length - 3} more
+                        </li>
+                      )}
+                    </ul>
+                    <div className="mt-1 flex flex-wrap items-center gap-2">
+                      <span className="text-2xs text-muted-foreground">
+                        Common cause: deleted user / SPN whose Owner grant
+                        was never cleaned up. Often safe to remove after
+                        spot-checking.
+                      </span>
+                      <Button
+                        type="button"
+                        variant="outline"
+                        size="sm"
+                        className="h-6 text-2xs"
+                        onClick={() => {
+                          setRoleFilter(AZURE_ROLE_OWNER);
+                          setStalenessFilter("unresolved");
+                          announce(
+                            `Filtered to ${riskInsights.unresolvedOwners.length} unresolved Owner assignments.`,
+                          );
+                        }}
+                      >
+                        <Filter className="h-3 w-3" />
+                        Filter list to these
+                      </Button>
+                    </div>
+                  </div>
+                )}
+                {riskInsights.deceptivePrincipals.length > 0 && (
+                  <div className="rounded-md border border-warning/40 bg-background p-2">
+                    <div className="flex flex-wrap items-center gap-2">
+                      <Badge variant="warning" className="text-2xs">
+                        {riskInsights.deceptivePrincipals.length} blending
+                        name
+                        {riskInsights.deceptivePrincipals.length === 1
+                          ? ""
+                          : "s"}
+                      </Badge>
+                      <span className="font-medium">
+                        User principals with backdoor-blending naming.
+                      </span>
+                    </div>
+                    <ul className="ml-4 mt-1 list-disc text-2xs text-muted-foreground">
+                      {riskInsights.deceptivePrincipals.slice(0, 3).map((r) => (
+                        <li key={r.assignment.id}>
+                          {r.principal?.displayName ??
+                            r.principal?.signInName ??
+                            r.assignment.principalId}{" "}
+                          · {r.roleName}
+                        </li>
+                      ))}
+                      {riskInsights.deceptivePrincipals.length > 3 && (
+                        <li>
+                          … and{" "}
+                          {riskInsights.deceptivePrincipals.length - 3} more
+                        </li>
+                      )}
+                    </ul>
+                    <div className="mt-1 text-2xs text-muted-foreground">
+                      Patterns:{" "}
+                      <code className="font-mono">
+                        svc-, _sync_, admin-, *backup*, *sync*
+                      </code>{" "}
+                      — Reference:{" "}
+                      <code className="font-mono">
+                        _bypass_modify_delete.md
+                      </code>{" "}
+                      §4.1 (backdoor user with pre-assigned role).
+                    </div>
+                  </div>
+                )}
+              </CardContent>
+            </Card>
           )}
 
           {/* ----- Filters + actions row --------------------------- */}
@@ -2494,7 +3046,7 @@ export const SubManagerPage: React.FC = () => {
                   rows={filteredRows}
                   selfPrincipalId={selfPrincipalId}
                   selected={selected}
-                  onToggleSelect={toggleSelect}
+                  getToggleSelect={getToggleSelect}
                   collapsedGroups={collapsedGroups}
                   onToggleGroup={toggleGroup}
                   deleting={deleting}
@@ -2511,7 +3063,7 @@ export const SubManagerPage: React.FC = () => {
                         r.assignment.principalId === selfPrincipalId
                       }
                       isChecked={selected.has(r.assignment.id)}
-                      onToggleSelect={() => toggleSelect(r.assignment.id)}
+                      onToggleSelect={getToggleSelect(r.assignment.id)}
                       deleting={deleting}
                       isCustomRole={
                         roleKindById.get(r.assignment.roleDefinitionId) ===

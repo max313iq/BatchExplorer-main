@@ -71,14 +71,17 @@ import {
   AlertTriangle,
   ArrowDownRight,
   ArrowUpRight,
+  BellRing,
   Bookmark,
   CheckCircle2,
   ChevronDown,
   ChevronRight,
   Cloud,
   ExternalLink,
+  FileCheck,
   GitCompare,
   Globe,
+  History,
   Info,
   KeyRound,
   Loader2,
@@ -88,6 +91,7 @@ import {
   Shield,
   ShieldAlert,
   ShieldCheck,
+  Sparkles,
   Trash2,
   Users,
   XCircle,
@@ -125,6 +129,7 @@ import { getActiveTenant, getGraphTokenForAccount } from "../../auth/msal-auth";
 import { resolveActiveTenantId } from "../../auth/perform-tenant-switch";
 import { useAbortableEffect } from "../../hooks/use-abortable-effect";
 import { usePersistedState } from "../../hooks/use-persisted-state";
+import { useShortcut } from "../../hooks/use-shortcut";
 import { useTenantChange } from "../../hooks/use-tenant-change";
 import { useUrlState } from "../../hooks/use-url-state";
 import { auditLog } from "../../services/audit-log";
@@ -135,11 +140,14 @@ import { ExportMenu, type ExportColumn } from "../shared/export-menu";
 import {
   type BaselineCheckId,
   type BaselineFinding,
+  type BaselineHistoryEntry,
   type BaselineSeverity,
   type BaselineSnapshot,
   type CloudEnvironmentInfo,
+  type ComplianceEvidence,
   type ConditionalAccessPolicyRaw,
   type DomainRaw,
+  type DriftSummary,
   type FederatedDomainEntry,
   type FederationConfigRaw,
   type FindingDrift,
@@ -150,13 +158,17 @@ import {
   type SpScoredRow,
   type SpType,
   TIER_ZERO_ROLE_TEMPLATE_IDS,
+  buildComplianceEvidence,
+  buildHistoryEntry,
   buildSnapshot,
+  compareHistoryEntries,
   compareIsoDates,
   compareSeverityDesc,
   detectCloudEnvironmentFromToken,
   diffAgainstSnapshot,
   portalLinkForFinding,
   portalLinkForServicePrincipal,
+  pushHistoryEntry,
   scoreCaPolicyDrift,
   scoreDefaultUserPermissions,
   scoreDomainsFederation,
@@ -168,6 +180,7 @@ import {
   scoreServicePrincipal,
   severityLabel,
   severityToBadgeVariant,
+  summarizeDrift,
   tallySeverities,
 } from "./tenant-baseline-helpers";
 
@@ -183,6 +196,12 @@ const SEARCH_DEBOUNCE_MS = 150;
 const SNAPSHOT_STORAGE_PREFIX = "tenant-baseline:snapshot:";
 /** Schema version — bump if BaselineSnapshot shape changes. */
 const SNAPSHOT_SCHEMA_VERSION = 1;
+/** localStorage key prefix for the drift-history ring buffer (per-tenant). */
+const HISTORY_STORAGE_PREFIX = "tenant-baseline:history:";
+/** Schema version for the history ring — bump if BaselineHistoryEntry shape changes. */
+const HISTORY_SCHEMA_VERSION = 1;
+/** localStorage key for the global "alert me on drift" preference. Cross-tenant. */
+const ALERT_ON_DRIFT_PREF_KEY = "tenant-baseline:alert-on-drift";
 
 // Severity filter chips for Tab 2 — kept module-scoped so the chip strip
 // component can render them without re-creating the array each render.
@@ -312,11 +331,33 @@ const JsonViewer: React.FC<{ value: unknown }> = ({ value }) => {
  * - improved:  this run is BETTER than the saved baseline
  * - summary-changed: same severity but the human summary changed
  *   (e.g. extra detail in the finding text — worth a glance)
+ * - new-check-introduced: this check id was added AFTER the saved baseline
+ *   was captured. Rendered as an info pill so the operator knows the
+ *   diff against an old baseline includes auditor schema additions.
  * - match: identical — no pill (we skip render)
  * - no-baseline: skipped (handled by caller)
  */
 const DriftPill: React.FC<{ drift: FindingDrift }> = ({ drift }) => {
   if (drift.status === "match" || drift.status === "no-baseline") return null;
+  if (drift.status === "new-check-introduced") {
+    return (
+      <TooltipProvider delayDuration={300}>
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <Badge variant="info" className="gap-1">
+              <Sparkles className="h-3 w-3" aria-hidden />
+              New check
+            </Badge>
+          </TooltipTrigger>
+          <TooltipContent side="top" className="max-w-md text-2xs">
+            This check id wasn&rsquo;t present when the approved baseline
+            snapshot was captured. Review it, then re-save the baseline so
+            future drift comparisons include this signal.
+          </TooltipContent>
+        </Tooltip>
+      </TooltipProvider>
+    );
+  }
   if (drift.status === "regressed") {
     return (
       <TooltipProvider delayDuration={300}>
@@ -441,13 +482,15 @@ const FindingCard: React.FC<{
   const isDrift =
     drift.status === "regressed" ||
     drift.status === "improved" ||
-    drift.status === "summary-changed";
+    drift.status === "summary-changed" ||
+    drift.status === "new-check-introduced";
   return (
     <Card
       className={cn(
         "overflow-hidden",
         drift.status === "regressed" && "border-destructive/60",
         drift.status === "improved" && "border-success/60",
+        drift.status === "new-check-introduced" && "border-info/60",
       )}
     >
       <CardHeader className="space-y-1 pb-2">
@@ -616,7 +659,216 @@ interface BaselineTabProps {
   snapshot: BaselineSnapshot | null;
   onSaveSnapshot: () => void;
   onClearSnapshot: () => void;
+  /** Persisted drift-history ring buffer (oldest → newest). */
+  history: ReadonlyArray<BaselineHistoryEntry>;
+  /** Operator's "alert me when posture regresses" preference. */
+  alertOnDrift: boolean;
+  /** Toggle handler for the alert preference (cross-tenant). */
+  onToggleAlertOnDrift: (next: boolean) => void;
+  /** Trigger a compliance-evidence export (computes SHA-256 hash). */
+  onExportEvidence: () => void;
+  /** True while the evidence-export is computing the hash. */
+  isExportingEvidence: boolean;
+  /** Refs the hot-key dispatcher can use to focus controls. */
+  refreshButtonRef: React.RefObject<HTMLButtonElement>;
+  /** Span wrapping the ExportMenu so the hot-key handler can locate the
+   *  dropdown trigger button via querySelector. */
+  exportMenuButtonRef: React.RefObject<HTMLSpanElement>;
 }
+
+/**
+ * Hidden ARIA-live region that announces drift outcomes to assistive
+ * tech. We render whenever the operator has the "Alert on drift"
+ * preference enabled AND a baseline snapshot exists. The region is
+ * visually hidden (no on-screen overlap) but kept in the DOM so
+ * `aria-live` semantics fire on text mutation.
+ *
+ * The visible drift counters in the toolbar above are sufficient for
+ * sighted operators; this region is a secondary channel that announces
+ * the SAME information politely (no focus theft, no role="alert" panic
+ * tone) to anyone running NVDA / JAWS / VoiceOver.
+ */
+const DriftLiveRegion: React.FC<{
+  enabled: boolean;
+  summary: DriftSummary;
+  hasBaseline: boolean;
+}> = ({ enabled, summary, hasBaseline }) => {
+  // Compose the human announcement.
+  const announcement = React.useMemo(() => {
+    if (!enabled || !hasBaseline) return "";
+    const parts: string[] = [];
+    if (summary.regressed > 0) {
+      parts.push(
+        `${summary.regressed} check${summary.regressed === 1 ? "" : "s"} regressed`,
+      );
+    }
+    if (summary.improved > 0) {
+      parts.push(
+        `${summary.improved} check${summary.improved === 1 ? "" : "s"} improved`,
+      );
+    }
+    if (summary.changed > 0) {
+      parts.push(
+        `${summary.changed} check${summary.changed === 1 ? "" : "s"} changed summary`,
+      );
+    }
+    if (summary.newlyIntroduced > 0) {
+      parts.push(
+        `${summary.newlyIntroduced} new check${summary.newlyIntroduced === 1 ? "" : "s"} since baseline`,
+      );
+    }
+    if (parts.length === 0) {
+      return "Tenant baseline matches saved snapshot — no drift detected.";
+    }
+    return `Tenant baseline drift: ${parts.join(", ")}.`;
+  }, [enabled, hasBaseline, summary]);
+
+  return (
+    <>
+      {/* Visible inline alert: only when there's regression to surface. */}
+      {enabled && hasBaseline && summary.hasRegressions && (
+        <Alert variant="warning" role="status">
+          <BellRing className="h-4 w-4" />
+          <AlertDescription className="text-2xs leading-relaxed">
+            <strong>Drift detected:</strong> {summary.regressed} check
+            {summary.regressed === 1 ? "" : "s"} regressed since the saved
+            baseline. Review the cards marked &ldquo;Regressed&rdquo; below
+            and re-save the baseline only after confirming the changes are
+            intentional.
+          </AlertDescription>
+        </Alert>
+      )}
+      {/* Always-present ARIA-live region — invisible to sighted users. */}
+      <div
+        aria-live="polite"
+        aria-atomic="true"
+        className="sr-only"
+        data-testid="tenant-baseline-drift-live-region"
+      >
+        {announcement}
+      </div>
+    </>
+  );
+};
+
+/**
+ * Drift-history timeline — small horizontal strip of severity heat-cells,
+ * one per persisted history entry. The most recent entry is on the right;
+ * the leftmost cell is the oldest. Cells colour-code by the worst
+ * severity in that run's tally (critical → high → medium → ok), and a
+ * bookmark icon marks the entry that was the approved baseline.
+ *
+ * Pure presentational — the parent owns the ring buffer.
+ *
+ * Why this exists (corpus framing):
+ *   Drift on the federation backdoor / CA policy axes is often slow-moving
+ *   (`_AZURE_BYPASS_PLAYBOOK.md` "Critical Defender Audit Surface" — an
+ *   attacker who has Global Admin for 5 minutes can flip CA off, then
+ *   wait days to use the bypass). Without a longitudinal record, a one-
+ *   shot audit only catches the live state. The timeline gives the
+ *   defender the "what did it look like 2 weeks ago" view without any
+ *   backend.
+ */
+const HistoryTimeline: React.FC<{
+  history: ReadonlyArray<BaselineHistoryEntry>;
+  approvedAt: string | null;
+}> = ({ history, approvedAt }) => {
+  if (history.length === 0) return null;
+  // Worst-severity helper — pure local function so the timeline can sort
+  // colours consistently with the per-card SeverityBadge.
+  const worstSeverity = (
+    tally: Record<BaselineSeverity, number>,
+  ): BaselineSeverity => {
+    if (tally.critical > 0) return "critical";
+    if (tally.high > 0) return "high";
+    if (tally.medium > 0) return "medium";
+    if (tally.low > 0) return "low";
+    if (tally.unknown > 0) return "unknown";
+    if (tally.ok > 0) return "ok";
+    return "info";
+  };
+
+  // Compute the delta vs the immediately-previous entry — used for the
+  // tooltip "got worse / got better".
+  const deltas = React.useMemo(() => {
+    const out: Array<{ delta: number; regressed: number; improved: number }> = [];
+    for (let i = 0; i < history.length; i += 1) {
+      if (i === 0) {
+        out.push({ delta: 0, regressed: 0, improved: 0 });
+        continue;
+      }
+      const prev = history[i - 1]!;
+      const cur = history[i]!;
+      const cmp = compareHistoryEntries(prev, cur);
+      out.push({
+        delta: cmp.delta,
+        regressed: cmp.regressed.length,
+        improved: cmp.improved.length,
+      });
+    }
+    return out;
+  }, [history]);
+
+  return (
+    <div
+      className="flex flex-wrap items-center gap-2 rounded-md border border-border bg-muted/30 px-2.5 py-1.5 text-2xs"
+      role="region"
+      aria-label="Tenant baseline drift history timeline"
+    >
+      <History className="h-3.5 w-3.5 text-muted-foreground" aria-hidden />
+      <span className="font-semibold text-foreground">History</span>
+      <span className="text-muted-foreground">
+        ({history.length} run{history.length === 1 ? "" : "s"} on device)
+      </span>
+      <div className="ml-1 flex items-center gap-0.5">
+        {history.map((h, i) => {
+          const worst = worstSeverity(h.tally);
+          const variant = severityToBadgeVariant(worst);
+          const delta = deltas[i]!;
+          const isApproved = approvedAt !== null && h.capturedAt === approvedAt;
+          const label = `${new Date(h.capturedAt).toLocaleString()} — worst: ${severityLabel(worst)}${
+            delta.delta !== 0
+              ? `, delta vs prior run: ${delta.delta > 0 ? "+" : ""}${delta.delta} (${delta.regressed} regressed, ${delta.improved} improved)`
+              : ""
+          }${isApproved ? " — approved baseline" : ""}`;
+          return (
+            <TooltipProvider key={`${h.capturedAt}-${i}`} delayDuration={200}>
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <span
+                    className={cn(
+                      "inline-flex h-4 w-4 cursor-default items-center justify-center rounded-sm border",
+                      // Variant-driven background so the cell colour matches
+                      // the same severity vocabulary the cards use.
+                      variant === "destructive" && "border-destructive/40 bg-destructive/30",
+                      variant === "warning" && "border-warning/40 bg-warning/30",
+                      variant === "info" && "border-info/40 bg-info/30",
+                      variant === "success" && "border-success/40 bg-success/30",
+                      variant === "secondary" && "border-border bg-muted/60",
+                      variant === "outline" && "border-border bg-card",
+                      isApproved && "ring-1 ring-primary",
+                    )}
+                    aria-label={label}
+                  >
+                    {isApproved && (
+                      <Bookmark className="h-2.5 w-2.5 text-primary" aria-hidden />
+                    )}
+                  </span>
+                </TooltipTrigger>
+                <TooltipContent side="top" className="max-w-md text-2xs">
+                  {label}
+                </TooltipContent>
+              </Tooltip>
+            </TooltipProvider>
+          );
+        })}
+      </div>
+      <span className="ml-1 text-3xs text-muted-foreground">
+        oldest → newest
+      </span>
+    </div>
+  );
+};
 
 /** Export columns for the baseline matrix CSV (Enhancement: CSV via ExportMenu). */
 const BASELINE_EXPORT_COLUMNS: ReadonlyArray<ExportColumn<BaselineFinding>> = [
@@ -635,6 +887,13 @@ const BaselineTab: React.FC<BaselineTabProps> = ({
   snapshot,
   onSaveSnapshot,
   onClearSnapshot,
+  history,
+  alertOnDrift,
+  onToggleAlertOnDrift,
+  onExportEvidence,
+  isExportingEvidence,
+  refreshButtonRef,
+  exportMenuButtonRef,
 }) => {
   const tally = React.useMemo(() => tallySeverities(state.findings), [
     state.findings,
@@ -647,18 +906,14 @@ const BaselineTab: React.FC<BaselineTabProps> = ({
     [state.findings, snapshot],
   );
 
-  // Tally drift outcomes for the summary row.
-  const driftCounts = React.useMemo(() => {
-    let regressed = 0;
-    let improved = 0;
-    let changed = 0;
-    for (const d of driftMap.values()) {
-      if (d.status === "regressed") regressed += 1;
-      else if (d.status === "improved") improved += 1;
-      else if (d.status === "summary-changed") changed += 1;
-    }
-    return { regressed, improved, changed };
-  }, [driftMap]);
+  // Single-pass drift summary (regressed / improved / changed / newly-
+  // introduced). The helper is pure + module-scoped — same input always
+  // yields the same counts which means the surrounding memo + the audit
+  // log "this run drifted vs baseline" record line up byte-for-byte.
+  const driftSummary: DriftSummary = React.useMemo(
+    () => summarizeDrift(driftMap),
+    [driftMap],
+  );
 
   // Cached portal-link map per check id. Stable references mean FindingCard
   // memos (if introduced later) won't tear on parent re-renders.
@@ -693,10 +948,10 @@ const BaselineTab: React.FC<BaselineTabProps> = ({
       tenantDisplayName,
       capturedAt: new Date().toISOString(),
       summary: tally,
-      driftCounts,
+      drift: driftSummary,
       hasSavedBaseline: snapshot !== null,
     }),
-    [tenantId, tenantDisplayName, tally, driftCounts, snapshot],
+    [tenantId, tenantDisplayName, tally, driftSummary, snapshot],
   );
 
   return (
@@ -744,22 +999,29 @@ const BaselineTab: React.FC<BaselineTabProps> = ({
           </Badge>
         )}
         {/* Drift counters — only render when a baseline is saved. */}
-        {snapshot && driftCounts.regressed > 0 && (
+        {snapshot && driftSummary.regressed > 0 && (
           <Badge variant="destructive" className="gap-1">
             <ArrowUpRight className="h-3 w-3" aria-hidden />
-            {driftCounts.regressed} regressed
+            {driftSummary.regressed} regressed
           </Badge>
         )}
-        {snapshot && driftCounts.improved > 0 && (
+        {snapshot && driftSummary.improved > 0 && (
           <Badge variant="success" className="gap-1">
             <ArrowDownRight className="h-3 w-3" aria-hidden />
-            {driftCounts.improved} improved
+            {driftSummary.improved} improved
           </Badge>
         )}
-        {snapshot && driftCounts.changed > 0 && (
+        {snapshot && driftSummary.changed > 0 && (
           <Badge variant="warning" className="gap-1">
             <GitCompare className="h-3 w-3" aria-hidden />
-            {driftCounts.changed} changed
+            {driftSummary.changed} changed
+          </Badge>
+        )}
+        {snapshot && driftSummary.newlyIntroduced > 0 && (
+          <Badge variant="info" className="gap-1">
+            <Sparkles className="h-3 w-3" aria-hidden />
+            {driftSummary.newlyIntroduced} new check
+            {driftSummary.newlyIntroduced === 1 ? "" : "s"}
           </Badge>
         )}
         <div className="ml-auto flex items-center gap-2">
@@ -768,22 +1030,63 @@ const BaselineTab: React.FC<BaselineTabProps> = ({
               Refreshed {formatRelativeTime(new Date(state.lastRefreshedAt))}
             </span>
           )}
-          <ExportMenu
-            rows={state.findings}
-            columns={BASELINE_EXPORT_COLUMNS}
-            filename={`tenant-baseline-${tenantId.slice(0, 8)}`}
-            jsonMetadata={jsonMetadata}
-            disabled={state.findings.length === 0}
-            label="Export"
-          />
+          {/*
+            ExportMenu does not accept a forwarded ref (it owns its own
+            DropdownMenuTrigger). We wrap it in a span the hot-key
+            handler can query — `exportMenuButtonRef.current
+            ?.querySelector('button')?.click()` opens the dropdown from
+            the keyboard without us having to fork the shared component.
+          */}
+          <span ref={exportMenuButtonRef} className="inline-flex">
+            <ExportMenu
+              rows={state.findings}
+              columns={BASELINE_EXPORT_COLUMNS}
+              filename={`tenant-baseline-${tenantId.slice(0, 8)}`}
+              jsonMetadata={jsonMetadata}
+              disabled={state.findings.length === 0}
+              label="Export"
+            />
+          </span>
+          <Button
+            type="button"
+            variant="outline"
+            size="sm"
+            onClick={onExportEvidence}
+            disabled={state.findings.length === 0 || state.loading || isExportingEvidence}
+            aria-label="Export compliance evidence with SHA-256 hash"
+            title="Export findings as a signed compliance-evidence envelope. Embeds a SHA-256 hash over the canonical findings JSON so an auditor can detect post-hoc tampering."
+          >
+            {isExportingEvidence ? (
+              <Loader2 className="animate-spin" />
+            ) : (
+              <FileCheck />
+            )}
+            Evidence
+          </Button>
+          <Button
+            type="button"
+            variant={alertOnDrift ? "default" : "outline"}
+            size="sm"
+            onClick={() => onToggleAlertOnDrift(!alertOnDrift)}
+            aria-pressed={alertOnDrift}
+            aria-label={
+              alertOnDrift
+                ? "Disable drift alert banner"
+                : "Enable drift alert banner"
+            }
+            title="Toggle screen-reader-announced drift banner. When ON, any regression in this run triggers a polite ARIA live announcement."
+          >
+            <BellRing />
+            Alert on drift
+          </Button>
           <Button
             type="button"
             variant="outline"
             size="sm"
             onClick={onSaveSnapshot}
             disabled={state.findings.length === 0 || state.loading}
-            aria-label="Save current findings as compliance baseline snapshot"
-            title="Save current findings as the approved compliance baseline. Future refreshes show drift against this snapshot."
+            aria-label="Save current findings as compliance baseline snapshot (hotkey s)"
+            title="Save current findings as the approved compliance baseline. Future refreshes show drift against this snapshot. Hotkey: s"
           >
             <Save />
             Save baseline
@@ -794,14 +1097,15 @@ const BaselineTab: React.FC<BaselineTabProps> = ({
               variant="outline"
               size="sm"
               onClick={onClearSnapshot}
-              aria-label="Clear the saved baseline snapshot"
-              title={`Clear saved baseline (captured ${formatRelativeTime(new Date(snapshot.capturedAt))})`}
+              aria-label="Clear the saved baseline snapshot (hotkey c)"
+              title={`Clear saved baseline (captured ${formatRelativeTime(new Date(snapshot.capturedAt))}). Hotkey: c`}
             >
               <Trash2 />
               Clear baseline
             </Button>
           )}
           <Button
+            ref={refreshButtonRef}
             type="button"
             variant="outline"
             size="sm"
@@ -818,6 +1122,23 @@ const BaselineTab: React.FC<BaselineTabProps> = ({
           </Button>
         </div>
       </div>
+
+      {/*
+        ARIA-live drift banner. Renders whenever `alertOnDrift` is on AND
+        the current run regressed against the saved baseline. The
+        polite aria-live region announces the regression count to
+        screen-reader users without stealing focus.
+      */}
+      <DriftLiveRegion
+        enabled={alertOnDrift}
+        summary={driftSummary}
+        hasBaseline={snapshot !== null}
+      />
+
+      {/* History timeline strip — visualises the last N runs at a glance. */}
+      {history.length > 0 && (
+        <HistoryTimeline history={history} approvedAt={snapshot?.capturedAt ?? null} />
+      )}
 
       {/* Saved-baseline pill (informational). */}
       {snapshot && (
@@ -1309,8 +1630,17 @@ const SpTab: React.FC<SpTabProps> = ({
  * One row in the SP credentials table. Splitting it out lets the
  * details/summary toggle hold its own state without re-rendering the
  * whole table when a single row is expanded.
+ *
+ * Memoised (deep-pass) so toggling one row's `expanded` state doesn't
+ * cause every other row to re-render. Large tenants commonly have 800+
+ * service principals; the previous unmemoised implementation produced a
+ * visible scroll-jank on every chevron click. The custom `arePropsEqual`
+ * comparator is intentionally shallow on `row` because the parent always
+ * creates a fresh array from a `slice().sort()` — so a new array
+ * reference is expected, but row IDENTITIES (and their internal severity
+ * + credentials) are stable across filter-only changes.
  */
-const SpRow: React.FC<{ row: SpScoredRow; tenantId: string }> = ({
+const SpRowInner: React.FC<{ row: SpScoredRow; tenantId: string }> = ({
   row,
   tenantId,
 }) => {
@@ -1513,6 +1843,19 @@ const SpRow: React.FC<{ row: SpScoredRow; tenantId: string }> = ({
     </>
   );
 };
+
+/**
+ * Memoised SpRow — re-renders only when `row` identity or `tenantId`
+ * changes. Filter-only mutations in `SpTab` reuse the underlying scored
+ * row objects (the filter chain calls `.slice().sort()` which preserves
+ * row references), so this memo prevents an N-row re-render storm when
+ * one row's local `expanded` state toggles.
+ */
+const SpRow = React.memo(
+  SpRowInner,
+  (prev, next) => prev.row === next.row && prev.tenantId === next.tenantId,
+);
+SpRow.displayName = "SpRow";
 
 // ===========================================================================
 // Probe orchestrators
@@ -1993,6 +2336,44 @@ export const TenantBaselinePage: React.FC = () => {
       },
     });
 
+  // Per-tenant drift-history ring buffer (Deep-pass enhancement). Every
+  // successful refresh appends a compact entry. The ring is capped in
+  // helpers.ts so the localStorage envelope stays well under quota.
+  const historyKey = primaryAccount
+    ? `${HISTORY_STORAGE_PREFIX}${primaryAccount.tenantId}`
+    : `${HISTORY_STORAGE_PREFIX}__no_tenant__`;
+  const [history, setHistory] = usePersistedState<BaselineHistoryEntry[]>(
+    historyKey,
+    [],
+    {
+      version: HISTORY_SCHEMA_VERSION,
+      migrate: (raw) => {
+        if (!Array.isArray(raw)) return [];
+        // Defensive shape coercion — drop entries that don't conform.
+        return raw.filter((entry): entry is BaselineHistoryEntry => {
+          if (!entry || typeof entry !== "object") return false;
+          const e = entry as Partial<BaselineHistoryEntry>;
+          return (
+            typeof e.capturedAt === "string" &&
+            typeof e.tally === "object" &&
+            e.tally !== null &&
+            typeof e.perCheck === "object" &&
+            e.perCheck !== null
+          );
+        });
+      },
+    },
+  );
+
+  // Global cross-tenant "alert me when posture regresses" preference.
+  // Persisted as a plain boolean. Defaulting to ON because the cost is
+  // negligible (one off-screen aria-live message) and the value is high
+  // when a defender flips tenants between audits.
+  const [alertOnDrift, setAlertOnDrift] = usePersistedState<boolean>(
+    ALERT_ON_DRIFT_PREF_KEY,
+    true,
+  );
+
   // Per-tab last-fetch-wins guards. Without these, switching tabs +
   // refreshing while a slow probe is in-flight can clobber the new
   // results with the old.
@@ -2027,6 +2408,11 @@ export const TenantBaselinePage: React.FC = () => {
         permissionWarnings,
         lastRefreshedAt: Date.now(),
       });
+      // Append a compact history entry on every successful refresh so the
+      // timeline strip in the baseline tab tracks longitudinal drift
+      // without a backend. `pushHistoryEntry` caps the ring at
+      // BASELINE_HISTORY_LIMIT — older entries fall off the left.
+      setHistory((prev) => pushHistoryEntry(prev, buildHistoryEntry(findings, false)));
       auditLog.record({
         actor: primaryAccount.username || primaryAccount.homeAccountId,
         action: "tenant_baseline_audit",
@@ -2058,7 +2444,7 @@ export const TenantBaselinePage: React.FC = () => {
         details: { tenantId: primaryAccount.tenantId },
       });
     }
-  }, [primaryAccount]);
+  }, [primaryAccount, setHistory]);
 
   const refreshSps = React.useCallback(async () => {
     if (!primaryAccount) return;
@@ -2147,12 +2533,44 @@ export const TenantBaselinePage: React.FC = () => {
   const handleSaveSnapshot = React.useCallback(() => {
     if (!primaryAccount) return;
     if (baselineState.findings.length === 0) return;
-    const snap = buildSnapshot(
+    const base = buildSnapshot(
       primaryAccount.tenantId,
       primaryAccount.name || primaryAccount.username,
       baselineState.findings,
     );
+    // Pin the snapshot's capturedAt to the latest history entry's
+    // capturedAt so the timeline bookmark check (`h.capturedAt ===
+    // snapshot.capturedAt`) lines up. Without this the two timestamps
+    // would drift by a few milliseconds (refresh wrote one, save wrote
+    // another) and no history entry would ever match.
+    //
+    // Read `history` from the closure (the rendered value at click-time)
+    // rather than the functional setHistory updater — that keeps the
+    // snapshot write deterministic and synchronous.
+    const latestHistoryAt =
+      history.length > 0 ? history[history.length - 1]!.capturedAt : null;
+    const snap: BaselineSnapshot = latestHistoryAt
+      ? { ...base, capturedAt: latestHistoryAt }
+      : base;
     setSnapshot(snap);
+    // Mark the latest history entry as the approved baseline so the
+    // timeline shows a bookmark on it.
+    setHistory((prev) => {
+      if (prev.length === 0) return prev;
+      const next = prev.slice();
+      // Clear any prior approved-flag — only one bookmark at a time.
+      for (let i = 0; i < next.length - 1; i += 1) {
+        const entry = next[i];
+        if (entry && entry.wasApproved) {
+          next[i] = { ...entry, wasApproved: false };
+        }
+      }
+      const last = next[next.length - 1];
+      if (last) {
+        next[next.length - 1] = { ...last, wasApproved: true };
+      }
+      return next;
+    });
     auditLog.record({
       actor: primaryAccount.username || primaryAccount.homeAccountId,
       action: "tenant_baseline_snapshot_save",
@@ -2164,7 +2582,7 @@ export const TenantBaselinePage: React.FC = () => {
         countsBySeverity: tallySeverities(baselineState.findings),
       },
     });
-  }, [primaryAccount, baselineState.findings, setSnapshot]);
+  }, [primaryAccount, baselineState.findings, setSnapshot, setHistory, history]);
 
   const handleClearSnapshot = React.useCallback(() => {
     if (!primaryAccount) {
@@ -2180,6 +2598,105 @@ export const TenantBaselinePage: React.FC = () => {
       details: { tenantId: primaryAccount.tenantId },
     });
   }, [primaryAccount, clearSnapshot]);
+
+  // Compliance-evidence export — builds an envelope with a SHA-256 hash
+  // over the canonical findings JSON (chain-of-custody anchor) and pushes
+  // it to the user's downloads. The hash itself is computed inside the
+  // helper via WebCrypto SubtleCrypto.
+  const [isExportingEvidence, setIsExportingEvidence] = React.useState(false);
+  const handleExportEvidence = React.useCallback(async () => {
+    if (!primaryAccount) return;
+    if (baselineState.findings.length === 0) return;
+    setIsExportingEvidence(true);
+    try {
+      // Re-derive drift summary here — we don't share the BaselineTab's
+      // memoised summary across the page (BaselineTab is the consumer).
+      // Recomputing is O(n) and only runs on the operator's click.
+      const driftMap = diffAgainstSnapshot(baselineState.findings, snapshot);
+      const drift = summarizeDrift(driftMap);
+      const envelope: ComplianceEvidence = await buildComplianceEvidence({
+        tenantId: primaryAccount.tenantId,
+        tenantDisplayName: primaryAccount.name || primaryAccount.username,
+        actor: primaryAccount.username || primaryAccount.homeAccountId,
+        cloudEnvironment: cloudInfo?.environment ?? "Unknown",
+        findings: baselineState.findings,
+        drift,
+      });
+      // Lazy import shape — we reuse the same `downloadJson` the
+      // ExportMenu uses to keep dependency surface small.
+      // Inline a tiny helper rather than pulling another import.
+      const json = JSON.stringify(envelope, null, 2);
+      const blob = new Blob([json], { type: "application/json" });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      const stamp = new Date().toISOString().slice(0, 10);
+      a.href = url;
+      a.download = `tenant-baseline-evidence-${primaryAccount.tenantId.slice(0, 8)}-${stamp}.json`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+      auditLog.record({
+        actor: primaryAccount.username || primaryAccount.homeAccountId,
+        action: "tenant_baseline_evidence_export",
+        target: primaryAccount.tenantId,
+        status: "success",
+        details: {
+          tenantId: primaryAccount.tenantId,
+          findingsCount: baselineState.findings.length,
+          evidenceHash: envelope.evidenceHash,
+          evidenceHashAlgorithm: envelope.evidenceHashAlgorithm,
+          drift,
+        },
+      });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      auditLog.record({
+        actor: primaryAccount.username || primaryAccount.homeAccountId,
+        action: "tenant_baseline_evidence_export",
+        target: primaryAccount.tenantId,
+        status: "failure",
+        error: msg,
+        details: { tenantId: primaryAccount.tenantId },
+      });
+    } finally {
+      setIsExportingEvidence(false);
+    }
+  }, [primaryAccount, baselineState.findings, snapshot, cloudInfo]);
+
+  // Refs for hot-key focus + click — see useShortcut bindings below.
+  const refreshButtonRef = React.useRef<HTMLButtonElement>(null);
+  const exportMenuButtonRef = React.useRef<HTMLSpanElement>(null);
+
+  // Hot-keys: only active when the operator is NOT typing in an input
+  // (useShortcut already gates this by default). Bound to the window so
+  // they work from any focus location on the page.
+  //   s → save baseline
+  //   c → clear baseline (if present)
+  //   e → open the Export dropdown (focuses the trigger button)
+  //   r → refresh
+  //   v → export compliance evidence (v for "verify")
+  useShortcut("s", () => {
+    void handleSaveSnapshot();
+  });
+  useShortcut("c", () => {
+    if (snapshot) void handleClearSnapshot();
+  });
+  useShortcut("e", () => {
+    const trigger = exportMenuButtonRef.current?.querySelector("button");
+    if (trigger instanceof HTMLButtonElement) {
+      trigger.focus();
+      trigger.click();
+    }
+  });
+  useShortcut("r", () => {
+    if (refreshButtonRef.current && !refreshButtonRef.current.disabled) {
+      refreshButtonRef.current.click();
+    }
+  });
+  useShortcut("v", () => {
+    void handleExportEvidence();
+  });
 
   const spLoadedRef = React.useRef(false);
   const handleTabChange = React.useCallback(
@@ -2327,6 +2844,13 @@ export const TenantBaselinePage: React.FC = () => {
             snapshot={snapshot}
             onSaveSnapshot={handleSaveSnapshot}
             onClearSnapshot={handleClearSnapshot}
+            history={history}
+            alertOnDrift={alertOnDrift}
+            onToggleAlertOnDrift={setAlertOnDrift}
+            onExportEvidence={handleExportEvidence}
+            isExportingEvidence={isExportingEvidence}
+            refreshButtonRef={refreshButtonRef}
+            exportMenuButtonRef={exportMenuButtonRef}
           />
         </TabsContent>
         <TabsContent value="sp">

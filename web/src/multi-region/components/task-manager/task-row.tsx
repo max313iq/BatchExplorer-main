@@ -95,8 +95,17 @@ export interface TaskRowProps {
    * Click handler for selecting the row. Buttons inside the row stop the
    * propagation so they keep acting as discrete actions; the row itself
    * surfaces the selection via this callback. Additive and optional.
+   *
+   * The optional second arg carries modifier state (shift / cmd / ctrl)
+   * so the parent can implement range-select (shift) and toggle-select
+   * (cmd/ctrl) on top of the single-select default. Callers that don't
+   * care about modifiers can simply ignore it — the existing signature is
+   * unchanged for them.
    */
-  onSelect?: (id: string) => void;
+  onSelect?: (
+    id: string,
+    modifiers?: { shift: boolean; meta: boolean; ctrl: boolean },
+  ) => void;
   /**
    * Optional inline JSON expander. Renders a fold-out `<pre>` showing the
    * raw `TaskRecord` for triage. No syntax highlight library — manual
@@ -142,7 +151,11 @@ export const TaskRow: React.FC<TaskRowProps> = ({
       // stopPropagation; the guard runs on the captured target tag.
       const target = e.target as HTMLElement;
       if (target.closest("button, a, [role=menu], [role=menuitem]")) return;
-      onSelect(task.id);
+      onSelect(task.id, {
+        shift: e.shiftKey,
+        meta: e.metaKey,
+        ctrl: e.ctrlKey,
+      });
     },
     [onSelect, task.id],
   );
@@ -158,7 +171,11 @@ export const TaskRow: React.FC<TaskRowProps> = ({
           ? (e) => {
               if (e.key === "Enter" || e.key === " ") {
                 e.preventDefault();
-                onSelect(task.id);
+                onSelect(task.id, {
+                  shift: e.shiftKey,
+                  meta: e.metaKey,
+                  ctrl: e.ctrlKey,
+                });
               }
             }
           : undefined

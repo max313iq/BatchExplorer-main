@@ -30,9 +30,11 @@ import * as React from "react";
 import {
   Activity,
   AlertTriangle,
+  BookOpen,
   CheckCircle2,
   Clock,
   CreditCard,
+  EyeOff,
   ExternalLink,
   FileText,
   Filter as FilterIcon,
@@ -44,6 +46,9 @@ import {
   Search,
   ShieldAlert,
   ShieldCheck,
+  ShieldOff,
+  TrendingDown,
+  TrendingUp,
   X,
 } from "lucide-react";
 
@@ -72,6 +77,7 @@ import { cn } from "@/lib/utils";
 import { resolveActiveTenantId } from "../../auth/perform-tenant-switch";
 import { useArmToken } from "../../auth/use-arm-token";
 import { usePersistedState } from "../../hooks/use-persisted-state";
+import { useShortcut } from "../../hooks/use-shortcut";
 import { useTenantChange } from "../../hooks/use-tenant-change";
 import { useUrlState } from "../../hooks/use-url-state";
 import { auditLog } from "../../services/audit-log";
@@ -113,15 +119,21 @@ import {
   summarizeFindings,
 } from "./security-audit-helpers";
 import {
+  appendPostureSnapshot,
+  computePostureTrendDelta,
+  computeTierZeroProtectionScore,
   DiagnosticSettingResource,
   evaluateDiagnosticSettings,
   evaluateIdleResourceGroups,
   evaluateSubscriptionStates,
   isCorpusFinding,
+  PostureSnapshot,
   ResourceGroupSummary,
   riskScoreFor,
   SubscriptionListEntry,
+  TierZeroProtectionScore,
 } from "./security-audit-corpus-signals";
+import { runbookFor } from "./security-audit-runbooks";
 
 // --------------------------------------------------------------------------
 // ARM constants
@@ -480,6 +492,21 @@ async function scanSubscription(
     // When it lands, wire it like the diagnostics probe above:
     //   const containers = await fetchArmPaged<ArmContainer>(...);
     //   result.findings.push(...evaluatePublicContainers(...));
+    // The portal-deep-link per container should use
+    //   `${portalUrlFor(storageAccountId)}/containers`
+    // (the storage-account blade has a containers sub-route).
+
+    // --- Signal E (cross-page, wave 8): dormant-SP credential rotation ---
+    // COORDINATOR: `evaluateDormantSpCredentialRotation` lives in
+    // security-audit-corpus-signals.ts but the data feed (SP sign-in +
+    // credential-add events from Graph) lives in role-graph /
+    // privileged-audit. When that pipeline lands, those pages should
+    // call evaluateDormantSpCredentialRotation() and push the
+    // resulting Finding[] into THIS page's findings list (via a small
+    // cross-page event or shared store slice). The rule was placed
+    // in the security-audit module so all defensive rule logic stays
+    // in one file — the page that COLLECTS the data drives the helper.
+    // citation: New folder\_bypass_role_grant.md §addKey.
 
     if (partialErrors.length > 0) {
       result.error = `Insufficient permissions on: ${partialErrors.join(", ")}. Partial results shown.`;
@@ -1112,6 +1139,29 @@ const SecurityAuditPageInner: React.FC = () => {
           idleThresholdDays,
         },
       });
+
+      // Push a posture-trend snapshot (wave 8). Pure helper bumps the
+      // newest entry to the head of the ring and drops the oldest once
+      // POSTURE_TREND_MAX (30) entries are reached. We compute the
+      // Tier-0 score from the freshly-aggregated findings rather than
+      // reading the memo so we don't have to thread it through the
+      // closure deps.
+      const t0Score = computeTierZeroProtectionScore({
+        findings: aggFindings,
+        vaultsScanned: aggCounts.vaults,
+      }).score;
+      setPostureSnapshots((prev) =>
+        appendPostureSnapshot(prev, {
+          iso: now,
+          total: summary.total,
+          critical: summary.critical,
+          high: summary.high,
+          medium: summary.medium,
+          info: summary.info,
+          tierZeroScore: t0Score,
+          subscriptionsInScope: targets.length,
+        }),
+      );
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       setScanError(msg);
@@ -1137,6 +1187,8 @@ const SecurityAuditPageInner: React.FC = () => {
     primaryAccount,
     selectedSubIds,
     idleThresholdDays,
+    setPostureSnapshots,
+    setFirstSeenAt,
   ]);
 
   // Cancel any in-flight scan when the component unmounts.
@@ -1167,6 +1219,10 @@ const SecurityAuditPageInner: React.FC = () => {
       // (defender-side detection signals). Off by default so the
       // existing storage/keyvault findings still surface.
       corpus: "",
+      // Show-suppressed chip — "1" reveals suppressed findings.
+      // Off by default so the operator's prior "this is a false
+      // positive" decisions stay quiet until they ask to see them.
+      sup: "",
     }),
     [],
   );
@@ -1211,6 +1267,9 @@ const SecurityAuditPageInner: React.FC = () => {
   const showCorpusOnly =
     (typeof urlState.corpus === "string" && urlState.corpus === "1") ||
     (Array.isArray(urlState.corpus) && urlState.corpus[0] === "1");
+  const showSuppressed =
+    (typeof urlState.sup === "string" && urlState.sup === "1") ||
+    (Array.isArray(urlState.sup) && urlState.sup[0] === "1");
 
   // Audit-log helper — fires once per *change* (not per render). We only
   // record human-driven filter mutations so the audit-log page isn't
@@ -1275,6 +1334,13 @@ const SecurityAuditPageInner: React.FC = () => {
     },
     [setUrlState, recordFilterChange],
   );
+  const setShowSuppressed = React.useCallback(
+    (v: boolean) => {
+      setUrlState({ sup: v ? "1" : "" });
+      recordFilterChange("show-suppressed", v);
+    },
+    [setUrlState, recordFilterChange],
+  );
 
   // ----------------- Finding "first seen" tracking -----------------
   // Persist when each finding-id was first observed so the "older than
@@ -1287,6 +1353,53 @@ const SecurityAuditPageInner: React.FC = () => {
     () => ({}),
     { version: 1 },
   );
+
+  // ----------------- Acknowledge / suppress (wave 8) -----------------
+  // Two-state per-finding decision the operator can persist:
+  //   - acknowledged: finding is real but expected (e.g. legacy KV
+  //     awaiting a migration window). Still visible in the table with
+  //     a muted style; counts AGAINST the total but is excluded from
+  //     the critical-only export and from the screen-reader live
+  //     "critical findings" announcement.
+  //   - suppressed: finding is a false positive for THIS environment
+  //     (e.g. a deliberately-public marketing-assets container). Filter
+  //     defaults to HIDING suppressed rows. Operator can flip the
+  //     "Show suppressed" chip to bring them back.
+  //
+  // Each decision carries an operator-attributed audit-log entry at the
+  // time it was made, so a reviewer can answer "who acknowledged this,
+  // when, and why?" by joining the audit log against the persisted map.
+  //
+  // Persistence key versioned (`-v1`) so we can migrate the envelope
+  // if the shape grows fields (note, expiry, etc.).
+  interface AckSuppressEntry {
+    /** "ack" or "suppress" — string union narrowed at the type level. */
+    state: "ack" | "suppress";
+    /** ISO timestamp of the decision. */
+    at: string;
+    /** Operator username (or "(unknown)") at decision time. */
+    actor: string;
+    /** Optional free-form note; defaults to empty string. */
+    note: string;
+  }
+  type AckSuppressMap = Record<string, AckSuppressEntry>;
+
+  const [ackSuppressMap, setAckSuppressMap] = usePersistedState<AckSuppressMap>(
+    "security-audit:ack-suppress-v1",
+    () => ({}),
+    { version: 1 },
+  );
+
+  // ----------------- Posture-trend snapshots (wave 8) -----------------
+  // Persist a small ring buffer of per-scan summaries so the operator
+  // sees movement between runs (sparkline + delta vs. previous). The
+  // ring is capped at POSTURE_TREND_MAX (30) inside the helper.
+  //
+  // citation: New folder\_analysis_defender_view.md §1 — ScoutSuite
+  // ships HTML reports keyed off snapshots; we mirror in-page.
+  const [postureSnapshots, setPostureSnapshots] = usePersistedState<
+    PostureSnapshot[]
+  >("security-audit:posture-trend-v1", () => [], { version: 1 });
 
   // Threshold for the "stale" chip — finding-id first observed more
   // than 30 days ago and still appears in the latest scan.
@@ -1306,6 +1419,12 @@ const SecurityAuditPageInner: React.FC = () => {
         ? f.severity === "critical" || f.severity === "high"
         : activeSeverities.has(f.severity);
     return findings.filter((f) => {
+      // Suppressed findings are hidden unless the operator opted in.
+      // Acknowledged findings stay visible (they're real + tracked) —
+      // they only get a muted style downstream.
+      if (!showSuppressed && ackSuppressMap[f.id]?.state === "suppress") {
+        return false;
+      }
       if (!sevPredicate(f)) return false;
       if (!activeResourceTypes.has(f.resourceType)) return false;
       if (showStaleOnly) {
@@ -1334,6 +1453,8 @@ const SecurityAuditPageInner: React.FC = () => {
     criticalHighOnly,
     showStaleOnly,
     showCorpusOnly,
+    showSuppressed,
+    ackSuppressMap,
     firstSeenAt,
     staleThreshold,
   ]);
@@ -1401,6 +1522,15 @@ const SecurityAuditPageInner: React.FC = () => {
     ];
   }, [scanWarnings, sortedFindings]);
 
+  // Stable id -> Finding lookup. We hand the original (stable across
+  // renders until findings[] mutates) reference to FindingRow so its
+  // React.memo shallow-compare actually short-circuits on chip toggles.
+  const sortedFindingsById = React.useMemo(() => {
+    const m = new Map<string, Finding>();
+    for (const f of sortedFindings) m.set(f.id, f);
+    return m;
+  }, [sortedFindings]);
+
   const onHeaderClick = React.useCallback(
     (col: SortColumn) => {
       if (sortColumn === col) {
@@ -1429,6 +1559,137 @@ const SecurityAuditPageInner: React.FC = () => {
     () => countByResourceType(findings),
     [findings],
   );
+
+  // ----------------- Tier-0 Protection Score (wave 8) -----------------
+  // Composite signal: of all Key Vaults scanned, how many have BOTH a
+  // configured diagnostic setting AND no high/critical KV-config
+  // finding? Score 0..100. Surfaced in the summary strip + tooltip
+  // breakdown. citation: New folder\_analysis_defender_view.md §1.
+  const tierZeroScore: TierZeroProtectionScore = React.useMemo(
+    () =>
+      computeTierZeroProtectionScore({
+        findings,
+        vaultsScanned: scanCounts.vaults,
+      }),
+    [findings, scanCounts.vaults],
+  );
+
+  // ----------------- Suppressed / acknowledged counts -----------------
+  const suppressedCount = React.useMemo(() => {
+    let n = 0;
+    for (const f of findings) {
+      if (ackSuppressMap[f.id]?.state === "suppress") n += 1;
+    }
+    return n;
+  }, [findings, ackSuppressMap]);
+
+  const acknowledgedCount = React.useMemo(() => {
+    let n = 0;
+    for (const f of findings) {
+      if (ackSuppressMap[f.id]?.state === "ack") n += 1;
+    }
+    return n;
+  }, [findings, ackSuppressMap]);
+
+  // Critical count for the screen-reader live region — EXCLUDES
+  // acknowledged + suppressed findings so the announcement reflects
+  // what the operator hasn't already triaged. citation: WAI-ARIA
+  // aria-live polite — change-only announcements.
+  const announcedCriticalCount = React.useMemo(() => {
+    let n = 0;
+    for (const f of findings) {
+      if (f.severity !== "critical") continue;
+      const dec = ackSuppressMap[f.id];
+      if (dec?.state === "ack" || dec?.state === "suppress") continue;
+      n += 1;
+    }
+    return n;
+  }, [findings, ackSuppressMap]);
+
+  // Posture-trend snapshot delta vs. previous run.
+  const postureDelta = React.useMemo(
+    () => computePostureTrendDelta(postureSnapshots),
+    [postureSnapshots],
+  );
+
+  // ----------------- Acknowledge / suppress callbacks -----------------
+  const operatorName = primaryAccount?.username ?? "(unknown)";
+  const setAckSuppress = React.useCallback(
+    (findingId: string, finding: Finding, state: "ack" | "suppress" | "clear", note = "") => {
+      setAckSuppressMap((prev) => {
+        const next = { ...prev };
+        if (state === "clear") {
+          delete next[findingId];
+        } else {
+          next[findingId] = {
+            state,
+            at: new Date().toISOString(),
+            actor: operatorName,
+            note,
+          };
+        }
+        return next;
+      });
+      auditLog.record({
+        actor: operatorName,
+        action: `security_audit_${state === "clear" ? "unmark" : state}`,
+        target: finding.resourceName,
+        status: "success",
+        details: {
+          findingId,
+          ruleId: finding.ruleId,
+          severity: finding.severity,
+          resourceId: finding.resourceId,
+          subscriptionId: finding.subscriptionId,
+          note,
+        },
+      });
+    },
+    [setAckSuppressMap, operatorName],
+  );
+
+  // ----------------- Focused-finding keyboard model (wave 8) -----------------
+  // Tracks which finding row currently has keyboard focus so the page
+  // hotkeys (`a` ack, `s` suppress) can target it. Updated when a row
+  // receives focus via Tab or click. Stored as the finding `id` rather
+  // than an index so it survives re-sort.
+  const [focusedFindingId, setFocusedFindingId] = React.useState<string | null>(
+    null,
+  );
+
+  // ----------------- Bulk acknowledge (visible, non-suppressed) -----------------
+  const bulkAcknowledgeVisible = React.useCallback(() => {
+    if (filteredFindings.length === 0) return;
+    setAckSuppressMap((prev) => {
+      const next = { ...prev };
+      const at = new Date().toISOString();
+      for (const f of filteredFindings) {
+        if (next[f.id]?.state === "suppress") continue;
+        next[f.id] = {
+          state: "ack",
+          at,
+          actor: operatorName,
+          note: "bulk-acknowledge",
+        };
+      }
+      return next;
+    });
+    auditLog.record({
+      actor: operatorName,
+      action: "security_audit_bulk_acknowledge",
+      target: `${filteredFindings.length} visible finding(s)`,
+      status: "success",
+      details: {
+        findingIds: filteredFindings.map((f) => f.id),
+        bucketCounts: {
+          critical: filteredFindings.filter((f) => f.severity === "critical").length,
+          high: filteredFindings.filter((f) => f.severity === "high").length,
+          medium: filteredFindings.filter((f) => f.severity === "medium").length,
+          info: filteredFindings.filter((f) => f.severity === "info").length,
+        },
+      },
+    });
+  }, [filteredFindings, setAckSuppressMap, operatorName]);
 
   // ----------------- Tenant-switch sync -----------------
   // When the operator switches the active tenant in the sidebar, swap
@@ -1502,11 +1763,24 @@ const SecurityAuditPageInner: React.FC = () => {
         criticalHighOnly,
         showStaleOnly,
         showCorpusOnly,
+        showSuppressed,
         staleThresholdDays: 30,
         idleResourceGroupThresholdDays: idleThresholdDays,
       },
       scanned: scanCounts,
       summary,
+      // Tier-0 protection score (wave 8) so JSON exports carry the
+      // composite signal alongside the per-finding rows.
+      tierZeroProtection: {
+        score: tierZeroScore.score,
+        protectedCount: tierZeroScore.protectedCount,
+        totalCount: tierZeroScore.totalCount,
+        topOffenders: tierZeroScore.topOffenders,
+      },
+      ackSuppressCounts: {
+        acknowledged: acknowledgedCount,
+        suppressed: suppressedCount,
+      },
     }),
     [
       lastScanAt,
@@ -1517,9 +1791,13 @@ const SecurityAuditPageInner: React.FC = () => {
       criticalHighOnly,
       showStaleOnly,
       showCorpusOnly,
+      showSuppressed,
       idleThresholdDays,
       scanCounts,
       summary,
+      tierZeroScore,
+      acknowledgedCount,
+      suppressedCount,
     ],
   );
 
@@ -1529,6 +1807,7 @@ const SecurityAuditPageInner: React.FC = () => {
   const critOnlyId = React.useId();
   const staleOnlyId = React.useId();
   const corpusOnlyId = React.useId();
+  const showSuppressedId = React.useId();
   const idleThresholdId = React.useId();
 
   // Count of findings older than 30 days (for the chip badge) — pulled
@@ -1562,9 +1841,121 @@ const SecurityAuditPageInner: React.FC = () => {
       crit: "",
       stale: "",
       corpus: "",
+      sup: "",
     });
     recordFilterChange("clear-filters", null);
   }, [setUrlState, recordFilterChange]);
+
+  // ----------------- Export-critical-only (wave 8 hotkey `e`) -----------------
+  // The ExportMenu uses `filteredFindings`. For the hotkey we hand-roll
+  // a CSV blob of CRITICAL-only findings (regardless of current
+  // filters) so the operator can ship a fast triage list. Tabs are CSV
+  // separators so we don't have to quote commas inside the
+  // remediation/whyItMatters text.
+  const exportCriticalOnly = React.useCallback(() => {
+    const crits = findings.filter((f) => f.severity === "critical");
+    if (crits.length === 0) {
+      auditLog.record({
+        actor: operatorName,
+        action: "security_audit_export_critical_only",
+        target: "no-critical-findings",
+        status: "success",
+        details: { count: 0 },
+      });
+      return;
+    }
+    const headers = [
+      "severity",
+      "ruleId",
+      "resourceType",
+      "resourceName",
+      "resourceGroup",
+      "region",
+      "subscriptionName",
+      "title",
+      "description",
+      "armId",
+    ];
+    const escape = (v: string) =>
+      `"${v.replace(/"/g, '""').replace(/\n/g, " ")}"`;
+    const lines = [headers.join(",")];
+    for (const f of crits) {
+      lines.push(
+        [
+          escape(SEVERITY_LABEL[f.severity]),
+          escape(f.ruleId),
+          escape(resourceTypeLabel(f.resourceType)),
+          escape(f.resourceName),
+          escape(f.resourceGroup),
+          escape(f.region),
+          escape(f.subscriptionName),
+          escape(f.title),
+          escape(f.description),
+          escape(f.resourceId),
+        ].join(","),
+      );
+    }
+    const csv = lines.join("\n");
+    const blob = new Blob([csv], { type: "text/csv;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    const ts = new Date().toISOString().replace(/[:.]/g, "-");
+    a.href = url;
+    a.download = `security-audit-critical-${ts}.csv`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+    auditLog.record({
+      actor: operatorName,
+      action: "security_audit_export_critical_only",
+      target: `${crits.length} critical finding(s)`,
+      status: "success",
+      details: { count: crits.length },
+    });
+  }, [findings, operatorName]);
+
+  // ----------------- Hotkeys (wave 8) -----------------
+  // `a` — acknowledge focused finding (or first visible critical when
+  //       nothing's focused).
+  // `s` — suppress focused finding (same fallback).
+  // `e` — export critical-only.
+  // All three respect input focus (the hook's default).
+  const focusedFinding = React.useMemo(() => {
+    if (!focusedFindingId) return null;
+    return sortedFindings.find((f) => f.id === focusedFindingId) ?? null;
+  }, [focusedFindingId, sortedFindings]);
+
+  useShortcut("a", () => {
+    const target =
+      focusedFinding ??
+      sortedFindings.find((f) => f.severity === "critical") ??
+      sortedFindings[0];
+    if (!target) return;
+    const dec = ackSuppressMap[target.id];
+    // Toggle: ack again clears.
+    setAckSuppress(
+      target.id,
+      target,
+      dec?.state === "ack" ? "clear" : "ack",
+    );
+  });
+  useShortcut("s", () => {
+    const target =
+      focusedFinding ??
+      sortedFindings.find((f) => f.severity === "critical") ??
+      sortedFindings[0];
+    if (!target) return;
+    const dec = ackSuppressMap[target.id];
+    setAckSuppress(
+      target.id,
+      target,
+      dec?.state === "suppress" ? "clear" : "suppress",
+    );
+  });
+  useShortcut("e", () => {
+    exportCriticalOnly();
+  });
 
   return (
     <div
@@ -1703,9 +2094,22 @@ const SecurityAuditPageInner: React.FC = () => {
         </div>
       )}
 
+      {/* Screen-reader-only critical-count change announcer. Surfaces a
+          targeted announcement when the un-acknowledged un-suppressed
+          critical count changes — separate from the visible summary so
+          the live region is small and the assistive-tech announcement
+          is short. citation: WAI-ARIA aria-live + aria-atomic. */}
+      <div role="status" aria-live="polite" aria-atomic="true" className="sr-only">
+        {lastScanAt
+          ? announcedCriticalCount === 0
+            ? "No critical findings outstanding."
+            : `${announcedCriticalCount} critical finding${announcedCriticalCount === 1 ? "" : "s"} outstanding.`
+          : ""}
+      </div>
+
       {/* Summary stats */}
       <div
-        className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-6"
+        className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-7"
         role="status"
         aria-live="polite"
       >
@@ -1715,7 +2119,11 @@ const SecurityAuditPageInner: React.FC = () => {
           tone={summary.total > 0 ? "info" : "muted"}
           hint={
             lastScanAt
-              ? `scanned ${new Date(lastScanAt).toLocaleString()}`
+              ? `scanned ${new Date(lastScanAt).toLocaleString()}${
+                  postureDelta && postureDelta.totalDelta !== 0
+                    ? ` (Δ${postureDelta.totalDelta > 0 ? "+" : ""}${postureDelta.totalDelta} vs. prior)`
+                    : ""
+                }`
               : "not scanned yet"
           }
         />
@@ -1723,6 +2131,11 @@ const SecurityAuditPageInner: React.FC = () => {
           label="Critical"
           value={summary.critical}
           tone={summary.critical > 0 ? "destructive" : "muted"}
+          hint={
+            acknowledgedCount + suppressedCount > 0
+              ? `${acknowledgedCount} ack · ${suppressedCount} suppressed`
+              : undefined
+          }
         />
         <SummaryStatItem
           label="High"
@@ -1754,7 +2167,74 @@ const SecurityAuditPageInner: React.FC = () => {
               : "no findings"
           }
         />
+        {/* Tier-0 Protection Score — composite signal (wave 8).
+            citation: New folder\_analysis_defender_view.md §1. */}
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <div className="cursor-help">
+              <SummaryStatItem
+                label="Tier-0 Score"
+                value={
+                  tierZeroScore.totalCount > 0
+                    ? `${tierZeroScore.score}%`
+                    : "—"
+                }
+                tone={
+                  tierZeroScore.totalCount === 0
+                    ? "muted"
+                    : tierZeroScore.score >= 80
+                      ? "success"
+                      : tierZeroScore.score >= 50
+                        ? "warning"
+                        : "destructive"
+                }
+                hint={
+                  tierZeroScore.totalCount > 0
+                    ? `${tierZeroScore.protectedCount}/${tierZeroScore.totalCount} vaults clean${
+                        postureDelta && postureDelta.tierZeroDelta !== 0
+                          ? ` (Δ${postureDelta.tierZeroDelta > 0 ? "+" : ""}${postureDelta.tierZeroDelta}pt)`
+                          : ""
+                      }`
+                    : "no vaults scanned"
+                }
+              />
+            </div>
+          </TooltipTrigger>
+          <TooltipContent side="bottom" align="end" className="max-w-md">
+            <p className="m-0 text-2xs font-semibold uppercase tracking-wider text-muted-foreground">
+              Tier-0 protection score
+            </p>
+            <p className="m-0 mt-1 text-xs leading-relaxed">
+              % of Key Vaults with NO purge/soft-delete/network gap AND
+              an active diagnostic setting forwarding audit logs. Treats
+              Key Vault as the canonical Tier-0 surface (bearer credential
+              custody). Score &lt; 50% means the majority of vaults have
+              at least one disqualifying finding.
+            </p>
+            {tierZeroScore.topOffenders.length > 0 && (
+              <div className="mt-2 border-t pt-2">
+                <p className="m-0 text-2xs font-semibold uppercase tracking-wider text-muted-foreground">
+                  Top offenders
+                </p>
+                <ul className="m-0 mt-1 list-none space-y-0.5 p-0 text-2xs">
+                  {tierZeroScore.topOffenders.map((o) => (
+                    <li key={o.ruleId} className="font-mono">
+                      {o.ruleId} <span className="text-muted-foreground">×{o.count}</span>
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            )}
+          </TooltipContent>
+        </Tooltip>
       </div>
+
+      {/* Posture-trend sparkline — minimal SVG, no charting lib.
+          citation: New folder\_analysis_defender_view.md §1 — ScoutSuite
+          ships HTML reports keyed off snapshot history; we mirror in-page. */}
+      {postureSnapshots.length >= 2 && (
+        <PostureTrendSparkline snapshots={postureSnapshots} delta={postureDelta} />
+      )}
 
       {/* Filter bar */}
       <div className="flex flex-wrap items-center gap-2 rounded-md border border-border bg-card p-2">
@@ -1928,12 +2408,65 @@ const SecurityAuditPageInner: React.FC = () => {
           />
           <span className="text-2xs text-muted-foreground">days</span>
         </div>
+        <span className="h-4 w-px bg-border" aria-hidden />
+        {/* Suppressed chip — bring back rows the operator suppressed
+            as false positives. Off by default. (wave 8) */}
+        <div className="flex items-center gap-1.5">
+          <Switch
+            id={showSuppressedId}
+            checked={showSuppressed}
+            onCheckedChange={(v) => setShowSuppressed(Boolean(v))}
+            aria-label="Show suppressed findings"
+          />
+          <Label
+            htmlFor={showSuppressedId}
+            className="inline-flex cursor-pointer items-center gap-1 text-2xs"
+            title="Findings the operator has previously suppressed as false positives are hidden by default. Toggle this to bring them back."
+          >
+            <EyeOff className="h-3 w-3" aria-hidden />
+            Show suppressed
+            <span
+              className="tabular-nums text-muted-foreground"
+              aria-label={`${suppressedCount} suppressed finding${suppressedCount === 1 ? "" : "s"}`}
+            >
+              ({suppressedCount})
+            </span>
+          </Label>
+        </div>
+        {/* Bulk acknowledge — applies to whatever is currently
+            VISIBLE in the filtered list. Operator audit-trail recorded
+            via auditLog. (wave 8) */}
+        {filteredFindings.length > 0 && (
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                onClick={bulkAcknowledgeVisible}
+                aria-label={`Acknowledge ${filteredFindings.length} visible findings`}
+              >
+                <ShieldCheck className="h-3 w-3" />
+                Ack visible
+                <span className="tabular-nums text-muted-foreground">
+                  ({filteredFindings.length})
+                </span>
+              </Button>
+            </TooltipTrigger>
+            <TooltipContent side="bottom" align="end" className="max-w-xs">
+              Bulk-mark every visible finding as acknowledged (real
+              but expected). Recorded in the audit log with your
+              operator name. Suppressed rows are skipped.
+            </TooltipContent>
+          </Tooltip>
+        )}
         {(activeSeverities.size < ALL_SEVERITIES.length ||
           activeResourceTypes.size < ALL_RESOURCE_TYPES.length ||
           searchText.trim() ||
           criticalHighOnly ||
           showStaleOnly ||
-          showCorpusOnly) && (
+          showCorpusOnly ||
+          showSuppressed) && (
           <Button
             type="button"
             variant="ghost"
@@ -1946,6 +2479,14 @@ const SecurityAuditPageInner: React.FC = () => {
           </Button>
         )}
       </div>
+      {/* Keyboard shortcuts hint — also reads via aria-label so
+          screen readers learn about the hotkeys. */}
+      <p className="m-0 text-3xs text-muted-foreground" aria-live="off">
+        Hotkeys: <kbd className="rounded border px-1 font-mono">a</kbd> acknowledge ·
+        {" "}<kbd className="rounded border px-1 font-mono">s</kbd> suppress ·
+        {" "}<kbd className="rounded border px-1 font-mono">e</kbd> export critical-only.
+        Focus a row by tabbing into the table.
+      </p>
 
       {/* Findings table */}
       {sortedDisplayRows.length === 0 ? (
@@ -2044,7 +2585,26 @@ const SecurityAuditPageInner: React.FC = () => {
                     </TableRow>
                   );
                 }
-                return <FindingRow key={row.id} finding={row} />;
+                const entry = ackSuppressMap[row.id];
+                // Look the original finding back up from the stable
+                // id->Finding map so we hand the memoized child the
+                // STABLE Finding reference (the `row` here is a freshly-
+                // spread {kind, ...f} object created in
+                // `sortedDisplayRows` and would defeat React.memo).
+                const original = sortedFindingsById.get(row.id);
+                if (!original) return null;
+                return (
+                  <FindingRow
+                    key={row.id}
+                    finding={original}
+                    decision={entry?.state ?? null}
+                    decisionAt={entry?.at}
+                    decisionActor={entry?.actor}
+                    focused={focusedFindingId === row.id}
+                    setFocused={setFocusedFindingId}
+                    setAckSuppress={setAckSuppress}
+                  />
+                );
               })}
             </TableBody>
           </Table>
@@ -2064,22 +2624,176 @@ const SortableHeader: React.FC<{
   dir: "asc" | "desc";
   onClick: () => void;
 }> = ({ label, active, dir, onClick }) => (
-  <TableHead>
+  <TableHead
+    aria-sort={
+      active ? (dir === "asc" ? "ascending" : "descending") : "none"
+    }
+  >
     <button
       type="button"
       onClick={onClick}
       className="-ml-1 inline-flex items-center gap-1 rounded px-1 py-0.5 transition-colors hover:bg-muted/40 hover:text-foreground"
-      aria-label={`Sort by ${label}`}
+      aria-label={
+        active
+          ? `Sorted by ${label} ${dir === "asc" ? "ascending" : "descending"}, click to flip direction`
+          : `Sort by ${label}`
+      }
     >
       <span>{label}</span>
       {active && (
-        <span className="text-2xs text-muted-foreground">
+        <span className="text-2xs text-muted-foreground" aria-hidden>
           {dir === "desc" ? "▼" : "▲"}
         </span>
       )}
     </button>
   </TableHead>
 );
+
+// --------------------------------------------------------------------------
+// PostureTrendSparkline (wave 8)
+// --------------------------------------------------------------------------
+//
+// Minimal inline SVG sparkline — no charting dep. Shows the total
+// finding count across the last N persisted snapshots and the Tier-0
+// protection score trend line in a contrasting color. The two series
+// are normalized to their own ranges so they coexist on one SVG.
+//
+// citation: New folder\_analysis_defender_view.md §1.
+
+interface PostureTrendSparklineProps {
+  snapshots: readonly PostureSnapshot[];
+  delta: {
+    totalDelta: number;
+    criticalDelta: number;
+    highDelta: number;
+    tierZeroDelta: number;
+  } | null;
+}
+
+const PostureTrendSparkline: React.FC<PostureTrendSparklineProps> = ({
+  snapshots,
+  delta,
+}) => {
+  // Order chronologically (oldest → newest) for the sparkline path. The
+  // persisted ring is newest-first.
+  const ordered = React.useMemo(
+    () => snapshots.slice().reverse(),
+    [snapshots],
+  );
+  const totals = ordered.map((s) => s.total);
+  const scores = ordered.map((s) => s.tierZeroScore);
+  if (totals.length < 2) return null;
+
+  const W = 240;
+  const H = 48;
+  const PAD_X = 4;
+  const PAD_Y = 4;
+  const innerW = W - PAD_X * 2;
+  const innerH = H - PAD_Y * 2;
+
+  const buildPath = (values: number[], min: number, max: number): string => {
+    if (values.length === 0) return "";
+    const range = max - min || 1;
+    const stepX = values.length === 1 ? innerW : innerW / (values.length - 1);
+    return values
+      .map((v, i) => {
+        const x = PAD_X + i * stepX;
+        const y = PAD_Y + innerH - ((v - min) / range) * innerH;
+        return `${i === 0 ? "M" : "L"}${x.toFixed(1)},${y.toFixed(1)}`;
+      })
+      .join(" ");
+  };
+
+  const totalMin = Math.min(...totals);
+  const totalMax = Math.max(...totals);
+  const scoreMin = Math.min(0, ...scores);
+  const scoreMax = Math.max(100, ...scores);
+  const totalsPath = buildPath(totals, totalMin, totalMax);
+  const scoresPath = buildPath(scores, scoreMin, scoreMax);
+
+  const deltaArrow =
+    delta == null
+      ? null
+      : delta.totalDelta === 0
+        ? null
+        : delta.totalDelta > 0
+          ? "up"
+          : "down";
+  // "up" on TOTAL = more findings = worse; "up" on TIER-0 SCORE = better.
+  // Render delta line for tier-zero score separately so semantics are clear.
+
+  return (
+    <div
+      className="flex flex-wrap items-center gap-3 rounded-md border border-border bg-card/60 px-3 py-2 text-2xs text-muted-foreground"
+      role="img"
+      aria-label={`Posture trend across ${snapshots.length} scans`}
+    >
+      <span className="font-medium uppercase tracking-wider">Posture trend</span>
+      <svg
+        width={W}
+        height={H}
+        viewBox={`0 0 ${W} ${H}`}
+        className="text-foreground"
+        aria-hidden
+      >
+        {/* Total findings — destructive tone (more is worse). */}
+        <path
+          d={totalsPath}
+          fill="none"
+          stroke="hsl(var(--destructive, 0 80% 60%))"
+          strokeWidth={1.5}
+          strokeLinecap="round"
+        />
+        {/* Tier-0 score — success tone (higher is better). Drawn on
+            top so it's the dominant line when both move together. */}
+        <path
+          d={scoresPath}
+          fill="none"
+          stroke="hsl(var(--success, 142 70% 45%))"
+          strokeWidth={1.5}
+          strokeLinecap="round"
+          strokeDasharray="3 2"
+        />
+      </svg>
+      <span className="inline-flex items-center gap-1">
+        <span
+          className="inline-block h-1.5 w-3 rounded-sm"
+          style={{ backgroundColor: "hsl(var(--destructive, 0 80% 60%))" }}
+          aria-hidden
+        />
+        total
+        {deltaArrow === "up" ? (
+          <TrendingUp className="h-3 w-3 text-destructive" aria-hidden />
+        ) : deltaArrow === "down" ? (
+          <TrendingDown className="h-3 w-3 text-success" aria-hidden />
+        ) : null}
+        {delta && delta.totalDelta !== 0 && (
+          <span className="tabular-nums">
+            {delta.totalDelta > 0 ? "+" : ""}
+            {delta.totalDelta}
+          </span>
+        )}
+      </span>
+      <span className="inline-flex items-center gap-1">
+        <span
+          className="inline-block h-1.5 w-3 rounded-sm"
+          style={{ backgroundColor: "hsl(var(--success, 142 70% 45%))" }}
+          aria-hidden
+        />
+        Tier-0
+        {delta && delta.tierZeroDelta !== 0 && (
+          <span className="tabular-nums">
+            {delta.tierZeroDelta > 0 ? "+" : ""}
+            {delta.tierZeroDelta}pt
+          </span>
+        )}
+      </span>
+      <span className="text-3xs text-muted-foreground">
+        {snapshots.length}/{30} snapshots
+      </span>
+    </div>
+  );
+};
 
 const SeverityDot: React.FC<{ severity: Severity }> = ({ severity }) => {
   const color =
@@ -2100,12 +2814,77 @@ const SeverityDot: React.FC<{ severity: Severity }> = ({ severity }) => {
   );
 };
 
-const FindingRow: React.FC<{ finding: Finding }> = ({ finding: f }) => {
+interface FindingRowProps {
+  finding: Finding;
+  decision: "ack" | "suppress" | null;
+  decisionAt: string | undefined;
+  decisionActor: string | undefined;
+  focused: boolean;
+  /** Stable parent-level setter — child wraps it in a per-row callback. */
+  setFocused: (id: string | null) => void;
+  /** Stable parent-level setter — child wraps it in per-row ack/suppress. */
+  setAckSuppress: (
+    findingId: string,
+    finding: Finding,
+    state: "ack" | "suppress" | "clear",
+    note?: string,
+  ) => void;
+}
+
+/**
+ * Single finding row. Memoized to avoid re-rendering all rows when a
+ * single chip / filter / sort toggle changes upstream — with O(100s)
+ * of findings in a large tenant this is a real win on every filter
+ * tweak. Props are passed individually rather than as a config object,
+ * and the parent passes the STABLE `setAckSuppress` + `setFocused`
+ * callbacks (not per-row inline arrows) so React's shallow-compare
+ * equality short-circuits cleanly.
+ */
+const FindingRowImpl: React.FC<FindingRowProps> = ({
+  finding: f,
+  decision,
+  decisionAt,
+  decisionActor,
+  focused,
+  setFocused,
+  setAckSuppress,
+}) => {
+  // Build per-row handlers inside the memoized child — they re-create
+  // only when `f` (specifically its id) or the stable parent setters
+  // change, NOT on every parent render.
+  const onFocus = React.useCallback(() => setFocused(f.id), [setFocused, f.id]);
+  const onAcknowledge = React.useCallback(() => {
+    setAckSuppress(f.id, f, decision === "ack" ? "clear" : "ack");
+  }, [setAckSuppress, f, decision]);
+  const onSuppress = React.useCallback(() => {
+    setAckSuppress(
+      f.id,
+      f,
+      decision === "suppress" ? "clear" : "suppress",
+    );
+  }, [setAckSuppress, f, decision]);
   const Icon = resourceTypeIcon(f.resourceType);
   const parsed = parseArmId(f.resourceId);
   const portalUrl = portalUrlFor(f.resourceId);
+  const runbook = runbookFor(f.ruleId);
+  const isAck = decision === "ack";
+  const isSuppress = decision === "suppress";
+  // Local row click/focus handler — bubbles up the focused id so
+  // page-level hotkeys can target it.
   return (
-    <TableRow>
+    <TableRow
+      tabIndex={0}
+      onFocus={onFocus}
+      // role="row" is provided by TableRow; this re-states it for clarity.
+      aria-selected={focused ? true : undefined}
+      data-finding-id={f.id}
+      className={cn(
+        "outline-none transition-colors",
+        focused && "ring-1 ring-inset ring-primary/60",
+        isAck && "bg-muted/30 opacity-75",
+        isSuppress && "bg-muted/40 italic opacity-60",
+      )}
+    >
       <TableCell>
         <Badge
           variant={SEVERITY_BADGE_VARIANT[f.severity]}
@@ -2113,6 +2892,18 @@ const FindingRow: React.FC<{ finding: Finding }> = ({ finding: f }) => {
         >
           {SEVERITY_LABEL[f.severity]}
         </Badge>
+        {decision && (
+          <span
+            className="ml-1 inline-flex items-center gap-0.5 rounded border px-1 py-0 text-3xs uppercase tracking-wider text-muted-foreground"
+            title={
+              decisionActor && decisionAt
+                ? `${decision === "ack" ? "Acknowledged" : "Suppressed"} by ${decisionActor} at ${new Date(decisionAt).toLocaleString()}`
+                : undefined
+            }
+          >
+            {isAck ? "ack" : "supp"}
+          </span>
+        )}
       </TableCell>
       <TableCell>
         <span
@@ -2203,6 +2994,75 @@ const FindingRow: React.FC<{ finding: Finding }> = ({ finding: f }) => {
         <div className="inline-flex items-center gap-0.5">
           <Tooltip>
             <TooltipTrigger asChild>
+              <button
+                type="button"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  onAcknowledge();
+                }}
+                aria-pressed={isAck}
+                aria-label={
+                  isAck
+                    ? `Clear acknowledgement on ${f.resourceName}`
+                    : `Acknowledge finding on ${f.resourceName} (hotkey: a)`
+                }
+                className={cn(
+                  "inline-flex h-5 w-5 items-center justify-center rounded text-muted-foreground hover:bg-accent/30 hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring",
+                  isAck && "text-success",
+                )}
+              >
+                <ShieldCheck className="h-3 w-3" />
+              </button>
+            </TooltipTrigger>
+            <TooltipContent>
+              {isAck ? "Clear acknowledgement" : "Acknowledge (a)"}
+            </TooltipContent>
+          </Tooltip>
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <button
+                type="button"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  onSuppress();
+                }}
+                aria-pressed={isSuppress}
+                aria-label={
+                  isSuppress
+                    ? `Unsuppress ${f.resourceName}`
+                    : `Suppress finding on ${f.resourceName} (hotkey: s)`
+                }
+                className={cn(
+                  "inline-flex h-5 w-5 items-center justify-center rounded text-muted-foreground hover:bg-accent/30 hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring",
+                  isSuppress && "text-destructive",
+                )}
+              >
+                <ShieldOff className="h-3 w-3" />
+              </button>
+            </TooltipTrigger>
+            <TooltipContent>
+              {isSuppress ? "Unsuppress" : "Suppress (s)"}
+            </TooltipContent>
+          </Tooltip>
+          {runbook && (
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <a
+                  href={runbook.url}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="inline-flex h-5 w-5 items-center justify-center rounded text-muted-foreground hover:bg-accent/30 hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                  aria-label={`Open runbook for ${f.ruleId}: ${runbook.label}`}
+                  onClick={(e) => e.stopPropagation()}
+                >
+                  <BookOpen className="h-3 w-3" />
+                </a>
+              </TooltipTrigger>
+              <TooltipContent>{runbook.label}</TooltipContent>
+            </Tooltip>
+          )}
+          <Tooltip>
+            <TooltipTrigger asChild>
               <span
                 className="group/copy inline-flex items-center"
                 aria-hidden={false}
@@ -2224,6 +3084,7 @@ const FindingRow: React.FC<{ finding: Finding }> = ({ finding: f }) => {
                 rel="noopener noreferrer"
                 className="inline-flex h-5 w-5 items-center justify-center rounded text-muted-foreground hover:bg-accent/30 hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
                 aria-label={`Open ${f.resourceName} in Azure Portal`}
+                onClick={(e) => e.stopPropagation()}
               >
                 <ExternalLink className="h-3 w-3" />
               </a>
@@ -2235,3 +3096,7 @@ const FindingRow: React.FC<{ finding: Finding }> = ({ finding: f }) => {
     </TableRow>
   );
 };
+
+// Memoize the row so a single ack/suppress toggle, sort flip, or
+// filter chip doesn't re-render hundreds of unaffected rows.
+const FindingRow = React.memo(FindingRowImpl);

@@ -41,8 +41,10 @@ import {
   CheckCircle2,
   ChevronDown,
   ChevronRight,
+  ClipboardPaste,
   Copy,
   Crown,
+  Eye,
   FolderTree,
   Hourglass,
   Layers,
@@ -394,6 +396,79 @@ interface RecentDestTenant {
   readonly label?: string;
   /** ISO timestamp of the last successful use — drives MRU ordering. */
   readonly lastUsedAt: string;
+}
+
+/**
+ * CORPUS-GROUNDED — bulk cross-tenant gate. Moving more than this many
+ * subscriptions to the SAME foreign tenant in one batch is unusual enough
+ * to require explicit "I understand" acknowledgement before the operator
+ * can Confirm. Justification: `_ea_subscription_cross_tenant.md` documents
+ * that cross-tenant subscription moves create a one-way audit trail (the
+ * destination tenant sees the migration in its Activity Log; the source
+ * tenant only sees the originating POST). Bulk-moving 5+ subs simultaneously
+ * to a tenant outside the source is a strong indicator of either an
+ * authorized M&A workflow OR an unauthorized exfil — surfacing the gate
+ * makes the deliberate / accidental distinction explicit in the audit log.
+ */
+const BULK_CROSS_TENANT_THRESHOLD = 5;
+
+/**
+ * ADVANCED-UI — parse a clipboard-style CSV/multi-line paste into a set of
+ * tokens that can be matched against a billing-sub's identifiers. Accepts:
+ *   - newline-separated lists
+ *   - CSV (comma-separated)
+ *   - whitespace-separated (one paste of `id1 id2 id3`)
+ *   - mixed (`id1, id2\nid3 id4`)
+ * Tokens are lowercased so casing in the source paste doesn't affect match.
+ */
+function parseSubIdPaste(raw: string): string[] {
+  if (!raw) return [];
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const tok of raw.split(/[\s,;]+/g)) {
+    const trimmed = tok.trim();
+    if (!trimmed) continue;
+    // Strip leading/trailing quotes that copy-paste from spreadsheets adds.
+    const stripped = trimmed.replace(/^["'`]+|["'`]+$/g, "");
+    if (!stripped) continue;
+    const lower = stripped.toLowerCase();
+    if (seen.has(lower)) continue;
+    seen.add(lower);
+    out.push(stripped);
+  }
+  return out;
+}
+
+/**
+ * CORPUS-GROUNDED — given a row + planned op, render a sanitized version of
+ * the ARM request body that will be POSTed. We surface this in the confirm
+ * dialog so the operator can eyeball what's actually leaving the browser
+ * before approving. No tokens, no headers, no `subscriptionOwnerId` leakage
+ * — just the request body and the canonical endpoint.
+ *
+ * The body shapes are:
+ *   - transfer-billing → `{ destinationEnrollmentAccountId: "<armId>" }`
+ *   - change-tenant   → `{ properties: { tenantId: "<guid>" } }`
+ */
+function buildArmRequestPreview(
+  op: OpKind,
+  destination: string,
+  billingAccountName: string,
+  sampleSubscriptionId: string,
+  sampleBillingSubName: string,
+): { method: "POST"; url: string; body: unknown } {
+  if (op === "transfer-billing") {
+    return {
+      method: "POST",
+      url: `/providers/Microsoft.Billing/billingAccounts/${billingAccountName}/billingSubscriptions/${sampleBillingSubName}/move?api-version=2020-05-01`,
+      body: { destinationEnrollmentAccountId: destination },
+    };
+  }
+  return {
+    method: "POST",
+    url: `/providers/Microsoft.Subscription/subscriptions/${sampleSubscriptionId}/changeTenant?api-version=2021-10-01`,
+    body: { properties: { tenantId: destination } },
+  };
 }
 
 export const SubMoverPage: React.FC = () => {
@@ -818,6 +893,29 @@ export const SubMoverPage: React.FC = () => {
   /** If true, poll the Azure-AsyncOperation URL until the LRO terminates. */
   const [pollLros, setPollLros] = React.useState(true);
 
+  /**
+   * CORPUS-GROUNDED — bulk cross-tenant gate state. When the planned batch
+   * is >= BULK_CROSS_TENANT_THRESHOLD subs to a single foreign tenant, the
+   * operator must explicitly tick this checkbox before Confirm goes hot.
+   * Resets whenever the destination / op-kind / selection changes so a
+   * prior "I understand" doesn't bleed into a fresh, unrelated batch.
+   * Citation: `_ea_subscription_cross_tenant.md` — cross-tenant moves
+   * create one-way audit visibility; bulk moves to one tenant warrant
+   * explicit operator acknowledgement.
+   */
+  const [bulkCrossTenantAck, setBulkCrossTenantAck] = React.useState(false);
+
+  /** ADVANCED-UI — CSV-paste dialog open/closed state and textarea buffer. */
+  const [csvPasteOpen, setCsvPasteOpen] = React.useState(false);
+  const [csvPasteBuffer, setCsvPasteBuffer] = React.useState("");
+  /** Last paste-import outcome — surfaced as a small toast-style banner
+   *  inside the dialog so the operator sees "matched 12 / 14, 2 unknown"
+   *  before closing. */
+  const [csvPasteResult, setCsvPasteResult] = React.useState<{
+    matched: number;
+    unknown: string[];
+  } | null>(null);
+
   const [running, setRunning] = React.useState(false);
   const [results, setResults] = React.useState<RowResult[]>([]);
   // Confirmation dialog state (replaces the native window.confirm).
@@ -938,8 +1036,19 @@ export const SubMoverPage: React.FC = () => {
       destTenantId.trim().toLowerCase() === account.tenantId.toLowerCase()
     )
       return false;
+    // CORPUS-GROUNDED gate — bulk cross-tenant moves require explicit
+    // "I understand" tick (see BULK_CROSS_TENANT_THRESHOLD).
+    if (requiresBulkCrossTenantAck && !bulkCrossTenantAck) return false;
     return true;
-  }, [rowsToRun.length, opKind, destEnrollmentArmId, destTenantId, account?.tenantId]);
+  }, [
+    rowsToRun.length,
+    opKind,
+    destEnrollmentArmId,
+    destTenantId,
+    account?.tenantId,
+    requiresBulkCrossTenantAck,
+    bulkCrossTenantAck,
+  ]);
 
   /**
    * Pre-flight warnings — none of these block submission, but they surface
@@ -999,6 +1108,124 @@ export const SubMoverPage: React.FC = () => {
     concurrency,
     armTokenTracker.secondsUntilExpiry,
   ]);
+
+  /**
+   * CORPUS-GROUNDED — derived flag: is this a bulk cross-tenant move that
+   * requires explicit operator acknowledgement? Defined as: change-tenant
+   * op + >= BULK_CROSS_TENANT_THRESHOLD rows + destination != source.
+   * Surfaced both as a warning banner and as a hard gate on the Confirm
+   * button (planValid AND-gates on this when applicable).
+   */
+  const requiresBulkCrossTenantAck = React.useMemo(() => {
+    if (opKind !== "change-tenant") return false;
+    if (rowsToRun.length < BULK_CROSS_TENANT_THRESHOLD) return false;
+    const dest = destTenantId.trim().toLowerCase();
+    const src = account?.tenantId?.toLowerCase();
+    if (!dest || !UUID_RE.test(dest)) return false;
+    if (src && src === dest) return false;
+    return true;
+  }, [opKind, rowsToRun.length, destTenantId, account?.tenantId]);
+
+  // Reset the bulk-cross-tenant ack whenever the destination / op / row
+  // count changes — a prior "I understand" tick must not carry over into a
+  // different batch composition (defense against accidental re-confirm).
+  React.useEffect(() => {
+    setBulkCrossTenantAck(false);
+  }, [
+    opKind,
+    destTenantId,
+    destEnrollmentArmId,
+    rowsToRun.length,
+    account?.tenantId,
+  ]);
+
+  /**
+   * Race-condition guard — if the operator switches the SOURCE account
+   * (and thus the ARM token's home tenant) WHILE a batch is in-flight,
+   * the in-flight rows would be processed against a stale token / wrong
+   * tenant context. Abort the controller so the worker pool unwinds
+   * cleanly; the pending rows flip to "cancelled" via the existing abort
+   * path. The accept calls already-dispatched on the prior tenant are
+   * unaffected (Azure side state is unchanged), and the operator gets a
+   * clear notification rather than a mysterious string of 401s.
+   */
+  const lastAccountIdRef = React.useRef<string | undefined>(account?.homeAccountId);
+  React.useEffect(() => {
+    const prev = lastAccountIdRef.current;
+    const next = account?.homeAccountId;
+    if (prev != null && next != null && prev !== next && running && abortRef.current) {
+      abortRef.current.abort();
+      store.addNotification({
+        type: "warning",
+        message:
+          "Source account changed mid-batch — the in-flight runner was aborted to avoid using a stale tenant token.",
+      });
+    }
+    lastAccountIdRef.current = next;
+  }, [account?.homeAccountId, running, store]);
+
+  /**
+   * ADVANCED-UI — apply a CSV / multi-line paste of subscription IDs into
+   * the existing selection. Tokens that match a billing-sub's
+   * `subscriptionId`, ARM `id`, or `name` are added to `selected`; unknown
+   * tokens are surfaced back as `csvPasteResult.unknown` so the operator
+   * can fix typos rather than silently dropping rows.
+   *
+   * Match precedence:
+   *   1. exact `subscriptionId` (AAD UUID, case-insensitive)
+   *   2. ARM `id` suffix (last path segment OR the full ARM id)
+   *   3. billing-sub `name`
+   */
+  const applyCsvPaste = React.useCallback(() => {
+    const tokens = parseSubIdPaste(csvPasteBuffer);
+    if (tokens.length === 0) {
+      setCsvPasteResult({ matched: 0, unknown: [] });
+      return;
+    }
+    // Build O(1) lookup tables keyed by lowercase identifier.
+    const bySubId = new Map<string, string>(); // subId -> billing-sub name
+    const byName = new Map<string, string>(); // billing-sub name -> billing-sub name (identity)
+    const byArmId = new Map<string, string>(); // full ARM id -> billing-sub name
+    for (const s of subscriptions) {
+      if (s.subscriptionId) bySubId.set(s.subscriptionId.toLowerCase(), s.name);
+      byName.set(s.name.toLowerCase(), s.name);
+      byArmId.set(s.id.toLowerCase(), s.name);
+    }
+    const matchedNames: string[] = [];
+    const unknown: string[] = [];
+    for (const tok of tokens) {
+      const lower = tok.toLowerCase();
+      // Try ARM id, subId, billing-sub name — in that order. Also try the
+      // last path segment of an ARM id-shaped token (operators often paste
+      // the full /providers/... path).
+      const armMatch = byArmId.get(lower);
+      const subMatch = bySubId.get(lower);
+      const nameMatch = byName.get(lower);
+      const trailMatch = lower.includes("/")
+        ? byName.get(lower.split("/").pop()!.toLowerCase())
+        : undefined;
+      const matched = armMatch ?? subMatch ?? nameMatch ?? trailMatch;
+      if (matched) {
+        matchedNames.push(matched);
+      } else {
+        unknown.push(tok);
+      }
+    }
+    if (matchedNames.length > 0) {
+      setSelected((prev) => {
+        const next = new Set(prev);
+        for (const n of matchedNames) next.add(n);
+        return next;
+      });
+    }
+    setCsvPasteResult({ matched: matchedNames.length, unknown });
+  }, [csvPasteBuffer, subscriptions]);
+
+  const openCsvPasteDialog = React.useCallback(() => {
+    setCsvPasteBuffer("");
+    setCsvPasteResult(null);
+    setCsvPasteOpen(true);
+  }, []);
 
   const confirmMessage = React.useMemo(() => {
     const skipped = selectedSubs.length - rowsToRun.length;
@@ -1505,6 +1732,33 @@ export const SubMoverPage: React.FC = () => {
     };
   }, [results]);
 
+  /**
+   * ADVANCED-UI — ETA estimate for the in-flight batch. Uses the running
+   * average duration of completed rows divided by the active concurrency
+   * to project remaining time. Returns null when there's no data yet
+   * (or no rows still in-flight).
+   */
+  const batchEta = React.useMemo(() => {
+    if (!running) return null;
+    if (resultStats.completedDurations === 0) return null;
+    const remaining =
+      resultStats.queued + resultStats.runningCount + resultStats.pollingCount;
+    if (remaining <= 0) return null;
+    const workers = Math.max(1, Math.min(concurrency, results.length));
+    const etaMs = (resultStats.avgMs * remaining) / workers;
+    if (!Number.isFinite(etaMs) || etaMs < 0) return null;
+    return etaMs;
+  }, [
+    running,
+    resultStats.completedDurations,
+    resultStats.queued,
+    resultStats.runningCount,
+    resultStats.pollingCount,
+    resultStats.avgMs,
+    concurrency,
+    results.length,
+  ]);
+
   /** Export columns for the bulk-results list — CSV + JSON share this. */
   const exportColumns = React.useMemo(
     () =>
@@ -1542,8 +1796,13 @@ export const SubMoverPage: React.FC = () => {
 
   /** Top-of-card keyboard shortcuts:
    *   - "/" focuses the search box
-   *   - Esc aborts an in-flight batch
-   *   - Ctrl+A on the search box selects all visible
+   *   - Esc aborts an in-flight batch (routes through the confirm modal)
+   *   - Ctrl+Enter commits the open confirm dialog when planValid
+   *     (saves a click on every batch — the most common destination after
+   *     setting up the plan is "press Confirm")
+   *   - Ctrl+V is intentionally NOT intercepted here — the CSV-paste
+   *     button opens a deliberate textarea so paste-into-page doesn't
+   *     ambush an in-flight selection
    */
   React.useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -1560,6 +1819,21 @@ export const SubMoverPage: React.FC = () => {
         searchInputRef.current?.focus();
         return;
       }
+      // Ctrl+Enter — commit the confirm dialog when it's open and the plan
+      // is valid. We don't fire from inside the CSV-paste textarea (where
+      // the operator may want Ctrl+Enter to mean "newline").
+      if (
+        (e.ctrlKey || e.metaKey) &&
+        e.key === "Enter" &&
+        confirmOpen &&
+        planValid &&
+        !running &&
+        !csvPasteOpen
+      ) {
+        e.preventDefault();
+        void runRows();
+        return;
+      }
       if (e.key === "Escape" && running) {
         e.preventDefault();
         requestAbortBatch();
@@ -1567,7 +1841,14 @@ export const SubMoverPage: React.FC = () => {
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [running, requestAbortBatch]);
+  }, [
+    running,
+    requestAbortBatch,
+    confirmOpen,
+    planValid,
+    csvPasteOpen,
+    runRows,
+  ]);
 
   // Global tenant-switch listener — when the operator flips tenants from
   // anywhere in the app (header switcher, etc.), pivot the SOURCE account
@@ -1795,6 +2076,24 @@ export const SubMoverPage: React.FC = () => {
                 >
                   <Copy className="h-3 w-3" aria-hidden />
                   Copy IDs
+                </Button>
+                {/* ADVANCED-UI — CSV/multi-line paste of subscription IDs.
+                    Operators routinely arrive at this page with a ticket
+                    listing 50+ sub IDs in arbitrary delimiters; previously
+                    they had to tick each row by hand or search-by-id one
+                    at a time. The dialog accepts mixed CSV/whitespace
+                    and reports back which tokens matched. */}
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="sm"
+                  className="h-7 text-xs"
+                  onClick={openCsvPasteDialog}
+                  disabled={running || subscriptions.length === 0}
+                  aria-label="Paste a CSV or multi-line list of subscription IDs to bulk-select"
+                >
+                  <ClipboardPaste className="h-3 w-3" aria-hidden />
+                  Paste IDs
                 </Button>
                 <Button
                   type="button"
@@ -2392,6 +2691,76 @@ export const SubMoverPage: React.FC = () => {
                   </Alert>
                 )}
 
+                {/* CORPUS-GROUNDED — cross-tenant audit-trail notice. Even
+                    for small batches, surface the one-way visibility
+                    asymmetry: the destination tenant's Activity Log
+                    captures the migration with full detail, while the
+                    source tenant only records the outbound POST. Operators
+                    investigating later need to know to pivot to the
+                    destination tenant to find the full trail.
+                    Citation: _bypass_tenant_switch.md — cross-tenant
+                    operations create asymmetric audit visibility. */}
+                {opKind === "change-tenant" && rowsToRun.length > 0 && (
+                  <Alert variant="info">
+                    <Eye className="h-4 w-4" aria-hidden />
+                    <AlertDescription>
+                      <p className="text-xs">
+                        <strong>Audit-trail note:</strong> the full migration
+                        event for a cross-tenant sub move is recorded in the{" "}
+                        <em>destination</em> tenant's Activity Log
+                        (Microsoft.Subscription/aliases). The source tenant
+                        only retains the outbound{" "}
+                        <code className="font-mono">changeTenant</code> POST.
+                        Pivot to the destination tenant when reconciling
+                        after this batch.
+                      </p>
+                    </AlertDescription>
+                  </Alert>
+                )}
+
+                {/* CORPUS-GROUNDED — bulk cross-tenant gate. Triggers when
+                    a single batch would move >= BULK_CROSS_TENANT_THRESHOLD
+                    subs into a foreign tenant. The ack checkbox HARD-GATES
+                    the Confirm button (see planValid) and resets on any
+                    plan change, so this can't carry over silently. */}
+                {requiresBulkCrossTenantAck && (
+                  <Alert variant="destructive" className="border-destructive/50 bg-destructive/5">
+                    <AlertTriangle className="h-4 w-4" aria-hidden />
+                    <AlertDescription>
+                      <div className="flex flex-col gap-2 text-xs">
+                        <p>
+                          <strong>
+                            Bulk cross-tenant move ({rowsToRun.length} subs to{" "}
+                            <code className="font-mono">{destTenantId.trim()}</code>).
+                          </strong>{" "}
+                          Moving {BULK_CROSS_TENANT_THRESHOLD}+ subscriptions
+                          to a single foreign tenant in one batch is unusual
+                          enough to warrant explicit acknowledgement. This
+                          is a one-way change-of-billing-relationship — the
+                          destination tenant gains full directory control,
+                          and the migration is logged in the destination
+                          tenant's audit log.
+                        </p>
+                        <label className="flex items-center gap-2">
+                          <Checkbox
+                            checked={bulkCrossTenantAck}
+                            onCheckedChange={(v) =>
+                              setBulkCrossTenantAck(v === true)
+                            }
+                            disabled={running}
+                            aria-label="Acknowledge bulk cross-tenant move risk"
+                          />
+                          <span className="font-medium">
+                            I understand this moves {rowsToRun.length}{" "}
+                            subscriptions out of my tenant and acknowledge
+                            the destination-tenant audit trail.
+                          </span>
+                        </label>
+                      </div>
+                    </AlertDescription>
+                  </Alert>
+                )}
+
                 {skipUnsafe && rowsToRun.length === 0 && selectedSubs.length > 0 && (
                   <Alert variant="destructive">
                     <AlertTriangle className="h-4 w-4" aria-hidden />
@@ -2473,6 +2842,18 @@ export const SubMoverPage: React.FC = () => {
                                 ? ` — ${resultStats.pollingCount} polling`
                                 : ""}
                             </span>
+                            {/* ADVANCED-UI — ETA display. Only shown once
+                                the first row has completed and we have a
+                                real average to extrapolate from. */}
+                            {batchEta != null && (
+                              <span className="inline-flex items-center gap-1">
+                                <Hourglass className="h-3 w-3" aria-hidden />
+                                ETA ~{fmtDuration(batchEta)}
+                                <span className="text-3xs opacity-70">
+                                  (avg {fmtDuration(resultStats.avgMs)}/row)
+                                </span>
+                              </span>
+                            )}
                           </div>
                           <div
                             className="h-1.5 w-full overflow-hidden rounded-full bg-muted"
@@ -2612,7 +2993,96 @@ export const SubMoverPage: React.FC = () => {
                     />
                   )}
                 </div>
-                <div className="flex flex-col gap-1">
+
+                {/* CORPUS-GROUNDED — post-batch audit-trail reconciliation
+                    summary. Shown only after a change-tenant batch finishes
+                    (success OR partial-failure) and only when the runner is
+                    no longer active. Tells the operator EXACTLY what to
+                    look for in each tenant's Activity Log to confirm the
+                    moves landed, distinguishing the source-tenant signal
+                    (outbound POST receipt) from the destination-tenant
+                    signal (sub appears, full provisioning trail).
+                    Citation: _bypass_tenant_switch.md — asymmetric audit
+                    visibility; _ea_subscription_cross_tenant.md —
+                    destination tenant's directory holds the post-move
+                    state of record. */}
+                {!running &&
+                  results.length > 0 &&
+                  results.some(
+                    (r) => r.op === "change-tenant" && r.state === "success",
+                  ) && (
+                    <Alert variant="info" className="mt-1">
+                      <Eye className="h-4 w-4" aria-hidden />
+                      <AlertDescription>
+                        <div className="flex flex-col gap-1 text-xs">
+                          <p className="font-medium">
+                            Audit-trail reconciliation
+                          </p>
+                          <p className="text-muted-foreground">
+                            Cross-tenant moves are recorded asymmetrically.
+                            Verify the batch landed by checking BOTH
+                            tenants:
+                          </p>
+                          <ul className="list-inside list-disc text-2xs">
+                            <li>
+                              <strong>Source tenant</strong>{" "}
+                              {account?.tenantId ? (
+                                <code className="font-mono">
+                                  ({account.tenantId})
+                                </code>
+                              ) : null}{" "}
+                              — Activity Log should show{" "}
+                              <code className="font-mono">
+                                Microsoft.Subscription/changeTenantStatus
+                              </code>{" "}
+                              entries.
+                            </li>
+                            <li>
+                              <strong>Destination tenant</strong>{" "}
+                              {(() => {
+                                const dest = results.find(
+                                  (r) =>
+                                    r.op === "change-tenant" &&
+                                    r.state === "success" &&
+                                    r.destination,
+                                )?.destination;
+                                return dest ? (
+                                  <code className="font-mono">({dest})</code>
+                                ) : null;
+                              })()}{" "}
+                              — Activity Log should show new{" "}
+                              <code className="font-mono">
+                                Microsoft.Subscription/aliases
+                              </code>{" "}
+                              + the sub appears under Cost
+                              Management/Subscriptions. May need destination-
+                              tenant admin to <em>accept the offer</em>.
+                            </li>
+                            <li>
+                              Any subs still missing after ~15 min →
+                              destination tenant likely needs to redeem the
+                              transfer offer (or the destination tenant's
+                              policy blocks inbound subs).
+                            </li>
+                          </ul>
+                        </div>
+                      </AlertDescription>
+                    </Alert>
+                  )}
+
+                {/* ADVANCED-UI — ARIA-live region wrapping per-row results
+                    so a screen-reader announces state transitions
+                    (pending → running → polling → success/failure) as the
+                    batch progresses. `aria-relevant="text"` confines the
+                    chatter to text changes (badges) — the row scaffold
+                    itself doesn't re-announce on every render. */}
+                <div
+                  className="flex flex-col gap-1"
+                  role="log"
+                  aria-live="polite"
+                  aria-relevant="text"
+                  aria-label="Per-subscription operation progress"
+                >
                   {results.map((r) => {
                     const expanded = expandedRows.has(r.rowKey);
                     return (
@@ -2846,6 +3316,56 @@ export const SubMoverPage: React.FC = () => {
                 for brevity, see the result panel after confirming.)
               </p>
             )}
+            {/* ADVANCED-UI — sanitized JSON preview of the ARM request
+                body. Operators frequently need to know exactly what's
+                hitting the wire (compliance review, ticket attachments,
+                or just paranoia). The preview shows the canonical URL +
+                body for the FIRST row in the batch; every other row is
+                identical except for the subscriptionId / billingSubName.
+                No tokens, no headers — just the payload. */}
+            {rowsToRun.length > 0 && (
+              <details className="rounded border border-border bg-muted/20 p-2 text-2xs">
+                <summary className="cursor-pointer font-medium text-muted-foreground">
+                  Show ARM request preview (sanitized, no tokens)
+                </summary>
+                <pre className="mt-1 max-h-48 overflow-auto whitespace-pre-wrap break-all rounded bg-background/70 p-2 font-mono text-3xs">
+                  {(() => {
+                    const sample = rowsToRun[0]!;
+                    const dest =
+                      opKind === "transfer-billing"
+                        ? destEnrollmentArmId.trim()
+                        : destTenantId.trim();
+                    const preview = buildArmRequestPreview(
+                      opKind,
+                      dest,
+                      billingAccountName,
+                      sample.subscriptionId ?? sample.name,
+                      sample.name,
+                    );
+                    return [
+                      `${preview.method} https://management.azure.com${preview.url}`,
+                      `Authorization: Bearer <redacted>`,
+                      `Content-Type: application/json`,
+                      ``,
+                      JSON.stringify(preview.body, null, 2),
+                      ``,
+                      rowsToRun.length > 1
+                        ? `(${rowsToRun.length - 1} additional row${rowsToRun.length === 2 ? "" : "s"} dispatched with the same body shape, swapping the subscription identifier.)`
+                        : ``,
+                    ]
+                      .filter(Boolean)
+                      .join("\n");
+                  })()}
+                </pre>
+              </details>
+            )}
+            <p className="text-2xs text-muted-foreground">
+              Tip:{" "}
+              <kbd className="rounded border border-border bg-muted/40 px-1 text-3xs font-mono">
+                Ctrl+Enter
+              </kbd>{" "}
+              commits this dialog.
+            </p>
           </div>
         }
         confirmText={
@@ -2883,6 +3403,103 @@ export const SubMoverPage: React.FC = () => {
         danger
         onConfirm={confirmAbortBatch}
         onCancel={() => setAbortConfirmOpen(false)}
+      />
+      {/* ADVANCED-UI — CSV / multi-line paste dialog. Lets the operator
+          paste an arbitrarily-formatted list of subscription identifiers
+          and have them resolved against the current billing-account's
+          subscription list. Matches are added to the current selection
+          (idempotent); unresolved tokens are surfaced back so the
+          operator can fix typos. */}
+      <ConfirmationDialog
+        hidden={!csvPasteOpen}
+        title="Bulk-select by paste"
+        message={
+          <div className="flex flex-col gap-2 text-xs">
+            <p>
+              Paste a list of subscription IDs (UUIDs), billing-sub names,
+              or full ARM IDs — newline, comma, semicolon, or whitespace
+              separated. Matched rows are <strong>added</strong> to the
+              current selection; nothing is removed.
+            </p>
+            <label
+              htmlFor="sub-mover-csv-paste"
+              className="text-2xs uppercase tracking-wider text-muted-foreground"
+            >
+              Paste here
+            </label>
+            <textarea
+              id="sub-mover-csv-paste"
+              value={csvPasteBuffer}
+              onChange={(e) => {
+                setCsvPasteBuffer(e.target.value);
+                // Clear the prior outcome banner whenever the buffer
+                // changes so the result line always reflects the most
+                // recent Apply press.
+                if (csvPasteResult) setCsvPasteResult(null);
+              }}
+              rows={8}
+              autoFocus
+              placeholder={
+                "00000000-0000-0000-0000-000000000000\n" +
+                "11111111-1111-1111-1111-111111111111, ea-billing-sub-name\n" +
+                "/providers/Microsoft.Billing/billingAccounts/.../billingSubscriptions/xyz"
+              }
+              spellCheck={false}
+              autoComplete="off"
+              autoCorrect="off"
+              className="min-h-[140px] w-full resize-y rounded-md border border-border bg-background px-2 py-1.5 font-mono text-2xs outline-none focus:ring-1 focus:ring-ring"
+              aria-label="Subscription IDs to bulk-select"
+            />
+            {csvPasteResult && (
+              <div
+                className={
+                  "rounded-md border p-2 text-2xs " +
+                  (csvPasteResult.matched > 0
+                    ? "border-success/40 bg-success/5"
+                    : "border-warning/40 bg-warning/10")
+                }
+                role="status"
+                aria-live="polite"
+              >
+                <p>
+                  <strong>{csvPasteResult.matched}</strong> token
+                  {csvPasteResult.matched === 1 ? "" : "s"} matched and
+                  added to the selection.
+                </p>
+                {csvPasteResult.unknown.length > 0 && (
+                  <details className="mt-1">
+                    <summary className="cursor-pointer font-medium text-warning">
+                      {csvPasteResult.unknown.length} unresolved token
+                      {csvPasteResult.unknown.length === 1 ? "" : "s"}
+                    </summary>
+                    <ul className="mt-1 max-h-32 overflow-auto pl-3 font-mono">
+                      {csvPasteResult.unknown.slice(0, 50).map((tok, i) => (
+                        <li key={i} className="break-all">
+                          {tok}
+                        </li>
+                      ))}
+                      {csvPasteResult.unknown.length > 50 && (
+                        <li className="text-muted-foreground">
+                          (…+{csvPasteResult.unknown.length - 50} more)
+                        </li>
+                      )}
+                    </ul>
+                  </details>
+                )}
+              </div>
+            )}
+            <p className="text-3xs text-muted-foreground">
+              Resolution order per token: ARM id → AAD subscriptionId →
+              billing-sub name → last path segment.
+            </p>
+          </div>
+        }
+        confirmText="Apply"
+        cancelText="Close"
+        onConfirm={() => {
+          applyCsvPaste();
+        }}
+        onCancel={() => setCsvPasteOpen(false)}
       />
     </div>
   );
