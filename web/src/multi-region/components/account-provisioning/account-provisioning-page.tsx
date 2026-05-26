@@ -4,6 +4,43 @@
  * `?step=...`. The `import existing accounts` flow remains as a sibling tab
  * since it is a different action class.
  *
+ * 2026-05-26 wave-8 (Opus deep pass):
+ *   - Lifted `PerSubSparkline` to module scope so it doesn't re-create per
+ *     render of the parent (was an inline component, churned every keystroke
+ *     on the filter inputs while a run was in flight).
+ *   - Moved `perSubSummary` + `confirmMessage` + the dispatch-preview
+ *     derivation into `React.useMemo` hooks at the component scope so they
+ *     don't recompute on every render of the result step / hidden-dialog.
+ *   - Added `Ctrl+Enter` (submit from Submit step) and `ArrowLeft` /
+ *     `ArrowRight` to walk enabled wizard steps. ESC keeps its existing
+ *     destructive-cancel-with-confirm behaviour.
+ *   - Wired `aria-current="step"` on the active AnimatedTabs entry and a
+ *     `role="progressbar"` mirror on the per-sub progress bar (Radix
+ *     Progress is already a `<progress>` but the per-sub variant uses our
+ *     internal component — explicit role + valuenow/valuemin/valuemax keep
+ *     it screen-reader correct).
+ *   - Per-region/by-sub toggle on the mid-run live rollup so an operator
+ *     debugging a stuck region can group by region instead of by sub
+ *     (defender-side telemetry view).
+ *   - Resume-aborted-run banner: when a persisted `attemptStartedAt`
+ *     outlives a hard reload, the configure step shows "Previous run
+ *     interrupted at sub X/Y — see audit log for the partial state".
+ *   - Defender-grade audit payload (per `_bypass_modify_delete.md` —
+ *     state-change operations should be reconstructable from the audit
+ *     trail alone): every submit now records a stable `attemptId` UUID,
+ *     a preview of the dispatch plan (first 10 pairs), the
+ *     `tokenExpirySecAtSubmit` (so a defender reviewing a 401 storm can
+ *     tell whether the token was already near-expiry), and the unique
+ *     tenant id set the run spans.
+ *   - "Post-creation enumeration preview" panel on the Review step
+ *     (corpus: NetSPI MicroBurst `Get-AzBatchAccounts` — every new Batch
+ *     account is discoverable via `Microsoft.Batch/batchAccounts` list).
+ *     Mirrors what an attacker enumerating this tenant would see immediately
+ *     after a successful run, so the operator has informed-consent at the
+ *     irreversible-action boundary.
+ *   - Per-step elapsed time chip rendered in the step header so the
+ *     operator can see how long they've spent reading vs. acting.
+ *
  * 2026-05-24 redesign: per-page improvement loop. Focus areas:
  *   - Cancellable inter-sub waits (Stop now aborts both the orchestrator
  *     and the configured delay between sub dispatches).
@@ -607,6 +644,91 @@ function azurePortalUrl(args: {
   return `https://portal.azure.com/#@/resource${resourceId}/overview`;
 }
 
+/**
+ * Stable per-sub sparkline. Lifted to module scope from the parent
+ * component so it doesn't get re-created on every parent render (which
+ * happens at 1Hz while the ticker effect is running). React.memo so
+ * sub rows with unchanged counts skip re-render.
+ */
+const PerSubSparkline: React.FC<{
+  created: number;
+  failed: number;
+  total: number;
+}> = React.memo(({ created, failed, total }) => {
+  const cells = Math.max(1, Math.min(total, 24));
+  const out: React.ReactNode[] = [];
+  let createdLeft = created;
+  let failedLeft = failed;
+  for (let i = 0; i < cells; i++) {
+    let tone = "bg-muted";
+    if (createdLeft > 0) {
+      tone = "bg-success/80";
+      createdLeft -= 1;
+    } else if (failedLeft > 0) {
+      tone = "bg-destructive/80";
+      failedLeft -= 1;
+    }
+    out.push(
+      <span
+        key={i}
+        className={cn("h-2.5 w-1 rounded-sm", tone)}
+        aria-hidden
+      />,
+    );
+  }
+  return (
+    <span
+      className="inline-flex items-center gap-[2px]"
+      aria-label={`${created} created, ${failed} failed of ${total}`}
+    >
+      {out}
+    </span>
+  );
+});
+PerSubSparkline.displayName = "PerSubSparkline";
+
+/**
+ * Cheap RFC-4122-ish v4 UUID. Used for stable `attemptId` audit
+ * correlation — the audit log records this id at submit, complete,
+ * stop, and esc_cancel, so a defender reviewing the trail can scope
+ * every event back to a single user intent. Falls back to
+ * `crypto.randomUUID()` when available (browsers since 2022); fallback
+ * is Math.random-based so it's not collision-resistant in a strict
+ * cryptographic sense — fine for audit correlation, not fine for
+ * security tokens. Corpus reference: `_bypass_modify_delete.md`
+ * § "state-change operations should be reconstructable from the
+ * audit trail alone".
+ */
+function newAttemptId(): string {
+  try {
+    if (
+      typeof crypto !== "undefined" &&
+      typeof crypto.randomUUID === "function"
+    ) {
+      return crypto.randomUUID();
+    }
+  } catch {
+    /* fall through */
+  }
+  // Non-crypto fallback — purely for correlation, never for auth.
+  return "atmpt-" + Math.random().toString(36).slice(2, 10) + "-" + Date.now().toString(36);
+}
+
+/**
+ * Persisted resume hint — when a hard reload interrupts a run mid-batch,
+ * the next mount surfaces a banner that says "Previous run was
+ * interrupted at sub X/Y — see audit log". Kept tiny so localStorage
+ * pressure stays negligible. The wizard draft (regions, subs, etc.)
+ * persists separately via `usePersistedState`.
+ */
+interface AttemptResumeHint {
+  attemptId: string;
+  attemptStartedAt: string;
+  completedSubs: number;
+  totalSubs: number;
+  currentSubId: string | null;
+}
+
 const AccountProvisioningPageInner: React.FC<AccountProvisioningPageProps> = ({
   orchestrator,
 }) => {
@@ -740,6 +862,55 @@ const AccountProvisioningPageInner: React.FC<AccountProvisioningPageProps> = ({
   const [attemptStartedAt, setAttemptStartedAt] = React.useState<string | null>(
     null,
   );
+  // Stable correlation id for the current attempt — used as the audit
+  // log's `attemptId` field so submit / complete / stop / esc_cancel
+  // events for the same user intent can be grouped server-side.
+  // Generated fresh at each submit; null between runs. Per
+  // `_bypass_modify_delete.md` § audit-reconstruction.
+  const [attemptId, setAttemptId] = React.useState<string | null>(null);
+  // Persisted resume hint for mid-batch interruptions — see
+  // `AttemptResumeHint` (module scope). When a hard reload happens
+  // while a run is in flight, the next mount reads this and surfaces
+  // a banner on the configure step. Cleared on completion / cancel.
+  const [resumeHint, setResumeHint] =
+    usePersistedState<AttemptResumeHint | null>(
+      "abm.account-provisioning.resume-hint",
+      null,
+      {
+        version: 1,
+        migrate: (raw) => {
+          if (!raw || typeof raw !== "object") return null;
+          const r = raw as Partial<AttemptResumeHint>;
+          if (
+            typeof r.attemptId !== "string" ||
+            typeof r.attemptStartedAt !== "string" ||
+            typeof r.completedSubs !== "number" ||
+            typeof r.totalSubs !== "number"
+          ) {
+            return null;
+          }
+          return {
+            attemptId: r.attemptId,
+            attemptStartedAt: r.attemptStartedAt,
+            completedSubs: r.completedSubs,
+            totalSubs: r.totalSubs,
+            currentSubId:
+              typeof r.currentSubId === "string" ? r.currentSubId : null,
+          };
+        },
+      },
+    );
+  // Per-step elapsed-time tracker. Whenever `currentStep` changes we
+  // capture the wall-clock at that moment; the step header renders
+  // the rolling delta. Pure UI signal — no persistence, no audit
+  // recording (would be too chatty).
+  const [stepEnteredAt, setStepEnteredAt] = React.useState<number>(() =>
+    Date.now(),
+  );
+  // Re-render every ~5s while the user is on a step so the elapsed
+  // chip refreshes. Cheap; cleaned up by useAbortableEffect on step
+  // change / unmount.
+  const [, setStepTick] = React.useState(0);
   // Wall-clock duration of the last completed attempt, in ms. Captured
   // when isRunning flips false so the result step can show a stable
   // "elapsed N min" stat without ticking after completion.
@@ -1224,6 +1395,31 @@ const AccountProvisioningPageInner: React.FC<AccountProvisioningPageProps> = ({
     [isRunning],
   );
 
+  // Step-elapsed timer: re-capture `stepEnteredAt` whenever the step
+  // changes, and tick once every 5s so the chip in the step header
+  // refreshes. Aborted on step change / unmount.
+  React.useEffect(() => {
+    setStepEnteredAt(Date.now());
+    setStepTick(0);
+  }, [currentStep]);
+  useAbortableEffect(
+    (signal) => {
+      const id = setInterval(() => {
+        if (signal.aborted) return;
+        setStepTick((n) => n + 1);
+      }, 5000);
+      return () => clearInterval(id);
+    },
+    [currentStep],
+  );
+
+  // Mid-run rollup grouping toggle. Default by-sub matches the wave-1
+  // sparkline layout; by-region transposes the matrix so an operator
+  // debugging a stuck region can see all subs that hit it at a glance.
+  const [liveGrouping, setLiveGrouping] = React.useState<"sub" | "region">(
+    "sub",
+  );
+
   // Auto-advance to "result" when submit completes — but ONLY for an
   // attempt that has actually started in this session. Previously the
   // effect fired the moment the user reached the submit step because
@@ -1291,7 +1487,9 @@ const AccountProvisioningPageInner: React.FC<AccountProvisioningPageProps> = ({
     setSubmitError(null);
     setLastAttemptDurationMs(null);
     const attemptStart = new Date();
+    const newId = newAttemptId();
     setAttemptStartedAt(attemptStart.toISOString());
+    setAttemptId(newId);
 
     // Fresh AbortController for this submit run. Stop button can call
     // .abort() on it to bail the inter-sub wait early; the orchestrator
@@ -1311,21 +1509,59 @@ const AccountProvisioningPageInner: React.FC<AccountProvisioningPageProps> = ({
     const errors: Array<{ subscriptionId: string; error: string }> = [];
     let cancelled = false;
 
+    // Seed the persisted resume hint so a hard-reload mid-run can
+    // surface a banner on the configure step. Cleared on
+    // completion / cancel. Per `_bypass_modify_delete.md` § audit-
+    // reconstruction — even an interrupted run should leave breadcrumbs.
+    setResumeHint({
+      attemptId: newId,
+      attemptStartedAt: attemptStart.toISOString(),
+      completedSubs: 0,
+      totalSubs: subs.length,
+      currentSubId: subs[0] ?? null,
+    });
+
+    // Compute the unique tenant id set the run spans — useful in the
+    // audit log so a defender can scope ARM-write-throttle alerts back
+    // to a single operator action that hit N tenants.
+    const tenantIdsSet = new Set<string>();
+    for (const sid of subs) {
+      const known = state.subscriptions.find((s) => s.subscriptionId === sid);
+      if (known?.tenantId) tenantIdsSet.add(known.tenantId);
+    }
+    const tenantIds = Array.from(tenantIdsSet);
+    // Token expiry at submit — if a defender investigates a 401 burst,
+    // they can immediately tell whether the token was already
+    // near-expiry when the operator clicked Create.
+    const tokenExpirySecAtSubmit = armTokenTracker.secondsUntilExpiry;
+
     // Audit the submit at the start of the run — captures the intent
     // even if the run is cancelled or partially fails. Result counters
-    // are recorded on completion below.
+    // are recorded on completion below. Payload enriched per
+    // `_bypass_modify_delete.md`: a defender reviewing the trail must
+    // be able to reconstruct the full operator intent (what, where,
+    // when, with which token, against which tenants).
     auditLog.record({
       actor: auditActor,
       action: "provision_accounts.submit",
       target: `subs:${subs.length} regions:${selectedRegions.length} dispatch:${dispatchPlan.length}`,
       status: "success",
       details: {
+        attemptId: newId,
         subscriptionIds: subs,
+        tenantIds,
         regions: selectedRegions,
         perSubDelaySec,
         skipExisting,
         skippedExistingCount,
         dispatchTotal: dispatchPlan.length,
+        // Preview first 10 (sub, region) pairs verbatim so the
+        // defender doesn't have to cross-reference subs+regions to
+        // reconstruct intent. Bounded to avoid blowing the audit row.
+        dispatchPlanPreview: dispatchPlan.slice(0, 10),
+        tokenExpirySecAtSubmit,
+        userAgent:
+          typeof navigator !== "undefined" ? navigator.userAgent : null,
       },
     });
 
@@ -1372,6 +1608,15 @@ const AccountProvisioningPageInner: React.FC<AccountProvisioningPageProps> = ({
         cancelled = true;
         break;
       }
+      // Update the persisted resume hint after each sub completes so
+      // a hard reload sees the right "X of Y done" state.
+      setResumeHint({
+        attemptId: newId,
+        attemptStartedAt: attemptStart.toISOString(),
+        completedSubs: i + 1,
+        totalSubs: subs.length,
+        currentSubId: subs[i + 1] ?? null,
+      });
       // Inter-sub delay. Skip for the last sub — no one's waiting.
       // Cancellable via AbortController so a Stop click halts the wait
       // immediately rather than letting it run to completion.
@@ -1416,6 +1661,10 @@ const AccountProvisioningPageInner: React.FC<AccountProvisioningPageProps> = ({
     setLastAttemptDurationMs(elapsedMs);
     if (submitAbortRef.current === ac) submitAbortRef.current = null;
     setIsRunning(false);
+    // Clear the resume hint — the run is no longer in flight, even if
+    // it cancelled / errored partway through. The audit log retains
+    // the full breadcrumb trail for forensic reconstruction.
+    setResumeHint(null);
 
     // Audit completion — surface whether the run finished, was
     // cancelled, or accrued errors so the audit-log page paints the
@@ -1427,10 +1676,13 @@ const AccountProvisioningPageInner: React.FC<AccountProvisioningPageProps> = ({
       target: `subs:${subs.length} regions:${selectedRegions.length}`,
       status: errors.length === 0 && !cancelled ? "success" : "failure",
       details: {
+        attemptId: newId,
+        tenantIds,
         elapsedMs,
         cancelled,
         errorsCount: errors.length,
         errors: errors.slice(0, 5),
+        dispatchTotal: dispatchPlan.length,
       },
       error:
         errors.length > 0
@@ -1446,16 +1698,21 @@ const AccountProvisioningPageInner: React.FC<AccountProvisioningPageProps> = ({
     selectedRegions,
     perSubDelaySec,
     auditActor,
-    dispatchPlan.length,
+    dispatchPlan,
     skipExisting,
     skippedExistingCount,
+    state.subscriptions,
+    armTokenTracker.secondsUntilExpiry,
+    setResumeHint,
   ]);
 
   // Stop = abort the inter-sub timer + tell the orchestrator to bail
   // mid-region. Both signals fire; whichever the loop is sitting on
   // gets the message. We also audit the explicit stop so the audit-log
   // can correlate the operator's intent with the per-region failures
-  // that follow.
+  // that follow. Audit payload includes the `attemptId` so a defender
+  // can group the stop event with the originating submit / complete
+  // pair (per `_bypass_modify_delete.md` § audit-reconstruction).
   const handleStop = React.useCallback(() => {
     submitAbortRef.current?.abort();
     orchestrator.cancel();
@@ -1464,8 +1721,9 @@ const AccountProvisioningPageInner: React.FC<AccountProvisioningPageProps> = ({
       action: "provision_accounts.stop",
       target: `subs:${effectiveSubscriptionIds.length}`,
       status: "success",
+      details: { attemptId },
     });
-  }, [orchestrator, auditActor, effectiveSubscriptionIds.length]);
+  }, [orchestrator, auditActor, effectiveSubscriptionIds.length, attemptId]);
 
   const handleDiscover = React.useCallback(async () => {
     // Discover walks one subscription at a time. When the operator has
@@ -1609,6 +1867,85 @@ const AccountProvisioningPageInner: React.FC<AccountProvisioningPageProps> = ({
     allowInInputs: true,
   });
 
+  // Ctrl/Cmd+Enter — submit when the operator is on the Submit step
+  // (or Review, jumping forward one step). Gated on `configureValid &&
+  // canPassPreflight && dispatchPlan.length > 0` and `!isRunning` so
+  // a hot-keyboarded operator can't bypass disabled-state checks.
+  // Disabled while a run is in flight or a destructive dialog is open.
+  const canHotkeySubmit =
+    !isRunning &&
+    configureValid &&
+    canPassPreflight &&
+    dispatchPlan.length > 0 &&
+    confirmHidden &&
+    escCancelHidden;
+  const handleHotkeySubmit = React.useCallback(
+    (e: KeyboardEvent) => {
+      // Avoid hijacking Ctrl+Enter when the user is typing a newline
+      // in a textarea / contenteditable. The current page has no
+      // textareas, but defensive.
+      const tag = (e.target as HTMLElement | null)?.tagName?.toLowerCase();
+      if (tag === "textarea") return;
+      if (currentStep === "submit" || currentStep === "review") {
+        e.preventDefault();
+        if (currentStep === "review") setStep("submit");
+        requestSubmit();
+      }
+    },
+    [currentStep, setStep, requestSubmit],
+  );
+  useShortcut("Mod+Enter", handleHotkeySubmit, {
+    enabled: canHotkeySubmit,
+    preventDefault: false, // handler does it explicitly when relevant
+    allowInInputs: true,
+  });
+  // Also bind plain Ctrl+Enter on non-Mac users; `Mod+` already maps
+  // to Ctrl off-Mac, so this is a defensive alias for keyboards that
+  // report Ctrl explicitly under different layouts.
+  useShortcut("Ctrl+Enter", handleHotkeySubmit, {
+    enabled: canHotkeySubmit,
+    preventDefault: false,
+    allowInInputs: true,
+  });
+
+  // Arrow keys → walk enabled wizard steps. Skip-over disabled steps
+  // so an operator who hasn't passed preflight can't accidentally land
+  // on submit. Disabled while a run is in flight (the operator should
+  // be watching, not navigating).
+  const walkStep = React.useCallback(
+    (dir: -1 | 1) => {
+      const idx = STEP_ORDER.indexOf(currentStep);
+      let next = idx + dir;
+      while (next >= 0 && next < STEP_ORDER.length) {
+        const candidate = STEP_ORDER[next];
+        if (!isStepDisabled(candidate)) {
+          setStep(candidate);
+          return;
+        }
+        next += dir;
+      }
+    },
+    [currentStep, isStepDisabled, setStep],
+  );
+  useShortcut(
+    "ArrowLeft",
+    () => walkStep(-1),
+    {
+      enabled: !isRunning && !isDiscovering && activeTab === "create",
+      preventDefault: false,
+      // No allowInInputs — we don't want to hijack arrow keys inside
+      // text inputs and the region/sub filter boxes.
+    },
+  );
+  useShortcut(
+    "ArrowRight",
+    () => walkStep(1),
+    {
+      enabled: !isRunning && !isDiscovering && activeTab === "create",
+      preventDefault: false,
+    },
+  );
+
   const handleEscCancelConfirm = React.useCallback(() => {
     setEscCancelHidden(true);
     submitAbortRef.current?.abort();
@@ -1618,8 +1955,9 @@ const AccountProvisioningPageInner: React.FC<AccountProvisioningPageProps> = ({
       action: "provision_accounts.esc_cancel",
       target: `running:${isRunning ? "1" : "0"} discovering:${isDiscovering ? "1" : "0"}`,
       status: "success",
+      details: { attemptId },
     });
-  }, [orchestrator, auditActor, isRunning, isDiscovering]);
+  }, [orchestrator, auditActor, isRunning, isDiscovering, attemptId]);
 
   // ---- Subscription selector (shared) --------------------------------------
   // Group the picker by owning Azure account when multiple operators are
@@ -1960,101 +2298,29 @@ const AccountProvisioningPageInner: React.FC<AccountProvisioningPageProps> = ({
   const atMaxRegions =
     selectedRegions.length >= DEFAULT_CONFIG.maxRegionsPerRequest;
 
-  // ---- Confirmation dialog body --------------------------------------------
-  // Total = dispatch plan size (post-skip), not raw N×M. Surfaces the
-  // skipped count so the operator can audit what's being dropped.
-  const totalToCreate = dispatchPlan.length;
-  const confirmMessage = (
-    <div className="space-y-3 text-sm leading-relaxed">
-      <p className="m-0">
-        You are about to create{" "}
-        <span className="font-semibold text-foreground">
-          {totalToCreate} Batch account
-          {totalToCreate === 1 ? "" : "s"}
-        </span>
-        {effectiveSubscriptionIds.length > 1 && (
-          <>
-            {" "}
-            across {effectiveSubscriptionIds.length} subscriptions ×{" "}
-            {selectedRegions.length} region
-            {selectedRegions.length === 1 ? "" : "s"}
-          </>
-        )}
-        {skippedExistingCount > 0 && (
-          <>
-            {" "}
-            <span className="text-muted-foreground">
-              (skipping {skippedExistingCount} existing)
-            </span>
-          </>
-        )}
-        :
-      </p>
-      {effectiveSubscriptionIds.length > 1 && (
-        <div className="rounded-md border border-border bg-surface-sunken/60 px-3 py-2 text-xs">
-          <div className="font-semibold text-foreground">Subscriptions</div>
-          <ul className="mt-1 list-disc space-y-0.5 pl-4 text-muted-foreground">
-            {effectiveSubscriptionDetails.map((s) => {
-              const regionsForSub =
-                dispatchPerSub.get(s.subscriptionId) ?? [];
-              return (
-                <li key={s.subscriptionId}>
-                  <span className="text-foreground">{s.displayName}</span>{" "}
-                  <span className="font-mono">
-                    {(s.subscriptionId ?? "").slice(0, 8)}&hellip;
-                  </span>
-                  {s.ownerAccountLabel && (
-                    <span> · {s.ownerAccountLabel}</span>
-                  )}
-                  <span className="ml-1 text-2xs">
-                    ({regionsForSub.length} region
-                    {regionsForSub.length === 1 ? "" : "s"})
-                  </span>
-                </li>
-              );
-            })}
-          </ul>
-        </div>
-      )}
-      <div className="max-h-20 overflow-y-auto rounded-md border border-border bg-surface-sunken/60 px-3 py-2 text-xs text-muted-foreground">
-        <span className="font-semibold text-foreground">Regions:</span>{" "}
-        {selectedRegions.join(", ")}
-      </div>
-      {effectiveSubscriptionIds.length > 1 && (
-        <Alert variant="info" className="px-3 py-2 text-xs">
-          <Info className="h-4 w-4" aria-hidden />
-          <AlertDescription className="text-xs leading-relaxed">
-            Subscriptions are processed sequentially with a{" "}
-            <span className="font-semibold">{perSubDelaySec}s delay</span>{" "}
-            between each. Estimated wall-clock minimum:{" "}
-            <span className="font-mono">
-              {formatEta(
-                (effectiveSubscriptionIds.length - 1) * perSubDelaySec,
-              )}
-            </span>{" "}
-            of inter-sub wait plus per-region creation time.
-          </AlertDescription>
-        </Alert>
-      )}
-      <Alert variant="warning" className="px-3 py-2 text-xs">
-        <AlertTriangle className="h-4 w-4" aria-hidden />
-        <AlertDescription className="text-xs leading-relaxed">
-          Each account incurs Azure storage and management overhead. Costs scale
-          with the number of pools and nodes you later attach.
-        </AlertDescription>
-      </Alert>
-      <Alert variant="destructive" className="px-3 py-2 text-xs">
-        <AlertCircle className="h-4 w-4" aria-hidden />
-        <AlertDescription className="text-xs leading-relaxed">
-          <span className="font-semibold">
-            This action is irreversible from this UI.
-          </span>{" "}
-          Account and resource group cleanup must be performed manually in the
-          Azure portal or via CLI.
-        </AlertDescription>
-      </Alert>
-    </div>
-  );
+  // (confirmMessage + totalToCreate are now memoized at component
+  // scope above so they don't rebuild on every parent render. See
+  // the `React.useMemo` block before `renderConfigure`.)
+
+  // Step-elapsed chip — rendered in each step's CardHeader. Re-renders
+  // every ~5s via the `stepEnteredAt` effect ticker above so it stays
+  // fresh without forcing a 1Hz re-render of the whole page. Hidden
+  // when the operator is mid-run (the submit progress already shows
+  // a wall-clock).
+  const stepElapsedSec = Math.floor((Date.now() - stepEnteredAt) / 1000);
+  const stepElapsedChip = !isRunning && stepElapsedSec > 5 ? (
+    <span
+      className="inline-flex items-center gap-1 rounded-full border border-border bg-muted/40 px-2 py-0.5 text-2xs text-muted-foreground tabular-nums"
+      title={`Time on this step (since you last navigated to it)`}
+      aria-label={`Time on this step: ${formatEta(stepElapsedSec)}`}
+    >
+      <Loader2
+        className="h-2.5 w-2.5"
+        aria-hidden
+      />
+      {formatEta(stepElapsedSec)} on step
+    </span>
+  ) : null;
 
   // ---- DataTable for provisioned accounts ----------------------------------
   // Scope to the current attempt so the result table doesn't bleed in
@@ -2193,6 +2459,233 @@ const AccountProvisioningPageInner: React.FC<AccountProvisioningPageProps> = ({
     [],
   );
 
+  // ---- Result-step rollup (memoized at component scope) --------------------
+  // Was previously an IIFE inside `renderResult()`, which meant it
+  // recomputed on every parent render even when the operator was
+  // sitting on another step. Hoist + memoize so it only changes when
+  // its real inputs change.
+  const perSubSummary = React.useMemo(() => {
+    const map = new Map<
+      string,
+      {
+        displayName: string;
+        created: number;
+        failed: number;
+        total: number;
+      }
+    >();
+    for (const a of attemptAccounts) {
+      const known = state.subscriptions.find(
+        (s) => s.subscriptionId === a.subscriptionId,
+      );
+      const entry = map.get(a.subscriptionId) ?? {
+        displayName:
+          known?.displayName ??
+          (a.subscriptionId ? a.subscriptionId.slice(0, 8) + "…" : "—"),
+        created: 0,
+        failed: 0,
+        total: 0,
+      };
+      entry.total += 1;
+      if (a.provisioningState === "created") entry.created += 1;
+      if (a.provisioningState === "failed") entry.failed += 1;
+      map.set(a.subscriptionId, entry);
+    }
+    return Array.from(map.entries()).map(([subscriptionId, v]) => ({
+      subscriptionId,
+      ...v,
+    }));
+  }, [attemptAccounts, state.subscriptions]);
+
+  // Mid-run rollup transposed by region — drives the "Group by region"
+  // toggle so the operator can see, per region, which subs already
+  // landed and which are still pending. Computed only when the
+  // grouping toggle is set; otherwise an empty array (cheap memo).
+  const liveRegionSummary = React.useMemo(() => {
+    if (liveGrouping !== "region") return [];
+    const map = new Map<
+      string,
+      { created: number; failed: number; total: number }
+    >();
+    for (const r of selectedRegions) {
+      // Total per region = number of subs that have this region in
+      // their dispatch plan (post-skip).
+      let totalForRegion = 0;
+      for (const sid of effectiveSubscriptionIds) {
+        const regions = dispatchPerSub.get(sid) ?? selectedRegions;
+        if (regions.includes(r)) totalForRegion += 1;
+      }
+      map.set(r, { created: 0, failed: 0, total: totalForRegion });
+    }
+    for (const a of attemptAccounts) {
+      const entry = map.get(a.region);
+      if (!entry) continue;
+      if (a.provisioningState === "created") entry.created += 1;
+      if (a.provisioningState === "failed") entry.failed += 1;
+    }
+    return Array.from(map.entries()).map(([region, v]) => ({
+      region,
+      ...v,
+    }));
+  }, [
+    liveGrouping,
+    selectedRegions,
+    effectiveSubscriptionIds,
+    dispatchPerSub,
+    attemptAccounts,
+  ]);
+
+  // ---- Post-creation enumeration preview ----------------------------------
+  // What an attacker (or any operator with Reader on the sub) will see
+  // immediately after this run completes, via the equivalent of NetSPI
+  // MicroBurst's `Get-AzBatchAccount` enumeration. Surfaces the
+  // {accountName, region, resourceGroup, subscriptionId} quadruple per
+  // planned account so the operator has informed consent at the
+  // irreversible-action boundary. Corpus reference: NetSPI
+  // `MicroBurst\AzureRM\Get-AzPasswords.ps1` and the
+  // `Microsoft.Batch/batchAccounts` list pattern. We do NOT
+  // hit ARM — this is a pure preview of what the dispatch plan will
+  // create, mirroring the orchestrator's per-region account name
+  // generator. Bounded to 12 rows so the dialog stays scannable.
+  const enumerationPreview = React.useMemo(() => {
+    const rows: Array<{
+      subscriptionId: string;
+      subscriptionLabel: string;
+      region: string;
+      accountNamePattern: string;
+      resourceGroupPattern: string;
+    }> = [];
+    for (const p of dispatchPlan) {
+      const known = state.subscriptions.find(
+        (s) => s.subscriptionId === p.subscriptionId,
+      );
+      // The orchestrator generates account names via the provisioner
+      // agent. Use a stable, transparent pattern here so the operator
+      // sees the SHAPE of what will be created. The actual name may
+      // differ — we annotate "(orchestrator may suffix)" to keep
+      // expectations correct without claiming we know the final name.
+      rows.push({
+        subscriptionId: p.subscriptionId,
+        subscriptionLabel: known?.displayName ?? p.subscriptionId.slice(0, 8) + "…",
+        region: p.region,
+        accountNamePattern: `batch${p.region}<6 hex>`,
+        resourceGroupPattern: `rg-batch-${p.region}`,
+      });
+      if (rows.length >= 12) break;
+    }
+    return rows;
+  }, [dispatchPlan, state.subscriptions]);
+
+  // Memoize the confirmation-dialog message body. Previously rebuilt
+  // on every parent render even when the dialog was hidden (which is
+  // ~all the time). Pure-derivation, depends only on the visible
+  // inputs.
+  const confirmMessage = React.useMemo(
+    () => (
+      <div className="space-y-3 text-sm leading-relaxed">
+        <p className="m-0">
+          You are about to create{" "}
+          <span className="font-semibold text-foreground">
+            {dispatchPlan.length} Batch account
+            {dispatchPlan.length === 1 ? "" : "s"}
+          </span>
+          {effectiveSubscriptionIds.length > 1 && (
+            <>
+              {" "}
+              across {effectiveSubscriptionIds.length} subscriptions ×{" "}
+              {selectedRegions.length} region
+              {selectedRegions.length === 1 ? "" : "s"}
+            </>
+          )}
+          {skippedExistingCount > 0 && (
+            <>
+              {" "}
+              <span className="text-muted-foreground">
+                (skipping {skippedExistingCount} existing)
+              </span>
+            </>
+          )}
+          :
+        </p>
+        {effectiveSubscriptionIds.length > 1 && (
+          <div className="rounded-md border border-border bg-surface-sunken/60 px-3 py-2 text-xs">
+            <div className="font-semibold text-foreground">Subscriptions</div>
+            <ul className="mt-1 list-disc space-y-0.5 pl-4 text-muted-foreground">
+              {effectiveSubscriptionDetails.map((s) => {
+                const regionsForSub =
+                  dispatchPerSub.get(s.subscriptionId) ?? [];
+                return (
+                  <li key={s.subscriptionId}>
+                    <span className="text-foreground">{s.displayName}</span>{" "}
+                    <span className="font-mono">
+                      {(s.subscriptionId ?? "").slice(0, 8)}&hellip;
+                    </span>
+                    {s.ownerAccountLabel && (
+                      <span> · {s.ownerAccountLabel}</span>
+                    )}
+                    <span className="ml-1 text-2xs">
+                      ({regionsForSub.length} region
+                      {regionsForSub.length === 1 ? "" : "s"})
+                    </span>
+                  </li>
+                );
+              })}
+            </ul>
+          </div>
+        )}
+        <div className="max-h-20 overflow-y-auto rounded-md border border-border bg-surface-sunken/60 px-3 py-2 text-xs text-muted-foreground">
+          <span className="font-semibold text-foreground">Regions:</span>{" "}
+          {selectedRegions.join(", ")}
+        </div>
+        {effectiveSubscriptionIds.length > 1 && (
+          <Alert variant="info" className="px-3 py-2 text-xs">
+            <Info className="h-4 w-4" aria-hidden />
+            <AlertDescription className="text-xs leading-relaxed">
+              Subscriptions are processed sequentially with a{" "}
+              <span className="font-semibold">{perSubDelaySec}s delay</span>{" "}
+              between each. Estimated wall-clock minimum:{" "}
+              <span className="font-mono">
+                {formatEta(
+                  (effectiveSubscriptionIds.length - 1) * perSubDelaySec,
+                )}
+              </span>{" "}
+              of inter-sub wait plus per-region creation time.
+            </AlertDescription>
+          </Alert>
+        )}
+        <Alert variant="warning" className="px-3 py-2 text-xs">
+          <AlertTriangle className="h-4 w-4" aria-hidden />
+          <AlertDescription className="text-xs leading-relaxed">
+            Each account incurs Azure storage and management overhead. Costs scale
+            with the number of pools and nodes you later attach.
+          </AlertDescription>
+        </Alert>
+        <Alert variant="destructive" className="px-3 py-2 text-xs">
+          <AlertCircle className="h-4 w-4" aria-hidden />
+          <AlertDescription className="text-xs leading-relaxed">
+            <span className="font-semibold">
+              This action is irreversible from this UI.
+            </span>{" "}
+            Account and resource group cleanup must be performed manually in the
+            Azure portal or via CLI.
+          </AlertDescription>
+        </Alert>
+      </div>
+    ),
+    [
+      dispatchPlan.length,
+      effectiveSubscriptionIds.length,
+      effectiveSubscriptionDetails,
+      selectedRegions,
+      skippedExistingCount,
+      perSubDelaySec,
+      dispatchPerSub,
+    ],
+  );
+  // `totalToCreate` is a stable derivation of the same plan and is
+  // re-used below in the Submit button label and the dialog confirmText.
+  const totalToCreate = dispatchPlan.length;
+
   // ---- Step body renderers --------------------------------------------------
   const renderConfigure = (): React.ReactNode => {
     const filterQuery = regionFilter.trim().toLowerCase();
@@ -2239,15 +2732,59 @@ const AccountProvisioningPageInner: React.FC<AccountProvisioningPageProps> = ({
     return (
       <Card>
         <CardHeader className="pb-3">
-          <CardTitle className="text-sm font-semibold uppercase tracking-wider text-muted-foreground">
-            Configuration
-          </CardTitle>
-          <CardDescription>
-            Choose a subscription and target regions. Each region creates one
-            Batch account.
-          </CardDescription>
+          <div className="flex flex-wrap items-start justify-between gap-2">
+            <div className="flex flex-col gap-0.5">
+              <CardTitle className="text-sm font-semibold uppercase tracking-wider text-muted-foreground">
+                Configuration
+              </CardTitle>
+              <CardDescription>
+                Choose a subscription and target regions. Each region creates one
+                Batch account.
+              </CardDescription>
+            </div>
+            {stepElapsedChip}
+          </div>
         </CardHeader>
         <CardContent className="flex flex-col gap-4">
+          {/* Resume-aborted-run banner — surfaced only when a hard
+              reload interrupted a previous batch and we still have a
+              persisted attemptId in localStorage. The banner is
+              actionable (dismiss + jump-to-audit-log) so the operator
+              can confirm the partial state before re-submitting. */}
+          {resumeHint && resumeHint.attemptId !== attemptId && (
+            <Alert variant="warning" className="px-3 py-2 text-xs" role="alert">
+              <AlertTriangle className="h-4 w-4" aria-hidden />
+              <AlertDescription className="flex flex-wrap items-center gap-2 text-xs leading-relaxed">
+                <span>
+                  <span className="font-semibold">
+                    Previous provisioning run was interrupted.
+                  </span>{" "}
+                  Completed {resumeHint.completedSubs} of {resumeHint.totalSubs}{" "}
+                  subscription{resumeHint.totalSubs === 1 ? "" : "s"} (started{" "}
+                  <span className="font-mono">
+                    {new Date(resumeHint.attemptStartedAt).toLocaleTimeString()}
+                  </span>
+                  ). Audit attemptId{" "}
+                  <span className="font-mono">
+                    {resumeHint.attemptId.slice(0, 8)}…
+                  </span>
+                  .
+                </span>
+                <span className="ml-auto inline-flex items-center gap-1">
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="xs"
+                    onClick={() => setResumeHint(null)}
+                    aria-label="Dismiss interrupted-run banner"
+                  >
+                    Dismiss
+                  </Button>
+                </span>
+              </AlertDescription>
+            </Alert>
+          )}
+
           {subscriptionSelector}
 
           <div className="flex flex-col gap-1.5 max-w-[28rem]">
@@ -2508,13 +3045,18 @@ const AccountProvisioningPageInner: React.FC<AccountProvisioningPageProps> = ({
   const renderPreflight = (): React.ReactNode => (
     <Card>
       <CardHeader className="pb-3">
-        <CardTitle className="text-sm font-semibold uppercase tracking-wider text-muted-foreground">
-          Pre-flight checks
-        </CardTitle>
-        <CardDescription>
-          Verifies subscription, region capacity, and naming uniqueness before
-          submission.
-        </CardDescription>
+        <div className="flex flex-wrap items-start justify-between gap-2">
+          <div className="flex flex-col gap-0.5">
+            <CardTitle className="text-sm font-semibold uppercase tracking-wider text-muted-foreground">
+              Pre-flight checks
+            </CardTitle>
+            <CardDescription>
+              Verifies subscription, region capacity, and naming uniqueness before
+              submission.
+            </CardDescription>
+          </div>
+          {stepElapsedChip}
+        </div>
       </CardHeader>
       <CardContent className="flex flex-col gap-4">
         <PreflightChips checks={preflight} />
@@ -2608,12 +3150,17 @@ const AccountProvisioningPageInner: React.FC<AccountProvisioningPageProps> = ({
   const renderReview = (): React.ReactNode => (
     <Card>
       <CardHeader className="pb-3">
-        <CardTitle className="text-sm font-semibold uppercase tracking-wider text-muted-foreground">
-          Review
-        </CardTitle>
-        <CardDescription>
-          Confirm the request below. You can jump back to edit any section.
-        </CardDescription>
+        <div className="flex flex-wrap items-start justify-between gap-2">
+          <div className="flex flex-col gap-0.5">
+            <CardTitle className="text-sm font-semibold uppercase tracking-wider text-muted-foreground">
+              Review
+            </CardTitle>
+            <CardDescription>
+              Confirm the request below. You can jump back to edit any section.
+            </CardDescription>
+          </div>
+          {stepElapsedChip}
+        </div>
       </CardHeader>
       <CardContent className="flex flex-col gap-4">
         <ConfigureFieldsetReadOnly
@@ -2658,6 +3205,78 @@ const AccountProvisioningPageInner: React.FC<AccountProvisioningPageProps> = ({
           </div>
           <PreflightChips checks={preflight} />
         </div>
+
+        {/* Post-creation enumeration preview — defender-side awareness.
+            Corpus: NetSPI MicroBurst — `Get-AzBatchAccount` and the
+            equivalent `az batch account list` enumerate every Batch
+            account in a sub via `Microsoft.Batch/batchAccounts` LIST,
+            with Reader-level RBAC. Surfacing this BEFORE the operator
+            commits the irreversible PUT means they know exactly what
+            an attacker pivoting through the tenant will see post-run. */}
+        {enumerationPreview.length > 0 && (
+          <details
+            className="rounded-md border border-border bg-surface-sunken/40 p-3 text-xs"
+            aria-label="Post-creation enumeration preview"
+          >
+            <summary className="flex cursor-pointer items-center gap-2 text-2xs font-semibold uppercase tracking-wider text-muted-foreground select-none">
+              <Search className="h-3 w-3" aria-hidden />
+              Post-creation enumeration preview
+              <span className="font-normal normal-case tracking-normal text-muted-foreground/80">
+                — what an operator with Reader on these subs will see
+              </span>
+            </summary>
+            <div className="mt-2 flex flex-col gap-1.5">
+              <p className="m-0 text-2xs text-muted-foreground leading-relaxed">
+                After this run completes, every account below is enumerable via{" "}
+                <code className="font-mono text-foreground">
+                  az batch account list
+                </code>{" "}
+                or the equivalent{" "}
+                <code className="font-mono text-foreground">
+                  Microsoft.Batch/batchAccounts
+                </code>{" "}
+                LIST call with{" "}
+                <span className="font-mono text-foreground">Reader</span> RBAC.
+                Account-name pattern shown is the orchestrator's template;
+                the final name may include a suffix.
+              </p>
+              <ul className="m-0 flex flex-col gap-0.5 p-0 text-2xs">
+                {enumerationPreview.map((row, idx) => (
+                  <li
+                    key={`${row.subscriptionId}::${row.region}::${idx}`}
+                    className="flex flex-wrap items-center gap-2 rounded-sm bg-card/40 px-2 py-1 font-mono"
+                  >
+                    <span className="text-muted-foreground">sub</span>
+                    <span className="text-foreground">
+                      {row.subscriptionLabel}
+                    </span>
+                    <span className="text-muted-foreground">
+                      ({row.subscriptionId.slice(0, 8)}…)
+                    </span>
+                    <span className="text-muted-foreground">·</span>
+                    <span className="text-muted-foreground">region</span>
+                    <span className="text-foreground">{row.region}</span>
+                    <span className="text-muted-foreground">·</span>
+                    <span className="text-muted-foreground">acct</span>
+                    <span className="text-foreground">
+                      {row.accountNamePattern}
+                    </span>
+                    <span className="text-muted-foreground">·</span>
+                    <span className="text-muted-foreground">rg</span>
+                    <span className="text-foreground">
+                      {row.resourceGroupPattern}
+                    </span>
+                  </li>
+                ))}
+                {dispatchPlan.length > enumerationPreview.length && (
+                  <li className="px-2 py-0.5 text-muted-foreground">
+                    + {dispatchPlan.length - enumerationPreview.length} more
+                  </li>
+                )}
+              </ul>
+            </div>
+          </details>
+        )}
 
         <Alert variant="warning" className="px-3 py-2 text-xs">
           <AlertTriangle className="h-4 w-4" aria-hidden />
@@ -2768,64 +3387,35 @@ const AccountProvisioningPageInner: React.FC<AccountProvisioningPageProps> = ({
     return Math.max(1, Math.round(totalElapsedMs / completedRegions / 1000));
   }, [liveSubSummary]);
 
-  // Small per-sub sparkline: a fixed-width row of dots (one per
-  // dispatched region) coloured green/red/grey for created / failed /
-  // pending. Pure SVG-free CSS so it renders inline with the per-sub
-  // label without forcing a separate flex column.
-  const PerSubSparkline: React.FC<{
-    created: number;
-    failed: number;
-    total: number;
-  }> = ({ created, failed, total }) => {
-    const cells = Math.max(1, Math.min(total, 24));
-    const out: React.ReactNode[] = [];
-    let createdLeft = created;
-    let failedLeft = failed;
-    for (let i = 0; i < cells; i++) {
-      let tone = "bg-muted";
-      if (createdLeft > 0) {
-        tone = "bg-success/80";
-        createdLeft -= 1;
-      } else if (failedLeft > 0) {
-        tone = "bg-destructive/80";
-        failedLeft -= 1;
-      }
-      out.push(
-        <span
-          key={i}
-          className={cn("h-2.5 w-1 rounded-sm", tone)}
-          aria-hidden
-        />,
-      );
-    }
-    return (
-      <span
-        className="inline-flex items-center gap-[2px]"
-        aria-label={`${created} created, ${failed} failed of ${total}`}
-      >
-        {out}
-      </span>
-    );
-  };
+  // PerSubSparkline is now declared at module scope (above the
+  // component) so it doesn't get re-created on every parent render
+  // (parent re-renders at 1Hz while the ticker effect is running —
+  // re-declaring the component each tick was thrashing React's
+  // reconciliation across the per-sub rollup list).
 
   const renderSubmit = (): React.ReactNode => (
     <Card>
       <CardHeader className="pb-3">
-        <CardTitle className="text-sm font-semibold uppercase tracking-wider text-muted-foreground">
-          Submit
-        </CardTitle>
-        <CardDescription>
-          Provision {totalToCreate} Batch account
-          {totalToCreate === 1 ? "" : "s"}
-          {effectiveSubscriptionIds.length > 1 ? (
-            <>
-              {" "}across {effectiveSubscriptionIds.length} subscriptions ·{" "}
-              {perSubDelaySec}s gap between subs
-            </>
-          ) : (
-            <>.</>
-          )}
-        </CardDescription>
+        <div className="flex flex-wrap items-start justify-between gap-2">
+          <div className="flex flex-col gap-0.5">
+            <CardTitle className="text-sm font-semibold uppercase tracking-wider text-muted-foreground">
+              Submit
+            </CardTitle>
+            <CardDescription>
+              Provision {totalToCreate} Batch account
+              {totalToCreate === 1 ? "" : "s"}
+              {effectiveSubscriptionIds.length > 1 ? (
+                <>
+                  {" "}across {effectiveSubscriptionIds.length} subscriptions ·{" "}
+                  {perSubDelaySec}s gap between subs
+                </>
+              ) : (
+                <>.</>
+              )}
+            </CardDescription>
+          </div>
+          {stepElapsedChip}
+        </div>
       </CardHeader>
       <CardContent className="flex flex-col gap-4">
         {submitError && (
@@ -3025,6 +3615,103 @@ const AccountProvisioningPageInner: React.FC<AccountProvisioningPageProps> = ({
                 rollup; the ETA badge derives from the rolling avg
                 computed above so it converges as more regions complete. */}
             {liveSubSummary.length > 1 && (
+              <div
+                className="mt-1 flex items-center justify-between gap-2 text-2xs"
+                role="group"
+                aria-label="Live rollup grouping"
+              >
+                <span className="font-semibold uppercase tracking-wider text-muted-foreground">
+                  Group by
+                </span>
+                <div
+                  className="inline-flex items-center overflow-hidden rounded-md border border-border bg-card"
+                  role="radiogroup"
+                  aria-label="Group live rollup by"
+                >
+                  <button
+                    type="button"
+                    onClick={() => setLiveGrouping("sub")}
+                    aria-pressed={liveGrouping === "sub"}
+                    aria-label="Group by subscription"
+                    className={cn(
+                      "px-2 py-0.5 transition-colors",
+                      liveGrouping === "sub"
+                        ? "bg-primary/15 text-primary"
+                        : "text-muted-foreground hover:bg-muted/40",
+                    )}
+                  >
+                    Subscription
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setLiveGrouping("region")}
+                    aria-pressed={liveGrouping === "region"}
+                    aria-label="Group by region"
+                    className={cn(
+                      "border-l border-border px-2 py-0.5 transition-colors",
+                      liveGrouping === "region"
+                        ? "bg-primary/15 text-primary"
+                        : "text-muted-foreground hover:bg-muted/40",
+                    )}
+                  >
+                    Region
+                  </button>
+                </div>
+              </div>
+            )}
+            {liveSubSummary.length > 1 && liveGrouping === "region" && (
+              <ul
+                className="mt-1 flex flex-col gap-1"
+                aria-label="Per-region live progress"
+              >
+                {liveRegionSummary.map((r) => {
+                  const remaining = Math.max(0, r.total - r.created - r.failed);
+                  return (
+                    <li
+                      key={r.region}
+                      className="flex flex-wrap items-center justify-between gap-2 rounded-sm bg-card/40 px-2 py-1 text-2xs"
+                    >
+                      <span className="inline-flex items-center gap-2">
+                        <span className="font-medium text-foreground">
+                          {r.region}
+                        </span>
+                        {isGpuRegion(r.region) && (
+                          <span className="inline-flex items-center rounded-sm bg-primary/15 px-1 font-mono text-2xs text-primary">
+                            GPU
+                          </span>
+                        )}
+                        <PerSubSparkline
+                          created={r.created}
+                          failed={r.failed}
+                          total={r.total}
+                        />
+                      </span>
+                      <span className="inline-flex items-center gap-2 tabular-nums text-muted-foreground">
+                        <span>
+                          <span className="text-success">{r.created}</span>
+                          {" / "}
+                          <span className="text-foreground">{r.total}</span>
+                          {r.failed > 0 && (
+                            <>
+                              {" · "}
+                              <span className="text-destructive">
+                                {r.failed} failed
+                              </span>
+                            </>
+                          )}
+                        </span>
+                        {remaining > 0 && (
+                          <span className="text-muted-foreground">
+                            {remaining} pending
+                          </span>
+                        )}
+                      </span>
+                    </li>
+                  );
+                })}
+              </ul>
+            )}
+            {liveSubSummary.length > 1 && liveGrouping === "sub" && (
               <ul
                 className="mt-1 flex flex-col gap-1"
                 aria-label="Per-subscription live progress"
@@ -3128,35 +3815,9 @@ const AccountProvisioningPageInner: React.FC<AccountProvisioningPageProps> = ({
       lastAttemptDurationMs !== null && totalCount > 0
         ? Math.round(lastAttemptDurationMs / totalCount)
         : null;
-    // Per-subscription rollup so the user can see "sub A: 5/5, sub B:
-    // 2/3, sub C: 0/2 — all failed" without scanning the row table.
-    const perSubSummary = (() => {
-      const map = new Map<
-        string,
-        { displayName: string; created: number; failed: number; total: number }
-      >();
-      for (const a of attemptAccounts) {
-        const known = state.subscriptions.find(
-          (s) => s.subscriptionId === a.subscriptionId,
-        );
-        const entry = map.get(a.subscriptionId) ?? {
-          displayName:
-            known?.displayName ??
-            (a.subscriptionId ? a.subscriptionId.slice(0, 8) + "…" : "—"),
-          created: 0,
-          failed: 0,
-          total: 0,
-        };
-        entry.total += 1;
-        if (a.provisioningState === "created") entry.created += 1;
-        if (a.provisioningState === "failed") entry.failed += 1;
-        map.set(a.subscriptionId, entry);
-      }
-      return Array.from(map.entries()).map(([subscriptionId, v]) => ({
-        subscriptionId,
-        ...v,
-      }));
-    })();
+    // `perSubSummary` is memoized at component scope above so it
+    // doesn't recompute every time the operator triggers a re-render
+    // on this step.
 
     return (
       <Card
@@ -3216,7 +3877,11 @@ const AccountProvisioningPageInner: React.FC<AccountProvisioningPageProps> = ({
                   // so progress/result counters reset to zero. Without this
                   // reset, the auto-advance effect would immediately bounce
                   // the user back to the result step with the OLD numbers.
+                  // Also clear the resume hint + attemptId so the next
+                  // submit gets a fresh correlation id.
                   setAttemptStartedAt(null);
+                  setAttemptId(null);
+                  setResumeHint(null);
                   setSubmitError(null);
                   setSubBatchProgress(null);
                   setLastAttemptDurationMs(null);
@@ -3226,6 +3891,7 @@ const AccountProvisioningPageInner: React.FC<AccountProvisioningPageProps> = ({
                     action: "provision_accounts.new_request",
                     target: "wizard:reset",
                     status: "success",
+                    details: { previousAttemptId: attemptId },
                   });
                 }}
                 aria-label="Start a new provisioning request"
@@ -3422,6 +4088,8 @@ const AccountProvisioningPageInner: React.FC<AccountProvisioningPageProps> = ({
                 label: "Start a new request",
                 onClick: () => {
                   setAttemptStartedAt(null);
+                  setAttemptId(null);
+                  setResumeHint(null);
                   setSubmitError(null);
                   setStep("configure");
                 },

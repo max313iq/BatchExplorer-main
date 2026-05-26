@@ -175,6 +175,36 @@ import { usePersistedState } from "../../hooks/use-persisted-state";
 import { useTenantChange } from "../../hooks/use-tenant-change";
 import { useDashboardOutletContext } from "../page-router";
 
+// Local-folder modules (extracted for testability / locality of reasoning):
+//   cost-anomaly-detector — pure helpers + corpus citation (`_bypass_role_grant.md`).
+//   billing-scope-watcher — fingerprint+diff snapshots for sub-transfer detection
+//                           (corpus: `_ea_subscription_cross_tenant.md`).
+//   cost-report-templates — persisted named filter presets.
+import {
+  detectCostAnomalies,
+  correlateAnomaliesWithRoleGrants,
+  forecastBudget,
+  type CostAnomaly,
+  type CorrelatedAnomaly,
+} from "./cost-anomaly-detector";
+import {
+  detectScopeChanges,
+  loadScopeSnapshot,
+  saveScopeSnapshot,
+  decodeFingerprint,
+  type ScopeChange,
+  type ScopeChangeMap,
+} from "./billing-scope-watcher";
+import {
+  upsertTemplate,
+  removeTemplate,
+  templateIdFromName,
+  migrateTemplates,
+  EMPTY_TEMPLATES_STATE,
+  type CostReportTemplatesState,
+  type CostReportTemplate,
+} from "./cost-report-templates";
+
 const STORAGE_ACCOUNT = "ea-billing-manager:account";
 const STORAGE_BILLING_ACCOUNT = "ea-billing-manager:billing-account";
 const STORAGE_TAB = "ea-billing-manager:tab";
@@ -3344,10 +3374,40 @@ const SubscriptionsTab: React.FC<{
     [armToken, billingAccountName],
   );
   const [search, setSearch] = React.useState("");
-  type SubFilter = "all" | "active" | "disabled";
+  type SubFilter = "all" | "active" | "disabled" | "scopeChanged";
   const [statusFilter, setStatusFilter] = React.useState<SubFilter>("all");
   const [moveTargetSub, setMoveTargetSub] = React.useState<EaBillingSubscription | null>(null);
   const [cancelTargetSub, setCancelTargetSub] = React.useState<EaBillingSubscription | null>(null);
+
+  // Billing-scope watcher (corpus: `_ea_subscription_cross_tenant.md`).
+  // Whenever the sub list loads, diff every sub's billing scope against
+  // the local snapshot from the previous load. Flag changed scopes so
+  // the operator can spot a quiet sub-transfer or invoice-section move
+  // even when there's no corresponding audit entry in this tenant.
+  //
+  // The snapshot is per-billing-account so two operators looking at the
+  // same enrollment from different machines don't fight over storage.
+  // We keep `changes` in component state (NOT persisted) so it clears
+  // on remount — once you've seen the diff, refreshing intentionally
+  // clears it.
+  const [scopeChanges, setScopeChanges] = React.useState<ScopeChangeMap>({});
+  React.useEffect(() => {
+    if (!subs.data) return;
+    const prev = loadScopeSnapshot(billingAccountName);
+    const { changes, nextSnapshot } = detectScopeChanges(subs.data, prev);
+    setScopeChanges(changes);
+    // Persist the new fingerprint set BEFORE the next load — without
+    // this, a rapid second load would re-flag every "scope changed" row
+    // because we never wrote the new fingerprints back.
+    saveScopeSnapshot(billingAccountName, nextSnapshot);
+  }, [subs.data, billingAccountName]);
+
+  const scopeChangedCount = React.useMemo(
+    () =>
+      Object.values(scopeChanges).filter((c) => c.kind === "scope-changed")
+        .length,
+    [scopeChanges],
+  );
   const counts = React.useMemo(() => {
     const list = subs.data ?? [];
     let active = 0;
@@ -3383,6 +3443,11 @@ const SubscriptionsTab: React.FC<{
             status !== "cancelled"
           )
             return false;
+        } else if (statusFilter === "scopeChanged") {
+          // Only show subs whose billing scope flipped since the last
+          // load — drives investigation of sub-transfer events (corpus:
+          // `_ea_subscription_cross_tenant.md` §billing-scope mutation).
+          if (scopeChanges[s.name]?.kind !== "scope-changed") return false;
         }
       }
       if (!q) return true;
@@ -3397,7 +3462,7 @@ const SubscriptionsTab: React.FC<{
         .toLowerCase()
         .includes(q);
     });
-  }, [subs.data, search, statusFilter]);
+  }, [subs.data, search, statusFilter, scopeChanges]);
   return (
     <>
       <TabCard
@@ -3438,7 +3503,42 @@ const SubscriptionsTab: React.FC<{
             compact
             tone={counts.disabled > 0 ? "warning" : undefined}
           />
+          {scopeChangedCount > 0 && (
+            <SummaryStatItem
+              label="Scope changed"
+              value={scopeChangedCount}
+              compact
+              tone="destructive"
+            />
+          )}
         </div>
+        {/*
+          Billing-scope-change banner — only renders when at least one
+          sub's billing scope mutated since the last visit. Cites the
+          corpus rationale inline so the operator understands *why*
+          this is worth a second look (not just "moved invoice section
+          on purpose" but also the quieter sub-transfer signature).
+        */}
+        {scopeChangedCount > 0 && (
+          <Alert
+            variant="destructive"
+            // aria-live so a screen-reader catches the new banner when
+            // it appears on refresh, not only on tab-key focus.
+            aria-live="polite"
+          >
+            <AlertTriangle className="h-4 w-4" aria-hidden />
+            <AlertDescription>
+              <strong>{scopeChangedCount} subscription{scopeChangedCount === 1 ? "" : "s"}</strong>{" "}
+              had their billing scope flipped since you last loaded this
+              tab. A flip can be a normal invoice-section move, but it
+              can also be the local-tenant signature of a cross-tenant
+              sub-transfer (the destination tenant sees the audit entry;
+              the source tenant only sees this fingerprint change).
+              Click the <em>Scope changed</em> filter to focus on the
+              affected rows.
+            </AlertDescription>
+          </Alert>
+        )}
         <div
           className="flex flex-wrap items-center gap-1"
           role="group"
@@ -3449,6 +3549,15 @@ const SubscriptionsTab: React.FC<{
               { key: "all", label: "All", count: counts.total },
               { key: "active", label: "Active", count: counts.active },
               { key: "disabled", label: "Disabled", count: counts.disabled },
+              ...(scopeChangedCount > 0
+                ? ([
+                    {
+                      key: "scopeChanged",
+                      label: "Scope changed",
+                      count: scopeChangedCount,
+                    },
+                  ] as const)
+                : ([] as const)),
             ] as const
           ).map(({ key, label, count }) => (
             <Button
@@ -3501,10 +3610,27 @@ const SubscriptionsTab: React.FC<{
           />
         ) : (
           <ul className="flex flex-col gap-1">
-            {filtered.map((s) => (
+            {filtered.map((s) => {
+              const rawChange = scopeChanges[s.name];
+              // Narrow once at the top so every downstream reference can
+              // dereference without optional chaining gymnastics.
+              const change: ScopeChange | null =
+                rawChange && rawChange.kind === "scope-changed"
+                  ? rawChange
+                  : null;
+              const isScopeChanged = change !== null;
+              const prevDecoded = change
+                ? decodeFingerprint(change.prevScope)
+                : null;
+              return (
               <li
                 key={s.id}
-                className="flex flex-wrap items-center gap-2 rounded-md border border-border px-2 py-1.5 text-xs"
+                className={cn(
+                  "flex flex-wrap items-center gap-2 rounded-md border px-2 py-1.5 text-xs",
+                  isScopeChanged
+                    ? "border-destructive/40 bg-destructive/5"
+                    : "border-border",
+                )}
               >
                 <Server className="h-3.5 w-3.5 text-muted-foreground" />
                 <span className="font-medium">{s.displayName}</span>
@@ -3517,6 +3643,39 @@ const SubscriptionsTab: React.FC<{
                 {s.costCenter && (
                   <Badge variant="secondary" className="text-2xs">
                     CC: {s.costCenter}
+                  </Badge>
+                )}
+                {isScopeChanged && (
+                  <Badge
+                    variant="destructive"
+                    className="text-2xs"
+                    // The title carries the prior scope details so an
+                    // operator can hover to see the actual delta without
+                    // forcing a layout shift. The aria-label duplicates
+                    // it for screen readers.
+                    title={
+                      prevDecoded
+                        ? `Was: ${prevDecoded.profileName || "(no profile)"} ▸ ${
+                            prevDecoded.sectionName || "(no section)"
+                          }${
+                            prevDecoded.costCenter
+                              ? ` · CC ${prevDecoded.costCenter}`
+                              : ""
+                          }${
+                            change.prevSeenAt
+                              ? ` · seen ${change.prevSeenAt.slice(0, 10)}`
+                              : ""
+                          }`
+                        : "Billing scope changed since the previous load"
+                    }
+                    aria-label={`Billing scope changed since previous load${
+                      change.prevSeenAt
+                        ? ` on ${change.prevSeenAt.slice(0, 10)}`
+                        : ""
+                    }`}
+                  >
+                    <AlertTriangle className="h-2.5 w-2.5" aria-hidden />
+                    scope changed
                   </Badge>
                 )}
                 {s.invoiceSectionDisplayName && (
@@ -3549,7 +3708,8 @@ const SubscriptionsTab: React.FC<{
                   </Button>
                 </span>
               </li>
-            ))}
+              );
+            })}
           </ul>
         )}
       </TabCard>
@@ -6222,6 +6382,11 @@ const CostTab: React.FC<{
   billingAccountName: string;
   accountUsername: string;
 }> = ({ armToken, billingAccountName, accountUsername }) => {
+  // Used by the correlated-anomaly banner to deep-link into the
+  // privileged-audit page. Wrapped in a try/catch via the hook's
+  // boundary: if the page is mounted outside an outlet (tests), the
+  // hook still returns a no-op navigator.
+  const { navigateToPage } = useDashboardOutletContext();
   const scope = `/providers/Microsoft.Billing/billingAccounts/${billingAccountName}`;
   const [timeframe, setTimeframe] = React.useState<CostQueryBody["timeframe"]>(
     "BillingMonthToDate",
@@ -6242,6 +6407,26 @@ const CostTab: React.FC<{
     0,
     { version: 1 },
   );
+
+  // Persisted saved-report templates. Each template captures the four
+  // filter knobs and the min-spend threshold so the operator can name a
+  // common drill-down ("Daily by ServiceName for this month") and reload
+  // it in one click instead of re-tuning four selects.
+  const [templatesState, setTemplatesState] =
+    usePersistedState<CostReportTemplatesState>(
+      "ea-billing-manager:cost:templates",
+      EMPTY_TEMPLATES_STATE,
+      { version: 1, migrate: migrateTemplates },
+    );
+  const templates = templatesState.templates;
+  const [newTemplateName, setNewTemplateName] = React.useState("");
+  const [selectedTemplateId, setSelectedTemplateId] = React.useState<string>("");
+
+  // ARIA-live announcement string — fires on threshold-breach detection
+  // so a screen reader catches "3 anomalies detected" without the user
+  // having to scan the page for the banner. Cleared on every successful
+  // query so old announcements don't replay.
+  const [liveAnnouncement, setLiveAnnouncement] = React.useState<string>("");
 
   // Best-effort detection of the "cost" and "currency" columns so we
   // can render a sortable, summable view. Cost Management returns column
@@ -6324,6 +6509,173 @@ const CostTab: React.FC<{
       .sort(([a], [b]) => a.localeCompare(b))
       .map(([date, value]) => ({ date, value }));
   }, [result, granularity, costColumnIndex]);
+
+  /**
+   * Anomaly detection — only meaningful when we have a date-bucketed
+   * series. Uses the trailing-window-mean rule from
+   * `cost-anomaly-detector` (corpus: `_bypass_role_grant.md` §1.1). The
+   * window size is chosen from the granularity — 7 buckets for daily
+   * (one week of trailing context), 3 buckets for monthly (a quarter).
+   */
+  const anomalies: CostAnomaly[] = React.useMemo(() => {
+    if (!sparklineSeries) return [];
+    const windowSize = granularity === "Monthly" ? 3 : 7;
+    return detectCostAnomalies(sparklineSeries, { windowSize });
+  }, [sparklineSeries, granularity]);
+
+  /**
+   * Role-grant correlation — pulls the in-session audit log and finds
+   * grant entries that line up with each anomaly bucket within a
+   * granularity-appropriate window. Corpus references inline in the
+   * cost-anomaly-detector module. The correlator runs on every audit-
+   * log change so a grant that lands AFTER the cost query updates the
+   * banner without the operator needing to re-run the query.
+   */
+  const [auditTick, setAuditTick] = React.useState(0);
+  React.useEffect(() => {
+    // Subscribe to the audit log so a new grant entry (e.g. operator
+    // creates a role assignment in the Roles tab) re-fires the
+    // correlation pass without a query re-run.
+    const unsub = auditLog.onChange(() => setAuditTick((n) => n + 1));
+    return unsub;
+  }, []);
+
+  const correlatedAnomalies: CorrelatedAnomaly[] = React.useMemo(() => {
+    if (anomalies.length === 0) return [];
+    // Window: 24h for daily, 30d for monthly. Caps at the per-bucket
+    // granularity so we don't over-correlate (a grant 25 days ago is
+    // not meaningfully linked to today's daily anomaly).
+    const windowHours = granularity === "Monthly" ? 24 * 30 : 24;
+    return correlateAnomaliesWithRoleGrants(anomalies, auditLog.getEntries(), {
+      windowHours,
+    });
+    // auditTick triggers re-evaluation when the audit log changes.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [anomalies, granularity, auditTick]);
+
+  /**
+   * Budget forecast — if we have a date-bucketed series and the
+   * timeframe is a "to date" window, project end-of-month spend from
+   * the trailing 7-bucket run rate. For "TheLastMonth"-style timeframes
+   * the forecast is suppressed because the period is already closed.
+   */
+  const forecast = React.useMemo(() => {
+    if (!sparklineSeries || sparklineSeries.length < 2) return null;
+    // Only project for "to date" timeframes — past-period queries are
+    // already a complete answer; projecting would be misleading.
+    const projectableFrames = new Set([
+      "MonthToDate",
+      "BillingMonthToDate",
+      "WeekToDate",
+    ]);
+    if (!timeframe || !projectableFrames.has(timeframe)) return null;
+    // Remaining buckets: estimate from the last date in the series.
+    // For Daily/Weekly, we estimate days remaining in the current month
+    // / week. This is approximate by design — Cost Management's own
+    // forecast API is the source of truth; this is a quick visual.
+    const lastDateStr = sparklineSeries[sparklineSeries.length - 1]?.date;
+    let remaining = 0;
+    if (lastDateStr) {
+      // Try to parse YYYYMMDD or ISO date.
+      let lastDate: Date | null = null;
+      if (/^\d{8}$/.test(lastDateStr)) {
+        const y = Number(lastDateStr.slice(0, 4));
+        const m = Number(lastDateStr.slice(4, 6)) - 1;
+        const d = Number(lastDateStr.slice(6, 8));
+        lastDate = new Date(Date.UTC(y, m, d));
+      } else {
+        const parsed = new Date(lastDateStr);
+        if (!Number.isNaN(parsed.getTime())) lastDate = parsed;
+      }
+      if (lastDate) {
+        if (timeframe === "WeekToDate") {
+          const dow = lastDate.getUTCDay();
+          remaining = Math.max(0, 6 - dow);
+        } else {
+          // Days remaining in the calendar month (good-enough proxy for
+          // billing month — billing months differ at most by a few days).
+          const monthEnd = new Date(
+            Date.UTC(lastDate.getUTCFullYear(), lastDate.getUTCMonth() + 1, 0),
+          );
+          const ms = monthEnd.getTime() - lastDate.getTime();
+          remaining = Math.max(0, Math.floor(ms / (1000 * 60 * 60 * 24)));
+        }
+      }
+    }
+    if (remaining === 0) return null;
+    return forecastBudget(sparklineSeries, remaining, granularity === "Monthly" ? 3 : 7);
+  }, [sparklineSeries, timeframe, granularity]);
+
+  // ARIA-live announcement: whenever the anomaly count changes (a new
+  // query produced different results), build a brief sentence the screen
+  // reader can voice. We deliberately only emit when count > 0 to avoid
+  // chatter on every benign reload.
+  React.useEffect(() => {
+    if (correlatedAnomalies.length > 0) {
+      setLiveAnnouncement(
+        `Warning: ${correlatedAnomalies.length} cost anomalies correlate with recent privileged role grants. Review the banner above the result table.`,
+      );
+    } else if (anomalies.length > 0) {
+      setLiveAnnouncement(
+        `${anomalies.length} cost anomalies detected. No correlated role grants found.`,
+      );
+    } else {
+      setLiveAnnouncement("");
+    }
+  }, [anomalies.length, correlatedAnomalies.length]);
+
+  /* ----- Template apply / save helpers ----------------------------- */
+  const applyTemplate = React.useCallback(
+    (tpl: CostReportTemplate) => {
+      setType(tpl.type);
+      setTimeframe(tpl.timeframe);
+      setGranularity(tpl.granularity);
+      setGroupBy(tpl.groupBy);
+      setMinSpend(tpl.minSpend);
+      setSelectedTemplateId(tpl.id);
+    },
+    [setMinSpend],
+  );
+
+  const saveCurrentAsTemplate = React.useCallback(() => {
+    const name = newTemplateName.trim();
+    if (!name) return;
+    const id = templateIdFromName(name);
+    const next: CostReportTemplate = {
+      id,
+      name,
+      savedAt: new Date().toISOString(),
+      type: type ?? "ActualCost",
+      timeframe: timeframe ?? "BillingMonthToDate",
+      granularity,
+      groupBy,
+      minSpend,
+    };
+    setTemplatesState({
+      templates: upsertTemplate(templates, next),
+    });
+    setNewTemplateName("");
+    setSelectedTemplateId(id);
+  }, [
+    newTemplateName,
+    type,
+    timeframe,
+    granularity,
+    groupBy,
+    minSpend,
+    templates,
+    setTemplatesState,
+  ]);
+
+  const deleteTemplateById = React.useCallback(
+    (id: string) => {
+      setTemplatesState({
+        templates: removeTemplate(templates, id),
+      });
+      if (selectedTemplateId === id) setSelectedTemplateId("");
+    },
+    [templates, setTemplatesState, selectedTemplateId],
+  );
 
   const run = React.useCallback(async () => {
     setLoading(true);
@@ -6458,17 +6810,107 @@ const CostTab: React.FC<{
           </Select>
         </div>
       </div>
-      <div>
+      <div className="flex flex-wrap items-center gap-2">
         <Button type="button" onClick={() => void run()} disabled={loading} loading={loading}>
           {!loading && <Gauge />}
           Run query
         </Button>
+        {/*
+          Saved templates picker — appears even with no templates to
+          hint at the feature ("Save current as template" input is
+          always visible). When templates exist, the operator can pick
+          one and the four selects above snap to that preset.
+        */}
+        {templates.length > 0 && (
+          <>
+            <Label className="ml-2 text-2xs uppercase tracking-wider text-muted-foreground" htmlFor="ea-cost-tpl">
+              Saved template
+            </Label>
+            <Select
+              value={selectedTemplateId}
+              onValueChange={(v) => {
+                const t = templates.find((t) => t.id === v);
+                if (t) applyTemplate(t);
+              }}
+            >
+              <SelectTrigger id="ea-cost-tpl" className="w-56 text-xs">
+                <SelectValue placeholder="Load a saved report…" />
+              </SelectTrigger>
+              <SelectContent>
+                {templates.map((t) => (
+                  <SelectItem key={t.id} value={t.id}>
+                    <span className="flex flex-col">
+                      <span className="text-sm">{t.name}</span>
+                      <span className="text-2xs text-muted-foreground">
+                        {t.type} · {t.timeframe} · {t.granularity} · by{" "}
+                        {t.groupBy}
+                        {t.minSpend > 0
+                          ? ` · floor ${t.minSpend.toLocaleString()}`
+                          : ""}
+                      </span>
+                    </span>
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+            {selectedTemplateId && (
+              <Button
+                type="button"
+                variant="ghost"
+                size="sm"
+                className="h-7 text-2xs text-destructive"
+                onClick={() => deleteTemplateById(selectedTemplateId)}
+                title="Delete the currently selected template"
+                aria-label="Delete the currently selected template"
+              >
+                <Trash2 className="h-3 w-3" aria-hidden />
+                Delete
+              </Button>
+            )}
+          </>
+        )}
+        <div className="ml-auto flex items-center gap-1.5">
+          <Input
+            value={newTemplateName}
+            onChange={(e) => setNewTemplateName(e.target.value)}
+            placeholder="Name this report…"
+            className="h-7 w-44 text-xs"
+            aria-label="Name to save the current cost-query knobs as a template"
+          />
+          <Button
+            type="button"
+            variant="outline"
+            size="sm"
+            className="h-7 text-2xs"
+            onClick={saveCurrentAsTemplate}
+            disabled={!newTemplateName.trim()}
+            title="Save the current filter combination as a named template"
+            aria-label="Save current cost query as named template"
+          >
+            <BadgeCheck className="h-3 w-3" aria-hidden />
+            Save template
+          </Button>
+        </div>
       </div>
       {error && (
         <Alert variant="destructive">
           <AlertDescription>{error}</AlertDescription>
         </Alert>
       )}
+      {/*
+        Off-screen ARIA-live region — screen readers announce the
+        latest message text. We keep it inside the TabCard but visually
+        hidden via the standard `sr-only` utility so sighted users see
+        the banner alone.
+      */}
+      <p
+        className="sr-only"
+        role="status"
+        aria-live="polite"
+        aria-atomic="true"
+      >
+        {liveAnnouncement}
+      </p>
       {result && (
         <div className="flex flex-col gap-2">
           <div
@@ -6527,6 +6969,20 @@ const CostTab: React.FC<{
                 />
               </div>
             )}
+            {/* Budget forecast tile — only when we have a "to date"
+                timeframe and a usable trailing run-rate. Renders the
+                run-rate, the projected end-of-period spend, and the
+                gap so the operator sees the projected overshoot. */}
+            {forecast && (
+              <SummaryStatItem
+                label="Projected end of period"
+                value={`${forecast.projected.toLocaleString(undefined, {
+                  maximumFractionDigits: 0,
+                })} ${detectedCurrency}`}
+                compact
+                tone={forecast.projected > forecast.current * 1.2 ? "warning" : "info"}
+              />
+            )}
             <div className="ml-auto">
               <ExportMenu<readonly (string | number)[]>
                 // Export the FILTERED view so CSV matches what the
@@ -6546,6 +7002,148 @@ const CostTab: React.FC<{
               />
             </div>
           </div>
+          {/* Forecast detail caption — explains the projected value above. */}
+          {forecast && (
+            <p className="text-2xs text-muted-foreground">
+              Run rate: <strong>{forecast.ratePerBucket.toLocaleString(undefined, {
+                maximumFractionDigits: 2,
+              })} {detectedCurrency}</strong> per bucket over the trailing{" "}
+              <strong>{forecast.windowUsed}</strong> buckets. Projection is a
+              linear extrapolation — Cost Management's own forecast API is the
+              source of truth.
+            </p>
+          )}
+          {/*
+            ============================================================
+            Cost anomaly + role-grant correlation banner.
+            ============================================================
+            Surfaces buckets where the per-bucket spend exceeds the
+            trailing-mean threshold (corpus:
+            `_bypass_role_grant.md` §1.1 — Direct role grant; §6 — WIF
+            as role-grant bypass).
+
+            Correlation: when a flagged bucket lines up (±window) with a
+            recent privileged role-grant audit entry, the row gets the
+            "correlated" treatment and a deep link to the privileged-
+            audit page. This is the operator's primary pivot point from
+            "we got a big bill" to "we got a big bill 14 minutes after
+            Alice granted Bob Storage Blob Data Contributor".
+
+            Plain anomalies (no correlated grant) are shown more
+            quietly — they may still be worth a look but are more
+            often legitimate spikes (end-of-month batch, etc.).
+          */}
+          {correlatedAnomalies.length > 0 && (
+            <Alert variant="destructive">
+              <AlertTriangle className="h-4 w-4" aria-hidden />
+              <AlertDescription>
+                <div className="flex flex-col gap-1">
+                  <strong>
+                    {correlatedAnomalies.length} cost anomal
+                    {correlatedAnomalies.length === 1 ? "y" : "ies"} correlate
+                    with recent privileged role grants
+                  </strong>
+                  <ul className="ml-1 flex flex-col gap-0.5 text-2xs">
+                    {correlatedAnomalies.slice(0, 5).map((a) => (
+                      <li key={a.date}>
+                        <span className="font-mono">{a.date}</span>:{" "}
+                        <strong>
+                          {a.value.toLocaleString(undefined, {
+                            maximumFractionDigits: 0,
+                          })}{" "}
+                          {detectedCurrency}
+                        </strong>{" "}
+                        — {a.reason} · <em>{a.grants.length}</em>{" "}
+                        role-grant audit{" "}
+                        {a.grants.length === 1 ? "entry" : "entries"} in
+                        window:{" "}
+                        {a.grants
+                          .slice(0, 2)
+                          .map(
+                            (g) =>
+                              `${g.action} by ${g.actor || "unknown"} on ${
+                                g.target.length > 40
+                                  ? `${g.target.slice(0, 37)}…`
+                                  : g.target
+                              }`,
+                          )
+                          .join("; ")}
+                        {a.grants.length > 2
+                          ? ` (+${a.grants.length - 2} more)`
+                          : ""}
+                      </li>
+                    ))}
+                  </ul>
+                  <div className="flex flex-wrap items-center gap-2 pt-1">
+                    <Button
+                      type="button"
+                      size="sm"
+                      variant="outline"
+                      className="h-7 text-2xs"
+                      onClick={() => {
+                        auditLog.record({
+                          actor: accountUsername,
+                          action: "drill_down_cost_anomaly_to_audit",
+                          target: scope,
+                          status: "success",
+                          details: {
+                            page: "ea-billing-manager",
+                            tab: "cost",
+                            anomaliesCorrelated: correlatedAnomalies.length,
+                            navigatedTo: "/privileged-audit",
+                          },
+                        });
+                        navigateToPage("/privileged-audit");
+                      }}
+                      title="Open the Privileged Audit page to inspect the correlated grants"
+                      aria-label="Open Privileged Audit"
+                    >
+                      <ChevronRight className="h-3 w-3" aria-hidden />
+                      Open Privileged Audit
+                    </Button>
+                    <Button
+                      type="button"
+                      size="sm"
+                      variant="ghost"
+                      className="h-7 text-2xs"
+                      onClick={() => navigateToPage("/role-graph")}
+                      title="Open the Role Graph to inspect who got what"
+                      aria-label="Open Role Graph page"
+                    >
+                      <UserCheck className="h-3 w-3" aria-hidden />
+                      Open Role Graph
+                    </Button>
+                  </div>
+                </div>
+              </AlertDescription>
+            </Alert>
+          )}
+          {/* Plain anomalies — no correlated grant, surfaced more
+              quietly. Often legitimate; still worth a glance. */}
+          {anomalies.length > 0 && correlatedAnomalies.length === 0 && (
+            <Alert variant="warning">
+              <Info className="h-4 w-4" aria-hidden />
+              <AlertDescription>
+                <strong>
+                  {anomalies.length} cost anomal
+                  {anomalies.length === 1 ? "y" : "ies"} detected
+                </strong>{" "}
+                — no role-grant audit entries fall in the correlation
+                window. Likely a legitimate spike (end-of-month batch,
+                new workload onboarding) but worth a glance:{" "}
+                {anomalies
+                  .slice(0, 3)
+                  .map(
+                    (a) =>
+                      `${a.date} (${a.value.toLocaleString(undefined, {
+                        maximumFractionDigits: 0,
+                      })} ${detectedCurrency}, ${a.reason})`,
+                  )
+                  .join("; ")}
+                {anomalies.length > 3 ? ` …+${anomalies.length - 3} more` : ""}.
+              </AlertDescription>
+            </Alert>
+          )}
           {/* Threshold chip strip — drives the persisted minSpend filter. */}
           {costColumnIndex >= 0 && (
             <div

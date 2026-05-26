@@ -71,10 +71,14 @@ import {
   FileText,
   Filter,
   Layers,
+  Pin,
+  PinOff,
   PlayCircle,
   RotateCcw,
   Search,
+  ShieldAlert,
   SlidersHorizontal,
+  StickyNote,
   Trash2,
   Users,
   X,
@@ -134,6 +138,7 @@ import {
 } from "@/lib/utils";
 
 import { usePersistedState } from "../../hooks/use-persisted-state";
+import { useUrlState } from "../../hooks/use-url-state";
 import { auditLog, type AuditEntry } from "../../services/audit-log";
 
 import { ConfirmationDialog } from "../shared/confirmation-dialog";
@@ -198,6 +203,246 @@ const AUDIT_RELATIVE_TIME_KEY = "audit-log.relativeTime.v1";
 const AUDIT_GROUP_BY_KEY = "audit-log.groupBy.v1";
 const AUDIT_TAIL_KEY = "audit-log.tail.v1";
 const AUDIT_SAVED_FILTERS_KEY = "audit-log.savedFilters.v1";
+/** Pinned entry IDs — persisted per-browser so operators can carry forward
+ * "watch these" rows across reloads. Capped at 50 to bound localStorage. */
+const AUDIT_PINNED_KEY = "audit-log.pinned.v1";
+/** Per-entry operator annotations (free-text notes), keyed by entry ID. Capped
+ * at 200 notes; older notes pruned LRU when over the cap. */
+const AUDIT_NOTES_KEY = "audit-log.notes.v1";
+
+// ---------------------------------------------------------------------------
+// Critical Defender Audit Surface — corpus-grounded chip templates
+// ---------------------------------------------------------------------------
+//
+// SOURCE: `C:\Users\baimgprodsesa1\Desktop\New folder\_AZURE_BYPASS_PLAYBOOK.md`
+// section "Critical Defender Audit Surface" (lines 139-152). The playbook
+// enumerates ten high-value detection events that any defensive program
+// should wire alerts on, in priority order. These chips give the operator
+// a one-click filter for each one against the local audit buffer.
+//
+// `matchers` is an OR-list of case-insensitive substrings; an entry matches
+// the chip if its `action` field (or, fallback, `target`) contains any of
+// them. The patterns are intentionally permissive — the audit-log here is
+// app-internal (not Graph activity), so we match the *English-language*
+// action names that this app's own services emit. For wire-level Graph
+// audit names (e.g. `Set domain authentication`), the patterns also match
+// since they substring against the same action field.
+//
+// `severity` is mapped to the chip color tone per the corpus risk framing:
+// `critical` (tenant-takeover-class), `high` (privilege/persistence),
+// `medium` (state-modification). Used to color-code the chip and the
+// detection-coverage tiles.
+//
+// `cite` is a short reference to the playbook bullet (1–10) so the tooltip
+// can show the operator exactly which corpus item the chip maps to.
+type CritSeverity = "critical" | "high" | "medium";
+interface CriticalEventTemplate {
+  /** Stable id used as a React key + as a slug for the URL state. */
+  id: string;
+  /** Short chip label (single-line). */
+  label: string;
+  /** Longer hover tooltip explaining what to look for. */
+  tooltip: string;
+  /** Corpus risk severity used for color coding. */
+  severity: CritSeverity;
+  /** OR-list of substring matchers (lowercased at match time). */
+  matchers: string[];
+  /** Short corpus citation rendered inside the tooltip. */
+  cite: string;
+}
+
+const CRITICAL_AUDIT_TEMPLATES: ReadonlyArray<CriticalEventTemplate> = [
+  {
+    id: "set-domain-auth",
+    label: "Federation change",
+    tooltip:
+      "Set domain authentication — new federated domain. A federated domain backdoor survives password resets, MFA resets, and role revocation.",
+    severity: "critical",
+    matchers: [
+      "set domain authentication",
+      "federation",
+      "federated domain",
+      "domain.*federate",
+    ],
+    cite: "_AZURE_BYPASS_PLAYBOOK.md §Critical Defender Audit Surface #1",
+  },
+  {
+    id: "ca-policy-change",
+    label: "CA policy disable",
+    tooltip:
+      "Update conditional access policy — state change to 'disabled' or new exclusion entries. Common stealth-disable of MFA enforcement.",
+    severity: "critical",
+    matchers: [
+      "update conditional access",
+      "conditional access policy",
+      "ca policy",
+      "disable conditional access",
+    ],
+    cite: "_AZURE_BYPASS_PLAYBOOK.md §Critical Defender Audit Surface #2",
+  },
+  {
+    id: "tap-issuance",
+    label: "TAP issuance",
+    tooltip:
+      "Issue temporary access pass — MFA-equivalent pass for any user. Auth Admin role can mint these without re-MFA.",
+    severity: "critical",
+    matchers: ["issue temporary access pass", "temporary access pass", "tap "],
+    cite: "_AZURE_BYPASS_PLAYBOOK.md §Critical Defender Audit Surface #3",
+  },
+  {
+    id: "approle-assign",
+    label: "App-role assign",
+    tooltip:
+      "Add app role assignment to service principal — especially Directory.ReadWrite.All / RoleManagement.ReadWrite.Directory which lead to GA.",
+    severity: "high",
+    matchers: [
+      "add app role assignment",
+      "approleassignment",
+      "app role assignment",
+    ],
+    cite: "_AZURE_BYPASS_PLAYBOOK.md §Critical Defender Audit Surface #4",
+  },
+  {
+    id: "addkey",
+    label: "addKey/addPassword",
+    tooltip:
+      "Update application — Certificates and secrets management (addPassword/addKey). Permanent app-only credential injection.",
+    severity: "critical",
+    matchers: [
+      "addkey",
+      "addpassword",
+      "certificates and secrets",
+      "application credentials",
+      "credential rolled",
+    ],
+    cite: "_AZURE_BYPASS_PLAYBOOK.md §Critical Defender Audit Surface #5",
+  },
+  {
+    id: "federated-cred",
+    label: "Federated cred",
+    tooltip:
+      "POST /applications/{id}/federatedIdentityCredentials — workload-identity backdoor; no specific audit name, watch the raw URI.",
+    severity: "critical",
+    matchers: [
+      "federatedidentitycredentials",
+      "federated identity credential",
+      "workload identity federation",
+    ],
+    cite: "_AZURE_BYPASS_PLAYBOOK.md §Critical Defender Audit Surface #6",
+  },
+  {
+    id: "pim-eligibility",
+    label: "PIM eligibility",
+    tooltip:
+      "POST /roleManagement/directory/roleEligibilityScheduleRequests — PIM eligibility creation. Stealth time-bomb persistence.",
+    severity: "high",
+    matchers: [
+      "roleeligibilityschedulerequests",
+      "pim eligibility",
+      "role eligibility",
+      "eligibility schedule",
+    ],
+    cite: "_AZURE_BYPASS_PLAYBOOK.md §Critical Defender Audit Surface #7",
+  },
+  {
+    id: "delete-diag",
+    label: "Diagnostic delete",
+    tooltip:
+      "Delete diagnostic setting (Activity Log). Disables log forwarding to Sentinel/SIEM — frequent first step before noisy ops.",
+    severity: "high",
+    matchers: [
+      "delete diagnostic setting",
+      "diagnosticsettings/delete",
+      "diagnostic setting",
+    ],
+    cite: "_AZURE_BYPASS_PLAYBOOK.md §Critical Defender Audit Surface #8",
+  },
+  {
+    id: "hard-delete-user",
+    label: "Hard delete user",
+    tooltip:
+      "Hard delete user — bypasses the 30-day soft-delete recovery window. Used to scrub attacker-created accounts.",
+    severity: "medium",
+    matchers: ["hard delete user", "permanently delete user", "users/delete"],
+    cite: "_AZURE_BYPASS_PLAYBOOK.md §Critical Defender Audit Surface #9",
+  },
+  {
+    id: "cancel-subscription",
+    label: "Cancel subscription",
+    tooltip:
+      "Cancel subscription Activity Log event. Severs billing/quotas — often follows mass-resource teardown.",
+    severity: "medium",
+    matchers: [
+      "cancel subscription",
+      "subscription.*cancel",
+      "subscriptions/cancel",
+    ],
+    cite: "_AZURE_BYPASS_PLAYBOOK.md §Critical Defender Audit Surface #10",
+  },
+] as const;
+
+/** Match a single audit entry against a critical-event template. Substring,
+ * case-insensitive, run on `action`+`target` so app-internal action names
+ * (e.g. "ca_policy_update") and Graph-style names (e.g. "Update conditional
+ * access policy") both fire. We intentionally do NOT regex-compile the
+ * matchers since several contain `.` as a literal delimiter (e.g. "ca policy"
+ * with embedded spaces) — substring is faster and predictable. */
+function matchesCriticalTemplate(
+  entry: AuditEntry,
+  template: CriticalEventTemplate,
+): boolean {
+  const hay = `${entry.action ?? ""} ${entry.target ?? ""}`.toLowerCase();
+  for (const needle of template.matchers) {
+    if (!needle) continue;
+    if (hay.includes(needle.toLowerCase())) return true;
+  }
+  return false;
+}
+
+/** Tailwind tone classes per corpus severity. */
+const SEVERITY_TONE: Record<
+  CritSeverity,
+  { active: string; idle: string; ring: string; dot: string }
+> = {
+  critical: {
+    active: "border-destructive bg-destructive/15 text-destructive",
+    idle: "border-destructive/40 text-destructive hover:bg-destructive/10",
+    ring: "ring-destructive/50",
+    dot: "bg-destructive",
+  },
+  high: {
+    active: "border-warning bg-warning/15 text-warning",
+    idle: "border-warning/40 text-warning hover:bg-warning/10",
+    ring: "ring-warning/50",
+    dot: "bg-warning",
+  },
+  medium: {
+    active: "border-info bg-info/15 text-info",
+    idle: "border-info/40 text-info hover:bg-info/10",
+    ring: "ring-info/50",
+    dot: "bg-info",
+  },
+};
+
+// ---------------------------------------------------------------------------
+// Time-range presets (URL-shareable via useUrlState)
+// ---------------------------------------------------------------------------
+//
+// Stored in the URL under `range=<preset>` so a link captures the operator's
+// time window for collaborators. `custom` indicates the date-range picker
+// drives the window and `range` is unset; the other presets compute a sliding
+// `[now - N, now]` window and bypass the calendar.
+type RangePreset = "1h" | "1d" | "7d" | "all" | "custom";
+const RANGE_PRESETS: ReadonlyArray<{
+  key: RangePreset;
+  label: string;
+  ms: number;
+}> = [
+  { key: "1h", label: "Last 1h", ms: 60 * 60 * 1000 },
+  { key: "1d", label: "Last 1d", ms: 24 * 60 * 60 * 1000 },
+  { key: "7d", label: "Last 7d", ms: 7 * 24 * 60 * 60 * 1000 },
+  { key: "all", label: "All", ms: Number.POSITIVE_INFINITY },
+] as const;
 
 /** Set guard so PAGE_SIZE_OPTIONS narrowing survives JSON round-trip. */
 const PAGE_SIZE_SET: ReadonlySet<number> = new Set(PAGE_SIZE_OPTIONS);
@@ -322,6 +567,104 @@ export const AuditLogPage: React.FC = () => {
   const [savedFilterName, setSavedFilterName] = React.useState("");
   const [savedFiltersOpen, setSavedFiltersOpen] = React.useState(false);
 
+  // Corpus-grounded critical-event filter: selected template IDs. When at
+  // least one is selected, only entries matching ANY of the selected templates
+  // pass the filter (OR across selected templates). Local state — these are
+  // ephemeral exploratory filters, not "saved" filters.
+  const [activeCritIds, setActiveCritIds] = React.useState<Set<string>>(
+    () => new Set(),
+  );
+
+  // Pinned entry IDs — operator-curated watch-list. Persisted so a pin
+  // survives reload (provided the entry survives the 500-entry retention cap).
+  const [pinnedIds, setPinnedIds] = usePersistedState<string[]>(
+    AUDIT_PINNED_KEY,
+    [],
+    {
+      deserialize: (raw) => {
+        try {
+          const v = JSON.parse(raw);
+          return Array.isArray(v) ? v.filter((x): x is string => typeof x === "string") : [];
+        } catch {
+          return [];
+        }
+      },
+    },
+  );
+  // Memo a Set for O(1) lookup; rebuilds only when the persisted array
+  // reference changes (i.e. on add/remove).
+  const pinnedSet = React.useMemo(() => new Set(pinnedIds), [pinnedIds]);
+
+  // Per-entry operator notes — keyed by entry id. Persisted.
+  const [notesMap, setNotesMap] = usePersistedState<Record<string, string>>(
+    AUDIT_NOTES_KEY,
+    {},
+    {
+      deserialize: (raw) => {
+        try {
+          const v = JSON.parse(raw);
+          return v && typeof v === "object" && !Array.isArray(v)
+            ? (v as Record<string, string>)
+            : {};
+        } catch {
+          return {};
+        }
+      },
+    },
+  );
+  // Which entry is currently in note-edit mode. Local (UI only).
+  const [editingNoteFor, setEditingNoteFor] = React.useState<string | null>(
+    null,
+  );
+  const [draftNote, setDraftNote] = React.useState("");
+
+  // URL-state: time-range preset + selected-template-ids so a deep link
+  // shares the operator's lens with collaborators. `range` defaults to "all"
+  // (no time clamp) so the page renders the full retained buffer by default.
+  // `crit` is a comma-joined template id list — useUrlState handles arrays.
+  const [urlState, setUrlState] = useUrlState<{
+    range: string;
+    crit: string[];
+  }>({ range: "all", crit: [] });
+  const rangePreset = React.useMemo<RangePreset>(() => {
+    const v = urlState.range;
+    if (v === "1h" || v === "1d" || v === "7d" || v === "all" || v === "custom")
+      return v;
+    return "all";
+  }, [urlState.range]);
+
+  // Two-way sync URL ↔ activeCritIds set. On mount we hydrate from URL; on
+  // local toggle we push back. We diff against the joined-key string to avoid
+  // unnecessary URL writes.
+  const critUrlKey = React.useMemo(() => urlState.crit.join(","), [urlState.crit]);
+  const activeCritKey = React.useMemo(
+    () => Array.from(activeCritIds).sort().join(","),
+    [activeCritIds],
+  );
+  // Hydrate on mount (and whenever URL changes externally — e.g. back-button).
+  React.useEffect(() => {
+    const fromUrl = urlState.crit.filter((id) =>
+      CRITICAL_AUDIT_TEMPLATES.some((t) => t.id === id),
+    );
+    const fromUrlKey = [...fromUrl].sort().join(",");
+    if (fromUrlKey !== activeCritKey) {
+      setActiveCritIds(new Set(fromUrl));
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [critUrlKey]);
+  // Push local → URL.
+  React.useEffect(() => {
+    if (activeCritKey === critUrlKey) return;
+    setUrlState({ crit: Array.from(activeCritIds) });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeCritKey]);
+
+  // Keyboard navigation: index of the currently-focused row (within `paged`
+  // for the flat view; for grouped view we still treat it as a row-index in
+  // the *visible* row sequence, header rows skipped). j/k move; Enter
+  // expands the focused row.
+  const [focusedRowIdx, setFocusedRowIdx] = React.useState<number | null>(null);
+
   // Confirmation dialog
   const [confirmOpen, setConfirmOpen] = React.useState(false);
 
@@ -384,6 +727,12 @@ export const AuditLogPage: React.FC = () => {
   const groupByRef = React.useRef(groupBy);
   groupByRef.current = groupBy;
   const hasEntriesRef = React.useRef(false);
+  // Live refs for the j/k/Enter navigation handlers — see effect below. They
+  // read the most recent paged slice + focused index without retriggering
+  // the listener attach effect.
+  const pagedRef = React.useRef<AuditEntry[]>([]);
+  const focusedIdxRef = React.useRef<number | null>(null);
+  focusedIdxRef.current = focusedRowIdx;
   // hasEntriesRef is wired to `entries.length` below after the entries
   // memos run; defining it up here means the keydown handler can see the
   // latest value without re-attaching.
@@ -450,13 +799,58 @@ export const AuditLogPage: React.FC = () => {
           setGroupBy(next);
           return;
         }
+        // j / k row navigation. Clamps to the visible paged slice; wraps at
+        // edges so j-spam stays useful. Down=j, Up=k (vim convention; common
+        // in our other paged grids).
+        case "j":
+        case "ArrowDown": {
+          const rows = pagedRef.current;
+          if (rows.length === 0) return;
+          event.preventDefault();
+          const cur = focusedIdxRef.current;
+          const nextIdx =
+            cur === null ? 0 : Math.min(rows.length - 1, cur + 1);
+          setFocusedRowIdx(nextIdx);
+          return;
+        }
+        case "k":
+        case "ArrowUp": {
+          const rows = pagedRef.current;
+          if (rows.length === 0) return;
+          event.preventDefault();
+          const cur = focusedIdxRef.current;
+          const nextIdx = cur === null ? 0 : Math.max(0, cur - 1);
+          setFocusedRowIdx(nextIdx);
+          return;
+        }
+        case "Enter": {
+          const rows = pagedRef.current;
+          const cur = focusedIdxRef.current;
+          if (cur === null || rows.length === 0) return;
+          const row = rows[cur];
+          if (!row) return;
+          event.preventDefault();
+          setExpandedId((prev) => (prev === row.id ? null : row.id));
+          return;
+        }
+        case "p": {
+          // Pin / unpin the focused row.
+          const rows = pagedRef.current;
+          const cur = focusedIdxRef.current;
+          if (cur === null || rows.length === 0) return;
+          const row = rows[cur];
+          if (!row) return;
+          event.preventDefault();
+          togglePin(row.id);
+          return;
+        }
         default:
           return;
       }
     };
     document.addEventListener("keydown", handler);
     return () => document.removeEventListener("keydown", handler);
-  }, [setTailMode, setGroupBy]);
+  }, [setTailMode, setGroupBy, togglePin]);
 
   // -------- Derived collections ------------------------------------------
 
@@ -476,9 +870,25 @@ export const AuditLogPage: React.FC = () => {
     };
   }, [entries]);
 
+  // Resolve the active time-clamp range. When a preset other than "all" or
+  // "custom" is selected, it wins over the date-range picker (the toolbar
+  // intentionally shows the preset's effective window). "custom" leaves
+  // the calendar in charge. We compute once per render against `now`.
+  const presetRangeMs = React.useMemo<number | null>(() => {
+    if (rangePreset === "custom" || rangePreset === "all") return null;
+    const preset = RANGE_PRESETS.find((p) => p.key === rangePreset);
+    return preset && Number.isFinite(preset.ms) ? preset.ms : null;
+  }, [rangePreset]);
+
   // Search + filter pipeline.
   const filtered = React.useMemo(() => {
     const query = searchText.trim().toLowerCase();
+    const activeTemplates = CRITICAL_AUDIT_TEMPLATES.filter((t) =>
+      activeCritIds.has(t.id),
+    );
+    // Preset time-range clamp — when active, supersedes the calendar.
+    const presetFromTs =
+      presetRangeMs !== null ? Date.now() - presetRangeMs : null;
     const fromTs = dateRange?.from
       ? new Date(
           dateRange.from.getFullYear(),
@@ -518,6 +928,23 @@ export const AuditLogPage: React.FC = () => {
       if (statusFilter !== "all" && e.status !== statusFilter) return false;
       if (actorFilter.size > 0 && !actorFilter.has(e.actor)) return false;
       if (actionFilter.size > 0 && !actionFilter.has(e.action)) return false;
+      // Corpus-grounded critical templates — OR across selected templates.
+      // No-op when the set is empty (i.e. no critical filter active).
+      if (activeTemplates.length > 0) {
+        let any = false;
+        for (const t of activeTemplates) {
+          if (matchesCriticalTemplate(e, t)) {
+            any = true;
+            break;
+          }
+        }
+        if (!any) return false;
+      }
+      // Preset range clamp (sliding window). Calendar range is additional.
+      if (presetFromTs !== null) {
+        const ts = new Date(e.timestamp).getTime();
+        if (Number.isNaN(ts) || ts < presetFromTs) return false;
+      }
       if (fromTs !== null || toTs !== null) {
         const ts = new Date(e.timestamp).getTime();
         if (Number.isNaN(ts)) return false;
@@ -547,6 +974,8 @@ export const AuditLogPage: React.FC = () => {
     actorFilter,
     actionFilter,
     dateRange,
+    activeCritIds,
+    presetRangeMs,
   ]);
 
   // Sort.
@@ -584,7 +1013,18 @@ export const AuditLogPage: React.FC = () => {
   // doesn't end up on an empty page after narrowing the result set.
   React.useEffect(() => {
     setPage(1);
-  }, [searchText, statusFilter, actorFilter, actionFilter, dateRange, pageSize, sort, groupBy]);
+  }, [
+    searchText,
+    statusFilter,
+    actorFilter,
+    actionFilter,
+    dateRange,
+    pageSize,
+    sort,
+    groupBy,
+    activeCritIds,
+    presetRangeMs,
+  ]);
 
   // Tail-mode: when enabled, pin to page 1 on every entries change and
   // scroll the table body to the top (which is the newest entry under
@@ -617,6 +1057,20 @@ export const AuditLogPage: React.FC = () => {
     }
   }, [paged, expandedId]);
 
+  // Keep the keydown navigation ref in sync, and clamp the focused row index
+  // whenever the visible page slice shrinks (page nav, filter narrowing).
+  pagedRef.current = paged;
+  React.useEffect(() => {
+    if (focusedRowIdx === null) return;
+    if (paged.length === 0) {
+      setFocusedRowIdx(null);
+      return;
+    }
+    if (focusedRowIdx >= paged.length) {
+      setFocusedRowIdx(paged.length - 1);
+    }
+  }, [paged, focusedRowIdx]);
+
   // -------- Handlers ------------------------------------------------------
 
   const handleRequestClear = React.useCallback(() => {
@@ -638,7 +1092,60 @@ export const AuditLogPage: React.FC = () => {
     setActionFilter(new Set());
     setDateRange(undefined);
     setSort({ key: "timestamp", dir: "desc" });
+    setActiveCritIds(new Set());
+    setUrlState({ range: "all", crit: [] });
+  }, [setUrlState]);
+
+  // Toggle a single critical-event template id. We mutate via Set so the
+  // identity changes (triggering the dependent memos) without us having to
+  // construct a new array everywhere.
+  const toggleCriticalTemplate = React.useCallback((id: string) => {
+    setActiveCritIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
   }, []);
+
+  // Pinning — append/remove. Capped at 50 to bound the persisted list.
+  const togglePin = React.useCallback(
+    (id: string) => {
+      setPinnedIds((prev) => {
+        if (prev.includes(id)) return prev.filter((x) => x !== id);
+        const next = [id, ...prev];
+        return next.length > 50 ? next.slice(0, 50) : next;
+      });
+    },
+    [setPinnedIds],
+  );
+
+  // Notes — LRU-prune over 200 entries on write.
+  const saveNote = React.useCallback(
+    (id: string, text: string) => {
+      const trimmed = text.trim();
+      setNotesMap((prev) => {
+        const next: Record<string, string> = { ...prev };
+        if (trimmed === "") {
+          delete next[id];
+          return next;
+        }
+        next[id] = trimmed;
+        const keys = Object.keys(next);
+        if (keys.length > 200) {
+          // Drop the keys least recently written. We don't have explicit
+          // recency metadata; instead approximate by dropping the head of
+          // the insertion order (oldest keys first in Object.keys).
+          const overflow = keys.length - 200;
+          for (let i = 0; i < overflow; i += 1) {
+            delete next[keys[i]!];
+          }
+        }
+        return next;
+      });
+    },
+    [setNotesMap],
+  );
 
   const toggleSort = React.useCallback((key: SortKey) => {
     setSort((prev) => {
@@ -671,6 +1178,128 @@ export const AuditLogPage: React.FC = () => {
 
   const handleRowToggle = React.useCallback((id: string) => {
     setExpandedId((prev) => (prev === id ? null : id));
+  }, []);
+
+  // Note-edit lifecycle.
+  const startEditingNote = React.useCallback(
+    (id: string, current: string) => {
+      setEditingNoteFor(id);
+      setDraftNote(current);
+      // Also expand the row so the note editor inside RowDetails is visible.
+      setExpandedId(id);
+    },
+    [],
+  );
+  const cancelEditingNote = React.useCallback(() => {
+    setEditingNoteFor(null);
+    setDraftNote("");
+  }, []);
+  const saveNoteAndClose = React.useCallback(
+    (id: string, text: string) => {
+      saveNote(id, text);
+      setEditingNoteFor(null);
+      setDraftNote("");
+    },
+    [saveNote],
+  );
+
+  // Diff-sibling map: for each entry id, the id of a paired create/delete
+  // (or related-action) event on the same target inside the current `paged`
+  // slice. Heuristic: if two entries in the page share the same `target` and
+  // one is a "create-like" action and the other a "delete-like" action (or
+  // an update→update pair), link them. Two entries → bidirectional link.
+  //
+  // We keep the pairing inside `paged` (not the full filtered list) so the
+  // jump link is guaranteed to land on a row that's currently rendered.
+  // Pages may shift around the sibling — that's a known limitation; for a
+  // global pair we'd need to surface the sibling outside the page boundary
+  // which is a more invasive UX change.
+  const diffSiblingIdMap = React.useMemo<Map<string, string>>(() => {
+    const out = new Map<string, string>();
+    if (paged.length < 2) return out;
+    const createish = /(create|add|grant|assign|provision|enable|issue)/i;
+    const deleteish = /(delete|remove|revoke|disable|cancel|hard.delete)/i;
+    // Group by trimmed target. Empty targets don't pair.
+    const byTarget = new Map<string, AuditEntry[]>();
+    for (const e of paged) {
+      const t = (e.target ?? "").trim().toLowerCase();
+      if (!t) continue;
+      const arr = byTarget.get(t) ?? [];
+      arr.push(e);
+      byTarget.set(t, arr);
+    }
+    for (const [, list] of byTarget) {
+      if (list.length < 2) continue;
+      // Find one create-ish and one delete-ish. If multiple, pick the
+      // nearest by timestamp.
+      const creates = list.filter((e) => createish.test(e.action));
+      const deletes = list.filter((e) => deleteish.test(e.action));
+      const pairs: Array<[AuditEntry, AuditEntry]> = [];
+      if (creates.length > 0 && deletes.length > 0) {
+        for (const c of creates) {
+          let best: AuditEntry | null = null;
+          let bestDelta = Number.POSITIVE_INFINITY;
+          const ct = new Date(c.timestamp).getTime();
+          for (const d of deletes) {
+            const dt = new Date(d.timestamp).getTime();
+            const delta = Math.abs(ct - dt);
+            if (delta < bestDelta) {
+              bestDelta = delta;
+              best = d;
+            }
+          }
+          if (best) pairs.push([c, best]);
+        }
+      } else if (list.length === 2) {
+        // No create/delete signal, but a tight pair of two entries on the
+        // same target is still worth linking — common for update→update.
+        pairs.push([list[0]!, list[1]!]);
+      }
+      for (const [a, b] of pairs) {
+        out.set(a.id, b.id);
+        out.set(b.id, a.id);
+      }
+    }
+    return out;
+  }, [paged]);
+
+  // O(1) lookup of an entry's index within `paged` for keyboard nav.
+  const pagedIndex = React.useMemo<Map<string, number>>(() => {
+    const m = new Map<string, number>();
+    for (let i = 0; i < paged.length; i += 1) {
+      m.set(paged[i]!.id, i);
+    }
+    return m;
+  }, [paged]);
+  const indexOfPaged = React.useCallback(
+    (id: string) => pagedIndex.get(id) ?? -1,
+    [pagedIndex],
+  );
+
+  // Jump-to-entry: scroll the row into view + briefly flash-highlight it via
+  // a `data-jump-flash` attribute the row reads through CSS-like inline
+  // styles. We rely on the table-scroller having stable DOM ids per row
+  // (`data-entry-id`).
+  const jumpToEntry = React.useCallback((id: string) => {
+    const scroller = tableScrollRef.current;
+    if (!scroller) return;
+    const row = scroller.querySelector<HTMLElement>(`[data-entry-id="${id}"]`);
+    if (!row) return;
+    row.scrollIntoView({ behavior: "smooth", block: "center" });
+    // Brief flash to draw attention. We toggle an outline-style highlight
+    // using inline styles so we don't introduce a global CSS animation class.
+    // 700ms total: 600ms transition + 100ms latency budget.
+    const prevOutline = row.style.outline;
+    const prevOutlineOffset = row.style.outlineOffset;
+    const prevTransition = row.style.transition;
+    row.style.transition = "outline-color 600ms ease-out";
+    row.style.outline = "2px solid hsl(var(--warning) / 0.85)";
+    row.style.outlineOffset = "-2px";
+    window.setTimeout(() => {
+      row.style.outline = prevOutline;
+      row.style.outlineOffset = prevOutlineOffset;
+      row.style.transition = prevTransition;
+    }, 700);
   }, []);
 
   // -------- Export columns ------------------------------------------------
@@ -722,8 +1351,18 @@ export const AuditLogPage: React.FC = () => {
       (statusFilter !== "all" ? 1 : 0) +
       (actorFilter.size > 0 ? 1 : 0) +
       (actionFilter.size > 0 ? 1 : 0) +
-      (dateRange?.from ? 1 : 0),
-    [searchText, statusFilter, actorFilter, actionFilter, dateRange],
+      (dateRange?.from ? 1 : 0) +
+      (activeCritIds.size > 0 ? 1 : 0) +
+      (presetRangeMs !== null ? 1 : 0),
+    [
+      searchText,
+      statusFilter,
+      actorFilter,
+      actionFilter,
+      dateRange,
+      activeCritIds,
+      presetRangeMs,
+    ],
   );
 
   // Keep the keydown handler's `hasEntriesRef` in sync without re-attaching.
@@ -785,6 +1424,144 @@ export const AuditLogPage: React.FC = () => {
       currentHourStart,
     };
   }, [entries]);
+
+  // -------- Detection coverage (corpus-grounded) ------------------------
+  //
+  // For each of the 10 critical-event templates, count how many filtered
+  // entries match it within the visible time window (the `sorted` slice
+  // post-filter except for the critical-template filter itself, so the panel
+  // remains useful when the operator narrows to a single template).
+  //
+  // We split the source: critical coverage should be computed over the
+  // *time/status/actor/action/date-clamped* set MINUS the critical filter.
+  // To avoid re-running the whole pipeline, we approximate by computing
+  // coverage over `entries` clamped to the same time window. Cheap O(n*10).
+  const coverage = React.useMemo(() => {
+    const presetFromTs =
+      presetRangeMs !== null ? Date.now() - presetRangeMs : null;
+    const fromTs = dateRange?.from
+      ? new Date(
+          dateRange.from.getFullYear(),
+          dateRange.from.getMonth(),
+          dateRange.from.getDate(),
+          0,
+          0,
+          0,
+          0,
+        ).getTime()
+      : null;
+    const toTs = dateRange?.to
+      ? new Date(
+          dateRange.to.getFullYear(),
+          dateRange.to.getMonth(),
+          dateRange.to.getDate(),
+          23,
+          59,
+          59,
+          999,
+        ).getTime()
+      : dateRange?.from
+        ? new Date(
+            dateRange.from.getFullYear(),
+            dateRange.from.getMonth(),
+            dateRange.from.getDate(),
+            23,
+            59,
+            59,
+            999,
+          ).getTime()
+        : null;
+    const inWindow = entries.filter((e) => {
+      const ts = new Date(e.timestamp).getTime();
+      if (Number.isNaN(ts)) return false;
+      if (presetFromTs !== null && ts < presetFromTs) return false;
+      if (fromTs !== null && ts < fromTs) return false;
+      if (toTs !== null && ts > toTs) return false;
+      return true;
+    });
+    const counts: Record<string, number> = {};
+    for (const t of CRITICAL_AUDIT_TEMPLATES) {
+      counts[t.id] = 0;
+    }
+    for (const entry of inWindow) {
+      for (const t of CRITICAL_AUDIT_TEMPLATES) {
+        if (matchesCriticalTemplate(entry, t)) {
+          counts[t.id] = (counts[t.id] ?? 0) + 1;
+        }
+      }
+    }
+    const observed = CRITICAL_AUDIT_TEMPLATES.filter(
+      (t) => (counts[t.id] ?? 0) > 0,
+    ).length;
+    return { counts, observed, total: CRITICAL_AUDIT_TEMPLATES.length, inWindow };
+  }, [entries, dateRange, presetRangeMs]);
+
+  // -------- Events-per-minute stacked-bar (success vs failure) -----------
+  //
+  // Computed over `sorted` so it reflects the operator's current lens. We
+  // bucket by minute over the *visible* time range; if the range exceeds
+  // 240 minutes (4h), we drop to hourly buckets to keep the chart legible.
+  // Stacked: success on the bottom (info tone), failure on top (destructive).
+  const perMinute = React.useMemo(() => {
+    if (sorted.length === 0) {
+      return { buckets: [] as Array<{ s: number; f: number; tsLabel: string }>, peak: 0, granularity: "minute" as "minute" | "hour" };
+    }
+    let minTs = Infinity;
+    let maxTs = -Infinity;
+    for (const e of sorted) {
+      const ts = new Date(e.timestamp).getTime();
+      if (Number.isNaN(ts)) continue;
+      if (ts < minTs) minTs = ts;
+      if (ts > maxTs) maxTs = ts;
+    }
+    if (!Number.isFinite(minTs)) {
+      return { buckets: [], peak: 0, granularity: "minute" as const };
+    }
+    const spanMs = Math.max(maxTs - minTs, 60_000);
+    const granularity: "minute" | "hour" =
+      spanMs > 240 * 60_000 ? "hour" : "minute";
+    const bucketMs = granularity === "hour" ? 60 * 60_000 : 60_000;
+    // Align minTs to the start of its bucket.
+    const start = minTs - (minTs % bucketMs);
+    const end = maxTs - (maxTs % bucketMs) + bucketMs;
+    const bucketCount = Math.min(120, Math.ceil((end - start) / bucketMs));
+    // If we hit the 120-bucket cap, widen granularity until we fit.
+    let effectiveBucketMs = bucketMs;
+    let effectiveCount = bucketCount;
+    while (Math.ceil((end - start) / effectiveBucketMs) > 120) {
+      effectiveBucketMs *= 2;
+      effectiveCount = Math.ceil((end - start) / effectiveBucketMs);
+    }
+    const buckets: Array<{ s: number; f: number; tsLabel: string }> = [];
+    for (let i = 0; i < effectiveCount; i += 1) {
+      const bStart = start + i * effectiveBucketMs;
+      buckets.push({
+        s: 0,
+        f: 0,
+        tsLabel: new Date(bStart).toLocaleString(undefined, {
+          month: "short",
+          day: "numeric",
+          hour: "numeric",
+          minute: granularity === "minute" ? "numeric" : undefined,
+        }),
+      });
+    }
+    let peak = 0;
+    for (const e of sorted) {
+      const ts = new Date(e.timestamp).getTime();
+      if (Number.isNaN(ts)) continue;
+      const idx = Math.min(
+        buckets.length - 1,
+        Math.max(0, Math.floor((ts - start) / effectiveBucketMs)),
+      );
+      const b = buckets[idx];
+      if (!b) continue;
+      if (e.status === "success") b.s += 1;
+      else b.f += 1;
+      if (b.s + b.f > peak) peak = b.s + b.f;
+    }
+    return { buckets, peak, granularity };
+  }, [sorted]);
 
   // Date range available in the log (used to bound the calendar picker).
   const dateBounds = React.useMemo(() => {
@@ -966,6 +1743,17 @@ export const AuditLogPage: React.FC = () => {
 
   return (
     <div className="flex flex-col gap-4 py-4">
+      {/* Live region — announces filtered/total counts to screen readers
+          whenever the visible row set changes. Hidden visually; polite to
+          avoid speech interruption during fast typing. */}
+      <span
+        className="sr-only"
+        role="status"
+        aria-live="polite"
+        aria-atomic="true"
+      >
+        {`${sorted.length} of ${entries.length} audit entries match the current filters; showing page ${currentPage} of ${totalPages}.`}
+      </span>
       <PageHeader
         title="Audit Log"
         description="Session history of destructive actions and login events."
@@ -1002,6 +1790,12 @@ export const AuditLogPage: React.FC = () => {
               <p className="m-0 text-2xs text-muted-foreground">
                 Press <Kbd>/</Kbd> from anywhere on this page to focus the
                 search box, and <Kbd>Esc</Kbd> while focused to clear it.
+              </p>
+              <p className="m-0 text-2xs text-muted-foreground">
+                Row navigation: <Kbd>j</Kbd> / <Kbd>k</Kbd> (or arrow keys)
+                to move, <Kbd>Enter</Kbd> to expand the focused row,{" "}
+                <Kbd>p</Kbd> to pin it. <Kbd>t</Kbd> tail · <Kbd>g</Kbd>{" "}
+                group · <Kbd>c</Kbd> clear · <Kbd>e</Kbd> export.
               </p>
             </div>
           }
@@ -1135,6 +1929,157 @@ export const AuditLogPage: React.FC = () => {
               </button>
             ))}
           </div>
+        </div>
+      )}
+
+      {/*
+       * Critical-event template row (corpus-grounded).
+       *
+       * Each chip is a one-click pre-canned filter for one of the 10
+       * high-value detection events from
+       * `_AZURE_BYPASS_PLAYBOOK.md` §Critical Defender Audit Surface
+       * (lines 139-152). Severity ordering follows the playbook:
+       *   • critical  red    — tenant-takeover-class (#1, #2, #3, #5, #6)
+       *   • high      amber  — privilege/persistence  (#4, #7, #8)
+       *   • medium    blue   — destructive cleanup    (#9, #10)
+       *
+       * Clicking a chip toggles its template into `activeCritIds`, which
+       * the filter pipeline OR-combines with the action/actor/date filters.
+       * Multiple chips can be active simultaneously (e.g. "show TAP issuance
+       * OR addKey events from the last hour").
+       */}
+      {hasEntries && (
+        <div
+          className="flex flex-wrap items-center gap-2 rounded-md border border-destructive/30 bg-destructive/5 p-2"
+          role="group"
+          aria-label="Critical defender audit events (corpus-grounded)"
+        >
+          <ShieldAlert
+            className="ml-1 h-3.5 w-3.5 text-destructive"
+            aria-hidden
+          />
+          <span className="text-2xs font-semibold uppercase tracking-wider text-destructive">
+            Critical events
+          </span>
+          <InfoTooltip
+            content={
+              <div className="space-y-1.5">
+                <p className="m-0 text-xs font-semibold">
+                  Critical Defender Audit Surface
+                </p>
+                <p className="m-0 text-xs leading-relaxed">
+                  Pre-canned filters for the 10 highest-value detection
+                  events any defensive program should alert on. Click to
+                  toggle; multiple chips OR together.
+                </p>
+                <p className="m-0 text-2xs text-muted-foreground">
+                  Source: <code>_AZURE_BYPASS_PLAYBOOK.md</code> §Critical
+                  Defender Audit Surface.
+                </p>
+              </div>
+            }
+            ariaLabel="Critical events help"
+          />
+          {CRITICAL_AUDIT_TEMPLATES.map((tpl) => {
+            const active = activeCritIds.has(tpl.id);
+            const count = coverage.counts[tpl.id] ?? 0;
+            const tone = SEVERITY_TONE[tpl.severity];
+            return (
+              <button
+                key={tpl.id}
+                type="button"
+                onClick={() => toggleCriticalTemplate(tpl.id)}
+                aria-pressed={active}
+                title={`${tpl.tooltip}\n\n${tpl.cite}`}
+                className={cn(
+                  "inline-flex items-center gap-1.5 rounded-full border px-2.5 py-1 text-2xs font-medium transition-colors duration-150 ease-out focus-visible:outline-none focus-visible:ring-2 motion-reduce:transition-none",
+                  active ? tone.active : tone.idle,
+                  tone.ring,
+                  count === 0 && !active && "opacity-60",
+                )}
+              >
+                <span
+                  className={cn("h-1.5 w-1.5 rounded-full", tone.dot)}
+                  aria-hidden
+                />
+                <span>{tpl.label}</span>
+                <span
+                  className={cn(
+                    "rounded-sm bg-background/60 px-1 text-3xs tabular-nums",
+                    count === 0 && "opacity-40",
+                  )}
+                  aria-label={`${count} matching event${count === 1 ? "" : "s"} in window`}
+                >
+                  {count}
+                </span>
+              </button>
+            );
+          })}
+          {activeCritIds.size > 0 && (
+            <button
+              type="button"
+              className="ml-auto inline-flex items-center gap-1 rounded px-2 py-1 text-2xs font-medium text-muted-foreground hover:bg-muted/40 hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+              onClick={() => setActiveCritIds(new Set())}
+              aria-label="Clear critical-event filter"
+            >
+              <X className="h-3 w-3" aria-hidden />
+              Clear
+            </button>
+          )}
+        </div>
+      )}
+
+      {/* Time-range preset row — URL-shareable so a deep link captures the
+          operator's time lens. Custom presets fall back to the calendar. */}
+      {hasEntries && (
+        <div
+          className="flex flex-wrap items-center gap-2 rounded-md border border-border bg-card/40 p-2"
+          role="group"
+          aria-label="Time range"
+        >
+          <Clock
+            className="ml-1 h-3.5 w-3.5 text-muted-foreground"
+            aria-hidden
+          />
+          <span className="text-2xs font-medium uppercase tracking-wider text-muted-foreground">
+            Range
+          </span>
+          {RANGE_PRESETS.map((preset) => {
+            const active = rangePreset === preset.key;
+            return (
+              <Button
+                key={preset.key}
+                type="button"
+                variant={active ? "default" : "outline"}
+                size="xs"
+                onClick={() => {
+                  setUrlState({ range: preset.key });
+                  // Clear the calendar range so the preset is unambiguously
+                  // in charge of the time window.
+                  setDateRange(undefined);
+                }}
+                aria-pressed={active}
+                className="h-7"
+              >
+                {preset.label}
+              </Button>
+            );
+          })}
+          <Button
+            type="button"
+            variant={rangePreset === "custom" ? "default" : "outline"}
+            size="xs"
+            onClick={() => setUrlState({ range: "custom" })}
+            aria-pressed={rangePreset === "custom"}
+            className="h-7"
+            title="Pick a custom range with the calendar below"
+          >
+            Custom
+          </Button>
+          <InfoTooltip
+            content="Shareable via URL — copy the page link to share your time window with a collaborator."
+            ariaLabel="Range help"
+          />
         </div>
       )}
 
@@ -1773,6 +2718,224 @@ export const AuditLogPage: React.FC = () => {
         </section>
       )}
 
+      {/*
+       * Detection-coverage panel (corpus-grounded).
+       *
+       * Shows, for each of the 10 critical-event templates from
+       * `_AZURE_BYPASS_PLAYBOOK.md` §Critical Defender Audit Surface,
+       * whether ANY matching event has been observed in the current time
+       * window (preset + calendar). Helps the operator self-assess audit
+       * completeness — green tiles mean we've seen the event class at
+       * least once; muted tiles mean a known-critical class has no
+       * evidence in the window (which can be normal silence OR a sign
+       * that logging coverage is broken).
+       *
+       * The tiles double as filter chips: clicking jumps the operator's
+       * filter set to that template (mirrors the chip row above).
+       */}
+      {hasEntries && (
+        <section
+          role="region"
+          aria-label="Detection coverage of critical audit events"
+          className="rounded-md border border-border bg-card p-4"
+        >
+          <div className="mb-3 flex items-center justify-between gap-2">
+            <h3 className="m-0 flex items-center gap-1.5 text-xs font-semibold uppercase tracking-wider text-muted-foreground">
+              <ShieldAlert className="h-3.5 w-3.5" aria-hidden />
+              Detection coverage
+              <InfoTooltip
+                content={
+                  <div className="space-y-1.5">
+                    <p className="m-0 text-xs">
+                      Self-assessment: which of the 10 critical-event classes
+                      from the corpus playbook have been observed in the
+                      visible time window. Tiles with zero hits may indicate
+                      normal silence OR a coverage gap in upstream logging.
+                    </p>
+                    <p className="m-0 text-2xs text-muted-foreground">
+                      Source: <code>_AZURE_BYPASS_PLAYBOOK.md</code> §Critical
+                      Defender Audit Surface (10 events).
+                    </p>
+                  </div>
+                }
+                ariaLabel="Detection coverage help"
+              />
+            </h3>
+            <span
+              className="rounded-md border border-border bg-surface-sunken px-2 py-1 text-2xs tabular-nums text-muted-foreground"
+              aria-label={`${coverage.observed} of ${coverage.total} event classes observed in window`}
+            >
+              <strong className="text-foreground">{coverage.observed}</strong>
+              {" / "}
+              {coverage.total} classes observed
+              <span className="ml-2 text-3xs">
+                ({coverage.inWindow.length} event
+                {coverage.inWindow.length === 1 ? "" : "s"} in window)
+              </span>
+            </span>
+          </div>
+          <div className="grid grid-cols-2 gap-2 sm:grid-cols-3 lg:grid-cols-5">
+            {CRITICAL_AUDIT_TEMPLATES.map((tpl) => {
+              const count = coverage.counts[tpl.id] ?? 0;
+              const observed = count > 0;
+              const tone = SEVERITY_TONE[tpl.severity];
+              const active = activeCritIds.has(tpl.id);
+              return (
+                <button
+                  key={tpl.id}
+                  type="button"
+                  onClick={() => toggleCriticalTemplate(tpl.id)}
+                  aria-pressed={active}
+                  title={`${tpl.tooltip}\n\n${tpl.cite}\n\n${observed ? `${count} matching event${count === 1 ? "" : "s"} in window` : "No events observed in window"}`}
+                  className={cn(
+                    "group flex flex-col gap-1.5 rounded-md border p-2.5 text-left transition-colors duration-150 ease-out focus-visible:outline-none focus-visible:ring-2 motion-reduce:transition-none",
+                    observed
+                      ? active
+                        ? tone.active
+                        : "border-border bg-surface-sunken hover:bg-accent/30"
+                      : "border-border/50 bg-surface-sunken/40 hover:bg-accent/20",
+                    tone.ring,
+                  )}
+                >
+                  <div className="flex items-center gap-1.5">
+                    <span
+                      className={cn(
+                        "h-2 w-2 rounded-full",
+                        observed ? tone.dot : "bg-muted-foreground/30",
+                      )}
+                      aria-hidden
+                    />
+                    <span
+                      className={cn(
+                        "truncate text-2xs font-semibold uppercase tracking-wider",
+                        observed ? "text-foreground" : "text-muted-foreground",
+                      )}
+                    >
+                      {tpl.label}
+                    </span>
+                  </div>
+                  <div className="flex items-baseline justify-between">
+                    <span
+                      className={cn(
+                        "text-lg font-semibold tabular-nums",
+                        observed ? "text-foreground" : "text-muted-foreground/60",
+                      )}
+                    >
+                      {count}
+                    </span>
+                    <span
+                      className={cn(
+                        "text-3xs uppercase tracking-wider",
+                        observed
+                          ? "text-muted-foreground"
+                          : "text-muted-foreground/50",
+                      )}
+                    >
+                      {observed ? "observed" : "none in window"}
+                    </span>
+                  </div>
+                </button>
+              );
+            })}
+          </div>
+        </section>
+      )}
+
+      {/*
+       * Events-per-minute stacked-bar over the *visible* (sorted) range.
+       * Bars stack failure on top of success so the operator can spot
+       * spikes at a glance. Granularity auto-degrades from per-minute to
+       * per-hour when the visible range exceeds 4 hours, capped at 120
+       * buckets to keep render bounded.
+       *
+       * Pure SVG — no chart dep introduced.
+       */}
+      {hasEntries && perMinute.buckets.length > 0 && (
+        <section
+          className="rounded-md border border-border bg-card p-4"
+          role="region"
+          aria-label="Events over visible time range, stacked success vs failure"
+        >
+          <div className="mb-2 flex items-center justify-between gap-2">
+            <h3 className="m-0 text-xs font-semibold uppercase tracking-wider text-muted-foreground">
+              Events per {perMinute.granularity}{" "}
+              <span className="text-3xs font-normal normal-case text-muted-foreground/70">
+                ({perMinute.buckets.length} bucket
+                {perMinute.buckets.length === 1 ? "" : "s"} · peak{" "}
+                {perMinute.peak})
+              </span>
+            </h3>
+            <div className="flex items-center gap-3 text-2xs text-muted-foreground">
+              <span className="inline-flex items-center gap-1">
+                <span
+                  className="h-2 w-2 rounded-sm bg-info"
+                  aria-hidden="true"
+                />
+                success
+              </span>
+              <span className="inline-flex items-center gap-1">
+                <span
+                  className="h-2 w-2 rounded-sm bg-destructive"
+                  aria-hidden="true"
+                />
+                failure
+              </span>
+            </div>
+          </div>
+          <div
+            className="flex h-16 items-end gap-px"
+            role="img"
+            aria-label={`Stacked bar chart of audit events per ${perMinute.granularity}; peak ${perMinute.peak} events.`}
+          >
+            {perMinute.buckets.map((bucket, idx) => {
+              const total = bucket.s + bucket.f;
+              if (total === 0) {
+                return (
+                  <span
+                    key={idx}
+                    className="flex-1 rounded-sm bg-muted/20"
+                    style={{ height: "6%" }}
+                    title={`${bucket.tsLabel}: no events`}
+                  />
+                );
+              }
+              const totalPct = (total / perMinute.peak) * 100;
+              const sShare = bucket.s / total;
+              const fShare = bucket.f / total;
+              return (
+                <span
+                  key={idx}
+                  className="flex-1 flex flex-col-reverse"
+                  style={{ height: `${Math.max(totalPct, 8)}%` }}
+                  title={`${bucket.tsLabel}: ${bucket.s} success, ${bucket.f} failure`}
+                >
+                  {sShare > 0 && (
+                    <span
+                      className="block rounded-b-sm bg-info"
+                      style={{ height: `${sShare * 100}%` }}
+                    />
+                  )}
+                  {fShare > 0 && (
+                    <span
+                      className={cn(
+                        "block bg-destructive",
+                        sShare === 0 && "rounded-b-sm",
+                        "rounded-t-sm",
+                      )}
+                      style={{ height: `${fShare * 100}%` }}
+                    />
+                  )}
+                </span>
+              );
+            })}
+          </div>
+          <div className="mt-1.5 flex justify-between text-3xs text-muted-foreground tabular-nums">
+            <span>{perMinute.buckets[0]?.tsLabel}</span>
+            <span>{perMinute.buckets[perMinute.buckets.length - 1]?.tsLabel}</span>
+          </div>
+        </section>
+      )}
+
       {!hasMatches ? (
         hasEntries ? (
           <EmptyState
@@ -1843,7 +3006,29 @@ export const AuditLogPage: React.FC = () => {
                 </TableRow>
               </TableHeader>
               <TableBody>
-                {groups
+                {(() => {
+                  // Single shared context object so we don't construct it
+                  // inside per-row map callbacks (would invalidate React
+                  // child reconciliation more often than needed).
+                  const rowCtx: RenderEntryRowsContext = {
+                    expandedId,
+                    relativeTime,
+                    handleRowToggle,
+                    togglePin,
+                    pinnedSet,
+                    notesMap,
+                    startEditingNote,
+                    saveNote: saveNoteAndClose,
+                    editingNoteFor,
+                    draftNote,
+                    setDraftNote,
+                    cancelEditingNote,
+                    focusedRowIdx,
+                    indexOf: indexOfPaged,
+                    diffSiblingIdMap,
+                    jumpToEntry,
+                  };
+                  return groups
                   ? groups.map((group) => {
                       const isCollapsed = collapsedGroups.has(group.key);
                       return (
@@ -1904,22 +3089,13 @@ export const AuditLogPage: React.FC = () => {
                           </TableRow>
                           {!isCollapsed &&
                             group.rows.map((entry) =>
-                              renderEntryRows(entry, {
-                                expandedId,
-                                relativeTime,
-                                handleRowToggle,
-                              }),
+                              renderEntryRows(entry, rowCtx),
                             )}
                         </React.Fragment>
                       );
                     })
-                  : paged.map((entry) =>
-                      renderEntryRows(entry, {
-                        expandedId,
-                        relativeTime,
-                        handleRowToggle,
-                      }),
-                    )}
+                  : paged.map((entry) => renderEntryRows(entry, rowCtx));
+                })()}
               </TableBody>
             </Table>
           </div>
@@ -2038,6 +3214,31 @@ interface RenderEntryRowsContext {
   expandedId: string | null;
   relativeTime: boolean;
   handleRowToggle: (id: string) => void;
+  /** Pin / unpin a row. */
+  togglePin: (id: string) => void;
+  pinnedSet: Set<string>;
+  /** Notes — per-entry free-text annotations. Persisted. */
+  notesMap: Record<string, string>;
+  /** Open the note-edit UI for a row. */
+  startEditingNote: (id: string, current: string) => void;
+  /** Save a note (or clear it when trimmed text is empty). */
+  saveNote: (id: string, text: string) => void;
+  /** Currently-editing entry id (one open at a time). */
+  editingNoteFor: string | null;
+  draftNote: string;
+  setDraftNote: (next: string) => void;
+  cancelEditingNote: () => void;
+  /** Pre-paged row index for the visual focused row (keyboard nav). */
+  focusedRowIdx: number | null;
+  /** Lookup of an entry's index within `paged`. Used to drive the focus. */
+  indexOf: (id: string) => number;
+  /** Lookup: for each entry id, the id of a paired "related event" — e.g.
+   *  the matching create/delete on the same target. Empty when the entry has
+   *  no obvious pair in the visible set. */
+  diffSiblingIdMap: Map<string, string>;
+  /** Scroll an entry into view + flash-highlight it. Used by diff-mode
+   *  "jump to sibling" links. */
+  jumpToEntry: (id: string) => void;
 }
 
 /**
@@ -2049,16 +3250,46 @@ function renderEntryRows(
   entry: AuditEntry,
   ctx: RenderEntryRowsContext,
 ): React.ReactElement {
-  const { expandedId, relativeTime, handleRowToggle } = ctx;
+  const {
+    expandedId,
+    relativeTime,
+    handleRowToggle,
+    togglePin,
+    pinnedSet,
+    notesMap,
+    startEditingNote,
+    saveNote,
+    editingNoteFor,
+    draftNote,
+    setDraftNote,
+    cancelEditingNote,
+    focusedRowIdx,
+    indexOf,
+    diffSiblingIdMap,
+    jumpToEntry,
+  } = ctx;
   const isExpanded = expandedId === entry.id;
   const hasExpandable = Boolean(entry.details) || Boolean(entry.error);
+  const isPinned = pinnedSet.has(entry.id);
+  const hasNote = Boolean(notesMap[entry.id]);
+  const isEditingNote = editingNoteFor === entry.id;
+  const entryIdx = indexOf(entry.id);
+  const isFocused = focusedRowIdx !== null && entryIdx === focusedRowIdx;
+  const siblingId = diffSiblingIdMap.get(entry.id) ?? null;
+  // Force an expanded view when we're editing a note for this row, so the
+  // user has somewhere to type without juggling two rows.
+  const effectiveExpanded = isExpanded || isEditingNote;
   return (
     <React.Fragment key={entry.id}>
       <TableRow
-        data-state={isExpanded ? "selected" : undefined}
+        data-state={effectiveExpanded ? "selected" : undefined}
+        data-entry-id={entry.id}
         className={cn(
+          "group/row",
           hasExpandable && "cursor-pointer",
-          isExpanded && "bg-muted/40",
+          effectiveExpanded && "bg-muted/40",
+          isPinned && "border-l-2 border-l-warning",
+          isFocused && "ring-2 ring-inset ring-primary/60",
         )}
         onClick={
           hasExpandable ? () => handleRowToggle(entry.id) : undefined
@@ -2134,24 +3365,170 @@ function renderEntryRows(
             <span className="text-muted-foreground/60">—</span>
           )}
         </TableCell>
-        <TableCell>
-          <Badge
-            variant={
-              entry.status === "success" ? "success" : "destructive"
-            }
-            className="capitalize"
-          >
-            {entry.status}
-          </Badge>
+        <TableCell onClick={(e) => e.stopPropagation()}>
+          <div className="flex items-center justify-between gap-1.5">
+            <Badge
+              variant={
+                entry.status === "success" ? "success" : "destructive"
+              }
+              className="capitalize"
+            >
+              {entry.status}
+            </Badge>
+            <div className="flex items-center gap-0.5 opacity-0 transition-opacity group-hover/row:opacity-100 focus-within:opacity-100">
+              {/* Pin toggle — persisted */}
+              <button
+                type="button"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  togglePin(entry.id);
+                }}
+                aria-pressed={isPinned}
+                aria-label={isPinned ? "Unpin row" : "Pin row"}
+                title={isPinned ? "Unpin" : "Pin"}
+                className={cn(
+                  "inline-flex h-6 w-6 items-center justify-center rounded transition-colors hover:bg-accent/40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring",
+                  isPinned
+                    ? "text-warning opacity-100"
+                    : "text-muted-foreground hover:text-foreground",
+                )}
+              >
+                {isPinned ? (
+                  <Pin className="h-3 w-3 fill-current" aria-hidden />
+                ) : (
+                  <PinOff className="h-3 w-3" aria-hidden />
+                )}
+              </button>
+              {/* Annotate toggle */}
+              <button
+                type="button"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  startEditingNote(entry.id, notesMap[entry.id] ?? "");
+                }}
+                aria-label={hasNote ? "Edit note" : "Add note"}
+                title={
+                  hasNote
+                    ? `Note: ${notesMap[entry.id]}`
+                    : "Add an operator note"
+                }
+                className={cn(
+                  "inline-flex h-6 w-6 items-center justify-center rounded transition-colors hover:bg-accent/40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring",
+                  hasNote
+                    ? "text-info opacity-100"
+                    : "text-muted-foreground hover:text-foreground",
+                )}
+              >
+                <StickyNote
+                  className={cn(
+                    "h-3 w-3",
+                    hasNote && "fill-current opacity-90",
+                  )}
+                  aria-hidden
+                />
+              </button>
+            </div>
+          </div>
+          {/* Diff-mode link — when this entry has a paired sibling on the
+              same target (create→delete or update→delete), surface a tiny
+              "jump to pair" affordance under the badge so the operator can
+              eyeball both events in sequence. */}
+          {siblingId && (
+            <button
+              type="button"
+              className="mt-1 inline-flex items-center gap-1 rounded px-1 py-0.5 text-3xs font-medium text-info underline-offset-2 hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+              onClick={(e) => {
+                e.stopPropagation();
+                jumpToEntry(siblingId);
+              }}
+              title="Jump to the paired event on the same target"
+              aria-label="Jump to the paired event"
+            >
+              <ChevronsUpDown className="h-3 w-3" aria-hidden />
+              pair
+            </button>
+          )}
         </TableCell>
       </TableRow>
+      {/* Always show a slim note bar when a note exists OR the row is being
+          annotated. We hide it when the row is in expanded-details mode to
+          avoid double-rendering — the note appears inside RowDetails. */}
+      {!isExpanded && (hasNote || isEditingNote) && (
+        <TableRow
+          className="bg-info/5 hover:bg-info/10"
+          aria-label="Row note"
+        >
+          <TableCell colSpan={6} className="px-3 py-1.5">
+            <div className="flex items-start gap-2">
+              <StickyNote
+                className="mt-0.5 h-3 w-3 shrink-0 text-info"
+                aria-hidden
+              />
+              {isEditingNote ? (
+                <div className="flex w-full items-center gap-1.5">
+                  <Input
+                    autoFocus
+                    value={draftNote}
+                    onChange={(e) => setDraftNote(e.target.value)}
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter") {
+                        e.preventDefault();
+                        saveNote(entry.id, draftNote);
+                      } else if (e.key === "Escape") {
+                        e.preventDefault();
+                        cancelEditingNote();
+                      }
+                    }}
+                    placeholder="Operator note (Enter to save, Esc to cancel)"
+                    className="h-7 text-xs"
+                    aria-label="Operator note"
+                  />
+                  <Button
+                    type="button"
+                    variant="default"
+                    size="xs"
+                    onClick={() => saveNote(entry.id, draftNote)}
+                    className="h-7 shrink-0"
+                  >
+                    Save
+                  </Button>
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="xs"
+                    onClick={cancelEditingNote}
+                    className="h-7 shrink-0"
+                  >
+                    Cancel
+                  </Button>
+                </div>
+              ) : (
+                <span className="flex-1 text-xs text-foreground/90">
+                  {notesMap[entry.id]}
+                </span>
+              )}
+            </div>
+          </TableCell>
+        </TableRow>
+      )}
       {isExpanded && (
         <TableRow
           className="bg-muted/20 hover:bg-muted/20"
           aria-label="Row details"
         >
           <TableCell colSpan={6} className="p-0">
-            <RowDetails entry={entry} />
+            <RowDetails
+              entry={entry}
+              note={notesMap[entry.id] ?? ""}
+              isEditingNote={isEditingNote}
+              draftNote={draftNote}
+              setDraftNote={setDraftNote}
+              startEditingNote={() =>
+                startEditingNote(entry.id, notesMap[entry.id] ?? "")
+              }
+              saveNote={(text) => saveNote(entry.id, text)}
+              cancelEditingNote={cancelEditingNote}
+            />
           </TableCell>
         </TableRow>
       )}
@@ -2223,9 +3600,25 @@ const SortableHead: React.FC<SortableHeadProps> = ({
 
 interface RowDetailsProps {
   entry: AuditEntry;
+  note: string;
+  isEditingNote: boolean;
+  draftNote: string;
+  setDraftNote: (next: string) => void;
+  startEditingNote: () => void;
+  saveNote: (text: string) => void;
+  cancelEditingNote: () => void;
 }
 
-const RowDetails: React.FC<RowDetailsProps> = ({ entry }) => {
+const RowDetails: React.FC<RowDetailsProps> = ({
+  entry,
+  note,
+  isEditingNote,
+  draftNote,
+  setDraftNote,
+  startEditingNote,
+  saveNote,
+  cancelEditingNote,
+}) => {
   const detailsJson = React.useMemo(
     () => (entry.details ? JSON.stringify(entry.details, null, 2) : ""),
     [entry.details],
@@ -2248,6 +3641,81 @@ const RowDetails: React.FC<RowDetailsProps> = ({ entry }) => {
           mono
           copyable
         />
+      </div>
+      {/* Operator note — full editor inside the expanded panel. */}
+      <div className="mt-3 rounded-md border border-info/40 bg-info/5 p-3">
+        <div className="flex items-center justify-between gap-2">
+          <span className="inline-flex items-center gap-1.5 text-2xs font-semibold uppercase tracking-wider text-info">
+            <StickyNote className="h-3 w-3" aria-hidden />
+            Operator note
+          </span>
+          {!isEditingNote && (
+            <button
+              type="button"
+              onClick={(e) => {
+                e.stopPropagation();
+                startEditingNote();
+              }}
+              className="rounded px-1.5 py-0.5 text-3xs font-medium uppercase tracking-wider text-muted-foreground hover:bg-muted/40 hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+              aria-label={note ? "Edit note" : "Add note"}
+            >
+              {note ? "Edit" : "Add"}
+            </button>
+          )}
+        </div>
+        {isEditingNote ? (
+          <div className="mt-1.5 flex items-center gap-1.5">
+            <Input
+              autoFocus
+              value={draftNote}
+              onChange={(e) => setDraftNote(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") {
+                  e.preventDefault();
+                  saveNote(draftNote);
+                } else if (e.key === "Escape") {
+                  e.preventDefault();
+                  cancelEditingNote();
+                }
+              }}
+              placeholder="Why does this entry matter?"
+              className="h-7 text-xs"
+            />
+            <Button
+              type="button"
+              variant="default"
+              size="xs"
+              onClick={(e) => {
+                e.stopPropagation();
+                saveNote(draftNote);
+              }}
+              className="h-7 shrink-0"
+            >
+              Save
+            </Button>
+            <Button
+              type="button"
+              variant="ghost"
+              size="xs"
+              onClick={(e) => {
+                e.stopPropagation();
+                cancelEditingNote();
+              }}
+              className="h-7 shrink-0"
+            >
+              Cancel
+            </Button>
+          </div>
+        ) : (
+          <p
+            className={cn(
+              "m-0 mt-1.5 text-xs",
+              note ? "text-foreground/90" : "italic text-muted-foreground",
+            )}
+          >
+            {note || "No note. Click Add to attach an operator annotation."}
+          </p>
+        )}
       </div>
       {entry.error && (
         <div className="mt-3 rounded-md border border-destructive/40 bg-destructive/10 p-3">

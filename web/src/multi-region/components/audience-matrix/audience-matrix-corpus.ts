@@ -336,6 +336,262 @@ export function tierShort(tier: AudienceRiskTier): string {
 /** localStorage key for the dismissed-banner flag. */
 export const FOCI_BANNER_DISMISS_KEY = "audience-matrix.foci-banner.dismissed";
 
+// ---------------------------------------------------------------------------
+//  Signal D — FOCI client → typical pre-consented scopes (defender catalog)
+// ---------------------------------------------------------------------------
+//
+// "WHAT does this FOCI client typically hold?" — annotation only. The matrix
+// uses this to tell a defender "Azure CLI typically holds AuditLog.Read.All —
+// be careful" when they see an Azure CLI RT row.
+//
+// Sources (annotation, not actuation):
+//   - `dirkjanm/family-of-client-ids-research/scope-map.txt`
+//     (scope → resource → client tabular dump from a known consenting tenant)
+//   - `dafthack/azure-ad-first-party-apps-permissions/README.md`
+//     (defender catalog of pre-consented Microsoft first-party scopes)
+//
+// Curation rules
+// --------------
+// - This is a CURATED subset — the canonical `scope-map.txt` is 2k+ lines and
+//   most rows are duplicative across the family. We surface the high-signal
+//   high-risk scopes per client so a defender can answer "if this RT leaks,
+//   what's the worst the holder can do without re-consenting?".
+// - "audiences" lists which AUDIENCE_COLUMNS keys the client is known to
+//   tokenize for (used by the reachability table).
+// - "highValueScopes" lists the scopes that should make a defender pause —
+//   selected for blast-radius, NOT exhaustive.
+// - "notes" is a one-line summary suitable for a tooltip.
+
+export interface FociClientProfile {
+  /** Lowercase client_id. */
+  readonly id: string;
+  /** Friendly application name. */
+  readonly name: string;
+  /** AudienceColumn keys the client is known to tokenize. */
+  readonly audiences: ReadonlyArray<string>;
+  /** Curated high-value scopes a defender should care about. */
+  readonly highValueScopes: ReadonlyArray<string>;
+  /** One-line operator/defender summary. */
+  readonly notes: string;
+}
+
+/**
+ * Per-FOCI-client annotated profile. Keyed by lowercase client_id. The
+ * matrix uses this for:
+ *   - the row-identifier popover ("Azure CLI typically holds…")
+ *   - the audience reachability table
+ *   - the audience→FOCI reverse map below
+ *
+ * Coverage: the highest-leverage clients first. Clients NOT in this map
+ * still appear in the FOCI badge — `clientIdIsFoci()` is a superset check;
+ * this map is the annotated subset. Adding a profile here NEVER changes
+ * the badge behaviour.
+ */
+export const FOCI_CLIENT_PROFILES: Readonly<Record<string, FociClientProfile>> =
+  Object.freeze({
+    "04b07795-8ddb-461a-bbee-02f9e1bf7b46": {
+      id: "04b07795-8ddb-461a-bbee-02f9e1bf7b46",
+      name: "Microsoft Azure CLI",
+      audiences: ["ARM", "Graph", "Batch", "Vault", "Storage", "Monitor"],
+      highValueScopes: [
+        "user_impersonation (ARM, ALL subscriptions)",
+        "AuditLog.Read.All (Graph)",
+        "Directory.AccessAsUser.All (Graph)",
+        "Application.ReadWrite.All (Graph)",
+      ],
+      notes:
+        "Azure CLI holds the broadest 'admin' set in the family — ARM user_impersonation + privileged Graph scopes. A leaked Azure CLI RT effectively grants tenant-wide read/write across both planes.",
+    },
+    "1950a258-227b-4e31-a9cf-717495945fc2": {
+      id: "1950a258-227b-4e31-a9cf-717495945fc2",
+      name: "Microsoft Azure PowerShell",
+      audiences: ["ARM", "Graph", "Batch", "Vault", "Storage"],
+      highValueScopes: [
+        "user_impersonation (ARM)",
+        "Directory.AccessAsUser.All (Graph)",
+        "AuditLog.Read.All (Graph)",
+      ],
+      notes:
+        "Azure PowerShell shares Azure CLI's ARM reach; Graph coverage is similar. Operator muscle-memory pivots through both interchangeably.",
+    },
+    "1fec8e78-bce4-4aaf-ab1b-5451cc387264": {
+      id: "1fec8e78-bce4-4aaf-ab1b-5451cc387264",
+      name: "Microsoft Teams",
+      audiences: ["Graph", "Substrate", "Power BI"],
+      highValueScopes: [
+        "Chat.ReadWrite (Graph)",
+        "User.Read.All (Graph)",
+        "Channel.ReadBasic.All (Graph)",
+        "Files.ReadWrite.All (Graph)",
+      ],
+      notes:
+        "Teams holds rich messaging + presence scopes — chat exfil, channel enumeration, and SharePoint/OneDrive file access via Substrate.",
+    },
+    "d3590ed6-52b3-4102-aeff-aad2292ab01c": {
+      id: "d3590ed6-52b3-4102-aeff-aad2292ab01c",
+      name: "Microsoft Office",
+      audiences: ["Graph", "Substrate", "Power BI"],
+      highValueScopes: [
+        "Mail.ReadWrite (Graph)",
+        "Calendars.ReadWrite (Graph)",
+        "Files.ReadWrite.All (Graph)",
+        "AuditLog.Read.All (Graph)",
+        "Contacts.ReadWrite (Graph)",
+      ],
+      notes:
+        "Microsoft Office shares the 'productivity' superset — mail, calendars, files. AuditLog.Read.All is unusual for this client; treat as elevated risk.",
+    },
+    "27922004-5251-4030-b22d-91ecd9a37ea4": {
+      id: "27922004-5251-4030-b22d-91ecd9a37ea4",
+      name: "Outlook Mobile",
+      audiences: ["Graph", "Substrate"],
+      highValueScopes: [
+        "Mail.ReadWrite (Outlook + Substrate)",
+        "Calendars.ReadWrite.All",
+        "Contacts.ReadWrite (Substrate)",
+      ],
+      notes:
+        "Outlook Mobile is the Substrate-heavy member — mail/calendar/contacts read+write. Common phishing-pivot target.",
+    },
+    "00b41c95-dab0-4487-9791-b9d2c32c80f2": {
+      id: "00b41c95-dab0-4487-9791-b9d2c32c80f2",
+      name: "Office 365 Management",
+      audiences: ["ARM", "Graph", "Substrate"],
+      highValueScopes: [
+        "AdminApi.AccessAsUser.All (Outlook admin)",
+        "Contacts.Read (Graph)",
+        "manage.office.com /.default",
+      ],
+      notes:
+        "O365 Management acts as a thin admin shim — admin APIs over Exchange Online plus broad Graph reach.",
+    },
+    "872cd9fa-d31f-45e0-9eab-6e460a02d1f1": {
+      id: "872cd9fa-d31f-45e0-9eab-6e460a02d1f1",
+      name: "Visual Studio",
+      audiences: ["ARM", "Graph", "DevOps", "Vault", "Storage"],
+      highValueScopes: [
+        "user_impersonation (ARM)",
+        "Code.ReadWrite (DevOps)",
+        "vso.* scopes (DevOps PATs)",
+      ],
+      notes:
+        "Visual Studio crosses ARM + Azure DevOps in one family member — supply-chain pivots through pipelines/service connections.",
+    },
+    "4813382a-8fa7-425e-ab75-3b753aab3abb": {
+      id: "4813382a-8fa7-425e-ab75-3b753aab3abb",
+      name: "Microsoft Authenticator App",
+      audiences: ["Graph", "Substrate"],
+      highValueScopes: [
+        "DeviceManagementManagedDevices.Read.All (Graph)",
+        "User.Read (Graph)",
+      ],
+      notes:
+        "Authenticator App RTs are valuable because they ride device-bound PRT cookies and can be redeemed without prompting; see _AZURE_LOGIN_METHODS.md §PRT.",
+    },
+    "ab9b8c07-8f02-4f72-87fa-80105867a763": {
+      id: "ab9b8c07-8f02-4f72-87fa-80105867a763",
+      name: "OneDrive SyncEngine",
+      audiences: ["Graph", "Substrate"],
+      highValueScopes: ["Files.ReadWrite.All (Graph)", "Sites.Read.All (Graph)"],
+      notes:
+        "OneDrive SyncEngine sees full file plane across the user's drive + delegated sites. Exfil-friendly.",
+    },
+    "c0d2a505-13b8-4ae0-aa9e-cddd5eab0b12": {
+      id: "c0d2a505-13b8-4ae0-aa9e-cddd5eab0b12",
+      name: "Microsoft Power BI",
+      audiences: ["Graph", "Power BI"],
+      highValueScopes: [
+        "Dataset.ReadWrite.All (Power BI)",
+        "Report.ReadWrite.All (Power BI)",
+      ],
+      notes:
+        "Power BI RTs unlock dataset + report APIs scoped to workspaces the principal can see. Useful for tenant-data exfil at the analytics tier.",
+    },
+    "9ba1a5c7-f17a-4de9-a1f1-6178c8d51223": {
+      id: "9ba1a5c7-f17a-4de9-a1f1-6178c8d51223",
+      name: "Microsoft Intune Company Portal",
+      audiences: ["Graph", "Intune"],
+      highValueScopes: [
+        "DeviceManagementManagedDevices.PrivilegedOperations.All (Graph)",
+        "DeviceManagementApps.ReadWrite.All (Graph)",
+      ],
+      notes:
+        "Intune Company Portal can pivot to managed-device commands and app-deployment plane — pivot to endpoints.",
+    },
+  });
+
+/**
+ * Look up a FOCI client's annotated profile. Returns `undefined` for unknown
+ * or un-annotated clients. NEVER throws.
+ *
+ * `id === ""` is treated as "not a real profile" — defensive guard in case a
+ * future maintainer adds a stub entry without a matching client_id.
+ */
+export function getFociClientProfile(
+  clientId: string | undefined | null,
+): FociClientProfile | undefined {
+  if (!clientId) return undefined;
+  const id = clientId.toLowerCase();
+  const p = FOCI_CLIENT_PROFILES[id];
+  if (!p || !p.id) return undefined;
+  return p;
+}
+
+// ---------------------------------------------------------------------------
+//  Signal E — Audience → reachable FOCI clients (reverse map)
+// ---------------------------------------------------------------------------
+//
+// "Per known FOCI client_id, which audiences are tokenable from it" is the
+// matrix's headline reachability claim. Surfacing the REVERSE — for each
+// audience, which FOCI client_ids are known to mint to it — is the
+// defender-side framing: "if my SOC sees a token mint to audience X from
+// client Y, is that on the published reachability?".
+//
+// Derived from FOCI_CLIENT_PROFILES above by inverting the audiences arrays.
+// Computed once at module load; the result is frozen.
+
+export interface AudienceReachability {
+  readonly audienceKey: string;
+  readonly clients: ReadonlyArray<{ id: string; name: string }>;
+}
+
+const AUDIENCE_TO_CLIENTS_BUILDER: Record<
+  string,
+  Array<{ id: string; name: string }>
+> = {};
+for (const id of Object.keys(FOCI_CLIENT_PROFILES)) {
+  const p = FOCI_CLIENT_PROFILES[id];
+  if (!p || !p.id) continue;
+  for (const aud of p.audiences) {
+    if (!AUDIENCE_TO_CLIENTS_BUILDER[aud]) AUDIENCE_TO_CLIENTS_BUILDER[aud] = [];
+    AUDIENCE_TO_CLIENTS_BUILDER[aud].push({ id: p.id, name: p.name });
+  }
+}
+// Sort each list by name for stable display.
+for (const aud of Object.keys(AUDIENCE_TO_CLIENTS_BUILDER)) {
+  AUDIENCE_TO_CLIENTS_BUILDER[aud]!.sort((a, b) => a.name.localeCompare(b.name));
+  Object.freeze(AUDIENCE_TO_CLIENTS_BUILDER[aud]);
+}
+
+/**
+ * For each audience column key, the list of annotated FOCI clients known to
+ * tokenize for that audience. An empty list means "no annotated client in
+ * `FOCI_CLIENT_PROFILES` reaches this audience" — which is NOT proof of
+ * unreachability (the audience may still be reachable via clients we haven't
+ * annotated). Treat absence as "uncalibrated".
+ */
+export const AUDIENCE_TO_FOCI_CLIENTS: Readonly<
+  Record<string, ReadonlyArray<{ id: string; name: string }>>
+> = Object.freeze(AUDIENCE_TO_CLIENTS_BUILDER);
+
+/**
+ * Count annotated FOCI clients reaching an audience. Used by the reachability
+ * table for the summary badge.
+ */
+export function fociClientsReachingAudience(audienceKey: string): number {
+  return AUDIENCE_TO_FOCI_CLIENTS[audienceKey]?.length ?? 0;
+}
+
 export interface DefenderBannerCopy {
   readonly title: string;
   readonly body: string;

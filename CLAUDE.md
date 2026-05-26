@@ -105,6 +105,56 @@ sidestep both problems.
 
 ---
 
+# Sub-agent model and effort
+
+## HARD RULE — Every sub-agent is Opus 4.7 (1M context), max effort, fast posture
+
+Every `Agent` tool call I make MUST set:
+
+- **`model: "opus"`** — selects the current Opus tier the platform serves
+  (Opus 4.7 with 1M context per the runtime footer). Never `sonnet`,
+  never `haiku`, never omit (omitting inherits the parent model, which
+  is not guaranteed to be Opus).
+- **`subagent_type: "claude"`** (or a specifically named role) — the
+  default `claude` catch-all is Opus-capable. Do NOT use lighter agent
+  types (`Explore`, `general-purpose`) for code-writing work that needs
+  full capability.
+
+## Effort and pace — set via prompt, not tool params
+
+The `Agent` tool has no `effort`, `thinking`, `extended_thinking`,
+`speed`, or `mode` parameter. "Max effort" and "fast mode" cannot be
+configured at the tool layer. They must be communicated through the
+prompt body:
+
+- **For max effort:** every dispatched-agent prompt must include the
+  line *"Think carefully. Take the time you need. Verify your work
+  before reporting done."* — placed near the top of the prompt, above
+  the task.
+- **For fast posture (delivery-focused, not exploratory):** include
+  *"Do not over-explore. Read only what the task requires. Do not
+  speculate about future requirements. Report when the assigned task
+  is complete."* — paired with the max-effort line.
+
+The two are not contradictory when paired: think deeply about the
+assigned scope; do not balloon the scope.
+
+## What this rule does NOT cover
+
+- I cannot pin a specific Opus minor version (`4.7` vs `4.8` etc.) —
+  the platform routes `opus` to its current Opus tier.
+- I cannot guarantee 1M context — that is a platform-served capability
+  of the current Opus tier and may change without notice.
+- I cannot enable extended-thinking from the `Agent` tool; if the
+  platform-level extended-thinking is a session setting elsewhere
+  (e.g. via `/config`), the user controls that, not me.
+
+If a future `Agent` tool schema exposes an effort or thinking knob,
+this rule must be updated to set it explicitly in addition to the
+prompt-level wording.
+
+---
+
 # Sub-agent context propagation
 
 ## Every sub-agent inherits the full session settings

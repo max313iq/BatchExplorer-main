@@ -33,6 +33,8 @@
  *   map without nested objects — cheaper to update immutably.
  */
 
+import * as React from "react";
+
 import { decodeJwtClaimsUnsafe } from "../../auth/msal-auth";
 
 /**
@@ -372,4 +374,262 @@ export function fmtDurationMs(ms: number): string {
   const min = Math.floor(sec / 60);
   const rem = Math.floor(sec % 60);
   return `${min}m${rem}s`;
+}
+
+// ---------------------------------------------------------------------------
+//  Row sorting
+// ---------------------------------------------------------------------------
+//
+// Operators sort by:
+//   - "name"   : display name (default, alphabetical)
+//   - "kind"   : RT rows first then accounts (or vice-versa with direction)
+//   - "tenant" : tenant id (clusters same-tenant principals)
+//   - "client" : source client_id (groups FOCI siblings)
+//   - "minted" : count of successful cells (descending by default)
+//
+// Sort state is URL-persisted by the page; this module only exports the
+// comparator factory so the page stays the source of truth on visible state.
+
+/** Row-sort key options. */
+export type RowSortKey = "name" | "kind" | "tenant" | "client" | "minted";
+
+/** Sort direction. */
+export type SortDirection = "asc" | "desc";
+
+/**
+ * Build a row comparator. `mintedCount` is a closure over the cells map and
+ * is read only when the sort key is "minted" — for other keys it can be a
+ * no-op (`() => 0`).
+ */
+export function buildRowComparator(
+  key: RowSortKey,
+  direction: SortDirection,
+  mintedCount: (rowId: string) => number,
+): (a: MintRow, b: MintRow) => number {
+  const sign = direction === "asc" ? 1 : -1;
+  return (a, b) => {
+    let cmp = 0;
+    switch (key) {
+      case "name":
+        cmp = a.displayName.localeCompare(b.displayName, undefined, {
+          sensitivity: "base",
+        });
+        break;
+      case "kind":
+        // RT vs account; deterministic tiebreak on name.
+        cmp = a.kind.localeCompare(b.kind);
+        if (cmp === 0) {
+          cmp = a.displayName.localeCompare(b.displayName, undefined, {
+            sensitivity: "base",
+          });
+        }
+        break;
+      case "tenant":
+        cmp = a.tenantId.localeCompare(b.tenantId);
+        if (cmp === 0) {
+          cmp = a.displayName.localeCompare(b.displayName, undefined, {
+            sensitivity: "base",
+          });
+        }
+        break;
+      case "client":
+        cmp = (a.clientId ?? "").localeCompare(b.clientId ?? "");
+        if (cmp === 0) {
+          cmp = a.displayName.localeCompare(b.displayName, undefined, {
+            sensitivity: "base",
+          });
+        }
+        break;
+      case "minted":
+        cmp = mintedCount(a.id) - mintedCount(b.id);
+        if (cmp === 0) {
+          cmp = a.displayName.localeCompare(b.displayName, undefined, {
+            sensitivity: "base",
+          });
+        }
+        break;
+    }
+    return cmp === 0 ? 0 : cmp * sign;
+  };
+}
+
+// ---------------------------------------------------------------------------
+//  Recency index — built once per `cells` change so per-row recency lookups
+//  drop from O(N_keys) to O(1).
+// ---------------------------------------------------------------------------
+
+/**
+ * Index `cells` by row id, mapping each row to:
+ *   - the count of successful cells (for the "minted" sort and the row-level
+ *     "any successful cell" predicate);
+ *   - the most recent successful `mintedAt` (seconds-epoch) for the recency
+ *     filter.
+ *
+ * Both fields are O(N_cells) to compute (single walk); each query is O(1).
+ * The page memoises this so each cells-map change does the walk exactly once.
+ */
+export interface RowCellIndexEntry {
+  /** Count of cells in `success` state for this row. */
+  readonly successCount: number;
+  /** Most recent `mintedAt` (seconds-epoch) of any successful cell. */
+  readonly latestMintedAt: number;
+}
+
+export function indexCellsByRow(
+  cells: Record<string, CellState>,
+): Map<string, RowCellIndexEntry> {
+  const out = new Map<string, RowCellIndexEntry>();
+  for (const k in cells) {
+    const sep = k.indexOf("|");
+    if (sep < 0) continue;
+    const rowId = k.slice(0, sep);
+    const s = cells[k];
+    if (!s || s.kind !== "success") continue;
+    const prev = out.get(rowId);
+    if (prev) {
+      // Replace immutably — Map only holds one record per row.
+      out.set(rowId, {
+        successCount: prev.successCount + 1,
+        latestMintedAt: Math.max(prev.latestMintedAt, s.mintedAt),
+      });
+    } else {
+      out.set(rowId, { successCount: 1, latestMintedAt: s.mintedAt });
+    }
+  }
+  return out;
+}
+
+// ---------------------------------------------------------------------------
+//  Density / view mode
+// ---------------------------------------------------------------------------
+
+/**
+ * Matrix density. "compact" reduces vertical padding and hides UPN/RT-prefix
+ * sub-rows in the identifier cell; "comfy" is the default verbose layout.
+ */
+export type MatrixDensity = "compact" | "comfy";
+
+/** localStorage key for the density preference (page-scoped). */
+export const MATRIX_DENSITY_KEY = "audience-matrix.density";
+
+// ---------------------------------------------------------------------------
+//  Keyboard navigation
+// ---------------------------------------------------------------------------
+
+/**
+ * Cell coordinate inside the matrix. Indexed against the CURRENT
+ * `visibleRows × AUDIENCE_COLUMNS` projection — the page is responsible
+ * for keeping this in sync when filters / sort change.
+ */
+export interface CellCoord {
+  readonly rowIndex: number;
+  readonly colIndex: number;
+}
+
+/**
+ * Compute the next focus coordinate given a keyboard arrow event. Returns
+ * the unchanged coord when the key isn't a navigation key, so the page can
+ * skip the setState. Wraps at the edges — wrap is a deliberate choice: with
+ * 12+ audience columns + N rows, "edge bump" frustrates the operator more
+ * than wrap surprises them.
+ */
+export function nextCoord(
+  current: CellCoord,
+  key: string,
+  rowCount: number,
+  colCount: number,
+): CellCoord {
+  if (rowCount <= 0 || colCount <= 0) return current;
+  let r = current.rowIndex;
+  let c = current.colIndex;
+  switch (key) {
+    case "ArrowUp":
+      r = (r - 1 + rowCount) % rowCount;
+      break;
+    case "ArrowDown":
+      r = (r + 1) % rowCount;
+      break;
+    case "ArrowLeft":
+      c = (c - 1 + colCount) % colCount;
+      break;
+    case "ArrowRight":
+      c = (c + 1) % colCount;
+      break;
+    case "Home":
+      c = 0;
+      break;
+    case "End":
+      c = colCount - 1;
+      break;
+    case "PageUp":
+      r = 0;
+      break;
+    case "PageDown":
+      r = rowCount - 1;
+      break;
+    default:
+      return current;
+  }
+  return { rowIndex: r, colIndex: c };
+}
+
+// ---------------------------------------------------------------------------
+//  Shared 1Hz clock
+// ---------------------------------------------------------------------------
+//
+// Pre-wave-8 every successful cell mounted its own `setInterval(1000)` to
+// drive the "Xm left" badge re-render. For a fully-minted matrix (visibleRows
+// × AUDIENCE_COLUMNS successful cells) that produced one wakeup per cell per
+// second — wasteful and racy across cells that started ticking at slightly
+// different times.
+//
+// The page now hosts ONE 1Hz ticker via this helper hook and broadcasts the
+// integer seconds-epoch to every consumer via the returned value. Cells
+// memoise based on `(expiresAt, nowSec)` so they only render the seconds
+// they care about. Net effect: ~1 wakeup per second, regardless of cell
+// count.
+//
+// Stop the interval when the document is hidden — the page is invisible so
+// the time-remaining badge doesn't need to update. `visibilitychange`
+// re-arms on return.
+
+/**
+ * Returns the current Unix-seconds epoch updated once per second while the
+ * tab is visible. Components consuming this value re-render with the new
+ * `nowSec` only — cell text uses `expiresAt - nowSec` so the math is local
+ * and pure.
+ */
+export function useSecondsTicker(): number {
+  const [now, setNow] = React.useState(() => Math.floor(Date.now() / 1000));
+  React.useEffect(() => {
+    let id: ReturnType<typeof setInterval> | null = null;
+    const start = (): void => {
+      if (id !== null) return;
+      id = setInterval(() => {
+        setNow(Math.floor(Date.now() / 1000));
+      }, 1000);
+    };
+    const stop = (): void => {
+      if (id !== null) {
+        clearInterval(id);
+        id = null;
+      }
+    };
+    const onVis = (): void => {
+      if (document.visibilityState === "visible") {
+        // Catch up on hidden time before re-arming.
+        setNow(Math.floor(Date.now() / 1000));
+        start();
+      } else {
+        stop();
+      }
+    };
+    if (document.visibilityState === "visible") start();
+    document.addEventListener("visibilitychange", onVis);
+    return () => {
+      document.removeEventListener("visibilitychange", onVis);
+      stop();
+    };
+  }, []);
+  return now;
 }

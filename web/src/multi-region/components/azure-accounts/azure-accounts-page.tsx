@@ -38,13 +38,16 @@
 import * as React from "react";
 import {
   AlertCircle,
+  AlertTriangle,
   Check,
   ChevronsUpDown,
   Clock,
   Filter,
+  Globe2,
   KeyRound,
   Loader2,
   LogIn,
+  Network,
   RefreshCw,
   RotateCw,
   Search,
@@ -53,6 +56,7 @@ import {
   Timer,
   Trash2,
   User,
+  Users,
 } from "lucide-react";
 
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
@@ -116,6 +120,7 @@ import {
   resolveActiveTenantId as resolveActiveTenantIdRaw,
 } from "../../auth/perform-tenant-switch";
 import { useAbortableEffect } from "../../hooks/use-abortable-effect";
+import { usePersistedState } from "../../hooks/use-persisted-state";
 import { useUrlState } from "../../hooks/use-url-state";
 import { useShortcut } from "../../hooks/use-shortcut";
 import { auditLog } from "../../services/audit-log";
@@ -127,8 +132,14 @@ import {
 } from "../../store/store-context";
 import { AzureLoginAccount } from "../../store/store-types";
 import { AccountIntelligencePanel } from "./account-intelligence-panel";
+import {
+  bucketAccountAge,
+  summarizePosture,
+  type PostureSummary,
+} from "./azure-accounts-intel";
 import { PreLoginTenantSelector } from "./pre-login-tenant-selector";
 import { SubscriptionList } from "./subscription-list";
+import { TenantGraphPanel, TokenAgeBars } from "./tenant-graph-panel";
 import { ConfirmationDialog } from "../shared/confirmation-dialog";
 import { CopyButton, CopyableText } from "../shared/copy-button";
 import {
@@ -801,7 +812,11 @@ const AccountDrawer: React.FC<AccountDrawerProps> = ({
                     <Badge variant="success">Active</Badge>
                   </div>
                 ) : (
-                  <div className="flex flex-col gap-2">
+                  <div
+                    className="flex flex-col gap-2"
+                    role="group"
+                    aria-label={`Switch tenant (${tenants.length} available)`}
+                  >
                     <Select
                       value={activeTenantId}
                       onValueChange={handleSwitchTenant}
@@ -809,7 +824,8 @@ const AccountDrawer: React.FC<AccountDrawerProps> = ({
                     >
                       <SelectTrigger
                         className="h-9"
-                        aria-label="Switch active tenant"
+                        aria-label={`Switch active tenant — currently ${findTenantLabel(tenants, activeTenantId, activeTenantId)}`}
+                        aria-busy={switchingTenantId !== null}
                       >
                         <SelectValue placeholder="Select a tenant" />
                       </SelectTrigger>
@@ -818,6 +834,8 @@ const AccountDrawer: React.FC<AccountDrawerProps> = ({
                           (tenant: TenantInfo) => {
                             const isHome =
                               tenant.tenantId === account.tenantId;
+                            const isActive =
+                              tenant.tenantId === activeTenantId;
                             const label =
                               tenant.displayName ||
                               tenant.defaultDomain ||
@@ -826,6 +844,7 @@ const AccountDrawer: React.FC<AccountDrawerProps> = ({
                               <SelectItem
                                 key={tenant.tenantId}
                                 value={tenant.tenantId}
+                                aria-label={`${label}${isHome ? " (home tenant)" : ""}${isActive ? " (currently active)" : ""}`}
                               >
                                 <span className="flex items-center gap-2">
                                   <span className="truncate">{label}</span>
@@ -845,9 +864,21 @@ const AccountDrawer: React.FC<AccountDrawerProps> = ({
                       </SelectContent>
                     </Select>
                     {switchingTenantId !== null && (
-                      <div className="flex items-center gap-2 text-2xs text-muted-foreground">
+                      <div
+                        className="flex items-center gap-2 text-2xs text-muted-foreground"
+                        role="status"
+                        aria-live="polite"
+                      >
                         <Loader2 className="h-3 w-3 animate-spin motion-reduce:animate-none" />
-                        <span>Switching tenant...</span>
+                        <span>
+                          Switching tenant to{" "}
+                          {findTenantLabel(
+                            tenants,
+                            switchingTenantId,
+                            "tenant",
+                          )}
+                          …
+                        </span>
                       </div>
                     )}
                   </div>
@@ -1215,6 +1246,21 @@ const AzureAccountsPageInner: React.FC = () => {
 
   const errorAccounts = React.useMemo(
     () => accounts.filter((a) => a.status === "error"),
+    [accounts],
+  );
+
+  /**
+   * Cross-tenant / sovereign-cloud / stale-tenant posture summary.
+   * Runs once per `accounts` change so the row cells and the tenant
+   * graph panel below share the same map (and the row cells don't each
+   * re-classify their own account on every render).
+   *
+   * Corpus refs:
+   *   New folder/_bypass_tenant_switch.md §2 (guest invitation),
+   *   §2.4 (stale guests), §8 (sovereign endpoint catalog).
+   */
+  const posture = React.useMemo<PostureSummary>(
+    () => summarizePosture(accounts),
     [accounts],
   );
 
@@ -1773,6 +1819,15 @@ const AzureAccountsPageInner: React.FC = () => {
     setFilters({ status: "", q: "" });
   }, [setFilters]);
 
+  /* ---- Tenant-graph panel persisted visibility ---- */
+  // Operators usually want to see the graph when triaging cross-tenant
+  // flows and hide it when they're back to single-tenant work. Persist
+  // the choice so the page picks up where they left it across reloads.
+  const [showTenantGraph, setShowTenantGraph] = usePersistedState<boolean>(
+    "azbm.azure-accounts.show-tenant-graph",
+    false,
+  );
+
   /* ---- Keyboard shortcuts ---- */
   useShortcut("mod+shift+l", () => {
     const el = document.getElementById(tenantInputId);
@@ -1781,18 +1836,96 @@ const AzureAccountsPageInner: React.FC = () => {
   useShortcut("/", () => {
     searchInputRef.current?.focus();
   });
-  // `t` — re-trigger tenant switch. If a drawer is open, jump to its
-  // Tenants tab so the picker is visible; otherwise open the first
-  // filtered account's drawer on the Tenants tab. Operators learn this
-  // chord faster than the multi-step "click row → click tab" path,
-  // and it composes with `/` (focus search → narrow → `t`).
+  // Two-step "g <key>" chord state. `useShortcut` doesn't natively
+  // support multi-key chords (it's a single-event chord matcher), so we
+  // arm a leader after `g` is pressed and consume the next key within
+  // 800ms. Press `Escape` (or just wait it out) to cancel. The leader
+  // is intentionally short-lived so it doesn't swallow plain typing.
+  const chordLeaderRef = React.useRef<{
+    armed: boolean;
+    timer: ReturnType<typeof setTimeout> | null;
+  }>({ armed: false, timer: null });
+  const armChordLeader = React.useCallback(() => {
+    if (chordLeaderRef.current.timer) {
+      clearTimeout(chordLeaderRef.current.timer);
+    }
+    chordLeaderRef.current.armed = true;
+    chordLeaderRef.current.timer = setTimeout(() => {
+      chordLeaderRef.current.armed = false;
+      chordLeaderRef.current.timer = null;
+    }, 800);
+  }, []);
+  const disarmChordLeader = React.useCallback(() => {
+    if (chordLeaderRef.current.timer) {
+      clearTimeout(chordLeaderRef.current.timer);
+      chordLeaderRef.current.timer = null;
+    }
+    chordLeaderRef.current.armed = false;
+  }, []);
+  React.useEffect(() => {
+    // Cleanup on unmount so a lingering timer doesn't fire post-unmount.
+    return () => {
+      if (chordLeaderRef.current.timer) {
+        clearTimeout(chordLeaderRef.current.timer);
+      }
+    };
+  }, []);
+
+  // `g` arms the leader. Doesn't trigger any side-effect on its own —
+  // the next key (`t` or `s`) determines the action.
+  useShortcut("g", () => {
+    armChordLeader();
+  });
+  // `t` — re-trigger tenant switch (single-key) OR jump to the tenant
+  // graph (when preceded by `g`). The drawer-open + first-filtered-row
+  // fallback below is the original single-key behaviour preserved.
   useShortcut("t", () => {
+    if (chordLeaderRef.current.armed) {
+      // `g t` — focus the global tenant graph: ensure it's visible and
+      // scroll it into view.
+      disarmChordLeader();
+      setShowTenantGraph(true);
+      // Defer so the panel actually mounted before we scroll.
+      requestAnimationFrame(() => {
+        const el = document.getElementById("azure-accounts-tenant-graph");
+        el?.scrollIntoView({ behavior: "smooth", block: "start" });
+      });
+      return;
+    }
     const targetId =
       drawerAccountId ||
       filteredAccounts[0]?.homeAccountId ||
       null;
     if (!targetId) return;
     setFilters({ account: targetId, tab: "tenants" });
+  });
+  // `g s` — jump to the subscriptions tab on the currently-open
+  // (or first-filtered) account.
+  useShortcut("s", () => {
+    if (!chordLeaderRef.current.armed) return;
+    disarmChordLeader();
+    const targetId =
+      drawerAccountId ||
+      filteredAccounts[0]?.homeAccountId ||
+      null;
+    if (!targetId) return;
+    setFilters({ account: targetId, tab: "subscriptions" });
+  });
+  // `Escape` cancels any armed leader (defensive — also closes Radix
+  // dialogs/menus on its own).
+  useShortcut("escape", () => {
+    if (chordLeaderRef.current.armed) disarmChordLeader();
+  });
+  // `r` — refresh selected accounts (or every account when nothing is
+  // selected). Power-user shortcut for "I just made changes externally,
+  // pull fresh state" without reaching for the toolbar.
+  useShortcut("r", () => {
+    if (chordLeaderRef.current.armed) return; // `g r` reserved for future use
+    if (selection.size > 0) {
+      void handleBulkRefresh();
+    } else {
+      void handleRefreshAll();
+    }
   });
 
   /* ---- Export columns ---- */
@@ -1867,10 +2000,98 @@ const AzureAccountsPageInner: React.FC = () => {
           const tenants = a.tenants ?? [];
           const isSwitching = !!rowSwitchingByAccountId[a.homeAccountId];
           const switchingTo = rowSwitchingByAccountId[a.homeAccountId];
+          // Corpus-grounded annotations:
+          //   - crossTenantState: account holds a token for a tenant
+          //     OTHER than its home — B2B guest token in active use.
+          //     See _bypass_tenant_switch.md §2 "Guest Invitation Abuse".
+          //   - cloud: which cloud minted the token (Commercial / Gov /
+          //     China / Germany). See _bypass_tenant_switch.md §8.1
+          //     "Endpoint catalog".
+          const crossTenantState = posture.crossTenantByAccount[a.homeAccountId];
+          const cloud = posture.cloudByAccount[a.homeAccountId];
+          const showCloudBadge =
+            cloud && cloud.kind !== "commercial" && cloud.kind !== "unknown";
+
+          const annotations = (
+            <>
+              {crossTenantState && (
+                <Tooltip>
+                  <TooltipTrigger asChild>
+                    <span>
+                      <Badge
+                        variant={
+                          crossTenantState.staleAssociation
+                            ? "destructive"
+                            : "warning"
+                        }
+                        className="gap-1 px-1 py-0 text-[9px]"
+                      >
+                        {crossTenantState.staleAssociation ? (
+                          <AlertTriangle
+                            className="h-2.5 w-2.5"
+                            aria-hidden
+                          />
+                        ) : (
+                          <Users className="h-2.5 w-2.5" aria-hidden />
+                        )}
+                        {crossTenantState.staleAssociation
+                          ? "Stale guest"
+                          : "Cross-tenant"}
+                      </Badge>
+                    </span>
+                  </TooltipTrigger>
+                  <TooltipContent side="top">
+                    <div className="flex max-w-[260px] flex-col gap-1 text-[11px]">
+                      <span>
+                        Active tenant{" "}
+                        <strong>{crossTenantState.activeTenantLabel}</strong>{" "}
+                        is NOT this account's home (
+                        <strong>{crossTenantState.homeTenantLabel}</strong>).
+                      </span>
+                      {crossTenantState.staleAssociation && (
+                        <span className="text-warning">
+                          Active tenant id is not in this account's
+                          discovered tenants list — likely a stale B2B /
+                          Lighthouse association. See{" "}
+                          <code>_bypass_tenant_switch.md §2.4</code>.
+                        </span>
+                      )}
+                    </div>
+                  </TooltipContent>
+                </Tooltip>
+              )}
+              {showCloudBadge && cloud && (
+                <Tooltip>
+                  <TooltipTrigger asChild>
+                    <span>
+                      <Badge
+                        variant="info"
+                        className="gap-1 px-1 py-0 text-[9px]"
+                      >
+                        <Globe2 className="h-2.5 w-2.5" aria-hidden />
+                        {cloud.label}
+                      </Badge>
+                    </span>
+                  </TooltipTrigger>
+                  <TooltipContent side="top">
+                    <div className="flex max-w-[260px] flex-col gap-1 text-[11px]">
+                      <span>{cloud.description}</span>
+                      <span className="text-muted-foreground">
+                        Classified from MSAL <code>environment</code>{" "}
+                        field. Defenders watching only commercial sign-in
+                        logs miss the sovereign side — see{" "}
+                        <code>_bypass_tenant_switch.md §8.2</code>.
+                      </span>
+                    </div>
+                  </TooltipContent>
+                </Tooltip>
+              )}
+            </>
+          );
 
           if (tenants.length <= 1) {
             return (
-              <div className="flex flex-col">
+              <div className="flex flex-col gap-0.5">
                 <span
                   className="truncate text-xs text-foreground"
                   title={activeTenantId}
@@ -1881,10 +2102,16 @@ const AzureAccountsPageInner: React.FC = () => {
                     </code>
                   )}
                 </span>
+                {(crossTenantState || showCloudBadge) && (
+                  <div className="flex flex-wrap items-center gap-1">
+                    {annotations}
+                  </div>
+                )}
               </div>
             );
           }
           return (
+            <div className="flex flex-col gap-1">
             <DropdownMenu>
               <DropdownMenuTrigger asChild>
                 <Button
@@ -1897,7 +2124,8 @@ const AzureAccountsPageInner: React.FC = () => {
                   // account drawer.
                   onClick={(e) => e.stopPropagation()}
                   disabled={isSwitching}
-                  aria-label={`Switch active tenant for ${a.username || a.name || a.homeAccountId}`}
+                  aria-label={`Switch active tenant for ${a.username || a.name || a.homeAccountId}. ${tenants.length} tenants available.`}
+                  aria-haspopup="menu"
                 >
                   <div className="flex flex-col items-start gap-0.5 min-w-0">
                     <span
@@ -1992,6 +2220,15 @@ const AzureAccountsPageInner: React.FC = () => {
                 })}
               </DropdownMenuContent>
             </DropdownMenu>
+            {(crossTenantState || showCloudBadge) && (
+              <div
+                className="flex flex-wrap items-center gap-1"
+                onClick={(e) => e.stopPropagation()}
+              >
+                {annotations}
+              </div>
+            )}
+            </div>
           );
         },
       },
@@ -2071,9 +2308,8 @@ const AzureAccountsPageInner: React.FC = () => {
       },
       {
         id: "added",
-        header: "Added",
-        width: "w-24",
-        defaultHidden: true,
+        header: "Age",
+        width: "w-28",
         sort: (a, b) => {
           const aTs = a.addedAt ? Date.parse(a.addedAt) : NaN;
           const bTs = b.addedAt ? Date.parse(b.addedAt) : NaN;
@@ -2083,11 +2319,30 @@ const AzureAccountsPageInner: React.FC = () => {
           return aTs - bTs;
         },
         csv: (a) => a.addedAt ?? "",
-        cell: (a) => (
-          <span className="text-2xs text-muted-foreground tabular-nums">
-            {formatRelativeTime(a.addedAt)}
-          </span>
-        ),
+        cell: (a) => {
+          // Mini "trend" sparkline encoding bucket(age) — operators
+          // scanning a long list can spot the accounts that haven't been
+          // refreshed in a while without reading the relative time
+          // string. The full ISO + relative-time still live in the
+          // drawer's Details tab.
+          const bucket = bucketAccountAge(a, Date.now());
+          return (
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <span className="inline-flex items-center gap-1.5">
+                  <TokenAgeBars
+                    bucket={bucket.bucket}
+                    ageLabel={bucket.ageLabel}
+                  />
+                </span>
+              </TooltipTrigger>
+              <TooltipContent side="top">
+                Last refreshed {formatRelativeTime(a.addedAt)} ·{" "}
+                bucket: {bucket.bucket}
+              </TooltipContent>
+            </Tooltip>
+          );
+        },
       },
       {
         id: "actions",
@@ -2155,6 +2410,7 @@ const AzureAccountsPageInner: React.FC = () => {
       refreshingIds,
       handleRefreshOne,
       handleRequestRemove,
+      posture,
     ],
   );
 
@@ -2390,6 +2646,38 @@ const AzureAccountsPageInner: React.FC = () => {
               </Button>
             )}
             <div className="ml-auto flex items-center gap-2">
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <Button
+                    type="button"
+                    variant={showTenantGraph ? "default" : "outline"}
+                    size="sm"
+                    onClick={() => setShowTenantGraph((v) => !v)}
+                    aria-pressed={showTenantGraph}
+                    aria-label={
+                      showTenantGraph
+                        ? "Hide tenant graph panel"
+                        : "Show tenant graph panel"
+                    }
+                  >
+                    <Network className="h-3.5 w-3.5" />
+                    Tenant graph
+                  </Button>
+                </TooltipTrigger>
+                <TooltipContent side="bottom">
+                  <div className="flex max-w-[260px] flex-col gap-1 text-[11px]">
+                    <span>
+                      Toggle the cross-tenant / sovereign-cloud trust
+                      topology view. Press <Kbd>g</Kbd> then <Kbd>t</Kbd>{" "}
+                      to jump to it.
+                    </span>
+                    <span className="text-muted-foreground">
+                      Inspired by SpecterOps/AzureHound &amp;
+                      ROADtools/roadrecon — see corpus.
+                    </span>
+                  </div>
+                </TooltipContent>
+              </Tooltip>
               <ExportMenu<AzureLoginAccount>
                 rows={filteredAccounts}
                 columns={exportColumns}
@@ -2398,6 +2686,9 @@ const AzureAccountsPageInner: React.FC = () => {
                   source: "AzureBatchManager.AzureAccounts",
                   statusFilter: filters.status || undefined,
                   searchQuery: filters.q || undefined,
+                  crossTenantCount: posture.crossTenantCount,
+                  staleTenantCount: posture.staleTenantCount,
+                  sovereignAccountCount: posture.sovereignAccountCount,
                 }}
                 disabled={filteredAccounts.length === 0}
               />
@@ -2521,6 +2812,98 @@ const AzureAccountsPageInner: React.FC = () => {
         </div>
       )}
 
+      {/* Posture banner — visible whenever an interesting signal fires.
+          Surfaces cross-tenant / sovereign / stale-tenant aggregates
+          alongside the regular status filter chips. Cheap status line
+          so the operator doesn't have to open the graph panel to spot
+          the trend. */}
+      {accounts.length > 0 &&
+        (posture.crossTenantCount > 0 ||
+          posture.sovereignAccountCount > 0 ||
+          posture.staleTenantCount > 0) && (
+          <Card
+            className="flex flex-wrap items-center gap-3 px-3 py-2"
+            role="status"
+            aria-live="polite"
+          >
+            {posture.crossTenantCount > 0 && (
+              <span className="inline-flex items-center gap-1.5 text-xs">
+                <Users className="h-3.5 w-3.5 text-warning" aria-hidden />
+                <strong>{posture.crossTenantCount}</strong> account
+                {posture.crossTenantCount === 1 ? "" : "s"} on a
+                non-home tenant
+                <InfoTooltip
+                  content="Account.activeTenantId differs from homeTenantId — B2B guest token in active use. See New folder/_bypass_tenant_switch.md §2."
+                  ariaLabel="Cross-tenant info"
+                  size={12}
+                />
+              </span>
+            )}
+            {posture.staleTenantCount > 0 && (
+              <span className="inline-flex items-center gap-1.5 text-xs">
+                <AlertTriangle
+                  className="h-3.5 w-3.5 text-destructive"
+                  aria-hidden
+                />
+                <strong>{posture.staleTenantCount}</strong> stale tenant
+                association{posture.staleTenantCount === 1 ? "" : "s"}
+                <InfoTooltip
+                  content="Active tenant id is not present in this account's discovered tenants list — likely a deleted B2B relationship or revoked guest invitation. See New folder/_bypass_tenant_switch.md §2.4."
+                  ariaLabel="Stale guest info"
+                  size={12}
+                />
+              </span>
+            )}
+            {posture.sovereignAccountCount > 0 && (
+              <span className="inline-flex items-center gap-1.5 text-xs">
+                <Globe2 className="h-3.5 w-3.5 text-info" aria-hidden />
+                <strong>{posture.sovereignAccountCount}</strong>{" "}
+                sovereign-cloud sign-in
+                {posture.sovereignAccountCount === 1 ? "" : "s"}
+                <InfoTooltip
+                  content="Account signed in via a sovereign cloud (Gov / China / Germany) endpoint rather than Commercial. See New folder/_bypass_tenant_switch.md §8."
+                  ariaLabel="Sovereign cloud info"
+                  size={12}
+                />
+              </span>
+            )}
+            <Button
+              type="button"
+              variant="ghost"
+              size="sm"
+              onClick={() => setShowTenantGraph((v) => !v)}
+              className="ml-auto"
+              aria-label={
+                showTenantGraph
+                  ? "Hide tenant graph"
+                  : "Show tenant graph"
+              }
+            >
+              {showTenantGraph ? "Hide graph" : "Open graph"}
+            </Button>
+          </Card>
+        )}
+
+      {/* Tenant trust-graph (collapsible, defaults to hidden). Built
+          from `buildTenantGraph(accounts)` — see tenant-graph-panel.tsx
+          and azure-accounts-intel.ts. Corpus refs:
+            _bypass_tenant_switch.md §1 (tenant enumeration),
+            §2 (B2B guest abuse), §8 (sovereign clouds).
+          Inspired by SpecterOps/AzureHound's User->Tenant edge view and
+          dirkjanm/ROADtools roadrecon's per-account tenant footprint. */}
+      {accounts.length > 0 && showTenantGraph && (
+        <div id="azure-accounts-tenant-graph">
+          <TenantGraphPanel
+            accounts={accounts}
+            cloudByAccount={posture.cloudByAccount}
+            crossTenantByAccount={posture.crossTenantByAccount}
+            onOpenAccount={(homeAccountId) =>
+              setFilters({ account: homeAccountId, tab: "tenants" })
+            }
+          />
+        </div>
+      )}
+
       {/* Accounts list / skeleton / empty */}
       {initialLoading && accounts.length === 0 ? (
         <SkeletonLoader variant="table" rows={4} columns={4} />
@@ -2592,7 +2975,11 @@ const AzureAccountsPageInner: React.FC = () => {
         <p className="self-center text-2xs text-muted-foreground">
           <Clock className="mr-1 inline h-3 w-3" aria-hidden /> Tip: press{" "}
           <Kbd>/</Kbd> to focus search, <Kbd>t</Kbd> to open the tenant
-          picker, <Kbd>Enter</Kbd> on a row to open its detail drawer.
+          picker, <Kbd>r</Kbd> to refresh{" "}
+          {selection.size > 0 ? "selected" : "all"}, <Kbd>g</Kbd> then{" "}
+          <Kbd>t</Kbd> to jump to the tenant graph, <Kbd>g</Kbd> then{" "}
+          <Kbd>s</Kbd> to jump to subscriptions, <Kbd>Enter</Kbd> on a row
+          to open its detail drawer.
         </p>
       )}
 

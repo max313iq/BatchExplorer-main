@@ -129,6 +129,20 @@ const ALL_REGIONS = "__all";
 const STALE_DATA_THRESHOLD_MS = 5 * 60 * 1000; // 5 min
 const CRITICAL_UTILIZATION_PCT = 80;
 const WARNING_UTILIZATION_PCT = 50;
+// Persisted threshold-alert (Wave-2 add). When per-account peak utilization
+// crosses this configurable percent, the row banner highlights the account
+// as "watch". Operators get a deep-link from the banner to the row's sheet.
+// Stored under a v1 key so future schema bumps can migrate cleanly.
+const THRESHOLD_ALERT_KEY = "azbm.account-info.threshold-alert-pct.v1";
+const THRESHOLD_ALERT_DEFAULT_PCT = 75;
+const THRESHOLD_ALERT_OPTIONS = [50, 60, 70, 75, 80, 90, 95] as const;
+// Hotkey chord sequences. `g a` / `g p` follows the Gmail-style "g + nav"
+// convention also used by GitHub. The chord buffer resets after 1.2s so a
+// stray `g` doesn't get bound to whatever the next keypress is.
+const CHORD_BUFFER_TIMEOUT_MS = 1200;
+// Active jobs is a quota-only metric — Azure Batch doesn't expose a "used"
+// count for active jobs in the account-quota response, so we display "—"
+// for the used value instead of a misleading 0. (Wave-2 correctness fix.)
 // Utilization band — URL-synced so a "show me only the critical accounts" view
 // is deep-linkable + shareable. "all" is treated as the default (no URL entry).
 type UtilizationBand = "all" | "critical" | "warning" | "healthy";
@@ -453,24 +467,29 @@ const AccountDetailSheet: React.FC<AccountDetailSheetProps> = ({
                       used={safeNum(account.dedicatedCoresUsed)}
                       quota={safeNum(account.dedicatedCoreQuota)}
                       free={safeNum(account.dedicatedCoresFree)}
+                      hint="Reserved-capacity cores. Counts against the subscription's per-region dedicated-core ceiling — pool resize fails if the family or account quota is exhausted."
                     />
                     <RawQuotaCard
                       label="Low-priority cores"
                       used={safeNum(account.lowPriorityCoresUsed)}
                       quota={safeNum(account.lowPriorityCoreQuota)}
                       free={safeNum(account.lowPriorityCoresFree)}
+                      hint="Spot/preemptible cores. Cheaper but can be evicted by Azure at any time; quota is independent from the dedicated-core ceiling."
                     />
                     <RawQuotaCard
                       label="Pools"
                       used={safeNum(account.poolCount)}
                       quota={safeNum(account.poolQuota)}
                       free={safeNum(account.poolsFree)}
+                      hint="Maximum simultaneous pools (compute groups) this account may hold. Hitting this cap blocks Create-Pool even when core quota is still free."
                     />
                     <RawQuotaCard
                       label="Active jobs"
                       used={0}
                       quota={safeNum(account.activeJobAndJobScheduleQuota)}
                       free={safeNum(account.activeJobAndJobScheduleQuota)}
+                      usedUnknown
+                      hint="Maximum simultaneously-active jobs + job-schedules. Azure Batch does not expose a live used-count via the quota API, so only the cap is shown."
                     />
                   </div>
                 </section>
@@ -675,6 +694,18 @@ interface RawQuotaCardProps {
   used: number;
   quota: number;
   free: number;
+  /**
+   * When true, render the "used" portion as "—" because Azure Batch
+   * doesn't expose a used-count for this metric (active jobs is the
+   * only case today). The bar still tracks quota vs free.
+   */
+  usedUnknown?: boolean;
+  /**
+   * Optional inline tooltip rendered next to the label. Used to
+   * disambiguate LP vs Dedicated vs ActiveJob for operators who
+   * are new to Azure Batch's quota terminology.
+   */
+  hint?: string;
 }
 
 type QuotaTone = "destructive" | "warning" | "success" | "muted";
@@ -698,7 +729,7 @@ const QUOTA_LABEL_TONE: Record<QuotaTone, string> = {
 };
 
 const RawQuotaCard: React.FC<RawQuotaCardProps> = React.memo(
-  ({ label, used, quota, free }) => {
+  ({ label, used, quota, free, usedUnknown = false, hint }) => {
     const pct = usagePct(used, quota);
     // Color-coded threshold band — matches the row-level UsageBar tone scale
     // so the operator's color → severity mapping is consistent across the
@@ -715,8 +746,9 @@ const RawQuotaCard: React.FC<RawQuotaCardProps> = React.memo(
             : "success";
     return (
       <div className="flex flex-col gap-1.5 rounded-md border border-border bg-card p-3 transition-shadow duration-200 ease-out hover:shadow-elev-1">
-        <span className="text-2xs uppercase tracking-wider text-muted-foreground">
+        <span className="inline-flex items-center gap-1 text-2xs uppercase tracking-wider text-muted-foreground">
           {label}
+          {hint && <InfoTooltip content={hint} size={11} />}
         </span>
         <div className="flex items-baseline justify-between gap-2">
           <span
@@ -725,7 +757,7 @@ const RawQuotaCard: React.FC<RawQuotaCardProps> = React.memo(
               QUOTA_LABEL_TONE[tone],
             )}
           >
-            {formatNumber(used)} / {formatNumber(quota)}
+            {usedUnknown ? "—" : formatNumber(used)} / {formatNumber(quota)}
           </span>
           <span
             className={cn(
@@ -734,26 +766,34 @@ const RawQuotaCard: React.FC<RawQuotaCardProps> = React.memo(
             )}
             aria-hidden
           >
-            {quota > 0 ? `${pct}%` : "—"}
+            {usedUnknown || quota <= 0 ? "—" : `${pct}%`}
           </span>
         </div>
         <Progress
-          value={pct}
+          value={usedUnknown ? 0 : pct}
           className={cn(
             "h-1.5",
             QUOTA_TRACK_TONE[tone],
             QUOTA_FILL_TONE[tone],
           )}
-          aria-label={`${label}: ${used} of ${quota} (${pct} percent used)`}
-          aria-valuetext={`${pct}% — ${
-            tone === "destructive"
-              ? "critical"
-              : tone === "warning"
-                ? "warning"
-                : tone === "success"
-                  ? "healthy"
-                  : "no quota assigned"
-          }`}
+          aria-label={
+            usedUnknown
+              ? `${label}: ${quota} quota (used count unavailable)`
+              : `${label}: ${used} of ${quota} (${pct} percent used)`
+          }
+          aria-valuetext={
+            usedUnknown
+              ? "used count not available from Azure Batch quota API"
+              : `${pct}% — ${
+                  tone === "destructive"
+                    ? "critical"
+                    : tone === "warning"
+                      ? "warning"
+                      : tone === "success"
+                        ? "healthy"
+                        : "no quota assigned"
+                }`
+          }
         />
         <span className="text-2xs text-muted-foreground tabular-nums">
           Free: {formatNumber(free)}
@@ -1001,6 +1041,546 @@ const AutoRefreshChip: React.FC<AutoRefreshChipProps> = ({
 };
 
 /* ------------------------------------------------------------------ */
+/*  Chord-sequence hotkeys (g a / g p)                                 */
+/* ------------------------------------------------------------------ */
+
+/**
+ * useChordSequence — listen for a two-key chord like `g a`. The buffer
+ * resets after `CHORD_BUFFER_TIMEOUT_MS` so a stray `g` doesn't capture
+ * the next unrelated keypress. Ignores edit-target events so typing in
+ * a search box doesn't accidentally fire navigation.
+ *
+ * Why local: the shared `useShortcut` matches single chords only. We
+ * don't want to extend the shared hook for an account-info-only feature.
+ */
+function useChordSequence(
+  prefix: string,
+  bindings: Readonly<Record<string, () => void>>,
+  enabled: boolean = true,
+): void {
+  // Stable ref so re-renders don't rebind the listener.
+  const bindingsRef = React.useRef(bindings);
+  bindingsRef.current = bindings;
+  React.useEffect(() => {
+    if (!enabled || typeof window === "undefined") return;
+    let armed = false;
+    let timer: number | null = null;
+    const disarm = () => {
+      armed = false;
+      if (timer != null) {
+        window.clearTimeout(timer);
+        timer = null;
+      }
+    };
+    const onKey = (e: KeyboardEvent) => {
+      // Skip when focus is in an editable target.
+      const target = e.target as HTMLElement | null;
+      if (target) {
+        const tag = target.tagName;
+        if (
+          tag === "INPUT" ||
+          tag === "TEXTAREA" ||
+          tag === "SELECT" ||
+          target.isContentEditable
+        )
+          return;
+      }
+      if (e.ctrlKey || e.metaKey || e.altKey) return;
+      const key = e.key.toLowerCase();
+      if (!armed) {
+        if (key === prefix) {
+          armed = true;
+          timer = window.setTimeout(disarm, CHORD_BUFFER_TIMEOUT_MS);
+        }
+        return;
+      }
+      // armed → second key
+      const handler = bindingsRef.current[key];
+      disarm();
+      if (handler) {
+        e.preventDefault();
+        handler();
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => {
+      disarm();
+      window.removeEventListener("keydown", onKey);
+    };
+  }, [prefix, enabled]);
+}
+
+/* ------------------------------------------------------------------ */
+/*  Threshold-alert banner                                             */
+/*  Defender-side surface inspired by NetSPI MicroBurst Batch recon:   */
+/*  Inspired by: New folder/_analysis_netspi.md — MicroBurst           */
+/*  Get-AzBatchAccountInfo / Get-AzBatchPools enumerates the same      */
+/*  quota fields offensively; surfacing "you're ≥X%" is the defender   */
+/*  view of the same data so an operator notices BEFORE quota runs out.*/
+/* ------------------------------------------------------------------ */
+
+interface ThresholdAlert {
+  id: string;
+  accountName: string;
+  region: string;
+  peakPct: number;
+  reason: string;
+}
+
+/**
+ * Compute which accounts cross the operator-configured threshold. Peak
+ * utilization is the max of (dedicated, LP, pool) — matches the
+ * `headlinePct` used in the detail sheet so the operator's mental model
+ * is consistent.
+ */
+function computeThresholdAlerts(
+  accounts: ReadonlyArray<AccountInfo>,
+  thresholdPct: number,
+): ThresholdAlert[] {
+  const out: ThresholdAlert[] = [];
+  for (const a of accounts) {
+    const dPct = usagePct(
+      safeNum(a.dedicatedCoresUsed),
+      safeNum(a.dedicatedCoreQuota),
+    );
+    const lPct = usagePct(
+      safeNum(a.lowPriorityCoresUsed),
+      safeNum(a.lowPriorityCoreQuota),
+    );
+    const pPct = usagePct(safeNum(a.poolCount), safeNum(a.poolQuota));
+    const peak = Math.max(dPct, lPct, pPct);
+    if (peak < thresholdPct) continue;
+    // Identify which axis is hottest so the banner is actionable.
+    let reason = "core capacity";
+    if (pPct === peak) reason = "pool count";
+    else if (lPct === peak) reason = "low-priority cores";
+    else if (dPct === peak) reason = "dedicated cores";
+    out.push({
+      id: a.id,
+      accountName: a.accountName,
+      region: a.region ?? "",
+      peakPct: peak,
+      reason,
+    });
+  }
+  // Hottest first — operator's eye lands on highest-risk account.
+  out.sort((a, b) => b.peakPct - a.peakPct);
+  return out;
+}
+
+interface ThresholdAlertsCardProps {
+  alerts: ReadonlyArray<ThresholdAlert>;
+  thresholdPct: number;
+  onChangeThreshold: (next: number) => void;
+  onOpenAccount: (id: string) => void;
+}
+
+const ThresholdAlertsCard: React.FC<ThresholdAlertsCardProps> = React.memo(
+  ({ alerts, thresholdPct, onChangeThreshold, onOpenAccount }) => {
+    return (
+      <section
+        className="rounded-md border border-warning/40 bg-warning/5 p-3"
+        role="region"
+        aria-labelledby="threshold-alerts-heading"
+      >
+        <div className="flex flex-wrap items-center gap-x-3 gap-y-1.5">
+          <h3
+            id="threshold-alerts-heading"
+            className="m-0 inline-flex items-center gap-1.5 text-xs font-semibold uppercase tracking-wider text-warning"
+          >
+            <AlertTriangle className="h-3.5 w-3.5" aria-hidden />
+            Threshold alerts ({alerts.length})
+          </h3>
+          <InfoTooltip
+            size={12}
+            content="Surfaces accounts whose peak utilization (worst of dedicated, LP, pool) crosses the configured threshold. Setting is persisted across reloads."
+          />
+          <div className="ml-auto flex items-center gap-1.5">
+            <Label
+              htmlFor="account-info-threshold"
+              className="text-2xs uppercase tracking-wider text-muted-foreground"
+            >
+              Warn at
+            </Label>
+            <Select
+              value={String(thresholdPct)}
+              onValueChange={(v) => {
+                const n = Number(v);
+                if (Number.isFinite(n)) onChangeThreshold(n);
+              }}
+            >
+              <SelectTrigger
+                id="account-info-threshold"
+                className="h-7 w-20"
+                aria-label="Threshold-alert percent"
+              >
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                {THRESHOLD_ALERT_OPTIONS.map((n) => (
+                  <SelectItem key={n} value={String(n)}>
+                    {n}%
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          </div>
+        </div>
+        <ul className="mt-2 flex flex-col gap-1">
+          {alerts.slice(0, 6).map((a) => (
+            <li key={a.id}>
+              <button
+                type="button"
+                onClick={() => onOpenAccount(a.id)}
+                className="flex w-full items-center justify-between gap-2 rounded px-1.5 py-1 text-left text-2xs transition-colors hover:bg-warning/10 focus-visible:bg-warning/10 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                aria-label={`Open ${a.accountName} — ${a.peakPct}% on ${a.reason}`}
+              >
+                <span className="inline-flex min-w-0 items-center gap-1.5">
+                  <span className="truncate font-mono text-foreground">
+                    {a.accountName}
+                  </span>
+                  {a.region && (
+                    <span className="text-muted-foreground/70">
+                      {a.region}
+                    </span>
+                  )}
+                  <span className="text-muted-foreground">— {a.reason}</span>
+                </span>
+                <span className="tabular-nums font-semibold text-warning">
+                  {a.peakPct}%
+                </span>
+              </button>
+            </li>
+          ))}
+          {alerts.length > 6 && (
+            <li className="px-1.5 text-2xs text-muted-foreground">
+              … {alerts.length - 6} more not shown — narrow the table or use the
+              critical chip above to see them all.
+            </li>
+          )}
+        </ul>
+      </section>
+    );
+  },
+);
+ThresholdAlertsCard.displayName = "ThresholdAlertsCard";
+
+/* ------------------------------------------------------------------ */
+/*  Lateral-surface scorer + unenforced-family flag                     */
+/*  Inspired by: New folder/_analysis_netspi.md — NetSPI MicroBurst    */
+/*  resource-plane enum maps Batch accounts → families → pools as the  */
+/*  attacker's pivot graph; surfacing the cardinality lets a defender  */
+/*  see at-a-glance which account has the widest pivot surface.        */
+/*  Inspired by: New folder/_analysis_defender_view.md — Azucar /      */
+/*  ScoutSuite policy checks: an unenforced per-family quota with a    */
+/*  hot family is a starvation-blast-radius risk.                      */
+/* ------------------------------------------------------------------ */
+
+interface SurfaceRiskRow {
+  id: string;
+  accountName: string;
+  region: string;
+  familiesWithQuota: number;
+  unenforcedAndHot: boolean;
+  hottestFamilyName: string | null;
+  hottestFamilyPct: number;
+}
+
+function computeSurfaceRiskRows(
+  accounts: ReadonlyArray<AccountInfo>,
+): SurfaceRiskRow[] {
+  const rows: SurfaceRiskRow[] = [];
+  for (const a of accounts) {
+    const families = a.dedicatedCoreQuotaPerVMFamily ?? [];
+    let familiesWithQuota = 0;
+    let hottestPct = 0;
+    let hottestName: string | null = null;
+    for (const fam of families) {
+      const q = safeNum(fam.coreQuota);
+      if (q <= 0) continue;
+      familiesWithQuota++;
+      const pct = usagePct(safeNum(fam.coresUsed), q);
+      if (pct > hottestPct) {
+        hottestPct = pct;
+        hottestName = fam.name ?? null;
+      }
+    }
+    const enforced = a.dedicatedCoreQuotaPerVMFamilyEnforced ?? false;
+    const unenforcedAndHot =
+      !enforced && hottestPct > CRITICAL_UTILIZATION_PCT;
+    // Skip accounts with no families and no risk flag — nothing to report.
+    if (familiesWithQuota === 0 && !unenforcedAndHot) continue;
+    rows.push({
+      id: a.id,
+      accountName: a.accountName,
+      region: a.region ?? "",
+      familiesWithQuota,
+      unenforcedAndHot,
+      hottestFamilyName: hottestName,
+      hottestFamilyPct: hottestPct,
+    });
+  }
+  // Sort by (unenforcedAndHot desc, familiesWithQuota desc) so the
+  // riskiest pivot-surface accounts float to the top.
+  rows.sort((a, b) => {
+    if (a.unenforcedAndHot !== b.unenforcedAndHot)
+      return a.unenforcedAndHot ? -1 : 1;
+    return b.familiesWithQuota - a.familiesWithQuota;
+  });
+  return rows;
+}
+
+interface SurfaceRiskCardProps {
+  rows: ReadonlyArray<SurfaceRiskRow>;
+  onOpenAccount: (id: string) => void;
+}
+
+const SurfaceRiskCard: React.FC<SurfaceRiskCardProps> = React.memo(
+  ({ rows, onOpenAccount }) => {
+    const flagged = rows.filter((r) => r.unenforcedAndHot);
+    if (rows.length === 0) return null;
+    return (
+      <section
+        className="rounded-md border border-border bg-card p-3"
+        role="region"
+        aria-labelledby="surface-risk-heading"
+      >
+        <div className="flex flex-wrap items-center gap-x-2">
+          <h3
+            id="surface-risk-heading"
+            className="m-0 inline-flex items-center gap-1.5 text-xs font-semibold uppercase tracking-wider text-muted-foreground"
+          >
+            <Cpu className="h-3.5 w-3.5" aria-hidden />
+            Lateral surface
+          </h3>
+          <InfoTooltip
+            size={12}
+            content="Count of distinct VM-families with assigned quota per account. More families = more places an attacker who lands a pool can pivot. Flagged when per-family quotas are NOT enforced AND a single family is already critical — risk of one family starving all others. Inspired by NetSPI MicroBurst Batch enumeration + Azucar/ScoutSuite policy lens."
+          />
+        </div>
+        {flagged.length > 0 && (
+          <div
+            className="mt-2 inline-flex items-center gap-1.5 rounded-md border border-destructive/40 bg-destructive/10 px-2 py-1 text-2xs text-destructive"
+            role="note"
+          >
+            <AlertTriangle className="h-3 w-3" aria-hidden />
+            {flagged.length} account{flagged.length === 1 ? "" : "s"} with{" "}
+            <strong>unenforced</strong> per-family quotas AND a hot family.
+          </div>
+        )}
+        <ul className="mt-2 grid grid-cols-1 gap-1 sm:grid-cols-2">
+          {rows.slice(0, 6).map((r) => (
+            <li key={r.id}>
+              <button
+                type="button"
+                onClick={() => onOpenAccount(r.id)}
+                className={cn(
+                  "flex w-full items-center justify-between gap-2 rounded border px-2 py-1.5 text-left text-2xs transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring",
+                  r.unenforcedAndHot
+                    ? "border-destructive/40 bg-destructive/5 hover:bg-destructive/10"
+                    : "border-border bg-muted/20 hover:bg-muted/40",
+                )}
+                aria-label={`Open ${r.accountName} — ${r.familiesWithQuota} VM-families with quota`}
+              >
+                <span className="inline-flex min-w-0 items-center gap-1.5">
+                  <span className="truncate font-mono text-foreground">
+                    {r.accountName}
+                  </span>
+                  {r.region && (
+                    <span className="text-muted-foreground/70">
+                      {r.region}
+                    </span>
+                  )}
+                </span>
+                <span className="inline-flex shrink-0 items-center gap-1.5">
+                  <span className="text-muted-foreground">families</span>
+                  <span className="tabular-nums font-semibold text-foreground">
+                    {r.familiesWithQuota}
+                  </span>
+                  {r.hottestFamilyName && r.hottestFamilyPct > 0 && (
+                    <span
+                      className={cn(
+                        "rounded bg-muted px-1 tabular-nums",
+                        r.hottestFamilyPct > CRITICAL_UTILIZATION_PCT
+                          ? "text-destructive"
+                          : r.hottestFamilyPct >= WARNING_UTILIZATION_PCT
+                            ? "text-warning"
+                            : "text-success",
+                      )}
+                      title={`Hottest family: ${r.hottestFamilyName}`}
+                    >
+                      {r.hottestFamilyPct}%
+                    </span>
+                  )}
+                </span>
+              </button>
+            </li>
+          ))}
+        </ul>
+      </section>
+    );
+  },
+);
+SurfaceRiskCard.displayName = "SurfaceRiskCard";
+
+/* ------------------------------------------------------------------ */
+/*  Subscription-collision detector                                    */
+/*  Inspired by: New folder/_analysis_netspi.md — MicroBurst surfaces  */
+/*  subscription-scoped core ceilings; multiple Batch accounts under   */
+/*  the same subscription share that ceiling so an account-level "free"*/
+/*  number can be misleading.                                          */
+/* ------------------------------------------------------------------ */
+
+interface SubscriptionCollision {
+  subscriptionId: string;
+  accountCount: number;
+  combinedUsed: number;
+  combinedQuota: number;
+  combinedPct: number;
+  accountIds: string[];
+}
+
+function computeSubscriptionCollisions(
+  accounts: ReadonlyArray<AccountInfo>,
+): SubscriptionCollision[] {
+  const bySub = new Map<
+    string,
+    {
+      accountCount: number;
+      combinedUsed: number;
+      combinedQuota: number;
+      accountIds: string[];
+    }
+  >();
+  for (const a of accounts) {
+    const sub = a.subscriptionId ?? "";
+    if (!sub) continue;
+    const used =
+      safeNum(a.dedicatedCoresUsed) + safeNum(a.lowPriorityCoresUsed);
+    const quota =
+      safeNum(a.dedicatedCoreQuota) + safeNum(a.lowPriorityCoreQuota);
+    const existing = bySub.get(sub);
+    if (existing) {
+      existing.accountCount++;
+      existing.combinedUsed += used;
+      existing.combinedQuota += quota;
+      existing.accountIds.push(a.id);
+    } else {
+      bySub.set(sub, {
+        accountCount: 1,
+        combinedUsed: used,
+        combinedQuota: quota,
+        accountIds: [a.id],
+      });
+    }
+  }
+  const out: SubscriptionCollision[] = [];
+  for (const [sub, v] of bySub) {
+    if (v.accountCount < 2) continue;
+    const pct = usagePct(v.combinedUsed, v.combinedQuota);
+    if (pct < WARNING_UTILIZATION_PCT) continue;
+    out.push({
+      subscriptionId: sub,
+      accountCount: v.accountCount,
+      combinedUsed: v.combinedUsed,
+      combinedQuota: v.combinedQuota,
+      combinedPct: pct,
+      accountIds: v.accountIds,
+    });
+  }
+  out.sort((a, b) => b.combinedPct - a.combinedPct);
+  return out;
+}
+
+interface SubscriptionCollisionsCardProps {
+  collisions: ReadonlyArray<SubscriptionCollision>;
+  onOpenAccount: (id: string) => void;
+}
+
+const SubscriptionCollisionsCard: React.FC<SubscriptionCollisionsCardProps> =
+  React.memo(({ collisions, onOpenAccount }) => {
+    if (collisions.length === 0) return null;
+    return (
+      <section
+        className="rounded-md border border-border bg-card p-3"
+        role="region"
+        aria-labelledby="sub-collisions-heading"
+      >
+        <div className="flex flex-wrap items-center gap-x-2">
+          <h3
+            id="sub-collisions-heading"
+            className="m-0 inline-flex items-center gap-1.5 text-xs font-semibold uppercase tracking-wider text-muted-foreground"
+          >
+            <Users className="h-3.5 w-3.5" aria-hidden />
+            Subscription collisions
+          </h3>
+          <InfoTooltip
+            size={12}
+            content="Subscriptions that host 2+ Batch accounts whose combined core utilization is already ≥50%. The subscription-level core ceiling will hit before any single account does. Inspired by NetSPI MicroBurst subscription-plane recon."
+          />
+        </div>
+        <ul className="mt-2 flex flex-col gap-1">
+          {collisions.slice(0, 4).map((c) => {
+            const subShort =
+              c.subscriptionId.length > 8
+                ? `${c.subscriptionId.slice(0, 8)}…`
+                : c.subscriptionId;
+            return (
+              <li key={c.subscriptionId}>
+                <div
+                  className={cn(
+                    "flex flex-wrap items-center justify-between gap-2 rounded border px-2 py-1.5 text-2xs",
+                    c.combinedPct > CRITICAL_UTILIZATION_PCT
+                      ? "border-destructive/40 bg-destructive/5"
+                      : "border-warning/40 bg-warning/5",
+                  )}
+                >
+                  <span className="inline-flex items-center gap-1.5">
+                    <span
+                      className="font-mono text-foreground"
+                      title={c.subscriptionId}
+                    >
+                      {subShort}
+                    </span>
+                    <span className="text-muted-foreground">
+                      {c.accountCount} accounts
+                    </span>
+                  </span>
+                  <span className="inline-flex items-center gap-1.5">
+                    <span
+                      className={cn(
+                        "tabular-nums font-semibold",
+                        c.combinedPct > CRITICAL_UTILIZATION_PCT
+                          ? "text-destructive"
+                          : "text-warning",
+                      )}
+                    >
+                      {c.combinedPct}%
+                    </span>
+                    <span className="text-muted-foreground tabular-nums">
+                      ({formatNumber(c.combinedUsed)}/
+                      {formatNumber(c.combinedQuota)})
+                    </span>
+                    <button
+                      type="button"
+                      onClick={() => onOpenAccount(c.accountIds[0]!)}
+                      className="rounded bg-muted px-1.5 py-0.5 text-foreground transition-colors hover:bg-muted-foreground/20 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                      aria-label={`Open first account in subscription ${subShort}`}
+                    >
+                      Open
+                    </button>
+                  </span>
+                </div>
+              </li>
+            );
+          })}
+        </ul>
+      </section>
+    );
+  });
+SubscriptionCollisionsCard.displayName = "SubscriptionCollisionsCard";
+
+/* ------------------------------------------------------------------ */
 /*  Inner page                                                         */
 /* ------------------------------------------------------------------ */
 
@@ -1047,7 +1627,22 @@ const AccountInfoPageInner: React.FC<AccountInfoPageProps> = ({
     [setFilters],
   );
 
-  const accountInfos = state.accountInfos ?? [];
+  // Memoize: `state.accountInfos ?? []` allocates a fresh empty array on every
+  // render when the slice is nullish, which would invalidate every downstream
+  // memo (regionOptions, accountById, utilizationCounts, alerts). Guard with
+  // useMemo so the empty-array identity is stable until the store updates.
+  const accountInfos = React.useMemo<ReadonlyArray<AccountInfo>>(
+    () => state.accountInfos ?? [],
+    [state.accountInfos],
+  );
+
+  // Operator-configurable threshold for the alert banner. Persisted across
+  // reloads — once an operator picks "warn at 90%" for a noisy fleet, that
+  // sticks. v1 schema; if the shape evolves bump the key.
+  const [thresholdAlertPct, setThresholdAlertPct] = usePersistedState<number>(
+    THRESHOLD_ALERT_KEY,
+    THRESHOLD_ALERT_DEFAULT_PCT,
+  );
 
   // ---- Page-level ARM token tracker ---------------------------------------
   // This page reads pre-fetched account info from the global store + the
@@ -1407,6 +2002,38 @@ const AccountInfoPageInner: React.FC<AccountInfoPageProps> = ({
   useShortcut("/", focusSearch);
   useShortcut("r", debouncedManualRefresh);
   useShortcut("a", toggleAutoRefresh);
+
+  // `g a` → go to accounts list root, `g p` → go to pools page scoped to the
+  // currently-focused account (or unscoped if no sheet is open). The chord
+  // approach mirrors GitHub/Gmail-style navigation and avoids stealing bare
+  // letter keys.
+  const chordBindings = React.useMemo<Record<string, () => void>>(
+    () => ({
+      a: () => navigate("/account-info"),
+      p: () => {
+        const id = focusedAccount?.id;
+        navigate(id ? `/pool-info?accountId=${encodeURIComponent(id)}` : "/pool-info");
+      },
+    }),
+    [navigate, focusedAccount],
+  );
+  useChordSequence("g", chordBindings);
+
+  // Memoized advanced-detection slices. Recomputed only when accountInfos or
+  // the persisted threshold change — cheap O(N) scans, but worth caching so
+  // typing in the search box doesn't re-walk the dataset.
+  const thresholdAlerts = React.useMemo(
+    () => computeThresholdAlerts(accountInfos, thresholdAlertPct),
+    [accountInfos, thresholdAlertPct],
+  );
+  const surfaceRiskRows = React.useMemo(
+    () => computeSurfaceRiskRows(accountInfos),
+    [accountInfos],
+  );
+  const subscriptionCollisions = React.useMemo(
+    () => computeSubscriptionCollisions(accountInfos),
+    [accountInfos],
+  );
 
   // ---- DataTable columns ---------------------------------------------------
   const columns = React.useMemo<DataTableColumn<AccountInfo>[]>(
@@ -1922,6 +2549,37 @@ const AccountInfoPageInner: React.FC<AccountInfoPageProps> = ({
         />
       )}
 
+      {/* Advanced detections — defender-side surfacing of attack/risk axes
+          inspired by NetSPI MicroBurst & Azucar/ScoutSuite Batch enumeration.
+          All three are pure reads from `accountInfos`; no extra ARM calls.
+          See: New folder/_analysis_netspi.md and
+          New folder/_analysis_defender_view.md */}
+      {accountInfos.length > 0 && thresholdAlerts.length > 0 && (
+        <ThresholdAlertsCard
+          alerts={thresholdAlerts}
+          thresholdPct={thresholdAlertPct}
+          onChangeThreshold={setThresholdAlertPct}
+          onOpenAccount={handleAccountIdActivate}
+        />
+      )}
+      {accountInfos.length > 0 &&
+        (surfaceRiskRows.length > 0 || subscriptionCollisions.length > 0) && (
+          <div className="grid grid-cols-1 gap-3 lg:grid-cols-2">
+            {surfaceRiskRows.length > 0 && (
+              <SurfaceRiskCard
+                rows={surfaceRiskRows}
+                onOpenAccount={handleAccountIdActivate}
+              />
+            )}
+            {subscriptionCollisions.length > 0 && (
+              <SubscriptionCollisionsCard
+                collisions={subscriptionCollisions}
+                onOpenAccount={handleAccountIdActivate}
+              />
+            )}
+          </div>
+        )}
+
       {/* Filters row */}
       <div
         className="flex flex-wrap items-end gap-3"
@@ -2114,7 +2772,7 @@ const AccountInfoPageInner: React.FC<AccountInfoPageProps> = ({
         />
       )}
 
-      {/* Keyboard hint footer — visible affordance for `/`, `r`, `a`. */}
+      {/* Keyboard hint footer — visible affordance for `/`, `r`, `a`, chords. */}
       <div className="flex flex-wrap items-center gap-3 text-2xs text-muted-foreground">
         <span className="inline-flex items-center gap-1">
           <Kbd>/</Kbd> search
@@ -2124,6 +2782,14 @@ const AccountInfoPageInner: React.FC<AccountInfoPageProps> = ({
         </span>
         <span className="inline-flex items-center gap-1">
           <Kbd>a</Kbd> auto-refresh
+        </span>
+        <span className="inline-flex items-center gap-1">
+          <Kbd>g</Kbd>
+          <Kbd>a</Kbd> accounts list
+        </span>
+        <span className="inline-flex items-center gap-1">
+          <Kbd>g</Kbd>
+          <Kbd>p</Kbd> pools{focusedAccount ? " (this account)" : ""}
         </span>
         <span className="inline-flex items-center gap-1">
           <Kbd>Esc</Kbd> close detail sheet

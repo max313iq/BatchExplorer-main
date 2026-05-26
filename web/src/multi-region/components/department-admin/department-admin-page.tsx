@@ -56,16 +56,21 @@ import {
   ArrowRight,
   ArrowUpDown,
   BadgeCheck,
+  Bot,
   Building2,
+  Camera,
   Crown,
   ExternalLink,
+  GitCompareArrows,
   HelpCircle,
   Layers,
   Loader2,
   PlusCircle,
   RefreshCw,
   Server,
+  ShieldAlert,
   Sparkles,
+  Trash2,
   UserCheck,
   Users,
 } from "lucide-react";
@@ -113,6 +118,20 @@ import {
   useMultiRegionState,
   useMultiRegionStore,
 } from "../../store/store-context";
+
+import {
+  type BaselineSnapshot,
+  type CloudInfo,
+  clearBaselineSnapshot,
+  computeBaselineDrift,
+  driftCount,
+  eaOwnersThatLookLikeSps,
+  inferCloudFromToken,
+  looksLikeServicePrincipal,
+  portalEnrollmentAccountLink,
+  readBaselineSnapshot,
+  writeBaselineSnapshot,
+} from "./department-admin-helpers";
 
 import { ConfirmationDialog } from "../shared/confirmation-dialog";
 import { CopyableText, CopyButton } from "../shared/copy-button";
@@ -805,6 +824,95 @@ export const DepartmentAdminPage: React.FC = () => {
     return ids;
   }, [eas, nowMs]);
 
+  /* ----- Corpus-grounded detections ------------------------------- *
+   * (a) SP-shaped enrollment-account owners. Cite
+   *     `_ea_subscription_cross_tenant.md` §"Granting subscription-
+   *     creator across tenants" — automation SPs in EA owner positions
+   *     are the same primitive used to mint subs cross-tenant. Surface
+   *     them so the dept admin can challenge unfamiliar entries at
+   *     audit time. Heuristic-only (we can't query the directory from
+   *     a billing-plane token), so false-positives are intentional —
+   *     better to over-flag.
+   *
+   * (b) Cloud-environment inference from the current ARM token's
+   *     `iss` claim. Drives cloud-correct portal deep-links per row.
+   *     Mapping comes from `_bypass_tenant_switch.md` §8.1 endpoint
+   *     catalog. Recomputed when the token rolls.
+   */
+  const spOwnerEas = React.useMemo(() => eaOwnersThatLookLikeSps(eas), [eas]);
+  const spOwnerEaIds = React.useMemo(
+    () => new Set(spOwnerEas.map((e) => e.id)),
+    [spOwnerEas],
+  );
+  const cloudInfo: CloudInfo = React.useMemo(
+    () => inferCloudFromToken(armToken),
+    [armToken],
+  );
+
+  /* ----- Baseline-drift snapshot (compliance evidence) ------------ *
+   * Persisted in localStorage, keyed by `(billingAccount, department)`.
+   * Auto-load on scope change. The drift compared against the live EA
+   * list is recomputed every time `eas` updates.
+   */
+  const [baseline, setBaseline] = React.useState<BaselineSnapshot | null>(
+    null,
+  );
+  React.useEffect(() => {
+    if (!billingAccountName || !departmentName) {
+      setBaseline(null);
+      return;
+    }
+    setBaseline(readBaselineSnapshot(billingAccountName, departmentName));
+  }, [billingAccountName, departmentName]);
+
+  const drift = React.useMemo(
+    () => computeBaselineDrift(baseline, eas),
+    [baseline, eas],
+  );
+  const totalDrift = driftCount(drift);
+
+  const handleSaveBaseline = React.useCallback(() => {
+    if (!billingAccountName || !departmentName) return;
+    const next = writeBaselineSnapshot(
+      billingAccountName,
+      departmentName,
+      actorUsername,
+      eas,
+    );
+    setBaseline(next);
+    auditLog.record({
+      actor: actorUsername,
+      action: "save_department_baseline",
+      target: `ba:${billingAccountName} dept:${departmentName}`,
+      status: "success",
+      details: {
+        billingAccountName,
+        departmentName,
+        memberCount: next.members.length,
+        takenAt: next.takenAt,
+      },
+    });
+    showToast(
+      store,
+      `Saved baseline (${next.members.length} EA${next.members.length === 1 ? "" : "s"}). Drift will be tracked against this snapshot.`,
+      "success",
+    );
+  }, [actorUsername, billingAccountName, departmentName, eas, store]);
+
+  const handleClearBaseline = React.useCallback(() => {
+    if (!billingAccountName || !departmentName) return;
+    clearBaselineSnapshot(billingAccountName, departmentName);
+    setBaseline(null);
+    auditLog.record({
+      actor: actorUsername,
+      action: "clear_department_baseline",
+      target: `ba:${billingAccountName} dept:${departmentName}`,
+      status: "success",
+      details: { billingAccountName, departmentName },
+    });
+    showToast(store, "Cleared baseline snapshot.", "info");
+  }, [actorUsername, billingAccountName, departmentName, store]);
+
   const filteredEas = React.useMemo(() => {
     const q = search.trim().toLowerCase();
     const filtered = eas.filter((e) => {
@@ -985,6 +1093,14 @@ export const DepartmentAdminPage: React.FC = () => {
       { header: "Name (id)", accessor: (e: EaEnrollmentAccount) => e.name },
       { header: "Status", accessor: (e: EaEnrollmentAccount) => e.status ?? "" },
       { header: "Account owner", accessor: (e: EaEnrollmentAccount) => e.accountOwner ?? "" },
+      {
+        // Compliance evidence: surfaces the SP-shaped-owner heuristic in
+        // exported CSV/JSON so a reviewer can sort/filter on it without
+        // re-running the page.
+        header: "Owner is SP-shaped",
+        accessor: (e: EaEnrollmentAccount) =>
+          looksLikeServicePrincipal(e.accountOwner) ? "yes" : "no",
+      },
       { header: "Cost center", accessor: (e: EaEnrollmentAccount) => e.costCenter ?? "" },
       { header: "Start date", accessor: (e: EaEnrollmentAccount) => e.startDate ?? "" },
       { header: "End date", accessor: (e: EaEnrollmentAccount) => e.endDate ?? "" },
@@ -1160,6 +1276,22 @@ export const DepartmentAdminPage: React.FC = () => {
             Refresh
           </Button>
         </PageHeader>
+        {/* Cloud-environment chip — silent for commercial (the 99%
+            case), surfaces a Shield + label for sovereign / Unknown so
+            the operator knows portal deep-links target a non-default
+            host. Driven by the live ARM-token `iss` claim, so it
+            tracks tenant switches automatically. */}
+        {cloudInfo.env !== "AzureCommercial" && armToken && (
+          <Badge
+            variant="outline"
+            className="text-2xs border-warning text-warning inline-flex items-center gap-1"
+            title={`Portal deep-links target ${cloudInfo.portalHost} (derived from token issuer)`}
+            aria-label={`Cloud environment: ${cloudInfo.label}`}
+          >
+            <ShieldAlert className="h-3 w-3" aria-hidden />
+            {cloudInfo.label}
+          </Badge>
+        )}
         {/* Token freshness badge — quiet by default, surfaces when
             < 10 min from expiry. Click to force-refresh BEFORE a long
             departmental survey or pivot so the token doesn't flip
@@ -1449,6 +1581,28 @@ export const DepartmentAdminPage: React.FC = () => {
                       hint="added last 7d"
                     />
                   )}
+                  {spOwnerEas.length > 0 && (
+                    <SummaryStatItem
+                      label="SP-shaped owners"
+                      value={spOwnerEas.length}
+                      compact
+                      tone="warning"
+                      hint="non-human"
+                    />
+                  )}
+                  {baseline && (
+                    <SummaryStatItem
+                      label="Drift vs baseline"
+                      value={totalDrift}
+                      compact
+                      tone={totalDrift === 0 ? "success" : "warning"}
+                      hint={
+                        totalDrift === 0
+                          ? "matches snapshot"
+                          : `${drift.added.length}+ ${drift.removed.length}-`
+                      }
+                    />
+                  )}
                   {orphanedSubs.length > 0 && (
                     <SummaryStatItem
                       label="Orphaned"
@@ -1469,6 +1623,235 @@ export const DepartmentAdminPage: React.FC = () => {
               </CardContent>
             </Card>
           )}
+
+          {/* ----- SP-shaped owner anomaly banner ---------------
+              Surfaces when at least one EA's `accountOwner` matches an
+              SP-shaped heuristic (GUID local part, *.onmicrosoft.com
+              base16 alias, or bare object id). Citing the playbook
+              keeps the rationale explicit so an operator triaging the
+              warning understands what they're being asked to verify. */}
+          {spOwnerEas.length > 0 && (
+            <Alert variant="default" className="border-warning/50 bg-warning/5">
+              <Bot
+                className="h-3.5 w-3.5 text-warning"
+                aria-hidden
+              />
+              <AlertDescription className="text-2xs">
+                <strong>{spOwnerEas.length}</strong> enrollment account
+                {spOwnerEas.length === 1 ? "" : "s"} in this department
+                {spOwnerEas.length === 1 ? " has" : " have"} an{" "}
+                <strong>SP-shaped owner</strong> rather than a human UPN —
+                usually automation (deployment SPN / managed identity).
+                Cross-tenant subscription-creator chains (see{" "}
+                <code className="font-mono">
+                  _ea_subscription_cross_tenant.md
+                </code>{" "}
+                §"Granting subscription-creator across tenants") are
+                bootstrapped by placing an SP into exactly this slot —
+                verify each is expected:
+                <ul className="m-0 mt-1 flex flex-col gap-0.5 pl-4">
+                  {spOwnerEas.slice(0, 5).map((e) => (
+                    <li key={e.id} className="flex flex-wrap items-center gap-1">
+                      <span className="font-medium">{e.displayName}</span>
+                      <span className="text-muted-foreground font-mono text-[10px]">
+                        ({e.name})
+                      </span>
+                      <span className="text-muted-foreground">→</span>
+                      <span className="font-mono text-[10px]">
+                        {e.accountOwner}
+                      </span>
+                    </li>
+                  ))}
+                  {spOwnerEas.length > 5 && (
+                    <li className="text-muted-foreground">
+                      … and {spOwnerEas.length - 5} more — see the list
+                      below (flagged with the SP icon).
+                    </li>
+                  )}
+                </ul>
+              </AlertDescription>
+            </Alert>
+          )}
+
+          {/* ----- Baseline / drift evidence panel ---------------
+              Lets an operator pin the current EA roster as a
+              compliance baseline and surfaces any drift since.
+              Storage is local-only — this is evidence for review, not
+              policy enforcement. */}
+          <Card className="border-dashed">
+            <CardHeader className="pb-2">
+              <CardTitle className="flex flex-wrap items-center gap-2 text-sm">
+                <GitCompareArrows
+                  className="h-4 w-4 text-primary"
+                  aria-hidden
+                />
+                Baseline &amp; drift
+                {baseline ? (
+                  <Badge
+                    variant="outline"
+                    className={
+                      totalDrift === 0
+                        ? "text-2xs border-success text-success"
+                        : "text-2xs border-warning text-warning"
+                    }
+                  >
+                    {totalDrift === 0
+                      ? "in sync"
+                      : `${totalDrift} change${totalDrift === 1 ? "" : "s"}`}
+                  </Badge>
+                ) : (
+                  <Badge variant="secondary" className="text-2xs">
+                    no snapshot
+                  </Badge>
+                )}
+                <InfoTooltip
+                  variant="help"
+                  content={
+                    <span className="block max-w-xs text-2xs">
+                      Pins the current enrollment-account roster (id,
+                      owner, status) as a baseline. Drift since the
+                      snapshot is recomputed on every refresh — useful
+                      for periodic compliance evidence and for spotting
+                      silent additions / owner-swaps. Stored in this
+                      browser only.
+                    </span>
+                  }
+                  ariaLabel="What is the baseline?"
+                />
+                <div className="ml-auto flex items-center gap-2">
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="sm"
+                    onClick={handleSaveBaseline}
+                    disabled={eaLoading || eas.length === 0}
+                    aria-label="Save current enrollment account roster as a baseline snapshot"
+                  >
+                    <Camera className="h-3.5 w-3.5" aria-hidden />
+                    {baseline ? "Re-snapshot" : "Save baseline"}
+                  </Button>
+                  {baseline && (
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      size="sm"
+                      onClick={handleClearBaseline}
+                      aria-label="Clear baseline snapshot"
+                    >
+                      <Trash2 className="h-3.5 w-3.5" aria-hidden />
+                      Clear
+                    </Button>
+                  )}
+                </div>
+              </CardTitle>
+              <CardDescription>
+                {baseline ? (
+                  <>
+                    Snapshot taken{" "}
+                    <span className="font-mono text-2xs">
+                      {baseline.takenAt}
+                    </span>{" "}
+                    by{" "}
+                    <span className="font-mono text-2xs">
+                      {baseline.takenBy}
+                    </span>{" "}
+                    ({baseline.members.length} EA
+                    {baseline.members.length === 1 ? "" : "s"}).
+                  </>
+                ) : (
+                  "Save a snapshot once you've reviewed today's roster — every subsequent visit will diff against it."
+                )}
+              </CardDescription>
+            </CardHeader>
+            {baseline && totalDrift > 0 && (
+              <CardContent className="flex flex-col gap-2 text-2xs">
+                {drift.added.length > 0 && (
+                  <div className="flex flex-col gap-1">
+                    <div className="font-semibold text-info">
+                      Added ({drift.added.length}) — new since snapshot
+                    </div>
+                    <ul className="m-0 flex flex-col gap-0.5 pl-4">
+                      {drift.added.map((e) => (
+                        <li key={e.id}>
+                          <span className="font-medium">{e.displayName}</span>{" "}
+                          <span className="font-mono text-[10px] text-muted-foreground">
+                            ({e.name})
+                          </span>
+                          {e.accountOwner ? (
+                            <>
+                              {" — owner "}
+                              <span className="font-mono text-[10px]">
+                                {e.accountOwner}
+                              </span>
+                            </>
+                          ) : null}
+                        </li>
+                      ))}
+                    </ul>
+                  </div>
+                )}
+                {drift.removed.length > 0 && (
+                  <div className="flex flex-col gap-1">
+                    <div className="font-semibold text-warning">
+                      Removed ({drift.removed.length}) — gone since snapshot
+                    </div>
+                    <ul className="m-0 flex flex-col gap-0.5 pl-4">
+                      {drift.removed.map((e) => (
+                        <li key={e.id}>
+                          <span className="font-medium">{e.displayName}</span>{" "}
+                          <span className="font-mono text-[10px] text-muted-foreground">
+                            ({e.name})
+                          </span>
+                        </li>
+                      ))}
+                    </ul>
+                  </div>
+                )}
+                {drift.ownerChanged.length > 0 && (
+                  <div className="flex flex-col gap-1">
+                    <div className="font-semibold text-warning">
+                      Owner changed ({drift.ownerChanged.length})
+                    </div>
+                    <ul className="m-0 flex flex-col gap-0.5 pl-4">
+                      {drift.ownerChanged.map((c) => (
+                        <li key={c.id}>
+                          <span className="font-medium">{c.displayName}</span>:{" "}
+                          <span className="font-mono text-[10px] line-through text-muted-foreground">
+                            {c.previous || "(none)"}
+                          </span>{" "}
+                          →{" "}
+                          <span className="font-mono text-[10px]">
+                            {c.current || "(none)"}
+                          </span>
+                        </li>
+                      ))}
+                    </ul>
+                  </div>
+                )}
+                {drift.statusChanged.length > 0 && (
+                  <div className="flex flex-col gap-1">
+                    <div className="font-semibold text-info">
+                      Status changed ({drift.statusChanged.length})
+                    </div>
+                    <ul className="m-0 flex flex-col gap-0.5 pl-4">
+                      {drift.statusChanged.map((c) => (
+                        <li key={c.id}>
+                          <span className="font-medium">{c.displayName}</span>:{" "}
+                          <span className="font-mono text-[10px] line-through text-muted-foreground">
+                            {c.previous || "(unknown)"}
+                          </span>{" "}
+                          →{" "}
+                          <span className="font-mono text-[10px]">
+                            {c.current || "(unknown)"}
+                          </span>
+                        </li>
+                      ))}
+                    </ul>
+                  </div>
+                )}
+              </CardContent>
+            )}
+          </Card>
 
           {/* ----- Enrollment accounts list -------------------- */}
           <Card>
@@ -1726,6 +2109,17 @@ export const DepartmentAdminPage: React.FC = () => {
                               New
                             </Badge>
                           )}
+                          {spOwnerEaIds.has(ea.id) && (
+                            <Badge
+                              variant="outline"
+                              className="text-2xs border-warning text-warning inline-flex items-center gap-1"
+                              title={`Account owner "${ea.accountOwner ?? ""}" looks like a service principal / managed identity rather than a human UPN. Verify this is expected automation — see _ea_subscription_cross_tenant.md.`}
+                              aria-label="Account owner looks like a service principal — review for expected automation"
+                            >
+                              <Bot className="h-3 w-3" aria-hidden />
+                              SP
+                            </Badge>
+                          )}
                           {ea.costCenter && (
                             <Badge variant="secondary" className="text-2xs">
                               CC: {ea.costCenter}
@@ -1766,6 +2160,22 @@ export const DepartmentAdminPage: React.FC = () => {
                             {subs.length} sub
                             {subs.length === 1 ? "" : "s"}
                           </Badge>
+                          <a
+                            href={portalEnrollmentAccountLink(
+                              cloudInfo,
+                              ea.id,
+                              account?.tenantId,
+                            )}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            className="inline-flex h-7 items-center gap-1 rounded-md border border-border bg-background px-2 text-2xs text-muted-foreground hover:text-foreground hover:bg-accent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                            onClick={(e) => e.stopPropagation()}
+                            title={`Open this enrollment account in ${cloudInfo.label} portal (${cloudInfo.portalHost})`}
+                            aria-label={`Open ${ea.displayName} in the Azure portal for ${cloudInfo.label}`}
+                          >
+                            <ExternalLink className="h-3 w-3" aria-hidden />
+                            Portal
+                          </a>
                           <Button
                             type="button"
                             size="sm"
@@ -2068,11 +2478,19 @@ export const DepartmentAdminPage: React.FC = () => {
                 // Grouped view: same data as flat, organised under each EA
                 // header — plus an explicit "Orphaned" group at the bottom
                 // for subs whose EA didn't appear in our list.
+                //
+                // Perf: build a Set of filtered ARM ids once so the inner
+                // membership check is O(1) per sub instead of O(n). The
+                // previous `.includes(s)` form was quadratic for very
+                // large departments (visible north of ~1k subs).
+                (() => {
+                  const filteredIdSet = new Set(filteredSubs.map((s) => s.id));
+                  return (
                 <div className="flex flex-col gap-3">
                   {Array.from(subsByEaDisplayName.entries())
                     .map(([eaName, subs]) => ({
                       eaName,
-                      subs: subs.filter((s) => filteredSubs.includes(s)),
+                      subs: subs.filter((s) => filteredIdSet.has(s.id)),
                     }))
                     .filter((g) => g.subs.length > 0)
                     .sort((a, b) => a.eaName.localeCompare(b.eaName))
@@ -2125,7 +2543,7 @@ export const DepartmentAdminPage: React.FC = () => {
                     ))}
                   {(() => {
                     const orphanedFiltered = orphanedSubs.filter((s) =>
-                      filteredSubs.includes(s),
+                      filteredIdSet.has(s.id),
                     );
                     if (orphanedFiltered.length === 0) return null;
                     return (
@@ -2173,6 +2591,8 @@ export const DepartmentAdminPage: React.FC = () => {
                     );
                   })()}
                 </div>
+                  );
+                })()
               )}
             </CardContent>
           </Card>

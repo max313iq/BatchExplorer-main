@@ -48,6 +48,8 @@
  */
 import * as React from "react";
 import {
+  ArrowDown,
+  ArrowUp,
   Check,
   Clock,
   Copy,
@@ -56,6 +58,8 @@ import {
   Layers,
   LayoutGrid,
   Loader2,
+  Maximize2,
+  Minimize2,
   Play,
   RefreshCw,
   Search,
@@ -137,20 +141,29 @@ import { TokenExpiryBadge } from "../shared/token-expiry-badge";
 
 import {
   AUDIENCE_COLUMNS,
+  buildRowComparator,
   cellKey,
   computeTimeSavedMs,
   fmtDurationMs,
   fmtRemaining,
+  indexCellsByRow,
   maskRefreshToken,
+  MATRIX_DENSITY_KEY,
+  nextCoord,
   runWithConcurrency,
-  secondsUntilExpiry,
   shortTenant,
   summariseFromJwt,
+  useSecondsTicker,
   type AudienceColumn,
+  type CellCoord,
   type CellState,
+  type MatrixDensity,
   type MintRow,
   type MintSuccess,
+  type RowCellIndexEntry,
   type RowKind,
+  type RowSortKey,
+  type SortDirection,
 } from "./audience-matrix-helpers";
 import {
   clientIdIsFoci,
@@ -158,9 +171,11 @@ import {
   FOCI_BANNER_DISMISS_KEY,
   fociClientName,
   getAudienceRisk,
+  getFociClientProfile,
   tierShort,
   tierTextClass,
 } from "./audience-matrix-corpus";
+import { AudienceReachabilityTable } from "./audience-matrix-reachability";
 
 // ---------------------------------------------------------------------------
 //  Local types
@@ -189,6 +204,10 @@ interface MatrixUrlState {
   custom: string;
   /** "1" when "only minted in last 24h" chip is active; "" otherwise. */
   recent: string;
+  /** Sort key — one of `RowSortKey`. Defaults to "name". */
+  sort: string;
+  /** Sort direction — "asc" | "desc". Defaults to "asc". */
+  dir: string;
 }
 
 const INITIAL_URL_STATE: MatrixUrlState = Object.freeze({
@@ -196,25 +215,21 @@ const INITIAL_URL_STATE: MatrixUrlState = Object.freeze({
   q: "",
   custom: "",
   recent: "",
+  sort: "name",
+  dir: "asc",
 }) as MatrixUrlState;
+
+/** Allowed sort keys mirroring `RowSortKey`. URL values outside this set fall back to "name". */
+const SORT_KEYS: ReadonlySet<RowSortKey> = new Set([
+  "name",
+  "kind",
+  "tenant",
+  "client",
+  "minted",
+]);
 
 /** Recency window for the "issued in last 24h" chip (seconds). */
 const RECENT_WINDOW_SEC = 24 * 60 * 60;
-
-/** True when a row has at least one successful cell inside the recency window. */
-function rowMatchesRecent(
-  rowId: string,
-  cells: Record<string, CellState>,
-  nowSec: number,
-): boolean {
-  for (const k in cells) {
-    if (!k.startsWith(`${rowId}|`)) continue;
-    const s = cells[k];
-    if (!s || s.kind !== "success") continue;
-    if (nowSec - s.mintedAt <= RECENT_WINDOW_SEC) return true;
-  }
-  return false;
-}
 
 // ---------------------------------------------------------------------------
 //  Page
@@ -273,6 +288,12 @@ export const AudienceMatrixPage: React.FC = () => {
   const search = urlState.q;
   const customScope = urlState.custom;
   const recentOnly = urlState.recent === "1";
+  // Sort key validated against the SORT_KEYS allow-list so a hand-edited URL
+  // (`?sort=evil-eval`) can't crash the comparator factory.
+  const sortKey: RowSortKey = SORT_KEYS.has(urlState.sort as RowSortKey)
+    ? (urlState.sort as RowSortKey)
+    : "name";
+  const sortDir: SortDirection = urlState.dir === "desc" ? "desc" : "asc";
 
   const setSourceFilter = React.useCallback(
     (next: RowSourceFilter) => setUrlState({ src: next }),
@@ -290,6 +311,24 @@ export const AudienceMatrixPage: React.FC = () => {
     (next: boolean) => setUrlState({ recent: next ? "1" : "" }),
     [setUrlState],
   );
+  const setSortKey = React.useCallback(
+    (next: RowSortKey) => setUrlState({ sort: next }),
+    [setUrlState],
+  );
+  const toggleSortDir = React.useCallback(
+    () => setUrlState({ dir: sortDir === "asc" ? "desc" : "asc" }),
+    [setUrlState, sortDir],
+  );
+
+  // ----- Matrix density (compact ↔ comfy) — persisted across reloads -----
+  // Comfy is the default because operators new to the page benefit from the
+  // verbose identifier rows. Returning operators usually toggle to compact
+  // once they know the shape; the persisted preference removes the friction.
+  const [density, setDensity] = usePersistedState<MatrixDensity>(
+    MATRIX_DENSITY_KEY,
+    "comfy",
+  );
+  const isCompact = density === "compact";
 
   // ----- Cell state map -----
   // One entry per (rowId, audienceKey). Absent === idle. Single Record
@@ -324,6 +363,23 @@ export const AudienceMatrixPage: React.FC = () => {
   // We render Popover instances inside the table; Radix needs `open` to be
   // controlled when we want re-mint / vault buttons to close the popover.
   const [openCellKey, setOpenCellKey] = React.useState<string | null>(null);
+
+  // ----- Focused cell coordinate (for keyboard navigation) -----
+  // Tracks the (rowIndex, colIndex) of the currently-focused cell. Updated
+  // by `onFocus` handlers on each cell button and by the arrow-key handler
+  // on the grid wrapper. Rendered as `aria-activedescendant`-style focus on
+  // the matching cell.
+  const [focusedCoord, setFocusedCoord] = React.useState<CellCoord | null>(
+    null,
+  );
+  // DOM ref to the table — used to imperatively focus a cell after arrow-key
+  // navigation. Querying by `data-row-index` / `data-col-index` keeps the
+  // page's render path React-idiomatic; we don't lift refs into every cell.
+  const gridRef = React.useRef<HTMLTableElement | null>(null);
+
+  // ----- Shared 1Hz ticker. ONE setInterval for the whole page; cells
+  //       subscribe to `nowSec` and render `expiresAt - nowSec` locally. -----
+  const nowSec = useSecondsTicker();
 
   // ----- Latest parallel-mint wall-clock for the "time saved" stat -----
   const [lastParallelMs, setLastParallelMs] = React.useState<number>(0);
@@ -441,15 +497,34 @@ export const AudienceMatrixPage: React.FC = () => {
     return set.size;
   }, [importedAccounts]);
 
+  // Build the row→cell-index map ONCE per cells change. Per-row recency
+  // and minted-count lookups then drop from O(N_cells) (a prefix scan per
+  // call) to O(1) — see helpers' `indexCellsByRow` for the implementation
+  // and motivation.
+  const rowCellIndex = React.useMemo(() => indexCellsByRow(cells), [cells]);
+  // Stable mintedCount accessor for the sort comparator below.
+  const mintedCount = React.useCallback(
+    (rowId: string): number =>
+      rowCellIndex.get(rowId)?.successCount ?? 0,
+    [rowCellIndex],
+  );
+
   // Filtered rows = source filter + free-text search + optional recency
-  // chip ("only audiences with a token issued in the last 24h").
+  // chip ("only audiences with a token issued in the last 24h"). Then
+  // sorted per the operator-chosen sort key / direction.
   const visibleRows = React.useMemo(() => {
     const needle = search.trim().toLowerCase();
-    const nowSec = Math.floor(Date.now() / 1000);
-    return allRows.filter((r) => {
+    // `nowSec` for the recency check is bound to the shared ticker — when
+    // it rolls past a 24h cliff, the row falls out of the filter on the
+    // NEXT 1Hz tick.
+    const filtered = allRows.filter((r) => {
       if (sourceFilter === "rt" && r.kind !== "rt") return false;
       if (sourceFilter === "account" && r.kind !== "account") return false;
-      if (recentOnly && !rowMatchesRecent(r.id, cells, nowSec)) return false;
+      if (recentOnly) {
+        const idx = rowCellIndex.get(r.id);
+        if (!idx) return false;
+        if (nowSec - idx.latestMintedAt > RECENT_WINDOW_SEC) return false;
+      }
       if (!needle) return true;
       return (
         r.displayName.toLowerCase().includes(needle) ||
@@ -459,17 +534,37 @@ export const AudienceMatrixPage: React.FC = () => {
         r.oid.toLowerCase().includes(needle)
       );
     });
-  }, [allRows, sourceFilter, search, recentOnly, cells]);
+    // `slice()` is a deliberate copy so we don't mutate the upstream
+    // `allRows` reference — `filter` already returned a fresh array but a
+    // future refactor that drops the filter could regress this.
+    const sorted = filtered.slice();
+    sorted.sort(buildRowComparator(sortKey, sortDir, mintedCount));
+    return sorted;
+  }, [
+    allRows,
+    sourceFilter,
+    search,
+    recentOnly,
+    rowCellIndex,
+    nowSec,
+    sortKey,
+    sortDir,
+    mintedCount,
+  ]);
 
   // Count rows that have at least one recent successful mint — drives the
   // count badge on the recent-only chip so the operator knows how many rows
-  // the filter would surface BEFORE flipping it on.
+  // the filter would surface BEFORE flipping it on. Now O(N_rows) per render
+  // (was O(N_rows × N_cells) before the row-cell index).
   const recentRowCount = React.useMemo(() => {
-    const nowSec = Math.floor(Date.now() / 1000);
     let n = 0;
-    for (const r of allRows) if (rowMatchesRecent(r.id, cells, nowSec)) n++;
+    for (const r of allRows) {
+      const idx = rowCellIndex.get(r.id);
+      if (!idx) continue;
+      if (nowSec - idx.latestMintedAt <= RECENT_WINDOW_SEC) n++;
+    }
     return n;
-  }, [allRows, cells]);
+  }, [allRows, rowCellIndex, nowSec]);
 
   // -----------------------------------------------------------------------
   //  Mint pipeline
@@ -807,6 +902,48 @@ export const AudienceMatrixPage: React.FC = () => {
   }, [visibleRows, mintCell, customScope]);
 
   // -----------------------------------------------------------------------
+  //  Refresh successful cells for a row
+  // -----------------------------------------------------------------------
+  //
+  // Operator affordance: "I have a row with 4 minted audiences sitting at
+  // 12m / 8m / 3m / expired. Just refresh THOSE — don't waste audit-log
+  // entries on the audiences I didn't intend to mint."
+  //
+  // Debounced per row via a ref-keyed timestamp map so rapid double-clicks
+  // collapse into a single refresh wave. The 1500ms window matches the
+  // page-router elsewhere; long enough to catch a stutter, short enough not
+  // to surprise the operator.
+
+  const lastRowRefreshAtRef = React.useRef<Map<string, number>>(new Map());
+
+  const refreshRowSuccessfulCells = React.useCallback(
+    async (row: MintRow) => {
+      const now = performance.now();
+      const last = lastRowRefreshAtRef.current.get(row.id) ?? 0;
+      if (now - last < 1500) return; // debounce
+      lastRowRefreshAtRef.current.set(row.id, now);
+      const tasks: Array<() => Promise<unknown>> = [];
+      for (const aud of AUDIENCE_COLUMNS) {
+        const k = cellKey(row.id, aud.key);
+        const s = cells[k];
+        if (!s || s.kind !== "success") continue;
+        // Re-use the same scope the original mint used so a refresh of a
+        // Custom-column success keeps the operator's typed scope rather
+        // than falling back to whatever's in the input now.
+        const scope = s.result.scope;
+        tasks.push(async () =>
+          mintCell(row, aud, aud.key === "Custom" ? scope : undefined),
+        );
+      }
+      if (tasks.length === 0) return;
+      const start = performance.now();
+      await runWithConcurrency(tasks, 5);
+      setLastParallelMs(performance.now() - start);
+    },
+    [cells, mintCell],
+  );
+
+  // -----------------------------------------------------------------------
   //  Bulk-confirmation dispatcher
   // -----------------------------------------------------------------------
 
@@ -941,6 +1078,76 @@ export const AudienceMatrixPage: React.FC = () => {
     generationRef.current++;
     refreshRowSources();
   });
+
+  // -----------------------------------------------------------------------
+  //  Keyboard navigation
+  // -----------------------------------------------------------------------
+  //
+  // Arrow keys + Home / End / PageUp / PageDown move focus across the matrix
+  // grid. We intercept BEFORE the browser scrolls so the operator's arrow-
+  // keys don't accidentally scroll a long page; only nav keys are consumed.
+  // `nextCoord()` is a pure helper in audience-matrix-helpers.ts — see its
+  // doc-comment for wrap behaviour.
+
+  const handleGridKeyDown = React.useCallback(
+    (e: React.KeyboardEvent<HTMLTableElement>) => {
+      const rowCount = visibleRows.length;
+      const colCount = AUDIENCE_COLUMNS.length;
+      if (rowCount === 0 || colCount === 0) return;
+      // Only act on the navigation keys nextCoord knows about — otherwise
+      // typing into an inline input must remain unblocked.
+      const navKeys = new Set([
+        "ArrowUp",
+        "ArrowDown",
+        "ArrowLeft",
+        "ArrowRight",
+        "Home",
+        "End",
+        "PageUp",
+        "PageDown",
+      ]);
+      if (!navKeys.has(e.key)) return;
+      // Don't hijack arrows while typing inside any input/textarea — the
+      // Custom-scope and free-text-filter inputs are inside the grid's
+      // ancestor card, so a stray focus shouldn't strand the operator.
+      const target = e.target as HTMLElement | null;
+      if (
+        target &&
+        (target.tagName === "INPUT" ||
+          target.tagName === "TEXTAREA" ||
+          target.isContentEditable)
+      ) {
+        return;
+      }
+      const cur =
+        focusedCoord ?? { rowIndex: 0, colIndex: 0 };
+      const next = nextCoord(cur, e.key, rowCount, colCount);
+      if (next === cur) return;
+      e.preventDefault();
+      setFocusedCoord(next);
+      // Imperatively focus the new cell button so the visible focus ring
+      // tracks our state. The cell button carries `data-row-index` /
+      // `data-col-index` for selection — kept attribute-based so we don't
+      // need a ref per cell (N × M refs would be wasteful).
+      const sel = `[data-row-index="${next.rowIndex}"][data-col-index="${next.colIndex}"]`;
+      const el = gridRef.current?.querySelector<HTMLButtonElement>(sel);
+      el?.focus();
+    },
+    [visibleRows.length, focusedCoord],
+  );
+
+  // -----------------------------------------------------------------------
+  //  Hovered row's client id — drives reachability highlight.
+  // -----------------------------------------------------------------------
+  // When the operator hovers/focuses a row in the matrix, the reachability
+  // table dims unrelated audiences and highlights the audiences this row's
+  // FOCI client can reach. Computed from the focused coord (NOT the hover —
+  // hover would jitter on every mouse-move; focus stays stable).
+  const focusedRowClientId = React.useMemo<string | null>(() => {
+    if (!focusedCoord) return null;
+    const row = visibleRows[focusedCoord.rowIndex];
+    return row?.clientId ?? null;
+  }, [focusedCoord, visibleRows]);
 
   // -----------------------------------------------------------------------
   //  Render
@@ -1180,6 +1387,98 @@ export const AudienceMatrixPage: React.FC = () => {
           </CardContent>
         </Card>
 
+        {/* Section D — Sort + density controls.
+            Sort key + direction are URL-state-backed so deep links preserve the
+            view. Density is persisted across reloads via usePersistedState.
+            Both controls are operator-tuning; they never change the underlying
+            data or fire audit-log entries. */}
+        <Card>
+          <CardContent className="flex flex-wrap items-center gap-2 p-3">
+            <span className="text-2xs font-semibold uppercase tracking-wider text-muted-foreground">
+              Sort
+            </span>
+            {(
+              [
+                { key: "name" as const, label: "Name" },
+                { key: "kind" as const, label: "Kind" },
+                { key: "tenant" as const, label: "Tenant" },
+                { key: "client" as const, label: "Client" },
+                { key: "minted" as const, label: "Minted" },
+              ]
+            ).map(({ key, label }) => (
+              <Button
+                key={key}
+                type="button"
+                size="sm"
+                variant={sortKey === key ? "default" : "outline"}
+                onClick={() => setSortKey(key)}
+                aria-pressed={sortKey === key}
+              >
+                {label}
+              </Button>
+            ))}
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <Button
+                  type="button"
+                  size="sm"
+                  variant="outline"
+                  onClick={toggleSortDir}
+                  aria-label={`Toggle sort direction (current: ${sortDir})`}
+                >
+                  {sortDir === "asc" ? (
+                    <ArrowUp className="h-3.5 w-3.5" aria-hidden />
+                  ) : (
+                    <ArrowDown className="h-3.5 w-3.5" aria-hidden />
+                  )}
+                  {sortDir.toUpperCase()}
+                </Button>
+              </TooltipTrigger>
+              <TooltipContent>
+                Click to toggle ascending / descending.
+              </TooltipContent>
+            </Tooltip>
+
+            <span className="ml-3 text-2xs font-semibold uppercase tracking-wider text-muted-foreground">
+              Density
+            </span>
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <Button
+                  type="button"
+                  size="sm"
+                  variant={isCompact ? "default" : "outline"}
+                  onClick={() =>
+                    setDensity(isCompact ? "comfy" : "compact")
+                  }
+                  aria-pressed={isCompact}
+                  aria-label="Toggle compact density"
+                >
+                  {isCompact ? (
+                    <Maximize2 className="h-3.5 w-3.5" aria-hidden />
+                  ) : (
+                    <Minimize2 className="h-3.5 w-3.5" aria-hidden />
+                  )}
+                  {isCompact ? "Comfy" : "Compact"}
+                </Button>
+              </TooltipTrigger>
+              <TooltipContent>
+                Compact density hides UPN + RT-prefix sub-rows in the identifier
+                column and tightens vertical padding.
+              </TooltipContent>
+            </Tooltip>
+            <span className="ml-auto text-2xs text-muted-foreground">
+              Showing {visibleRows.length} of {allRows.length} rows.
+            </span>
+          </CardContent>
+        </Card>
+
+        {/* Audience-reachability companion table — defender-facing static
+            reachability map from `audience-matrix-corpus.ts`. Collapsed by
+            default; persists open-state across reloads. Highlights audiences
+            reachable from the currently-focused row's source client_id. */}
+        <AudienceReachabilityTable highlightClientId={focusedRowClientId} />
+
         {/* Section E — Summary stats */}
         <div
           className="flex flex-wrap gap-2"
@@ -1241,16 +1540,32 @@ export const AudienceMatrixPage: React.FC = () => {
           <Card>
             <CardContent className="p-0">
               <div className="overflow-x-auto">
-                <table className="w-full border-separate border-spacing-0 text-xs">
+                {/* ARIA-grid semantics. Per WAI-ARIA 1.2, a grid is a
+                    composite widget — we explicitly mark the table
+                    `role="grid"`, every header cell `role="columnheader"` /
+                    `role="rowheader"`, and every data cell `role="gridcell"`.
+                    Keyboard navigation is wired via `onKeyDown` at the grid
+                    level (one listener, not N×M). */}
+                <table
+                  ref={gridRef}
+                  role="grid"
+                  aria-label="Audience matrix grid"
+                  aria-rowcount={visibleRows.length + 1}
+                  aria-colcount={AUDIENCE_COLUMNS.length + 2}
+                  onKeyDown={handleGridKeyDown}
+                  className={`w-full border-separate border-spacing-0 text-xs ${isCompact ? "audience-matrix-compact" : ""}`}
+                >
                   <thead className="sticky top-0 z-10 bg-card/95 backdrop-blur-sm">
-                    <tr>
+                    <tr role="row" aria-rowindex={1}>
                       <th
                         scope="col"
+                        role="columnheader"
+                        aria-colindex={1}
                         className="sticky left-0 z-20 min-w-[260px] border-b border-r bg-card px-3 py-2 text-left text-2xs font-semibold uppercase tracking-wider text-muted-foreground"
                       >
                         Identity ({visibleRows.length})
                       </th>
-                      {AUDIENCE_COLUMNS.map((aud) => {
+                      {AUDIENCE_COLUMNS.map((aud, audIdx) => {
                         // Signal B — risk tier per audience column. The
                         // tier + rationale live in audience-matrix-corpus.ts;
                         // see that module's header for the citation chain.
@@ -1259,6 +1574,8 @@ export const AudienceMatrixPage: React.FC = () => {
                         <th
                           key={aud.key}
                           scope="col"
+                          role="columnheader"
+                          aria-colindex={audIdx + 2}
                           data-audience-risk={risk.tier}
                           className="border-b px-2 py-2 text-center text-2xs font-semibold uppercase tracking-wider text-muted-foreground"
                         >
@@ -1339,6 +1656,8 @@ export const AudienceMatrixPage: React.FC = () => {
                       })}
                       <th
                         scope="col"
+                        role="columnheader"
+                        aria-colindex={AUDIENCE_COLUMNS.length + 2}
                         className="border-b px-2 py-2 text-center text-2xs font-semibold uppercase tracking-wider text-muted-foreground"
                       >
                         Mint row
@@ -1346,24 +1665,34 @@ export const AudienceMatrixPage: React.FC = () => {
                     </tr>
                   </thead>
                   <tbody>
-                    {visibleRows.map((row) => (
+                    {visibleRows.map((row, rowIdx) => {
+                      const rowIdxEntry: RowCellIndexEntry | undefined =
+                        rowCellIndex.get(row.id);
+                      const successCount = rowIdxEntry?.successCount ?? 0;
+                      return (
                       <tr
                         key={row.id}
+                        role="row"
+                        aria-rowindex={rowIdx + 2}
                         className="group hover:bg-accent/10"
                       >
                         <th
                           scope="row"
-                          className="sticky left-0 z-10 border-b border-r bg-card/95 px-3 py-2 text-left align-top backdrop-blur-sm group-hover:bg-accent/10"
+                          role="rowheader"
+                          aria-colindex={1}
+                          className={`sticky left-0 z-10 border-b border-r bg-card/95 text-left align-top backdrop-blur-sm group-hover:bg-accent/10 ${isCompact ? "px-2 py-1" : "px-3 py-2"}`}
                         >
-                          <RowIdentifierCell row={row} />
+                          <RowIdentifierCell row={row} compact={isCompact} />
                         </th>
-                        {AUDIENCE_COLUMNS.map((aud) => {
+                        {AUDIENCE_COLUMNS.map((aud, colIdx) => {
                           const k = cellKey(row.id, aud.key);
                           const cell = cells[k];
                           return (
                             <td
                               key={aud.key}
-                              className="border-b px-1 py-1 text-center align-middle"
+                              role="gridcell"
+                              aria-colindex={colIdx + 2}
+                              className={`border-b text-center align-middle ${isCompact ? "px-0.5 py-0" : "px-1 py-1"}`}
                             >
                               <MatrixCell
                                 row={row}
@@ -1371,8 +1700,17 @@ export const AudienceMatrixPage: React.FC = () => {
                                 state={cell}
                                 customScope={customScope}
                                 isOpen={openCellKey === k}
+                                rowIndex={rowIdx}
+                                colIndex={colIdx}
+                                nowSec={nowSec}
                                 onOpenChange={(open) =>
                                   setOpenCellKey(open ? k : null)
+                                }
+                                onFocus={() =>
+                                  setFocusedCoord({
+                                    rowIndex: rowIdx,
+                                    colIndex: colIdx,
+                                  })
                                 }
                                 onClick={() => handleCellClick(row, aud)}
                                 onReMint={() => {
@@ -1404,33 +1742,68 @@ export const AudienceMatrixPage: React.FC = () => {
                             </td>
                           );
                         })}
-                        <td className="border-b px-1 py-1 text-center align-middle">
-                          <Tooltip>
-                            <TooltipTrigger asChild>
-                              <Button
-                                type="button"
-                                size="sm"
-                                variant="outline"
-                                onClick={() => {
-                                  pendingBulkArgRef.current = {
-                                    rowId: row.id,
-                                  };
-                                  setPendingBulk("all-row");
-                                }}
-                                aria-label={`Mint every audience for ${row.displayName}`}
-                              >
-                                <Play className="h-3 w-3" aria-hidden />
-                                All
-                              </Button>
-                            </TooltipTrigger>
-                            <TooltipContent>
-                              Mint every audience for this row (capped at 5
-                              concurrent).
-                            </TooltipContent>
-                          </Tooltip>
+                        <td
+                          role="gridcell"
+                          aria-colindex={AUDIENCE_COLUMNS.length + 2}
+                          className={`border-b text-center align-middle ${isCompact ? "px-0.5 py-0" : "px-1 py-1"}`}
+                        >
+                          <div className="inline-flex items-center gap-1">
+                            <Tooltip>
+                              <TooltipTrigger asChild>
+                                <Button
+                                  type="button"
+                                  size="sm"
+                                  variant="outline"
+                                  onClick={() => {
+                                    pendingBulkArgRef.current = {
+                                      rowId: row.id,
+                                    };
+                                    setPendingBulk("all-row");
+                                  }}
+                                  aria-label={`Mint every audience for ${row.displayName}`}
+                                >
+                                  <Play className="h-3 w-3" aria-hidden />
+                                  All
+                                </Button>
+                              </TooltipTrigger>
+                              <TooltipContent>
+                                Mint every audience for this row (capped at 5
+                                concurrent).
+                              </TooltipContent>
+                            </Tooltip>
+                            {successCount > 0 && (
+                              <Tooltip>
+                                <TooltipTrigger asChild>
+                                  <Button
+                                    type="button"
+                                    size="sm"
+                                    variant="ghost"
+                                    onClick={() =>
+                                      void refreshRowSuccessfulCells(row)
+                                    }
+                                    aria-label={`Refresh ${successCount} successful cell${successCount === 1 ? "" : "s"} for ${row.displayName}`}
+                                  >
+                                    <RefreshCw
+                                      className="h-3 w-3"
+                                      aria-hidden
+                                    />
+                                    <span className="text-3xs tabular-nums">
+                                      {successCount}
+                                    </span>
+                                  </Button>
+                                </TooltipTrigger>
+                                <TooltipContent>
+                                  Re-mint only the {successCount} audience
+                                  {successCount === 1 ? "" : "s"} that already
+                                  succeeded for this row. Debounced to 1.5s.
+                                </TooltipContent>
+                              </Tooltip>
+                            )}
+                          </div>
                         </td>
                       </tr>
-                    ))}
+                      );
+                    })}
                   </tbody>
                 </table>
               </div>
@@ -1544,7 +1917,11 @@ export const AudienceMatrixPage: React.FC = () => {
 //  (shows client name + masked RT prefix) vs account rows (name + UPN).
 // ---------------------------------------------------------------------------
 
-const RowIdentifierCell: React.FC<{ row: MintRow }> = ({ row }) => {
+const RowIdentifierCell: React.FC<{
+  row: MintRow;
+  /** When true, hide UPN + RT-prefix sub-rows for a tighter view. */
+  compact?: boolean;
+}> = ({ row, compact = false }) => {
   if (row.kind === "rt") {
     // Signal A — FOCI family detection.
     // Source: `dirkjanm/family-of-client-ids-research/known-foci-clients.csv`
@@ -1553,6 +1930,10 @@ const RowIdentifierCell: React.FC<{ row: MintRow }> = ({ row }) => {
     // member's audience scopes. See `audience-matrix-corpus.ts`.
     const isFoci = clientIdIsFoci(row.clientId);
     const fociName = fociClientName(row.clientId);
+    // Signal D — annotated FOCI-client profile (typical pre-consented scopes
+    // + audiences). Only populated for clients we've curated; absence is NOT
+    // proof of "no risk", only "not annotated".
+    const profile = getFociClientProfile(row.clientId);
     return (
       <div className="flex flex-col gap-0.5">
         <span className="inline-flex items-center gap-1.5">
@@ -1581,6 +1962,23 @@ const RowIdentifierCell: React.FC<{ row: MintRow }> = ({ row }) => {
                   member, with that member's pre-consented scopes — no
                   re-authentication required.
                 </p>
+                {profile && profile.highValueScopes.length > 0 && (
+                  <div className="mt-2 border-t pt-2">
+                    <p className="m-0 text-3xs font-semibold text-foreground">
+                      Typical high-value scopes
+                    </p>
+                    <ul className="m-0 mt-0.5 list-disc pl-4 text-3xs text-muted-foreground">
+                      {profile.highValueScopes.map((s) => (
+                        <li key={s}>
+                          <code className="font-mono">{s}</code>
+                        </li>
+                      ))}
+                    </ul>
+                    <p className="m-0 mt-1 text-3xs text-muted-foreground">
+                      {profile.notes}
+                    </p>
+                  </div>
+                )}
                 <p className="m-0 mt-1 text-3xs text-muted-foreground">
                   Reference:{" "}
                   <code className="font-mono">
@@ -1588,18 +1986,24 @@ const RowIdentifierCell: React.FC<{ row: MintRow }> = ({ row }) => {
                   </code>
                   ,{" "}
                   <code className="font-mono">_AZURE_LOGIN_METHODS.md §FOCI</code>
+                  ,{" "}
+                  <code className="font-mono">
+                    dafthack/azure-ad-first-party-apps-permissions
+                  </code>
                   .
                 </p>
               </TooltipContent>
             </Tooltip>
           )}
         </span>
-        {row.upn && (
+        {!compact && row.upn && (
           <span className="text-3xs text-muted-foreground">{row.upn}</span>
         )}
-        <span className="font-mono text-3xs text-muted-foreground">
-          {shortTenant(row.tenantId)} · {row.rtPrefix}
-        </span>
+        {!compact && (
+          <span className="font-mono text-3xs text-muted-foreground">
+            {shortTenant(row.tenantId)} · {row.rtPrefix}
+          </span>
+        )}
         {row.clientId && (
           <span className="font-mono text-3xs text-muted-foreground">
             client {row.clientId.slice(0, 8)}…
@@ -1620,12 +2024,14 @@ const RowIdentifierCell: React.FC<{ row: MintRow }> = ({ row }) => {
           MSAL
         </Badge>
       </span>
-      {row.upn && (
+      {!compact && row.upn && (
         <span className="text-3xs text-muted-foreground">{row.upn}</span>
       )}
-      <span className="font-mono text-3xs text-muted-foreground">
-        tenant {shortTenant(row.tenantId)}
-      </span>
+      {!compact && (
+        <span className="font-mono text-3xs text-muted-foreground">
+          tenant {shortTenant(row.tenantId)}
+        </span>
+      )}
     </div>
   );
 };
@@ -1641,34 +2047,50 @@ interface MatrixCellProps {
   state: CellState | undefined;
   customScope: string;
   isOpen: boolean;
+  /** Grid row index (0-based among visible rows). */
+  rowIndex: number;
+  /** Grid column index (0-based among AUDIENCE_COLUMNS). */
+  colIndex: number;
+  /** Shared 1Hz seconds-epoch from the page-level ticker. */
+  nowSec: number;
   onOpenChange: (open: boolean) => void;
   onClick: () => void;
+  onFocus: () => void;
   onReMint: () => void;
   onImportToVault: () => void;
 }
 
-const MatrixCell: React.FC<MatrixCellProps> = ({
+/**
+ * Single matrix cell — idle / pending / success / error variants.
+ *
+ * Memoised on its props so re-renders fire only when the cell's state or the
+ * shared ticker actually moved. Without `React.memo` here, every cells-map
+ * update would force a re-render across ALL cells in the table; with it,
+ * only the cells whose row(or shared ticker) changed re-render. For a fully-
+ * minted matrix this is the difference between O(N*M) and O(1) re-renders.
+ */
+const MatrixCellInner: React.FC<MatrixCellProps> = ({
   row,
   audience,
   state,
   customScope,
   isOpen,
+  rowIndex,
+  colIndex,
+  nowSec,
   onOpenChange,
   onClick,
+  onFocus,
   onReMint,
   onImportToVault,
 }) => {
-  // Force a 1Hz tick so the expiry-minutes badge inside success cells
-  // re-renders without callers having to push their own clock.
-  const [, tick] = React.useState(0);
-  React.useEffect(() => {
-    if (state?.kind !== "success") return;
-    const id = window.setInterval(() => tick((n) => n + 1), 1000);
-    return () => window.clearInterval(id);
-  }, [state?.kind]);
-
   // Disable when Custom column has no scope yet
   const customDisabled = audience.key === "Custom" && !customScope.trim();
+
+  const dataAttrs = {
+    "data-row-index": rowIndex,
+    "data-col-index": colIndex,
+  } as const;
 
   if (!state || state.kind === "idle") {
     return (
@@ -1677,8 +2099,10 @@ const MatrixCell: React.FC<MatrixCellProps> = ({
           <button
             type="button"
             onClick={onClick}
+            onFocus={onFocus}
             disabled={customDisabled}
             aria-label={`Mint ${audience.key} for ${row.displayName}`}
+            {...dataAttrs}
             className="inline-flex h-7 w-full items-center justify-center rounded text-xs text-muted-foreground transition-colors hover:bg-accent/30 hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:cursor-not-allowed disabled:opacity-40"
           >
             –
@@ -1700,7 +2124,9 @@ const MatrixCell: React.FC<MatrixCellProps> = ({
           <button
             type="button"
             onClick={onClick}
+            onFocus={onFocus}
             aria-label="Cancel mint"
+            {...dataAttrs}
             className="inline-flex h-7 w-full items-center justify-center rounded text-info hover:bg-accent/30 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
           >
             <Loader2
@@ -1722,7 +2148,9 @@ const MatrixCell: React.FC<MatrixCellProps> = ({
           <button
             type="button"
             onClick={onClick}
+            onFocus={onFocus}
             aria-label={`Retry mint (failed: ${aadCode})`}
+            {...dataAttrs}
             className="inline-flex h-7 w-full items-center justify-center gap-1 rounded text-3xs text-destructive hover:bg-destructive/10 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
           >
             <X className="h-3 w-3" aria-hidden />
@@ -1741,8 +2169,9 @@ const MatrixCell: React.FC<MatrixCellProps> = ({
     );
   }
 
-  // success
-  const sec = secondsUntilExpiry(state.result);
+  // success — derive remaining seconds from the shared ticker so the cell
+  // re-renders ONLY when the page's `nowSec` actually changes (1Hz max).
+  const sec = Math.max(0, state.result.expiresAt - nowSec);
   const tone =
     sec < 60 ? "destructive" : sec < 5 * 60 ? "warning" : "success";
   return (
@@ -1750,7 +2179,9 @@ const MatrixCell: React.FC<MatrixCellProps> = ({
       <PopoverTrigger asChild>
         <button
           type="button"
+          onFocus={onFocus}
           aria-label={`Token minted (${fmtRemaining(sec)} left) — open claims viewer`}
+          {...dataAttrs}
           className="inline-flex h-7 w-full items-center justify-center gap-1 rounded hover:bg-accent/30 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
         >
           <Check
@@ -1781,6 +2212,7 @@ const MatrixCell: React.FC<MatrixCellProps> = ({
           row={row}
           audience={audience}
           result={state.result}
+          nowSec={nowSec}
           onReMint={onReMint}
           onImportToVault={onImportToVault}
         />
@@ -1788,6 +2220,29 @@ const MatrixCell: React.FC<MatrixCellProps> = ({
     </Popover>
   );
 };
+
+/**
+ * Memo wrapper. Compares each prop shallowly; `onClick` / `onFocus` /
+ * `onReMint` / `onImportToVault` / `onOpenChange` are reference-stable
+ * across renders of a given (row, audience) pair because the parent uses
+ * inline arrow functions per cell. So we can't rely on referential
+ * equality there — but the non-callback props (state, isOpen, nowSec,
+ * customScope, rowIndex, colIndex) are the ones that materially change
+ * cell output. We compare just those; identical callbacks-with-new-refs
+ * are intentionally treated as "no re-render needed".
+ */
+const MatrixCell = React.memo<MatrixCellProps>(
+  MatrixCellInner,
+  (prev, next) =>
+    prev.state === next.state &&
+    prev.isOpen === next.isOpen &&
+    prev.nowSec === next.nowSec &&
+    prev.customScope === next.customScope &&
+    prev.rowIndex === next.rowIndex &&
+    prev.colIndex === next.colIndex &&
+    prev.row === next.row &&
+    prev.audience === next.audience,
+);
 
 // ---------------------------------------------------------------------------
 //  SuccessPopoverBody — decoded claims + actions for a successful cell.
@@ -1839,11 +2294,13 @@ const SuccessPopoverBody: React.FC<{
   row: MintRow;
   audience: AudienceColumn;
   result: MintSuccess;
+  /** Shared 1Hz ticker. Drives the "Xm left" countdown without per-popover intervals. */
+  nowSec: number;
   onReMint: () => void;
   onImportToVault: () => void;
-}> = ({ row, audience, result, onReMint, onImportToVault }) => {
+}> = ({ row, audience, result, nowSec, onReMint, onImportToVault }) => {
   // Memoise the claim summary — `summariseFromJwt` walks the JWT payload
-  // and the popover re-renders on every 1s tick from the parent cell.
+  // and the popover re-renders on every 1s tick from the shared clock.
   const claims = React.useMemo(
     () => summariseFromJwt(result.accessToken),
     [result.accessToken],
@@ -1852,6 +2309,32 @@ const SuccessPopoverBody: React.FC<{
   const expIso = claims.exp
     ? new Date(claims.exp * 1000).toISOString()
     : undefined;
+  // Operator can expand all 30+ raw claims when they want them; collapsed
+  // by default so the popover stays focused on the high-signal handful.
+  const [expanded, setExpanded] = React.useState(false);
+  // Full claim entries sorted alphabetically for stable rendering.
+  const fullClaimEntries = React.useMemo(() => {
+    const entries: Array<[string, string]> = [];
+    for (const k of Object.keys(result.claims)) {
+      const v = result.claims[k];
+      if (v == null) continue;
+      let s: string;
+      if (typeof v === "string" || typeof v === "number" || typeof v === "boolean") {
+        s = String(v);
+      } else {
+        try {
+          s = JSON.stringify(v);
+        } catch {
+          s = "(unserializable)";
+        }
+      }
+      entries.push([k, s]);
+    }
+    entries.sort((a, b) => a[0].localeCompare(b[0]));
+    return entries;
+  }, [result.claims]);
+  // Live remaining seconds from the shared ticker — same math as the cell.
+  const remainingSec = Math.max(0, result.expiresAt - nowSec);
   return (
     <div className="flex flex-col gap-2 text-xs">
       <div className="flex items-center justify-between gap-2">
@@ -1859,8 +2342,8 @@ const SuccessPopoverBody: React.FC<{
           <Sparkles className="h-3.5 w-3.5 text-success" aria-hidden />
           {audience.key} token
         </span>
-        <Badge variant="outline" className="text-3xs">
-          {fmtRemaining(secondsUntilExpiry(result))} left
+        <Badge variant="outline" className="text-3xs tabular-nums">
+          {fmtRemaining(remainingSec)} left
         </Badge>
       </div>
 
@@ -1931,6 +2414,28 @@ const SuccessPopoverBody: React.FC<{
         </dl>
       )}
 
+      {/* Full claims expansion — collapsed by default so the popover stays
+          focused on the high-signal handful. Operators who need every claim
+          (scope auditing, manual debugging) can click to expand and copy
+          values via the per-row copy button. */}
+      <div className="border-t pt-2">
+        <button
+          type="button"
+          onClick={() => setExpanded((v) => !v)}
+          aria-expanded={expanded}
+          className="inline-flex items-center gap-1 text-3xs text-muted-foreground hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+        >
+          {expanded ? "Hide" : "Show"} all {fullClaimEntries.length} claims
+        </button>
+        {expanded && (
+          <dl className="mt-1 grid max-h-48 grid-cols-[100px_1fr] gap-x-2 gap-y-1 overflow-y-auto text-2xs">
+            {fullClaimEntries.map(([k, v]) => (
+              <ClaimRow key={k} term={k} value={v} copyLabel={`Copy ${k}`} />
+            ))}
+          </dl>
+        )}
+      </div>
+
       <div className="flex flex-wrap items-center gap-1.5 border-t pt-2">
         <Button
           type="button"
@@ -1963,7 +2468,10 @@ const SuccessPopoverBody: React.FC<{
         <AlertTitle className="text-2xs">Treat as a secret</AlertTitle>
         <AlertDescription className="text-3xs">
           The raw token grants the same access as the original sign-in. Don't
-          paste it into chat / tickets / commits.
+          paste it into chat / tickets / commits. NEVER auto-open external
+          decoders (jwt.io etc.) with the token in the URL fragment — the
+          decoder host receives the bearer. Copy locally and paste manually
+          if you need to inspect outside this popover.
         </AlertDescription>
       </Alert>
     </div>
