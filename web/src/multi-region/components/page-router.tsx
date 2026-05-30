@@ -56,6 +56,7 @@ import { EaSubQuickPage } from "./ea-sub-quick/ea-sub-quick-page";
 import { EaCreatorPregrantPage } from "./ea-creator-pregrant/ea-creator-pregrant-page";
 import { PartnerCenterPage } from "./partner-center/partner-center-page";
 import { TenantUsersPage } from "./tenant-users/tenant-users-page";
+import { MfaManagerPage } from "./mfa-manager/mfa-manager-page";
 import { UnusedQuotaPage } from "./unused-quota/unused-quota-page";
 import { UserCreatorPage } from "./user-creator/user-creator-page";
 // ROADtools-inspired defensive audit pages (Stormspotter / MicroBurst /
@@ -111,6 +112,7 @@ export type PageKey =
   | "gpu-calculator"
   | "audit-log"
   | "tenant-users"
+  | "mfa-manager"
   | "user-creator"
   | "invite-user"
   | "sub-manager"
@@ -148,6 +150,7 @@ const PAGE_KEY_TO_PATH: Record<PageKey, string> = {
   "gpu-calculator": "/gpu-calculator",
   "audit-log": "/audit-log",
   "tenant-users": "/tenant-users",
+  "mfa-manager": "/mfa-manager",
   "user-creator": "/user-creator",
   "invite-user": "/invite-user",
   "sub-manager": "/sub-manager",
@@ -213,6 +216,7 @@ export const PAGE_ORDER: PageKey[] = [
   "gpu-calculator",
   "audit-log",
   "tenant-users",
+  "mfa-manager",
   "user-creator",
   "invite-user",
   "sub-manager",
@@ -414,6 +418,12 @@ const TenantUsersRoute: React.FC = () => {
     </PageBoundary>
   );
 };
+
+const MfaManagerRoute: React.FC = () => (
+  <PageBoundary pageKey="mfa-manager">
+    <MfaManagerPage />
+  </PageBoundary>
+);
 
 const UserCreatorRoute: React.FC = () => {
   const { orchestrator, navigateToPage } = useDashboardOutletContext();
@@ -622,6 +632,7 @@ export const PageRouter: React.FC<PageRouterProps> = ({
         <Route path="/gpu-calculator" element={<GpuCalculatorRoute />} />
         <Route path="/audit-log" element={<AuditLogRoute />} />
         <Route path="/tenant-users" element={<TenantUsersRoute />} />
+        <Route path="/mfa-manager" element={<MfaManagerRoute />} />
         <Route path="/user-creator" element={<UserCreatorRoute />} />
         <Route path="/invite-user" element={<InviteUserRoute />} />
         <Route path="/sub-manager" element={<SubManagerRoute />} />

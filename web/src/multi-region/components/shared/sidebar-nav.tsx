@@ -66,6 +66,7 @@ export type PageKey =
   | "nodes"
   | "gpu-calculator"
   | "tenant-users"
+  | "mfa-manager"
   | "user-creator"
   | "invite-user"
   | "sub-manager"
@@ -341,6 +342,14 @@ export const SidebarNav: React.FC<SidebarNavProps> = ({
         badge: capCounts.passwordReset,
       });
     }
+    // MFA Manager — manage authentication methods for the operator's OWN
+    // signed-in accounts as well as a target user. Always available (self
+    // reads need no admin role), so it isn't gated on a capability count.
+    identity.push({
+      key: "mfa-manager" as PageKey,
+      label: "MFA Manager",
+      icon: ShieldCheck,
+    });
     identity.push({
       key: "user-creator" as PageKey,
       label: "Create User",

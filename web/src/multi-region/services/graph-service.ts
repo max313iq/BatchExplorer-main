@@ -768,18 +768,81 @@ function describeAuthMethod(raw: Record<string, unknown>): string | undefined {
   );
 }
 
-/** List a user's registered authentication methods (Graph, paginated). */
-export async function listUserAuthMethods(
+/**
+ * Target of an authentication-method operation. Either the *signed-in user*
+ * (`/me`, used by the MFA Manager's "signed-in accounts" mode, which manages
+ * the operator's OWN logged-in accounts) or *another user* by object id
+ * (`/users/{id}`, used by Tenant Users and the MFA Manager's "target user"
+ * mode). `/me` is preferred for self-service because the least-privileged
+ * delegated permission (`UserAuthenticationMethod.Read`) is honoured there,
+ * whereas `/users/{id}` reads/writes require the `.All` variant + a directory
+ * role even when `{id}` is the caller.
+ */
+export type AuthMethodTarget =
+  | { readonly kind: "me" }
+  | { readonly kind: "user"; readonly userId: string };
+
+/** The signed-in user (`/me`). */
+export const SELF_TARGET: AuthMethodTarget = { kind: "me" };
+
+/** Another user, by AAD object id. Validates the GUID eagerly. */
+export function userTarget(userId: string): AuthMethodTarget {
+  validateUserId(userId);
+  return { kind: "user", userId };
+}
+
+/** `/me` or `/users/{id}` — the principal root for session/method calls. */
+function principalRoot(target: AuthMethodTarget): string {
+  if (target.kind === "me") return `${GRAPH_BASE}/me`;
+  validateUserId(target.userId);
+  return `${GRAPH_BASE}/users/${encodeURIComponent(target.userId)}`;
+}
+
+/** `…/authentication` — the root for every authentication-method collection. */
+function authRoot(target: AuthMethodTarget): string {
+  return `${principalRoot(target)}/authentication`;
+}
+
+/** Human label for audit entries / error messages. */
+export function targetLabel(target: AuthMethodTarget): string {
+  return target.kind === "me" ? "(signed-in user)" : target.userId;
+}
+
+/**
+ * Normalize one entry from the polymorphic Graph `/authentication/methods`
+ * collection into our {@link UserAuthMethod}. Shared by the list call and by
+ * the per-type create calls (which echo back a single method object).
+ */
+function normalizeAuthMethod(m: Record<string, unknown>): UserAuthMethod {
+  const odataType = (m["@odata.type"] as string) ?? "";
+  const known = MFA_METHOD_SEGMENTS[odataType];
+  const derivedKind =
+    odataType
+      .replace("#microsoft.graph.", "")
+      .replace(/AuthenticationMethod$/, "") || "Unknown method";
+  const kind = known?.kind ?? MFA_KIND_FALLBACK[odataType] ?? derivedKind;
+  return {
+    id: String(m.id ?? ""),
+    odataType,
+    kind,
+    detail: describeAuthMethod(m),
+    removable: Boolean(known),
+    segment: known?.segment,
+  };
+}
+
+/**
+ * List a target's registered authentication methods (Graph, paginated).
+ * Works for `/me` (self) and `/users/{id}` (another user) via {@link AuthMethodTarget}.
+ */
+export async function listAuthMethods(
   tenantId: string,
-  userId: string,
+  target: AuthMethodTarget,
   accessToken: string,
   opts?: { signal?: AbortSignal },
 ): Promise<UserAuthMethod[]> {
   validateTenantId(tenantId);
-  validateUserId(userId);
-  const url =
-    `${GRAPH_BASE}/users/${encodeURIComponent(userId)}` +
-    `/authentication/methods`;
+  const url = `${authRoot(target)}/methods`;
   const raw = await fetchAllPages<Record<string, unknown>>(
     url,
     accessToken,
@@ -787,47 +850,43 @@ export async function listUserAuthMethods(
     undefined,
     opts?.signal,
   );
-  return raw.map((m) => {
-    const odataType = (m["@odata.type"] as string) ?? "";
-    const known = MFA_METHOD_SEGMENTS[odataType];
-    const derivedKind =
-      odataType
-        .replace("#microsoft.graph.", "")
-        .replace(/AuthenticationMethod$/, "") || "Unknown method";
-    const kind = known?.kind ?? MFA_KIND_FALLBACK[odataType] ?? derivedKind;
-    return {
-      id: String(m.id ?? ""),
-      odataType,
-      kind,
-      detail: describeAuthMethod(m),
-      removable: Boolean(known),
-      segment: known?.segment,
-    };
-  });
+  return raw.map(normalizeAuthMethod);
 }
 
 /**
- * Delete a single authentication method by its type segment + id. A 404 is
- * treated as success (already gone) so the operation stays idempotent.
+ * List *another user's* registered authentication methods. Thin wrapper over
+ * {@link listAuthMethods} kept for the existing Tenant Users call sites.
  */
-export async function deleteUserAuthMethod(
+export async function listUserAuthMethods(
   tenantId: string,
   userId: string,
+  accessToken: string,
+  opts?: { signal?: AbortSignal },
+): Promise<UserAuthMethod[]> {
+  validateUserId(userId);
+  return listAuthMethods(tenantId, { kind: "user", userId }, accessToken, opts);
+}
+
+/**
+ * Delete a single authentication method by its type segment + id, for any
+ * {@link AuthMethodTarget}. A 404 is treated as success (already gone) so the
+ * operation stays idempotent and safe to re-run.
+ */
+export async function deleteAuthMethod(
+  tenantId: string,
+  target: AuthMethodTarget,
   segment: string,
   methodId: string,
   accessToken: string,
   opts?: { signal?: AbortSignal },
 ): Promise<void> {
   validateTenantId(tenantId);
-  validateUserId(userId);
   // `segment` comes from our own allow-list map, but guard against any
   // future caller passing arbitrary input into the URL path.
   if (!/^[A-Za-z0-9]+$/.test(segment)) {
     throw new Error("Invalid authentication-method segment.");
   }
-  const url =
-    `${GRAPH_BASE}/users/${encodeURIComponent(userId)}/authentication/` +
-    `${segment}/${encodeURIComponent(methodId)}`;
+  const url = `${authRoot(target)}/${segment}/${encodeURIComponent(methodId)}`;
   const response = await graphFetch(
     url,
     {
@@ -842,21 +901,40 @@ export async function deleteUserAuthMethod(
   }
 }
 
-/**
- * Force a user to re-authenticate by invalidating their refresh tokens
- * (POST /users/{id}/revokeSignInSessions). Pairs with an MFA reset so the
- * user can't keep using an existing session after their methods are wiped.
- */
-export async function revokeUserSignInSessions(
+/** Delete *another user's* authentication method. Thin back-compat wrapper. */
+export async function deleteUserAuthMethod(
   tenantId: string,
   userId: string,
+  segment: string,
+  methodId: string,
+  accessToken: string,
+  opts?: { signal?: AbortSignal },
+): Promise<void> {
+  validateUserId(userId);
+  return deleteAuthMethod(
+    tenantId,
+    { kind: "user", userId },
+    segment,
+    methodId,
+    accessToken,
+    opts,
+  );
+}
+
+/**
+ * Force a target to re-authenticate by invalidating their refresh tokens
+ * (POST {root}/revokeSignInSessions). Pairs with an MFA reset so the principal
+ * can't keep using an existing session after their methods are wiped. Works
+ * for `/me` and `/users/{id}` via {@link AuthMethodTarget}.
+ */
+export async function revokeSignInSessions(
+  tenantId: string,
+  target: AuthMethodTarget,
   accessToken: string,
   opts?: { signal?: AbortSignal },
 ): Promise<void> {
   validateTenantId(tenantId);
-  validateUserId(userId);
-  const url =
-    `${GRAPH_BASE}/users/${encodeURIComponent(userId)}/revokeSignInSessions`;
+  const url = `${principalRoot(target)}/revokeSignInSessions`;
   const response = await graphFetch(
     url,
     {
@@ -871,6 +949,22 @@ export async function revokeUserSignInSessions(
   if (!response.ok) {
     throw await toGraphError(response);
   }
+}
+
+/** Revoke *another user's* sessions. Thin back-compat wrapper. */
+export async function revokeUserSignInSessions(
+  tenantId: string,
+  userId: string,
+  accessToken: string,
+  opts?: { signal?: AbortSignal },
+): Promise<void> {
+  validateUserId(userId);
+  return revokeSignInSessions(
+    tenantId,
+    { kind: "user", userId },
+    accessToken,
+    opts,
+  );
 }
 
 export interface MfaResetResult {
@@ -892,9 +986,9 @@ export interface MfaResetResult {
  * changed) doesn't abort the rest. Non-removable methods (password, and any
  * type without a delete endpoint) are returned in `skipped`, untouched.
  */
-export async function resetUserMfa(
+export async function resetMfa(
   tenantId: string,
-  userId: string,
+  target: AuthMethodTarget,
   accessToken: string,
   opts: {
     methods: UserAuthMethod[];
@@ -912,7 +1006,7 @@ export async function resetUserMfa(
       continue;
     }
     try {
-      await deleteUserAuthMethod(tenantId, userId, m.segment, m.id, accessToken, {
+      await deleteAuthMethod(tenantId, target, m.segment, m.id, accessToken, {
         signal: opts.signal,
       });
       deleted.push(m);
@@ -925,12 +1019,30 @@ export async function resetUserMfa(
   }
   let sessionsRevoked = false;
   if (opts.revokeSessions && !opts.signal?.aborted) {
-    await revokeUserSignInSessions(tenantId, userId, accessToken, {
+    await revokeSignInSessions(tenantId, target, accessToken, {
       signal: opts.signal,
     });
     sessionsRevoked = true;
   }
   return { deleted, failed, skipped, sessionsRevoked };
+}
+
+/**
+ * Reset *another user's* MFA. Thin back-compat wrapper over {@link resetMfa}
+ * for the existing Tenant Users call site.
+ */
+export async function resetUserMfa(
+  tenantId: string,
+  userId: string,
+  accessToken: string,
+  opts: {
+    methods: UserAuthMethod[];
+    revokeSessions: boolean;
+    signal?: AbortSignal;
+  },
+): Promise<MfaResetResult> {
+  validateUserId(userId);
+  return resetMfa(tenantId, { kind: "user", userId }, accessToken, opts);
 }
 
 // Roles that can manage ANOTHER user's authentication methods. Note this is
@@ -949,6 +1061,308 @@ const MFA_MANAGE_ROLE_TEMPLATES = new Set<string>([
 export function canManageMfa(roles: DirectoryRole[]): boolean {
   if (!Array.isArray(roles) || roles.length === 0) return false;
   return roles.some((r) => MFA_MANAGE_ROLE_TEMPLATES.has(r.roleTemplateId));
+}
+
+// ---------------------------------------------------------------------------
+// Authentication-method WRITES — register a method, issue a Temporary Access
+// Pass, read/clear the default method.
+//
+// These power the MFA Manager page (manage MFA for the operator's OWN
+// signed-in accounts via `/me`, or a target user via `/users/{id}`). All
+// writes need delegated `UserAuthenticationMethod.ReadWrite[.All]` plus, for
+// the `/users/{id}` target, an Authentication / Privileged Authentication
+// Administrator directory role ({@link canManageMfa}). A 403 surfaces through
+// {@link toGraphError} with the same actionable role/consent guidance the
+// reset path uses.
+//
+// Endpoints + bodies verified against Microsoft Graph v1.0:
+//   POST …/authentication/phoneMethods                { phoneNumber, phoneType }
+//   POST …/authentication/emailMethods                { emailAddress }
+//   POST …/authentication/temporaryAccessPassMethods  { lifetimeInMinutes?, isUsableOnce?, startDateTime? }
+//   GET/PATCH …/authentication/signInPreferences      { userPreferredMethodForSecondaryAuthentication, … }
+// ---------------------------------------------------------------------------
+
+/**
+ * Shared JSON write helper for the method-create / preference-patch calls.
+ * Sends `body` as JSON, throws an enriched {@link AzureRequestError} on a
+ * non-2xx, and returns the parsed response (or `undefined` for a 204).
+ */
+async function graphSend<T>(
+  url: string,
+  method: "POST" | "PATCH" | "PUT",
+  body: unknown,
+  accessToken: string,
+  tenantId: string,
+  signal?: AbortSignal,
+): Promise<T> {
+  const response = await graphFetch(
+    url,
+    {
+      method,
+      headers: graphHeaders(accessToken, { "Content-Type": "application/json" }),
+      body: JSON.stringify(body),
+      ...(signal ? { signal } : {}),
+    },
+    tenantId,
+  );
+  if (!response.ok) {
+    throw await toGraphError(response);
+  }
+  if (response.status === 204) return undefined as unknown as T;
+  return (await response.json()) as T;
+}
+
+/** The phone slots Graph accepts for a `phoneAuthenticationMethod`. */
+export type PhoneAuthType = "mobile" | "alternateMobile" | "office";
+
+/**
+ * Microsoft Graph requires E.164-style phone numbers written as a country
+ * code, a single space, then the subscriber number — e.g. `+1 2065551234`.
+ * We validate that shape client-side so the operator gets an instant, precise
+ * message instead of a round-tripped Graph 400.
+ */
+const PHONE_NUMBER_RE = /^\+[1-9]\d{0,3} \d[\d ]{3,17}$/;
+
+/** Pragmatic email shape check (Graph does the authoritative validation). */
+const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+
+export interface AddPhoneMethodInput {
+  /** International format, e.g. `"+1 2065551234"`. */
+  phoneNumber: string;
+  /** Defaults to `"mobile"` (the only type usable for SMS/voice MFA). */
+  phoneType?: PhoneAuthType;
+  signal?: AbortSignal;
+}
+
+/**
+ * Register a phone authentication method (SMS / voice). Returns the created
+ * method normalized as a {@link UserAuthMethod} so the caller can drop it
+ * straight into the on-screen method list.
+ */
+export async function addPhoneMethod(
+  tenantId: string,
+  target: AuthMethodTarget,
+  input: AddPhoneMethodInput,
+  accessToken: string,
+): Promise<UserAuthMethod> {
+  validateTenantId(tenantId);
+  const phoneNumber = input.phoneNumber.trim();
+  if (!PHONE_NUMBER_RE.test(phoneNumber)) {
+    throw new Error(
+      'Invalid phone number. Use international format with a country code, ' +
+        'a space, then the number — e.g. "+1 2065551234".',
+    );
+  }
+  const phoneType: PhoneAuthType = input.phoneType ?? "mobile";
+  const raw = await graphSend<Record<string, unknown>>(
+    `${authRoot(target)}/phoneMethods`,
+    "POST",
+    { phoneNumber, phoneType },
+    accessToken,
+    tenantId,
+    input.signal,
+  );
+  return normalizeAuthMethod({
+    "@odata.type": "#microsoft.graph.phoneAuthenticationMethod",
+    ...raw,
+  });
+}
+
+export interface AddEmailMethodInput {
+  emailAddress: string;
+  signal?: AbortSignal;
+}
+
+/**
+ * Register an email authentication method (used for self-service password
+ * reset, and as a recovery factor). Returns the created method normalized.
+ */
+export async function addEmailMethod(
+  tenantId: string,
+  target: AuthMethodTarget,
+  input: AddEmailMethodInput,
+  accessToken: string,
+): Promise<UserAuthMethod> {
+  validateTenantId(tenantId);
+  const emailAddress = input.emailAddress.trim();
+  if (!EMAIL_RE.test(emailAddress)) {
+    throw new Error("Invalid email address.");
+  }
+  const raw = await graphSend<Record<string, unknown>>(
+    `${authRoot(target)}/emailMethods`,
+    "POST",
+    { emailAddress },
+    accessToken,
+    tenantId,
+    input.signal,
+  );
+  return normalizeAuthMethod({
+    "@odata.type": "#microsoft.graph.emailAuthenticationMethod",
+    ...raw,
+  });
+}
+
+/**
+ * A freshly minted Temporary Access Pass. The `temporaryAccessPass` value is
+ * the actual passcode — returned ONLY on creation, never on subsequent reads
+ * (Graph hides it). Treat it like a one-time secret: show once, copy, forget.
+ */
+export interface TemporaryAccessPass {
+  id: string;
+  /** The passcode itself. Only populated on the create response. */
+  temporaryAccessPass: string;
+  lifetimeInMinutes: number;
+  isUsableOnce: boolean;
+  /** Whether the pass is currently usable (false when `startDateTime` is future). */
+  isUsable: boolean;
+  /** `EnabledByPolicy` | `DisabledByPolicy` | `Expired` | `NotYetValid` | `OneTimeUsed`. */
+  methodUsabilityReason?: string;
+  startDateTime?: string;
+  createdDateTime?: string;
+}
+
+/** Graph clamps Temporary Access Pass lifetime to [10, 43200] minutes (30 days). */
+export const TAP_MIN_LIFETIME_MINUTES = 10;
+export const TAP_MAX_LIFETIME_MINUTES = 43200;
+
+export interface CreateTapInput {
+  /** 10–43200; omitted → the tenant TAP policy default. */
+  lifetimeInMinutes?: number;
+  /** One-time passes can't be reused; multi-use needs the TAP policy to allow it. */
+  isUsableOnce?: boolean;
+  /** ISO 8601; omitted → usable immediately. */
+  startDateTime?: string;
+  signal?: AbortSignal;
+}
+
+/**
+ * Issue a Temporary Access Pass — a time-bound passcode that satisfies MFA and
+ * can bootstrap passwordless / re-register other methods. A user may hold only
+ * ONE usable TAP at a time; creating a new one replaces the previous. This is
+ * the modern, fully-supported equivalent of the legacy "bootstrap a method"
+ * trick (Graph v1.0 `softwareOathMethods` returns a null secret, so a usable
+ * TOTP seed can't be minted server-side — see the OATH seed lab instead).
+ */
+export async function createTemporaryAccessPass(
+  tenantId: string,
+  target: AuthMethodTarget,
+  accessToken: string,
+  opts: CreateTapInput = {},
+): Promise<TemporaryAccessPass> {
+  validateTenantId(tenantId);
+  const body: Record<string, unknown> = {};
+  if (opts.lifetimeInMinutes != null) {
+    if (
+      !Number.isInteger(opts.lifetimeInMinutes) ||
+      opts.lifetimeInMinutes < TAP_MIN_LIFETIME_MINUTES ||
+      opts.lifetimeInMinutes > TAP_MAX_LIFETIME_MINUTES
+    ) {
+      throw new Error(
+        `Temporary Access Pass lifetime must be an integer between ` +
+          `${TAP_MIN_LIFETIME_MINUTES} and ${TAP_MAX_LIFETIME_MINUTES} minutes.`,
+      );
+    }
+    body.lifetimeInMinutes = opts.lifetimeInMinutes;
+  }
+  if (opts.isUsableOnce != null) body.isUsableOnce = opts.isUsableOnce;
+  if (opts.startDateTime) body.startDateTime = opts.startDateTime;
+
+  const raw = await graphSend<Record<string, unknown>>(
+    `${authRoot(target)}/temporaryAccessPassMethods`,
+    "POST",
+    body,
+    accessToken,
+    tenantId,
+    opts.signal,
+  );
+  return {
+    id: String(raw.id ?? ""),
+    temporaryAccessPass: String(raw.temporaryAccessPass ?? ""),
+    lifetimeInMinutes: Number(raw.lifetimeInMinutes ?? opts.lifetimeInMinutes ?? 0),
+    isUsableOnce: Boolean(raw.isUsableOnce),
+    isUsable: Boolean(raw.isUsable),
+    methodUsabilityReason: (raw.methodUsabilityReason as string) ?? undefined,
+    startDateTime: (raw.startDateTime as string) ?? undefined,
+    createdDateTime: (raw.createdDateTime as string) ?? undefined,
+  };
+}
+
+/** The Graph values for a user's preferred second-factor method. */
+export type PreferredMfaMethod =
+  | "push"
+  | "oath"
+  | "voiceMobile"
+  | "voiceAlternateMobile"
+  | "voiceOffice"
+  | "sms";
+
+export interface SignInPreferences {
+  /** Whether Entra picks the most-secure registered method automatically. */
+  isSystemPreferredAuthenticationMethodEnabled?: boolean | null;
+  /** The method Entra currently considers system-preferred (read-only). */
+  systemPreferredAuthenticationMethod?: string | null;
+  /** The user's explicitly chosen second factor, or null if unset. */
+  userPreferredMethodForSecondaryAuthentication?: PreferredMfaMethod | null;
+}
+
+/**
+ * Read a target's sign-in preferences (system-preferred toggle + the user's
+ * chosen default second factor). Surfaced read-only as context, and used to
+ * explain why Graph may refuse to delete a *default* method until the default
+ * is reassigned.
+ */
+export async function getSignInPreferences(
+  tenantId: string,
+  target: AuthMethodTarget,
+  accessToken: string,
+  opts?: { signal?: AbortSignal },
+): Promise<SignInPreferences> {
+  validateTenantId(tenantId);
+  const response = await graphFetch(
+    `${authRoot(target)}/signInPreferences`,
+    {
+      headers: graphHeaders(accessToken),
+      ...(opts?.signal ? { signal: opts.signal } : {}),
+    },
+    tenantId,
+  );
+  if (!response.ok) {
+    throw await toGraphError(response);
+  }
+  const raw = (await response.json()) as Record<string, unknown>;
+  return {
+    isSystemPreferredAuthenticationMethodEnabled:
+      (raw.isSystemPreferredAuthenticationMethodEnabled as boolean | null) ?? null,
+    systemPreferredAuthenticationMethod:
+      (raw.systemPreferredAuthenticationMethod as string | null) ?? null,
+    userPreferredMethodForSecondaryAuthentication:
+      (raw.userPreferredMethodForSecondaryAuthentication as
+        | PreferredMfaMethod
+        | null) ?? null,
+  };
+}
+
+/**
+ * Patch a target's sign-in preferences — e.g. clear the user-preferred default
+ * (`userPreferredMethodForSecondaryAuthentication: null`) so a default method
+ * can then be deleted, or toggle the system-preferred policy.
+ */
+export async function setSignInPreferences(
+  tenantId: string,
+  target: AuthMethodTarget,
+  prefs: SignInPreferences,
+  accessToken: string,
+  opts?: { signal?: AbortSignal },
+): Promise<void> {
+  validateTenantId(tenantId);
+  await graphSend<void>(
+    `${authRoot(target)}/signInPreferences`,
+    "PATCH",
+    prefs,
+    accessToken,
+    tenantId,
+    opts?.signal,
+  );
 }
 
 const USER_CREATE_ROLE_TEMPLATES = new Set<string>([

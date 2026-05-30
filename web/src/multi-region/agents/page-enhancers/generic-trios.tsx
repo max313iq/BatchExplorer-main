@@ -620,6 +620,35 @@ const SPECS: TrioSpec[] = [
   },
 
   {
+    pageKey: "mfa-manager",
+    uiTitle: "MFA manager",
+    uiDescription:
+      "Authentication-method coverage across the accounts signed into this app.",
+    stats: (s) => {
+      const accounts = readArr(s, "azureAccounts") as Array<{
+        signedOut?: boolean;
+      }>;
+      return [
+        { label: "Signed-in", value: () => accounts.length, icon: User },
+        {
+          label: "Active",
+          value: () => accounts.filter((a) => a.signedOut !== true).length,
+          icon: CheckCircle2,
+        },
+      ];
+    },
+    toolsTitle: "MFA tools",
+    toolsDescription: "Open the portal methods blade or refresh.",
+    tools: [
+      todoTool("bulk-tap", "Issue TAP to all accounts", KeyRound),
+      openPortalTool,
+    ],
+    workflowTitle: "MFA-manager workflow",
+    workflowDescription:
+      "Passes method registers/resets straight through; every write is audit-logged.",
+  },
+
+  {
     pageKey: "ea-subscription",
     uiTitle: "EA subscription",
     uiDescription:
