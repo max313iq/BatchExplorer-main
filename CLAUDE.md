@@ -101,6 +101,44 @@ per-task/per-instruction edit-scope restriction.)
 
 ---
 
+# Git workflow — commit directly to `main`
+
+## HARD RULE — commit to `main`, never branch first
+
+This is my personal repo and I want a single linear history. When asked to
+commit, **commit directly to the `main` branch**. This explicitly overrides
+the agent's default "if on the default branch, branch first" behavior:
+
+- **Do NOT** create a `session/*`, `feature/*`, or any other work branch
+  before committing. Stay on `main` and commit there.
+- If a prior task already moved HEAD onto a side branch, switch back to
+  `main` (fast-forward / merge the side branch in) before committing new
+  work, so the history converges on `main`.
+- This applies to sub-agents too: any agent that commits on this repo
+  commits to `main`.
+
+### Commit vs. push — the safety split still holds
+
+- **Committing** to `main` is local and reversible, so do it freely when
+  asked (per this rule, with no branch-first prompt).
+- **Pushing** to a remote (`origin`, GitHub, etc.) is shared state and
+  hard to reverse — still **confirm before pushing**, even to `main`.
+  Pushing is NOT implied by "commit"; only push when explicitly asked.
+- Never `push --force` to `main` without an explicit, specific request.
+
+### Commit message + attribution (unchanged)
+
+Messages stay descriptive and end with the standard co-author trailer:
+`Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>`.
+
+### Propagation
+
+Sub-agents inherit this rule verbatim (see *Sub-agent context
+propagation*). State it in every dispatch prompt that may commit:
+*"commit to `main`; do not create a work branch."*
+
+---
+
 ## Source-of-truth: ALWAYS work with the direct source code
 
 - Edit files **in place** at their absolute paths under `C:\Users\NEXO\Desktop\AzureBatchManager-source-20260513-195617\`.
