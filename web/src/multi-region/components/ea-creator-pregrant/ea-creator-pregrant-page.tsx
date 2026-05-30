@@ -98,6 +98,7 @@ import {
   RotateCw,
   ShieldAlert,
   ShieldCheck,
+  Sparkles,
   Trash2,
   UserCheck,
   Users,
@@ -569,11 +570,19 @@ export const EaCreatorPregrantPage: React.FC = () => {
     }
   }, [eaName, urlState.ea, setEaParam]);
 
+  // Custom enrollmentScope override — paste any Microsoft.Billing path
+  // when the BA / EA picker can't reach the target (hasReadAccess false,
+  // MPA customers, hand-built paths). Mirrors the toggle on the EA Sub
+  // pages.
+  const [customScopeMode, setCustomScopeMode] = React.useState(false);
+  const [customScopeText, setCustomScopeText] = React.useState<string>("");
+
   /** The enrollment-account ARM scope we'll write the grant against. */
   const enrollmentScope = React.useMemo(() => {
+    if (customScopeMode) return customScopeText.trim();
     if (!billingAccountName || !eaName) return "";
     return `/providers/Microsoft.Billing/billingAccounts/${billingAccountName}/enrollmentAccounts/${eaName}`;
-  }, [billingAccountName, eaName]);
+  }, [customScopeMode, customScopeText, billingAccountName, eaName]);
 
   /** The currently-selected enrollment-account object for richer display. */
   const selectedEa = React.useMemo(
@@ -2024,6 +2033,77 @@ export const EaCreatorPregrantPage: React.FC = () => {
                     {selectedEa.costCenter && (
                       <span>Cost center: {selectedEa.costCenter}</span>
                     )}
+                  </div>
+                )}
+              </div>
+
+              {/* Custom enrollmentScope override — paste any Microsoft.Billing
+                  path when the BA / EA pickers can't reach the target scope.
+                  Mirrors the toggle on the EA Sub pages. */}
+              <div
+                className={
+                  "flex flex-col gap-2 rounded-md border border-dashed p-3 " +
+                  (customScopeMode
+                    ? "border-primary/50 bg-primary/5"
+                    : "border-border/60 bg-muted/30")
+                }
+              >
+                <label
+                  className="flex cursor-pointer items-start gap-2 text-xs"
+                  htmlFor="ea-pregrant-custom-scope-toggle"
+                >
+                  <input
+                    id="ea-pregrant-custom-scope-toggle"
+                    type="checkbox"
+                    checked={customScopeMode}
+                    onChange={(e) => setCustomScopeMode(e.target.checked)}
+                    aria-label="Toggle custom billingScope (advanced)"
+                    className="mt-0.5 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                  />
+                  <span className="flex flex-col gap-0.5">
+                    <span className="flex items-center gap-1.5 font-medium">
+                      <Sparkles className="h-3.5 w-3.5 text-primary" />
+                      Use custom billingScope (advanced)
+                      <InfoTooltip content="Bypass the BA / EA pickers above. Paste any Microsoft.Billing scope ARM path — useful when the parent BA has hasReadAccess: false and doesn't surface in the dropdown, or when you obtained the path out-of-band." />
+                    </span>
+                    <span className="text-2xs text-muted-foreground">
+                      Paste a full ARM path. Overrides the BA / EA pickers;
+                      the grant PUT only needs the resulting scope string.
+                    </span>
+                  </span>
+                </label>
+                {customScopeMode && (
+                  <div className="flex flex-col gap-1 pl-6">
+                    <Label
+                      htmlFor="ea-pregrant-custom-scope-input"
+                      className="text-2xs uppercase tracking-wider text-muted-foreground"
+                    >
+                      billingScope ARM path
+                    </Label>
+                    <Input
+                      id="ea-pregrant-custom-scope-input"
+                      value={customScopeText}
+                      onChange={(e) => setCustomScopeText(e.target.value)}
+                      placeholder="/providers/Microsoft.Billing/billingAccounts/.../enrollmentAccounts/..."
+                      className="font-mono text-[11px]"
+                      aria-label="Custom billingScope ARM path"
+                    />
+                    <p className="text-[10px] text-muted-foreground">
+                      Accepted shapes: EA{" "}
+                      <code className="font-mono">
+                        /billingAccounts/{"{ba}"}/enrollmentAccounts/{"{ea}"}
+                      </code>
+                      ; MCA{" "}
+                      <code className="font-mono">
+                        /billingAccounts/{"{ba}"}/billingProfiles/{"{bp}"}
+                        /invoiceSections/{"{is}"}
+                      </code>
+                      ; MPA{" "}
+                      <code className="font-mono">
+                        /billingAccounts/{"{ba}"}/customers/{"{c}"}
+                      </code>
+                      ; or any well-formed Microsoft.Billing path.
+                    </p>
                   </div>
                 )}
               </div>

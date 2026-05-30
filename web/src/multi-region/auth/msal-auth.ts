@@ -36,7 +36,6 @@ import {
   classifyHttpError,
 } from "../services/types";
 import { guardedFetch } from "../scheduling/request-governance";
-import { credentialVault } from "./credential-vault";
 import * as importedTokens from "./imported-tokens";
 import { recordAuditEvent } from "./audit-binding";
 
@@ -994,6 +993,10 @@ export async function logoutAccount(homeAccountId: string): Promise<void> {
     const toDrop: string[] = [];
     for (let i = 0; i < localStorage.length; i++) {
       const k = localStorage.key(i);
+      // Keep the per-account credential vault (`azbm:credential-vault:v1:<id>`):
+      // its key contains the homeAccountId, but saved passwords must survive
+      // sign-out so the operator still sees what they created.
+      if (k && k.startsWith("azbm:credential-vault:")) continue;
       if (k && k.includes(homeAccountId)) {
         toDrop.push(k);
       }
@@ -1206,7 +1209,38 @@ async function acquireTokenForAccount(
 
   const promise = (async () => {
     try {
-      return await msalApp.acquireTokenSilent(silentRequest);
+      const result = await msalApp.acquireTokenSilent(silentRequest);
+      // WRONG-TENANT-TID GUARD. MSAL's silent cache is keyed by realm, but
+      // a stale or cross-tenant cache entry can occasionally satisfy a
+      // tenant-scoped request with a token minted against a DIFFERENT
+      // tenant. Downstream ARM/Graph then reject it with "the access token
+      // is from the wrong issuer" — the exact "access token wrong" symptom
+      // seen after tenant switches. When a specific tenant (GUID) was
+      // requested, verify the returned token's `tid` claim matches it; on
+      // mismatch, force ONE fresh authority-scoped mint. Skipped when
+      // already forceRefresh, when tenantId isn't a GUID (domain authority
+      // — tid is always a GUID, so a string compare would false-mismatch),
+      // or when the token can't be decoded. Technique mirrors the project's
+      // own device-code tid check and ROADtools/AADInternals authority
+      // scoping (techingresources corpus).
+      if (tenantId && !forceRefresh && UUID_LIKE.test(tenantId)) {
+        const claims = decodeJwtClaimsUnsafe(result.accessToken);
+        const tid = typeof claims?.tid === "string" ? claims.tid : null;
+        if (tid && tid.toLowerCase() !== tenantId.toLowerCase()) {
+          console.warn(
+            "[MSAL] silent token tid",
+            tid,
+            "≠ requested tenant",
+            tenantId,
+            "— re-minting with forceRefresh to avoid wrong-issuer 401.",
+          );
+          return await msalApp.acquireTokenSilent({
+            ...silentRequest,
+            forceRefresh: true,
+          });
+        }
+      }
+      return result;
     } catch (error) {
       // Cache quota exceeded — clear and surface a clear message
       if (_isQuotaError(error)) {
@@ -1641,6 +1675,12 @@ function _targetedClearAuthLocalStorage(): void {
     for (let i = 0; i < localStorage.length; i++) {
       const k = localStorage.key(i);
       if (!k) continue;
+      // Preserve the credential vault across logout. Saved create/reset
+      // passwords must survive sign-out so a returning operator still sees
+      // what they created; only an explicit credentialVault.clearAll() wipes
+      // them. The vault keys share the `azbm:` prefix that AUTH_STORAGE_PREFIXES
+      // matches, so they need an explicit skip here.
+      if (k.startsWith("azbm:credential-vault:")) continue;
       const matches =
         AUTH_STORAGE_PREFIXES.some((p) => k.startsWith(p)) ||
         IMPORTED_TOKEN_KEYS.includes(k) ||
@@ -1682,12 +1722,13 @@ export async function logout(opts?: { everywhere?: boolean }): Promise<void> {
   _accounts.clear();
   _activeAccount = null;
 
-  // Wipe credential vault — safe to call before/after MSAL logout.
-  try {
-    credentialVault.clearAll();
-  } catch {
-    /* best-effort */
-  }
+  // NOTE: the credential vault is intentionally PRESERVED across logout.
+  // Sign-out clears the MSAL token cache below, but saved create/reset
+  // passwords must survive so an operator who signs back in still sees what
+  // they created. The vault exposes its own explicit clearAll() for a
+  // deliberate wipe; logout must not call it. (Earlier builds wiped it here,
+  // which made every saved password vanish the moment the creating account
+  // signed out.)
 
   try {
     if (opts?.everywhere && accountsBefore.length > 0) {
@@ -1901,12 +1942,32 @@ export async function getGraphToken(tenantId?: string): Promise<string> {
 }
 
 /**
- * Persist the active tenant for an account in sessionStorage.
+ * Persist the active tenant for an account in **localStorage**.
  * Subsequent token acquisitions for that account default to this tenant.
+ *
+ * WHY localStorage (changed from sessionStorage 2026-05-28): the active-
+ * tenant pointer is the source of truth for which tenant every page mints
+ * tokens against. sessionStorage is per-tab and is wiped on tab close, and
+ * is NOT shared across tabs/windows — so a reload in a new tab, a second
+ * app tab, or a browser restart lost the selection and silently reverted
+ * token minting to the account's HOME tenant. That produced the ARM
+ * "access token is from the wrong issuer" 401 on cross-tenant
+ * subscriptions and made tenant switches feel non-permanent. localStorage
+ * matches the MSAL token cache (also localStorage) so the pointer is now
+ * durable and consistent across the whole web app. A one-time migration in
+ * getActiveTenant() promotes any legacy sessionStorage value.
  */
 export function setActiveTenant(homeAccountId: string, tenantId: string): void {
   if (!homeAccountId || !tenantId) return;
   try {
+    if (typeof localStorage !== "undefined") {
+      localStorage.setItem(
+        `${ACTIVE_TENANT_KEY_PREFIX}${homeAccountId}`,
+        tenantId,
+      );
+    }
+    // Keep sessionStorage in sync too (harmless) so any same-tab code that
+    // might still read it directly stays consistent within the tab.
     if (typeof sessionStorage !== "undefined") {
       sessionStorage.setItem(
         `${ACTIVE_TENANT_KEY_PREFIX}${homeAccountId}`,
@@ -1914,33 +1975,57 @@ export function setActiveTenant(homeAccountId: string, tenantId: string): void {
       );
     }
   } catch {
-    // sessionStorage may be disabled — fail soft
+    // storage may be disabled — fail soft
   }
 }
 
 /**
  * Read the persisted active tenant for an account, or null if none.
+ *
+ * Reads localStorage first (the durable pointer). If empty, falls back to
+ * a legacy sessionStorage value written by an older build and PROMOTES it
+ * to localStorage so the durable copy survives the next tab close.
  */
 export function getActiveTenant(homeAccountId: string): string | null {
   if (!homeAccountId) return null;
+  const key = `${ACTIVE_TENANT_KEY_PREFIX}${homeAccountId}`;
   try {
-    if (typeof sessionStorage === "undefined") return null;
-    return sessionStorage.getItem(
-      `${ACTIVE_TENANT_KEY_PREFIX}${homeAccountId}`,
-    );
+    if (typeof localStorage !== "undefined") {
+      const ls = localStorage.getItem(key);
+      if (ls) return ls;
+    }
+    // Legacy migration: older builds stored this in sessionStorage only.
+    if (typeof sessionStorage !== "undefined") {
+      const ss = sessionStorage.getItem(key);
+      if (ss) {
+        try {
+          if (typeof localStorage !== "undefined") {
+            localStorage.setItem(key, ss);
+          }
+        } catch {
+          /* localStorage may be full — still return the legacy value */
+        }
+        return ss;
+      }
+    }
+    return null;
   } catch {
     return null;
   }
 }
 
 /**
- * Clear the persisted active tenant for an account.
+ * Clear the persisted active tenant for an account (both stores).
  */
 export function clearActiveTenant(homeAccountId: string): void {
   if (!homeAccountId) return;
+  const key = `${ACTIVE_TENANT_KEY_PREFIX}${homeAccountId}`;
   try {
+    if (typeof localStorage !== "undefined") {
+      localStorage.removeItem(key);
+    }
     if (typeof sessionStorage !== "undefined") {
-      sessionStorage.removeItem(`${ACTIVE_TENANT_KEY_PREFIX}${homeAccountId}`);
+      sessionStorage.removeItem(key);
     }
   } catch {
     // ignore

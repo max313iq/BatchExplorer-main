@@ -74,7 +74,16 @@ export const Application: React.FC = () => {
     <AppRoot theme={defaultTheme}>
       <ErrorBoundary fallback={<RootErrorFallback />}>
         <TooltipProvider delayDuration={300} skipDelayDuration={0}>
-          <HashRouter>
+          <HashRouter
+            // Opt into v7 behavior so the dev console isn't spammed with
+            // future-flag warnings: v7_startTransition wraps router state
+            // updates in startTransition; v7_relativeSplatPath fixes
+            // relative resolution under the splat route below.
+            future={{
+              v7_startTransition: true,
+              v7_relativeSplatPath: true,
+            }}
+          >
             <Main>
               <Routes>
                 <Route path="/*" element={<MultiRegionDashboard />} />

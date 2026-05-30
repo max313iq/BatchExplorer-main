@@ -88,10 +88,15 @@ import {
 } from "../../auth/portal-auto-login";
 import { auditLog } from "../../services/audit-log";
 import {
+  assignDirectoryRole,
   canCreateUsers,
+  canManageRoles,
   createUser,
+  ENTRA_DIRECTORY_ROLES,
+  findDirectoryRole,
   getMyDirectoryRoles,
   listVerifiedDomains,
+  ROLE_USER_ADMIN,
 } from "../../services/graph-service";
 import type { VerifiedDomain } from "../../services/graph-service";
 import { GraphUser } from "../../services/types";
@@ -940,6 +945,13 @@ const UserCreatorPageInner: React.FC<UserCreatorPageProps> = ({
   const [privilegedMap, setPrivilegedMap] = React.useState<
     Record<string, boolean>
   >({});
+  // Per-account capability to GRANT directory roles (Global Admin / Privileged
+  // Role Admin), discovered in the same probe as user-creation capability.
+  // Drives the role-picker pre-flight gate so a User-Admin-only operator is
+  // warned before a privileged grant 403s.
+  const [roleManagerMap, setRoleManagerMap] = React.useState<
+    Record<string, boolean>
+  >({});
   const [discovering, setDiscovering] = React.useState(true);
 
   const accountKey = React.useMemo(
@@ -970,6 +982,7 @@ const UserCreatorPageInner: React.FC<UserCreatorPageProps> = ({
     setProbeErrors({});
     (async () => {
       const next: Record<string, boolean> = {};
+      const mgr: Record<string, boolean> = {};
       const errs: Record<string, string> = {};
       await Promise.allSettled(
         azureAccounts.map(async (a) => {
@@ -980,6 +993,7 @@ const UserCreatorPageInner: React.FC<UserCreatorPageProps> = ({
             a.tenantId;
           if (!tenantId) {
             next[a.homeAccountId] = false;
+            mgr[a.homeAccountId] = false;
             errs[a.homeAccountId] = "Missing active tenant.";
             return;
           }
@@ -992,8 +1006,10 @@ const UserCreatorPageInner: React.FC<UserCreatorPageProps> = ({
             const roles = await getMyDirectoryRoles(tenantId, token);
             if (cancelled) return;
             next[a.homeAccountId] = canCreateUsers(roles);
+            mgr[a.homeAccountId] = canManageRoles(roles);
           } catch (err) {
             next[a.homeAccountId] = false;
+            mgr[a.homeAccountId] = false;
             errs[a.homeAccountId] =
               err instanceof Error ? err.message : String(err);
           }
@@ -1001,6 +1017,7 @@ const UserCreatorPageInner: React.FC<UserCreatorPageProps> = ({
       );
       if (!cancelled) {
         setPrivilegedMap(next);
+        setRoleManagerMap(mgr);
         setProbeErrors(errs);
         setDiscovering(false);
       }
@@ -1390,6 +1407,12 @@ const UserCreatorPageInner: React.FC<UserCreatorPageProps> = ({
         <TabsContent value="create">
           <CreateUserForm
             account={activeAccount}
+            canGrantRoles={
+              activeAccount
+                ? !!roleManagerMap[activeAccount.homeAccountId]
+                : false
+            }
+            roleProbePending={discovering}
             onCreated={() => {
               /* keep user on tab */
             }}
@@ -1422,6 +1445,7 @@ const UserCreatorPageInner: React.FC<UserCreatorPageProps> = ({
         <TabsContent value="created">
           <CreatedByMeTab
             account={activeAccount}
+            homeAccountIds={azureAccounts.map((a) => a.homeAccountId)}
             store={store}
           />
         </TabsContent>
@@ -1432,6 +1456,15 @@ const UserCreatorPageInner: React.FC<UserCreatorPageProps> = ({
 
 interface CreateUserFormProps {
   account: PrivilegedAccount | null;
+  /**
+   * Whether the active account holds a role that can GRANT directory roles
+   * (Global Admin / Privileged Role Admin). When `false`, the role picker
+   * shows a pre-flight block on privileged roles — the create would succeed
+   * but the grant would 403.
+   */
+  canGrantRoles: boolean;
+  /** True while the directory-role probe is still running for this account. */
+  roleProbePending: boolean;
   onCreated: () => void;
   store: ReturnType<typeof useMultiRegionStore>;
 }
@@ -1473,8 +1506,111 @@ const FormSection: React.FC<FormSectionProps> = ({
   </section>
 );
 
+/**
+ * Sentinel value for the "no directory role" option. Radix `SelectItem`
+ * forbids an empty-string value, so we use this token and map it back to
+ * `""` (standard member, no role grant) at the change boundary.
+ */
+const NO_ROLE_SENTINEL = "__none__";
+
+/**
+ * Directory-role picker — lets the operator grant a real Microsoft Entra
+ * built-in directory role to the new user at create-time, backed by the
+ * full {@link ENTRA_DIRECTORY_ROLES} catalog (every known + obscure built-in
+ * role). This is the fix for "Admin preset created a plain member": picking
+ * a role here triggers an `assignDirectoryRole` call after the user is
+ * created. Privileged roles surface an inline warning because granting them
+ * requires Global Admin / Privileged Role Admin.
+ *
+ * Pre-flight gating: when `canGrantRoles` is `false` (the active account can
+ * create users but isn't a Global / Privileged Role Admin) and a privileged
+ * role is selected, we escalate the inline note to a destructive pre-flight
+ * block so the operator sees the certain-403 before submitting rather than
+ * after. While `probePending` we stay neutral — we don't yet know.
+ */
+const DirectoryRoleSelect: React.FC<{
+  value: string;
+  onChange: (templateId: string) => void;
+  id?: string;
+  canGrantRoles?: boolean;
+  probePending?: boolean;
+}> = ({ value, onChange, id, canGrantRoles, probePending }) => {
+  const selected = value ? findDirectoryRole(value) : undefined;
+  // A privileged grant is doomed when the probe has completed and reports the
+  // account can't grant roles. Non-privileged roles still require manage-role
+  // rights to add members, but the common, certain-failure case we gate on is
+  // the privileged one (User-Admin-only operator picking Global/User Admin).
+  const willFailPreflight =
+    !!selected?.privileged && probePending === false && canGrantRoles === false;
+  return (
+    <div className="flex flex-col gap-1.5">
+      <Select
+        value={value || NO_ROLE_SENTINEL}
+        onValueChange={(v) => onChange(v === NO_ROLE_SENTINEL ? "" : v)}
+      >
+        <SelectTrigger
+          id={id}
+          aria-label="Directory role to grant after creation"
+          aria-invalid={willFailPreflight ? true : undefined}
+          className={cn(
+            "text-xs",
+            willFailPreflight && "border-destructive ring-1 ring-destructive",
+          )}
+        >
+          <SelectValue placeholder="No directory role (standard member)" />
+        </SelectTrigger>
+        <SelectContent className="max-h-80">
+          <SelectItem value={NO_ROLE_SENTINEL}>
+            No directory role (standard member)
+          </SelectItem>
+          {ENTRA_DIRECTORY_ROLES.map((r) => (
+            <SelectItem key={r.templateId} value={r.templateId}>
+              <span className="flex items-center gap-1.5">
+                <span>{r.displayName}</span>
+                {r.privileged && (
+                  <Badge variant="warning" className="text-2xs">
+                    privileged
+                  </Badge>
+                )}
+              </span>
+            </SelectItem>
+          ))}
+        </SelectContent>
+      </Select>
+      {willFailPreflight ? (
+        <Alert variant="destructive" className="text-2xs">
+          <ShieldAlert className="h-3.5 w-3.5" />
+          <AlertDescription>
+            Your signed-in account can create users but is{" "}
+            <strong>not a Global Administrator or Privileged Role
+            Administrator</strong>, so it cannot grant{" "}
+            <strong>{selected!.displayName}</strong>. The user would be created
+            but the role grant would fail with <strong>403</strong>. Switch to
+            an account with Global Admin / Privileged Role Admin, or choose
+            “standard member”.
+          </AlertDescription>
+        </Alert>
+      ) : (
+        selected?.privileged && (
+          <Alert variant="warning" className="text-2xs">
+            <ShieldAlert className="h-3.5 w-3.5" />
+            <AlertDescription>
+              <strong>{selected.displayName}</strong> is a privileged role.
+              Granting it requires your signed-in account to be a Global
+              Administrator or Privileged Role Administrator — otherwise the
+              grant fails with 403 and the user is left as a standard member.
+            </AlertDescription>
+          </Alert>
+        )
+      )}
+    </div>
+  );
+};
+
 const CreateUserForm: React.FC<CreateUserFormProps> = ({
   account,
+  canGrantRoles,
+  roleProbePending,
   onCreated,
   store,
 }) => {
@@ -1498,6 +1634,18 @@ const CreateUserForm: React.FC<CreateUserFormProps> = ({
   const [forceChange, setForceChange] = React.useState(true);
   const [accountEnabled, setAccountEnabled] = React.useState(true);
   const [presetKey, setPresetKey] = React.useState<string>("");
+  /**
+   * Directory role template GUID to grant to the newly-created user right
+   * after the `POST /users` succeeds. Empty string = standard member (no
+   * role assignment — historical behavior). Picking the "Admin" preset
+   * defaults this to User Administrator; the operator can override via the
+   * role dropdown. Applies to BOTH detailed (single) and quick (bulk)
+   * create paths. Granting any *privileged* role requires the signed-in
+   * account to be Global Admin / Privileged Role Admin — otherwise Graph
+   * returns 403 and we surface it without rolling back the created user.
+   */
+  const [grantRoleTemplateId, setGrantRoleTemplateId] =
+    React.useState<string>("");
   /**
    * Whether to fire the /api/portal/auto-login endpoint right after a
    * successful create. Persisted across reloads so the operator's
@@ -1714,6 +1862,7 @@ const CreateUserForm: React.FC<CreateUserFormProps> = ({
     setForceChange(true);
     setAccountEnabled(true);
     setPresetKey("");
+    setGrantRoleTemplateId("");
     setAvailability({ status: "idle" });
     setSubmitError(null);
   }, [account?.homeAccountId, account?.tenantId]);
@@ -1794,8 +1943,98 @@ const CreateUserForm: React.FC<CreateUserFormProps> = ({
     setUsageLocation(preset.usageLocation);
     setForceChange(preset.forceChangePassword);
     setAccountEnabled(preset.accountEnabled);
+    // The "Admin" preset previously only set a cosmetic job-title — the
+    // created user was still a plain member. Default it to actually grant
+    // the User Administrator directory role so "Admin" means admin. The
+    // operator can override (or clear) via the role dropdown. Non-admin
+    // presets clear any previously-selected role.
+    setGrantRoleTemplateId(key === "admin" ? ROLE_USER_ADMIN : "");
     setSubmitError(null);
   }, []);
+
+  /**
+   * Resolved catalog entry for the currently-selected directory role, or
+   * `null` when no role is selected (standard member). Drives the inline
+   * "will be granted" hint and the privileged-role warning.
+   */
+  const selectedGrantRole = React.useMemo(
+    () => (grantRoleTemplateId ? findDirectoryRole(grantRoleTemplateId) ?? null : null),
+    [grantRoleTemplateId],
+  );
+
+  /**
+   * Grant the operator-selected directory role to a freshly-created user.
+   * No-op (resolves ok) when no role is selected. Records an `assign_role`
+   * audit entry on both success and failure. NEVER throws — a failed grant
+   * must not look like a failed create, since the user already exists. The
+   * caller decides how loudly to surface `{ ok:false, error }`.
+   */
+  const grantSelectedRole = React.useCallback(
+    async (
+      userId: string,
+      finalUpn: string,
+      token: string,
+      actor: string,
+    ): Promise<{ ok: boolean; skipped?: boolean; error?: string }> => {
+      if (!grantRoleTemplateId || !account) return { ok: true, skipped: true };
+      const roleName =
+        findDirectoryRole(grantRoleTemplateId)?.displayName ?? grantRoleTemplateId;
+      if (!userId) {
+        const error =
+          "User was created but returned no object id — cannot assign the directory role.";
+        auditLog.record({
+          actor,
+          action: "assign_role",
+          target: finalUpn,
+          status: "failure",
+          error,
+          details: {
+            tenantId: account.tenantId,
+            roleTemplateId: grantRoleTemplateId,
+            roleName,
+          },
+        });
+        return { ok: false, error };
+      }
+      try {
+        const res = await assignDirectoryRole(
+          account.tenantId,
+          userId,
+          grantRoleTemplateId,
+          token,
+        );
+        auditLog.record({
+          actor,
+          action: "assign_role",
+          target: finalUpn,
+          status: "success",
+          details: {
+            tenantId: account.tenantId,
+            roleTemplateId: grantRoleTemplateId,
+            roleName,
+            alreadyMember: res.alreadyMember,
+          },
+        });
+        return { ok: true };
+      } catch (err) {
+        const error = err instanceof Error ? err.message : String(err);
+        auditLog.record({
+          actor,
+          action: "assign_role",
+          target: finalUpn,
+          status: "failure",
+          error,
+          details: {
+            tenantId: account.tenantId,
+            roleTemplateId: grantRoleTemplateId,
+            roleName,
+          },
+        });
+        return { ok: false, error };
+      }
+    },
+    [account, grantRoleTemplateId],
+  );
 
   const formValues: UserFormValues = React.useMemo(
     () => ({
@@ -2094,6 +2333,13 @@ const CreateUserForm: React.FC<CreateUserFormProps> = ({
     }
     let succeeded = 0;
     let failed = 0;
+    // Track role grants separately from creates — a user can be created
+    // successfully yet have the directory-role grant fail (e.g. caller lacks
+    // Privileged Role Admin). We surface that distinctly so "Admin" creates
+    // that silently landed as plain members can't slip by unnoticed.
+    let roleGranted = 0;
+    let roleGrantFailed = 0;
+    const roleFailSamples: string[] = [];
     let lastSuccess: QuickUserPayload | null = null;
     for (let i = 0; i < batchPreview.length; i++) {
       const p = batchPreview[i]!;
@@ -2136,6 +2382,25 @@ const CreateUserForm: React.FC<CreateUserFormProps> = ({
             batchSize: batchPreview.length,
           },
         });
+        // Grant the selected directory role (if any). Non-fatal: the user
+        // already exists, so a failed grant is tracked but doesn't count the
+        // row as a failed create.
+        if (grantRoleTemplateId) {
+          const roleRes = await grantSelectedRole(
+            result.id,
+            finalUpn,
+            token,
+            actor,
+          );
+          if (roleRes.ok && !roleRes.skipped) {
+            roleGranted += 1;
+          } else if (!roleRes.ok) {
+            roleGrantFailed += 1;
+            if (roleFailSamples.length < 3 && roleRes.error) {
+              roleFailSamples.push(`${finalUpn}: ${roleRes.error}`);
+            }
+          }
+        }
         try {
           await credentialVault.put({
             upn: finalUpn,
@@ -2218,6 +2483,24 @@ const CreateUserForm: React.FC<CreateUserFormProps> = ({
         type: "success",
         message: `Created user ${lastSuccess.upn}`,
       });
+      if (grantRoleTemplateId) {
+        const roleName =
+          selectedGrantRole?.displayName ?? "the selected directory role";
+        if (roleGrantFailed > 0) {
+          store.addNotification({
+            type: "error",
+            message: `User created, but granting ${roleName} failed: ${roleFailSamples[0] ?? "see audit log"}. The user exists as a standard member.`,
+          });
+          setSubmitError(
+            `Role grant failed — ${roleName} was not assigned. The signed-in account likely lacks Global Administrator / Privileged Role Administrator. ${roleFailSamples[0] ?? ""}`,
+          );
+        } else if (roleGranted > 0) {
+          store.addNotification({
+            type: "success",
+            message: `Granted ${roleName} to ${lastSuccess.upn}.`,
+          });
+        }
+      }
       if (autoLoginEnabled) {
         setAutoLoginInflight(true);
         store.addNotification({
@@ -2248,7 +2531,7 @@ const CreateUserForm: React.FC<CreateUserFormProps> = ({
                   : undefined,
             });
             if (res.ok) {
-              if (newPassword) {
+              if (newPassword && res.passwordRotationStatus === "confirmed") {
                 try {
                   await credentialVault.put({
                     upn: successSnapshot.upn,
@@ -2341,13 +2624,26 @@ const CreateUserForm: React.FC<CreateUserFormProps> = ({
       }
     } else {
       // Multi-user batch — just summary toast + tab switch hint.
+      const roleSuffix = grantRoleTemplateId
+        ? ` · roles granted ${roleGranted}${roleGrantFailed > 0 ? `, ${roleGrantFailed} role grant${roleGrantFailed === 1 ? "" : "s"} failed` : ""}`
+        : "";
       store.addNotification({
-        type: failed > 0 ? "warning" : "success",
-        message: `Created ${succeeded} of ${batchPreview.length} users${failed > 0 ? ` · ${failed} failed` : ""}. Open the "Created by me" tab to sign in as any of them.`,
+        type: failed > 0 || roleGrantFailed > 0 ? "warning" : "success",
+        message: `Created ${succeeded} of ${batchPreview.length} users${failed > 0 ? ` · ${failed} failed` : ""}${roleSuffix}. Open the "Created by me" tab to sign in as any of them.`,
       });
-      if (failed > 0) {
+      if (failed > 0 || roleGrantFailed > 0) {
+        const parts: string[] = [];
+        if (failed > 0) {
+          parts.push(`${failed} create failure${failed === 1 ? "" : "s"}`);
+        }
+        if (roleGrantFailed > 0) {
+          const roleName = selectedGrantRole?.displayName ?? "directory role";
+          parts.push(
+            `${roleGrantFailed} ${roleName} grant${roleGrantFailed === 1 ? "" : "s"} failed (caller may lack Global Admin / Privileged Role Admin)`,
+          );
+        }
         setSubmitError(
-          `Bulk create finished with ${failed} failure${failed === 1 ? "" : "s"}. Check the audit log for details.`,
+          `Bulk create finished with ${parts.join(" and ")}. ${roleFailSamples[0] ?? ""} Check the audit log for details.`,
         );
       }
     }
@@ -2363,6 +2659,9 @@ const CreateUserForm: React.FC<CreateUserFormProps> = ({
     autoLoginEnabled,
     store,
     onCreated,
+    grantRoleTemplateId,
+    grantSelectedRole,
+    selectedGrantRole,
   ]);
 
   /**
@@ -2486,6 +2785,13 @@ const CreateUserForm: React.FC<CreateUserFormProps> = ({
       const finalUpn = result.userPrincipalName || upn;
       const auditActor =
         account.username || account.name || account.homeAccountId;
+      // Grant the operator-selected directory role (if any) before kicking
+      // off auto-login, so the new user signs in already holding the role.
+      // Non-fatal: the user already exists, so a failed grant is surfaced
+      // but does NOT roll back the create.
+      const roleGrantResult = grantRoleTemplateId
+        ? await grantSelectedRole(result.id, finalUpn, token, auditActor)
+        : null;
       try {
         await credentialVault.put({
           upn: finalUpn,
@@ -2532,6 +2838,24 @@ const CreateUserForm: React.FC<CreateUserFormProps> = ({
         type: "success",
         message: `Created user ${result.userPrincipalName}`,
       });
+      if (roleGrantResult) {
+        const roleName =
+          selectedGrantRole?.displayName ?? "the selected directory role";
+        if (roleGrantResult.ok && !roleGrantResult.skipped) {
+          store.addNotification({
+            type: "success",
+            message: `Granted ${roleName} to ${finalUpn}.`,
+          });
+        } else if (!roleGrantResult.ok) {
+          store.addNotification({
+            type: "error",
+            message: `User created, but granting ${roleName} failed: ${roleGrantResult.error ?? "see audit log"}. The user exists as a standard member — the signed-in account likely lacks Global Administrator / Privileged Role Administrator.`,
+          });
+          setSubmitError(
+            `Role grant failed — ${roleName} was not assigned. ${roleGrantResult.error ?? ""}`,
+          );
+        }
+      }
       // Fire-and-forget the portal auto-login. We don't await on the success
       // path — the dev-server endpoint launches a real Chromium window and
       // returns 200 only after Playwright has filled the email + password,
@@ -2582,7 +2906,7 @@ const CreateUserForm: React.FC<CreateUserFormProps> = ({
                   : undefined,
             });
             if (res.ok) {
-              if (newPassword) {
+              if (newPassword && res.passwordRotationStatus === "confirmed") {
                 try {
                   await credentialVault.put({
                     upn: upnSnapshot,
@@ -2686,6 +3010,7 @@ const CreateUserForm: React.FC<CreateUserFormProps> = ({
       setForceChange(true);
       setAccountEnabled(true);
       setPresetKey("");
+      setGrantRoleTemplateId("");
       setAvailability({ status: "idle" });
       onCreated();
     } catch (err: unknown) {
@@ -2725,6 +3050,9 @@ const CreateUserForm: React.FC<CreateUserFormProps> = ({
     store,
     onCreated,
     autoLoginEnabled,
+    grantRoleTemplateId,
+    grantSelectedRole,
+    selectedGrantRole,
   ]);
 
   if (!account) {
@@ -2872,6 +3200,29 @@ const CreateUserForm: React.FC<CreateUserFormProps> = ({
                   <p className="text-2xs text-muted-foreground">
                     Determines job title, department, usage location,
                     force-change-password, and account-enabled defaults.
+                  </p>
+                </div>
+
+                {/* Directory role to grant after creation */}
+                <div className="flex flex-col gap-1.5">
+                  <Label
+                    htmlFor="user-creator-quick-grant-role"
+                    className="text-xs font-medium"
+                  >
+                    Directory role to grant
+                  </Label>
+                  <DirectoryRoleSelect
+                    id="user-creator-quick-grant-role"
+                    value={grantRoleTemplateId}
+                    onChange={setGrantRoleTemplateId}
+                    canGrantRoles={canGrantRoles}
+                    probePending={roleProbePending}
+                  />
+                  <p className="text-2xs text-muted-foreground">
+                    Optional. Assigns a real Entra directory role to every
+                    created user (not just a cosmetic job title). The “Admin”
+                    role above defaults this to User Administrator. Leave as
+                    “standard member” for a plain user.
                   </p>
                 </div>
 
@@ -3596,6 +3947,26 @@ const CreateUserForm: React.FC<CreateUserFormProps> = ({
             )}
           </div>
 
+          <div className="flex flex-col gap-1.5">
+            <Label htmlFor="user-creator-grant-role">
+              Directory role to grant
+            </Label>
+            <DirectoryRoleSelect
+              id="user-creator-grant-role"
+              value={grantRoleTemplateId}
+              onChange={setGrantRoleTemplateId}
+              canGrantRoles={canGrantRoles}
+              probePending={roleProbePending}
+            />
+            <p className="text-2xs text-muted-foreground">
+              Optional. Assigns a real Entra directory role to the user after
+              creation — this is what actually makes an “admin”. The “Admin”
+              preset defaults this to User Administrator; leave as “standard
+              member” for a plain user. A cosmetic job title alone grants no
+              privileges.
+            </p>
+          </div>
+
           <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
             <div className="flex flex-col gap-1.5 sm:col-span-2">
               <Label htmlFor="user-creator-prefix">User ID (UPN prefix)</Label>
@@ -4040,7 +4411,7 @@ const CreateUserForm: React.FC<CreateUserFormProps> = ({
                       // reset prompt entirely. Note the original temp
                       // password is now invalid on Azure's side; the
                       // vault is the source of truth.
-                      if (newPassword) {
+                      if (newPassword && res.passwordRotationStatus === "confirmed") {
                         try {
                           await credentialVault.put({
                             upn: lastCreated.upn,
@@ -4517,10 +4888,22 @@ const StatChip: React.FC<{
 
 interface CreatedByMeTabProps {
   account: PrivilegedAccount | null;
+  /**
+   * Home-account ids of EVERY signed-in Azure account. The vault is encrypted
+   * per-account, so to show every saved password "no matter who created it"
+   * we decrypt across all of these, not just the active account. Saved
+   * passwords for an account that later signs out still surface as long as
+   * that account is signed in again (the vault survives logout).
+   */
+  homeAccountIds: string[];
   store: ReturnType<typeof useMultiRegionStore>;
 }
 
-const CreatedByMeTab: React.FC<CreatedByMeTabProps> = ({ account, store }) => {
+const CreatedByMeTab: React.FC<CreatedByMeTabProps> = ({
+  account,
+  homeAccountIds,
+  store,
+}) => {
   const [entries, setEntries] = React.useState<CredentialEntry[]>([]);
   const [loading, setLoading] = React.useState(false);
   /**
@@ -4629,16 +5012,30 @@ const CreatedByMeTab: React.FC<CreatedByMeTabProps> = ({ account, store }) => {
     });
   }, []);
 
+  // Stable key so the reload callback only re-creates when the SET of
+  // signed-in accounts actually changes (not on every parent render).
+  const homeAccountIdsKey = React.useMemo(
+    () => [...homeAccountIds].sort().join("|"),
+    [homeAccountIds],
+  );
+
   const reload = React.useCallback(async () => {
-    if (!account) {
+    // Decrypt across every signed-in account so a password shows up no matter
+    // which account created it. Falls back to the active account alone if the
+    // caller didn't pass any ids (keeps the tab working in isolation).
+    const ids =
+      homeAccountIds.length > 0
+        ? homeAccountIds
+        : account
+          ? [account.homeAccountId]
+          : [];
+    if (ids.length === 0) {
       setEntries([]);
       return;
     }
     setLoading(true);
     try {
-      const list = await credentialVault.list({
-        homeAccountId: account.homeAccountId,
-      });
+      const list = await credentialVault.listAllForAccounts(ids);
       // Newest first.
       list.sort((a, b) => (b.createdAt ?? "").localeCompare(a.createdAt ?? ""));
       setEntries(list);
@@ -4648,7 +5045,8 @@ const CreatedByMeTab: React.FC<CreatedByMeTabProps> = ({ account, store }) => {
     } finally {
       setLoading(false);
     }
-  }, [account]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [homeAccountIdsKey, account?.homeAccountId]);
 
   React.useEffect(() => {
     void reload();
@@ -4802,7 +5200,12 @@ const CreatedByMeTab: React.FC<CreatedByMeTabProps> = ({ account, store }) => {
               : undefined,
         });
         if (res.ok) {
-          if (newPassword) {
+          // Persist the rotated password ONLY when the dev-server CONFIRMED
+          // AAD accepted the change. res.ok can be true while the change-
+          // password form never appeared (rotationStatus "none"), where AAD
+          // still holds the ORIGINAL password — overwriting the vault with the
+          // unused newPassword would strand the account on its next sign-in.
+          if (newPassword && res.passwordRotationStatus === "confirmed") {
             try {
               await credentialVault.put({
                 upn: e.upn,

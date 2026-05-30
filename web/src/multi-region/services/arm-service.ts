@@ -49,11 +49,15 @@ const ARM_BILLING_ENROLLMENT_API = "2024-04-01";
 const ARM_SUBSCRIPTION_ALIAS_API = "2021-10-01";
 const EA_BILLING_ACCOUNT_NAME_REGEX = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 const EA_ALIAS_NAME_REGEX = /^[a-z0-9-]{3,63}$/;
-// Accepts both billing scopes the alias API supports:
-//   MCA: .../billingAccounts/{ba}/billingProfiles/{bp}/invoiceSections/{is}
-//   EA:  .../billingAccounts/{ba}/enrollmentAccounts/{ea}
+// Accepted shape for any Microsoft.Subscription/aliases billingScope:
+// anchored at /providers/Microsoft.Billing/billingAccounts/{ba}, followed
+// by zero or more /{segment}/{value} pairs. Covers EA enrollmentAccounts,
+// MCA billingProfiles/invoiceSections, MPA customers, bare billing-account
+// (legacy MOSP), plus any hand-built path with the same shape — the strict
+// two-form regex used previously rejected scopes the operator obtained
+// out-of-band when the picker couldn't reach them.
 const EA_BILLING_SCOPE_REGEX =
-  /^\/providers\/Microsoft\.Billing\/billingAccounts\/[^/]+\/(?:billingProfiles\/[^/]+\/invoiceSections\/[^/]+|enrollmentAccounts\/[^/]+)$/;
+  /^\/providers\/Microsoft\.Billing\/billingAccounts\/[^/\s]+(?:\/[A-Za-z][A-Za-z0-9]*\/[^/\s]+)*$/;
 
 const ARM_SUB_RE = /\/subscriptions\/([0-9a-f-]{36})/i;
 
@@ -476,28 +480,88 @@ export async function registerProvider(
 
 // In-memory cache of namespaces confirmed Registered for a given
 // subscription within this session. Avoids redundant GETs across multiple
-// provisioning runs.
+// provisioning runs. Only namespaces observed in `Registered` state are
+// cached — a namespace we failed to register (403 / timeout) is never
+// cached so a later run with broader rights retries it.
 const _registeredCache = new Map<string, Set<string>>();
 
 /**
- * Ensure each listed namespace is in `Registered` state on the
+ * A namespace `ensureProvidersRegistered` could not bring to `Registered`.
+ * Collected (not thrown) so one forbidden namespace doesn't abort the
+ * others, and so the caller can decide policy — usually "proceed anyway",
+ * because the provider may already be usable, or the resource create's own
+ * error will surface the real `MissingSubscriptionRegistration`.
+ */
+export interface ProviderRegistrationFailure {
+  namespace: string;
+  /** HTTP status of the failing ARM call, when it was an `AzureRequestError`. */
+  status?: number;
+  /** Azure error code (e.g. `AuthorizationFailed`) or a synthetic one. */
+  code?: string;
+  /** Human-readable reason, suitable for surfacing in a warning log. */
+  reason: string;
+}
+
+export interface EnsureProvidersResult {
+  /** Namespaces already in `Registered` state (or cached as such). */
+  alreadyRegistered: string[];
+  /** Namespaces this call transitioned to `Registered`. */
+  newlyRegistered: string[];
+  /**
+   * Namespaces that could NOT be brought to `Registered` — typically a 403
+   * on the register POST (caller lacks subscription-scoped
+   * `<ns>/register/action`), an Azure Policy that blocks registration, or a
+   * registration that didn't converge before the timeout.
+   */
+  failed: ProviderRegistrationFailure[];
+}
+
+/** Normalize any thrown value into a `ProviderRegistrationFailure`. */
+function toProviderFailure(
+  namespace: string,
+  err: unknown,
+): ProviderRegistrationFailure {
+  if (err instanceof AzureRequestError) {
+    return {
+      namespace,
+      status: err.status,
+      code: err.code,
+      reason: err.message,
+    };
+  }
+  return {
+    namespace,
+    reason: err instanceof Error ? err.message : String(err),
+  };
+}
+
+/**
+ * Best-effort: ensure each listed namespace is in `Registered` state on the
  * subscription. For any that aren't, POST register and poll until they
  * reach `Registered` or the timeout elapses.
  *
- * Returns lists of namespaces that were already registered vs. newly
- * registered, so callers can log what changed.
+ * **Resilient by design — never throws for a per-namespace failure.**
+ * Provider registration requires subscription-scoped `<ns>/register/action`
+ * (part of Contributor/Owner at sub scope). An operator who only holds
+ * resource-group-scoped rights — enough to create a Batch account inside an
+ * existing RG — gets a 403 here. Rather than fail-fast (which previously
+ * aborted the whole provisioning run before a single account was attempted),
+ * each namespace is handled independently and any failure is collected into
+ * `failed`. Callers decide policy: the common case is "proceed", because the
+ * providers are very often already registered (so the create succeeds), and
+ * only `Microsoft.Batch` is strictly required up front.
  *
- * Throws `AzureRequestError` if a namespace fails to register (permission
- * denied, timeout, etc.) — the caller should surface this to the user
- * because Batch account creation will otherwise fail with the cryptic
- * `MissingSubscriptionRegistration` 409.
+ * A 403 on the register POST triggers a single re-GET: another principal or
+ * an Azure Policy may have registered the namespace already (race / pre-
+ * existing), in which case it's reported as `alreadyRegistered` instead of
+ * `failed`.
  */
 export async function ensureProvidersRegistered(
   subscriptionId: string,
   namespaces: string[],
   token: string,
   opts: { timeoutMs?: number; intervalMs?: number } = {},
-): Promise<{ alreadyRegistered: string[]; newlyRegistered: string[] }> {
+): Promise<EnsureProvidersResult> {
   validateSubscriptionId(subscriptionId);
   const timeoutMs = opts.timeoutMs ?? 120_000;
   const intervalMs = opts.intervalMs ?? 5_000;
@@ -505,67 +569,92 @@ export async function ensureProvidersRegistered(
   const cached = _registeredCache.get(subscriptionId) ?? new Set<string>();
   const alreadyRegistered: string[] = [];
   const newlyRegistered: string[] = [];
+  const failed: ProviderRegistrationFailure[] = [];
 
   // Parallel fan-out: each namespace registration is independent, so we
-  // run them concurrently (4 namespaces × ~10 polls each). Previously
-  // the loop was serial, multiplying total wall time by N. Promise.all
+  // run them concurrently (4 namespaces × ~10 polls each). Promise.all
   // here is bounded — REQUIRED_PROVIDERS in provisioner-agent has ≤ 4
   // entries, well within ARM's per-sub concurrency cap. Each underlying
   // ARM call still flows through guardedFetch's circuit breaker so a
-  // throttle in one namespace doesn't cascade.
+  // throttle in one namespace doesn't cascade. Each branch isolates its
+  // own error so a single forbidden namespace can't reject the batch.
   await Promise.all(
     namespaces.map(async (namespace) => {
-      if (cached.has(namespace)) {
-        alreadyRegistered.push(namespace);
-        return;
-      }
+      try {
+        if (cached.has(namespace)) {
+          alreadyRegistered.push(namespace);
+          return;
+        }
 
-      const initial = await getProviderRegistration(
-        subscriptionId,
-        namespace,
-        token,
-      );
-
-      if (initial.registrationState === "Registered") {
-        alreadyRegistered.push(namespace);
-        cached.add(namespace);
-        return;
-      }
-
-      if (initial.registrationState !== "Registering") {
-        await registerProvider(subscriptionId, namespace, token);
-      }
-
-      const start = Date.now();
-      let lastState = initial.registrationState;
-      while (Date.now() - start < timeoutMs) {
-        await new Promise((r) => setTimeout(r, intervalMs));
-        const cur = await getProviderRegistration(
+        const initial = await getProviderRegistration(
           subscriptionId,
           namespace,
           token,
         );
-        lastState = cur.registrationState;
-        if (lastState === "Registered") break;
-      }
 
-      if (lastState !== "Registered") {
-        throw new AzureRequestError(
-          `Provider ${namespace} did not reach Registered state within ${
-            timeoutMs / 1000
-          }s on subscription ${subscriptionId} (last state: ${lastState}).`,
-          408,
-          "ProviderRegistrationTimeout",
-          {},
-        );
+        if (initial.registrationState === "Registered") {
+          alreadyRegistered.push(namespace);
+          cached.add(namespace);
+          return;
+        }
+
+        if (initial.registrationState !== "Registering") {
+          try {
+            await registerProvider(subscriptionId, namespace, token);
+          } catch (regErr) {
+            // 403 here = we lack `<ns>/register/action`, or an Azure Policy
+            // blocks it. Re-check once: a concurrent principal or a policy
+            // may have registered it in the meantime.
+            const recheck = await getProviderRegistration(
+              subscriptionId,
+              namespace,
+              token,
+            ).catch(() => null);
+            if (recheck?.registrationState === "Registered") {
+              alreadyRegistered.push(namespace);
+              cached.add(namespace);
+              return;
+            }
+            failed.push(toProviderFailure(namespace, regErr));
+            return;
+          }
+        }
+
+        const start = Date.now();
+        let lastState = initial.registrationState;
+        while (Date.now() - start < timeoutMs) {
+          await new Promise((r) => setTimeout(r, intervalMs));
+          const cur = await getProviderRegistration(
+            subscriptionId,
+            namespace,
+            token,
+          );
+          lastState = cur.registrationState;
+          if (lastState === "Registered") break;
+        }
+
+        if (lastState !== "Registered") {
+          failed.push({
+            namespace,
+            code: "ProviderRegistrationTimeout",
+            reason: `Provider ${namespace} did not reach Registered state within ${
+              timeoutMs / 1000
+            }s on subscription ${subscriptionId} (last state: ${lastState}).`,
+          });
+          return;
+        }
+        cached.add(namespace);
+        newlyRegistered.push(namespace);
+      } catch (err) {
+        // GET-state failure (e.g. 403 on read) or any other unexpected
+        // error for this namespace — record and continue with the rest.
+        failed.push(toProviderFailure(namespace, err));
       }
-      cached.add(namespace);
-      newlyRegistered.push(namespace);
     }),
   );
 
   _registeredCache.set(subscriptionId, cached);
-  return { alreadyRegistered, newlyRegistered };
+  return { alreadyRegistered, newlyRegistered, failed };
 }
 
 /**
@@ -606,6 +695,130 @@ export async function listResourceGroups(
     `${ARM_BASE}/subscriptions/${encodeURIComponent(subscriptionId)}` +
     `/resourcegroups?api-version=${ARM_RESOURCE_GROUP_API}`;
   return fetchAllPages<ArmResourceGroup>(url, token);
+}
+
+// ---------------------------------------------------------------------------
+// Effective-permission probe — "what can I (the caller) do here?"
+// ---------------------------------------------------------------------------
+
+/**
+ * api-version for Microsoft.Authorization/permissions — same version the
+ * role-assignment endpoints use (see ARM_ROLE_ASSIGNMENT_API below). Kept as
+ * a literal rather than referencing that const, which is declared later in
+ * the file (a forward reference would hit the temporal dead zone here).
+ */
+const ARM_PERMISSIONS_API = "2022-04-01";
+
+/**
+ * One effective-permission entry as returned by
+ * `Microsoft.Authorization/permissions`. Each entry is the merged
+ * action/notAction set contributed by one role the caller holds at (or
+ * above) the queried scope. An action is permitted iff it matches some
+ * entry's `actions` and none of that entry's `notActions`.
+ */
+export interface EffectivePermission {
+  actions: string[];
+  notActions: string[];
+  dataActions: string[];
+  notDataActions: string[];
+}
+
+interface RawPermission {
+  actions?: string[];
+  notActions?: string[];
+  dataActions?: string[];
+  notDataActions?: string[];
+}
+
+/**
+ * Convert an Azure RBAC action pattern to a RegExp. Azure uses a single
+ * `*` wildcard that matches any run of characters **including `/`** (e.g.
+ * `Microsoft.Batch/*` covers `Microsoft.Batch/batchAccounts/write`). The
+ * match is case-insensitive — ARM treats action strings case-insensitively.
+ */
+function rbacActionToRegExp(pattern: string): RegExp {
+  const escaped = pattern
+    .replace(/[.+^${}()|[\]\\]/g, "\\$&")
+    .replace(/\*/g, ".*");
+  return new RegExp(`^${escaped}$`, "i");
+}
+
+/**
+ * Evaluate whether `action` is permitted by an effective-permission set,
+ * applying Azure RBAC semantics: allowed if it matches at least one entry's
+ * `actions` glob AND is not excluded by that same entry's `notActions`.
+ * `notActions` only subtract within the entry that granted the match — a
+ * different entry can still grant it. Pure function; exported for testing
+ * and for callers that already hold a permission set.
+ */
+export function isActionAllowed(
+  permissions: EffectivePermission[],
+  action: string,
+): boolean {
+  for (const perm of permissions) {
+    const granted = perm.actions.some((a) => rbacActionToRegExp(a).test(action));
+    if (!granted) continue;
+    const excluded = perm.notActions.some((na) =>
+      rbacActionToRegExp(na).test(action),
+    );
+    if (!excluded) return true;
+  }
+  return false;
+}
+
+/**
+ * List the CALLER's effective permissions at a resource-group scope. This is
+ * the same `Microsoft.Authorization/permissions` call the Azure Portal uses
+ * to decide which buttons to enable — it reports only what the *current*
+ * principal can do, so it never reveals anyone else's access. Requires
+ * `Microsoft.Authorization/permissions/read` (held by Reader and above);
+ * callers should treat a 403 here as "unknown" rather than "denied".
+ */
+export async function listResourceGroupPermissions(
+  subscriptionId: string,
+  resourceGroupName: string,
+  token: string,
+): Promise<EffectivePermission[]> {
+  validateSubscriptionId(subscriptionId);
+  if (!resourceGroupName) {
+    throw new ValidationError(
+      "resourceGroupName is required.",
+      "InvalidInput",
+      { field: "resourceGroupName" },
+    );
+  }
+  const url =
+    `${ARM_BASE}/subscriptions/${encodeURIComponent(subscriptionId)}` +
+    `/resourceGroups/${encodeURIComponent(resourceGroupName)}` +
+    `/providers/Microsoft.Authorization/permissions` +
+    `?api-version=${ARM_PERMISSIONS_API}`;
+  const rows = await fetchAllPages<RawPermission>(url, token);
+  return rows.map((r) => ({
+    actions: r.actions ?? [],
+    notActions: r.notActions ?? [],
+    dataActions: r.dataActions ?? [],
+    notDataActions: r.notDataActions ?? [],
+  }));
+}
+
+/**
+ * Resolve whether the caller can create a Batch account inside an existing
+ * resource group — i.e. whether they hold `Microsoft.Batch/batchAccounts/write`
+ * at that RG scope. This is exactly the right-side of the "Pick existing"
+ * resource-group flow: the operator only needs RG-scoped write to drop a
+ * Batch account into an RG they don't own at the subscription level.
+ */
+export async function canCreateBatchAccountInResourceGroup(
+  subscriptionId: string,
+  resourceGroupName: string,
+  token: string,
+): Promise<boolean> {
+  const perms = await listResourceGroupPermissions(
+    subscriptionId,
+    resourceGroupName,
+    token,
+  );
+  return isActionAllowed(perms, "Microsoft.Batch/batchAccounts/write");
 }
 
 /**
@@ -1047,6 +1260,141 @@ export async function listSubscriptionRoleAssignments(
 }
 
 /**
+ * Per-principal subscription-access summary, derived purely from ARM role
+ * assignments — i.e. "which subscriptions does each user/SP have a role on",
+ * computed from the SIGNED-IN ADMIN's own token. This is NOT impersonation:
+ * it's the same enumeration the Azure portal's "Access control (IAM)" blades
+ * expose, just aggregated tenant-wide. A principal appears here only if it
+ * holds at least one role assignment scoped at or under a subscription the
+ * caller can read.
+ */
+export interface PrincipalSubscriptionAccess {
+  /** AAD object id of the user / group / service principal. */
+  principalId: string;
+  /** "User" | "Group" | "ServicePrincipal" | "ForeignGroup" | "Unknown". */
+  principalType: string;
+  /** Distinct subscription ids this principal has a role assignment on. */
+  subscriptionIds: string[];
+}
+
+export interface SubscriptionAccessResult {
+  /** One row per principal that holds a role on ≥1 visible subscription. */
+  principals: PrincipalSubscriptionAccess[];
+  /** Subscriptions the caller could enumerate (id → displayName). */
+  subscriptions: Array<{ subscriptionId: string; displayName: string }>;
+  /** Subscriptions whose role-assignment read failed (e.g. 403), id → reason. */
+  failedSubscriptions: Array<{ subscriptionId: string; reason: string }>;
+}
+
+/**
+ * Map every principal in the tenant to the subscriptions they have access to,
+ * using ONLY the caller's ARM token (no per-user sign-in). For each
+ * subscription the caller can list, we read `Microsoft.Authorization/
+ * roleAssignments` and group by `principalId`. Inherited assignments (from a
+ * management group or the tenant root) are honored — the assignment surfaces
+ * under every subscription it cascades to, which is exactly what "does this
+ * user have access to this subscription" means operationally.
+ *
+ * Permissions: the token needs `Microsoft.Authorization/roleAssignments/read`
+ * on each subscription (Reader is enough). Subscriptions the caller can't read
+ * assignments on are collected into `failedSubscriptions` rather than aborting
+ * the whole sweep — partial visibility is the norm in large tenants.
+ *
+ * Cost: 1 ARM call to list subscriptions + 1 (paged) call per subscription.
+ * Reads are fanned out with a small concurrency bound so a 200-subscription
+ * tenant doesn't open 200 simultaneous ARM connections.
+ */
+export async function listSubscriptionAccessByPrincipal(
+  token: string,
+  opts?: {
+    signal?: AbortSignal;
+    /** Restrict to these subscription ids (defaults to all visible). */
+    subscriptionIds?: string[];
+    /** Max concurrent per-subscription reads. Default 6. */
+    concurrency?: number;
+  },
+): Promise<SubscriptionAccessResult> {
+  const concurrency = Math.max(1, Math.min(opts?.concurrency ?? 6, 16));
+
+  // 1. Enumerate the subscriptions in scope.
+  const allSubs = await listSubscriptions(token, { signal: opts?.signal });
+  const filterSet = opts?.subscriptionIds
+    ? new Set(opts.subscriptionIds.map((s) => s.toLowerCase()))
+    : null;
+  const subs = allSubs.filter(
+    (s) =>
+      s.subscriptionId &&
+      (!filterSet || filterSet.has(s.subscriptionId.toLowerCase())),
+  );
+
+  const subscriptions = subs.map((s) => ({
+    subscriptionId: s.subscriptionId,
+    displayName: s.displayName ?? s.subscriptionId,
+  }));
+
+  // 2. principalId → { type, set<subscriptionId> }, filled as reads complete.
+  const byPrincipal = new Map<
+    string,
+    { principalType: string; subs: Set<string> }
+  >();
+  const failedSubscriptions: Array<{ subscriptionId: string; reason: string }> =
+    [];
+
+  // Bounded fan-out: a fixed pool of workers drains the subscription list.
+  let cursor = 0;
+  const worker = async (): Promise<void> => {
+    for (;;) {
+      if (opts?.signal?.aborted) return;
+      const idx = cursor++;
+      if (idx >= subs.length) return;
+      const sub = subs[idx];
+      try {
+        const rows = await listSubscriptionRoleAssignments(
+          sub.subscriptionId,
+          token,
+        );
+        for (const r of rows) {
+          if (!r.principalId) continue;
+          let entry = byPrincipal.get(r.principalId);
+          if (!entry) {
+            entry = { principalType: r.principalType, subs: new Set() };
+            byPrincipal.set(r.principalId, entry);
+          }
+          // Prefer a concrete principal type over a previously-seen Unknown.
+          if (
+            (entry.principalType === "Unknown" || !entry.principalType) &&
+            r.principalType
+          ) {
+            entry.principalType = r.principalType;
+          }
+          entry.subs.add(sub.subscriptionId);
+        }
+      } catch (err) {
+        failedSubscriptions.push({
+          subscriptionId: sub.subscriptionId,
+          reason: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }
+  };
+
+  await Promise.all(
+    Array.from({ length: Math.min(concurrency, subs.length) }, () => worker()),
+  );
+
+  const principals: PrincipalSubscriptionAccess[] = [];
+  for (const [principalId, entry] of byPrincipal) {
+    principals.push({
+      principalId,
+      principalType: entry.principalType || "Unknown",
+      subscriptionIds: Array.from(entry.subs),
+    });
+  }
+
+  return { principals, subscriptions, failedSubscriptions };
+}
+
+/**
  * Delete a role assignment by its full ARM resource id. The ARM API
  * returns 204 No Content on success and 204 / 404 on "already gone" —
  * both are treated as success here so a retry after a partial failure
@@ -1444,9 +1792,24 @@ function validateAliasName(name: string): void {
 }
 
 function validateBillingScope(scope: string): void {
+  if (typeof scope !== "string" || scope.length === 0) {
+    throw new Error("Invalid billingScope: must be a non-empty string.");
+  }
+  if (scope.length > 1024) {
+    throw new Error("Invalid billingScope: exceeds 1024 characters.");
+  }
+  if (scope.includes("..") || scope.includes("//")) {
+    throw new Error(
+      "Invalid billingScope: contains path traversal ('..') or empty segments ('//').",
+    );
+  }
   if (!EA_BILLING_SCOPE_REGEX.test(scope)) {
     throw new Error(
-      "Invalid billingScope: expected /providers/Microsoft.Billing/billingAccounts/{ba}/billingProfiles/{bp}/invoiceSections/{is} (MCA) or /providers/Microsoft.Billing/billingAccounts/{ba}/enrollmentAccounts/{ea} (EA enrollment).",
+      "Invalid billingScope: must start with /providers/Microsoft.Billing/billingAccounts/{ba}, " +
+        "optionally followed by /{segment}/{value} pairs. " +
+        "Examples: EA — .../enrollmentAccounts/{ea}; " +
+        "MCA — .../billingProfiles/{bp}/invoiceSections/{is}; " +
+        "MPA — .../customers/{c}; bare BA — just /billingAccounts/{ba}.",
     );
   }
 }
@@ -3603,9 +3966,31 @@ export async function createLegacyEaSubscription(
   };
   if (req.displayName?.trim()) body.displayName = req.displayName.trim();
   if (req.owners && req.owners.length > 0) {
-    body.owners = req.owners
-      .filter((o) => UUID_REGEX.test(o))
-      .map((o) => ({ objectId: o }));
+    // Clean + validate owners up front. Previously any non-GUID entry was
+    // silently dropped — which could leave `owners: []`, and Azure rejects an
+    // empty owners array with the cryptic 400 "Owners are not valid, please
+    // make sure request has correct tenant Id and object Id". Each owner must
+    // be an AAD object id (user / group / service principal) that exists in
+    // the SAME tenant as the enrollment account.
+    const cleaned = req.owners.map((o) => o.trim()).filter((o) => o.length > 0);
+    const invalid = cleaned.filter((o) => !UUID_REGEX.test(o));
+    if (invalid.length > 0) {
+      throw new ValidationError(
+        `These owner values are not AAD object ids (GUIDs): ${invalid.join(", ")}. ` +
+          `Paste each owner's objectId from Microsoft Entra ID (Users / Groups / ` +
+          `Enterprise applications → Object ID) — not a UPN, email, or subscription ` +
+          `id. Every owner must exist in the same tenant as the enrollment account. ` +
+          `Leave owners empty to make yourself the sole owner.`,
+        "InvalidOwner",
+        { field: "owners" },
+      );
+    }
+    // Only attach a non-empty owners array — an empty one is what triggers the
+    // 400. When the cleaned list is empty (all blank rows), omit `owners`
+    // entirely so Azure defaults ownership to the calling identity.
+    if (cleaned.length > 0) {
+      body.owners = cleaned.map((o) => ({ objectId: o }));
+    }
   }
   const response = await armFetch(url, {
     method: "POST",

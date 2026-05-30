@@ -156,6 +156,7 @@ import { useTenantChange } from "../../hooks/use-tenant-change";
 import { ConfirmationDialog } from "../shared/confirmation-dialog";
 import { EmptyState } from "../shared/empty-state";
 import { ErrorBoundary } from "../shared/error-boundary";
+import { InfoTooltip } from "../shared/info-tooltip";
 import { PageHeader } from "../shared/page-header";
 import { SkeletonLoader } from "../shared/skeleton-loader";
 import { SummaryStatItem } from "../shared/summary-stat-item";
@@ -554,6 +555,14 @@ const EaSubscriptionPageInner: React.FC<EaSubscriptionPageProps> = ({
     React.useState<string>("");
   const [selectedEnrollmentAccount, setSelectedEnrollmentAccount] =
     React.useState<string>("");
+
+  // Custom billingScope override — the operator pastes a full
+  // Microsoft.Billing scope path when the cascade picker can't reach the
+  // target (hasReadAccess: false rows, MPA customers, MOSP parallels, or
+  // an out-of-band scope string). Mirrors the toggle on
+  // Create EA Sub (quick).
+  const [customScopeMode, setCustomScopeMode] = React.useState(false);
+  const [customScopeText, setCustomScopeText] = React.useState<string>("");
 
   const [loadingBa, setLoadingBa] = React.useState(false);
   const [loadingBp, setLoadingBp] = React.useState(false);
@@ -1200,12 +1209,15 @@ const EaSubscriptionPageInner: React.FC<EaSubscriptionPageProps> = ({
   );
 
   const billingScope = React.useMemo(() => {
+    if (customScopeMode) return customScopeText.trim();
     if (!selectedBillingAccount) return "";
     if (isEa) {
       return selectedEnrollmentAccountObj?.id ?? "";
     }
     return selectedInvoiceSectionObj?.id ?? "";
   }, [
+    customScopeMode,
+    customScopeText,
     isEa,
     selectedBillingAccount,
     selectedEnrollmentAccountObj,
@@ -1214,18 +1226,22 @@ const EaSubscriptionPageInner: React.FC<EaSubscriptionPageProps> = ({
 
   // Hoisted up from the JSX so it can be referenced by performSubmit (audit
   // events log the human-readable scope leaf, not just the ARM id).
-  const confirmLeafName = isEa
-    ? selectedEnrollmentAccountObj?.displayName
-    : selectedInvoiceSectionObj?.displayName;
+  const confirmLeafName = customScopeMode
+    ? "(custom billingScope)"
+    : isEa
+      ? selectedEnrollmentAccountObj?.displayName
+      : selectedInvoiceSectionObj?.displayName;
 
   // Keep zod-validated `billingScope` in sync with the cascade selection.
   React.useEffect(() => {
     form.setValue("billingScope", billingScope, { shouldValidate: true });
   }, [billingScope, form]);
 
-  const leafSelectionReady = isEa
-    ? Boolean(selectedEnrollmentAccount)
-    : Boolean(selectedBillingProfile && selectedInvoiceSection);
+  const leafSelectionReady = customScopeMode
+    ? customScopeText.trim().length > 0
+    : isEa
+      ? Boolean(selectedEnrollmentAccount)
+      : Boolean(selectedBillingProfile && selectedInvoiceSection);
 
   const selfAssignRecipient = React.useMemo<Recipient | null>(() => {
     if (!selfAssign || !activeAccount) return null;
@@ -2141,6 +2157,29 @@ const EaSubscriptionPageInner: React.FC<EaSubscriptionPageProps> = ({
     { enabled: confirmOpen, allowInInputs: true, preventDefault: false },
   );
 
+  // RULES OF HOOKS: srStatusMessage MUST sit above the early-return
+  // branches below — otherwise transitioning from the empty/probing state
+  // to the populated state changes the hook count and React crashes with
+  // "Rendered more hooks than during the previous render". Same fix
+  // pattern as tenant-users-page and sticky-tasks-panel.
+  const successResultsCountForSr = effectiveRecipients.filter(
+    (r) => statusMap[r.key]?.state === "success",
+  ).length;
+  const srStatusMessage = React.useMemo(() => {
+    if (submitting) {
+      if (totalInFlight === 0) return "Batch starting.";
+      return `Provisioning subscriptions: ${completedCount} of ${totalInFlight} complete.`;
+    }
+    if (totalInFlight > 0 && completedCount === totalInFlight) {
+      const failCount = totalInFlight - successResultsCountForSr;
+      if (failCount === 0) {
+        return `Batch complete. All ${totalInFlight} subscriptions provisioned successfully.`;
+      }
+      return `Batch complete with ${failCount} failure${failCount === 1 ? "" : "s"} of ${totalInFlight}.`;
+    }
+    return "";
+  }, [submitting, totalInFlight, completedCount, successResultsCountForSr]);
+
   if (discoveringEa && eaAccounts.length === 0) {
     return (
       <div className="flex flex-col gap-4 py-4">
@@ -2321,25 +2360,6 @@ const EaSubscriptionPageInner: React.FC<EaSubscriptionPageProps> = ({
       } => Boolean(x),
     );
 
-  // Screen-reader-only live announcement of batch progress. Distinct from
-  // the visible polite-live region inside the Provisioning Summary so
-  // milestones (start / each-completed / done) reach assistive tech
-  // without re-announcing the entire summary card on every re-render.
-  const srStatusMessage = React.useMemo(() => {
-    if (submitting) {
-      if (totalInFlight === 0) return "Batch starting.";
-      return `Provisioning subscriptions: ${completedCount} of ${totalInFlight} complete.`;
-    }
-    if (totalInFlight > 0 && completedCount === totalInFlight) {
-      const failCount = totalInFlight - successResults.length;
-      if (failCount === 0) {
-        return `Batch complete. All ${totalInFlight} subscriptions provisioned successfully.`;
-      }
-      return `Batch complete with ${failCount} failure${failCount === 1 ? "" : "s"} of ${totalInFlight}.`;
-    }
-    return "";
-  }, [submitting, totalInFlight, completedCount, successResults.length]);
-
   return (
     <div className="flex flex-col gap-4 py-4">
       {/* Off-screen ARIA-live announcer for batch progress. The visible
@@ -2494,11 +2514,97 @@ const EaSubscriptionPageInner: React.FC<EaSubscriptionPageProps> = ({
             </div>
           )}
 
-          <Card>
+          {/* Custom billingScope override — bypass the cascade picker when
+              the right BA / BP / IS / EA isn't reachable (hasReadAccess
+              false, MPA customers, MOSP parallels, hand-built paths).
+              When on, the path typed below replaces whatever the cascade
+              would have produced. */}
+          <div
+            className={
+              "flex flex-col gap-2 rounded-md border border-dashed p-3 " +
+              (customScopeMode
+                ? "border-primary/50 bg-primary/5"
+                : "border-border/60 bg-muted/30")
+            }
+          >
+            <label
+              className="flex cursor-pointer items-start gap-2 text-xs"
+              htmlFor="ea-sub-custom-scope-toggle"
+            >
+              <input
+                id="ea-sub-custom-scope-toggle"
+                type="checkbox"
+                checked={customScopeMode}
+                onChange={(e) => setCustomScopeMode(e.target.checked)}
+                aria-label="Toggle custom billingScope (advanced)"
+                className="mt-0.5 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+              />
+              <span className="flex flex-col gap-0.5">
+                <span className="flex items-center gap-1.5 font-medium">
+                  <Sparkles className="h-3.5 w-3.5 text-primary" />
+                  Use custom billingScope (advanced)
+                  <InfoTooltip
+                    variant="help"
+                    ariaLabel="When to use custom billingScope"
+                    content="Bypass the picker below. Paste any Microsoft.Billing scope ARM path — EA, MCA invoice section, MPA customer, or bare billing account. Useful when the parent BA has hasReadAccess: false and doesn't surface in the dropdowns."
+                  />
+                </span>
+                <span className="text-2xs text-muted-foreground">
+                  Paste a full Microsoft.Billing ARM path. Overrides the
+                  cascade pickers; the alias API only needs the resulting
+                  string.
+                </span>
+              </span>
+            </label>
+            {customScopeMode && (
+              <div className="flex flex-col gap-1 pl-6">
+                <Label
+                  htmlFor="ea-sub-custom-scope-input"
+                  className="text-2xs uppercase tracking-wider text-muted-foreground"
+                >
+                  billingScope ARM path
+                </Label>
+                <Input
+                  id="ea-sub-custom-scope-input"
+                  value={customScopeText}
+                  onChange={(e) => setCustomScopeText(e.target.value)}
+                  placeholder="/providers/Microsoft.Billing/billingAccounts/.../enrollmentAccounts/..."
+                  className="font-mono text-[11px]"
+                  aria-label="Custom billingScope ARM path"
+                />
+                <p className="text-[10px] text-muted-foreground">
+                  Accepted shapes: EA{" "}
+                  <code className="font-mono">
+                    /billingAccounts/{"{ba}"}/enrollmentAccounts/{"{ea}"}
+                  </code>
+                  ; MCA{" "}
+                  <code className="font-mono">
+                    /billingAccounts/{"{ba}"}/billingProfiles/{"{bp}"}
+                    /invoiceSections/{"{is}"}
+                  </code>
+                  ; MPA{" "}
+                  <code className="font-mono">
+                    /billingAccounts/{"{ba}"}/customers/{"{c}"}
+                  </code>
+                  ; or any well-formed Microsoft.Billing path.
+                </p>
+              </div>
+            )}
+          </div>
+
+          <Card aria-disabled={customScopeMode || undefined}>
             <CardHeader>
               <CardTitle className="flex items-center gap-2 text-sm">
                 <Building2 className="h-4 w-4 text-primary" aria-hidden />
                 Billing Account
+                {customScopeMode && (
+                  <Badge
+                    variant="secondary"
+                    className="ml-1 text-2xs font-normal"
+                  >
+                    bypassed (custom scope)
+                  </Badge>
+                )}
               </CardTitle>
               <CardDescription>
                 The top-level Enterprise Agreement (or MCA) enrollment.

@@ -140,19 +140,30 @@ export class ProvisionerAgent implements Agent {
       };
     }
 
-    // Auto-register required ARM resource providers on the subscription.
-    // Without this, the first PUT /Microsoft.Batch/batchAccounts returns a
-    // 409 MissingSubscriptionRegistration. Idempotent + cached per session.
-    // In dry-run we skip the registration probe entirely — it's a write
-    // (PUT /register), and the whole point of dry-run is no writes.
-    try {
-      if (dryRun) {
-        store.addLog({
-          agent: "provisioner",
-          level: "info",
-          message: `[dry-run] would ensure providers registered on ${input.subscriptionId}: ${REQUIRED_PROVIDERS.join(", ")}`,
-        });
-      } else {
+    // Best-effort: register required ARM resource providers on the
+    // subscription. Without Microsoft.Batch the first PUT
+    // /Microsoft.Batch/batchAccounts returns a 409
+    // MissingSubscriptionRegistration; Storage/Network/Compute are needed
+    // later when pools spin up storage/VMSS/VNets.
+    //
+    // Registration needs subscription-scoped `<ns>/register/action`
+    // (Contributor/Owner at sub scope). An operator who only holds
+    // RG-scoped rights — enough to create a Batch account inside an existing
+    // RG — gets a 403 here. That must NOT abort the run: the providers are
+    // very often already registered (the create then succeeds without us
+    // touching registration), and only Microsoft.Batch is required up front.
+    // So we register what we can, warn about what we can't, and proceed —
+    // the per-region create surfaces the real MissingSubscriptionRegistration
+    // if Microsoft.Batch genuinely isn't registered. Dry-run skips entirely
+    // (registration is a write).
+    if (dryRun) {
+      store.addLog({
+        agent: "provisioner",
+        level: "info",
+        message: `[dry-run] would ensure providers registered on ${input.subscriptionId}: ${REQUIRED_PROVIDERS.join(", ")}`,
+      });
+    } else {
+      try {
         const token = await getAccessToken();
         const result = await ensureProvidersRegistered(
           input.subscriptionId,
@@ -166,36 +177,61 @@ export class ProvisionerAgent implements Agent {
             message: `Registered providers on subscription ${input.subscriptionId}: ${result.newlyRegistered.join(", ")}`,
           });
         }
+        const failedProviders = result.failed ?? [];
+        for (const f of failedProviders) {
+          store.addLog({
+            agent: "provisioner",
+            level: "warn",
+            message: `Could not register ${f.namespace} on ${input.subscriptionId} (${f.code ?? f.status ?? "error"}): ${f.reason}. Proceeding — it may already be usable; otherwise ask a subscription Owner to run \`az provider register --namespace ${f.namespace}\`.`,
+          });
+        }
+        const batchUnregistered = failedProviders.some(
+          (f) => f.namespace.toLowerCase() === "microsoft.batch",
+        );
+        if (batchUnregistered) {
+          store.addLog({
+            agent: "provisioner",
+            level: "warn",
+            message: `Microsoft.Batch is not confirmed registered on ${input.subscriptionId}. Account creation may fail with MissingSubscriptionRegistration until a subscription Owner registers it — attempting anyway.`,
+          });
+        }
+      } catch (e: unknown) {
+        // ensureProvidersRegistered no longer throws for per-provider
+        // permission/timeout failures (those arrive via result.failed). A
+        // throw here is an unexpected fault (e.g. token acquisition). Degrade
+        // to a warning and proceed — the per-region create will surface any
+        // real, actionable failure with full Azure detail.
+        const msg =
+          e instanceof AzureRequestError
+            ? e.message
+            : e instanceof Error
+              ? e.message
+              : String(e);
+        store.addLog({
+          agent: "provisioner",
+          level: "warn",
+          message: `Provider-registration pre-check could not run on ${input.subscriptionId}: ${msg}. Proceeding to attempt account creation.`,
+        });
       }
-    } catch (e: any) {
-      const msg =
-        e instanceof AzureRequestError ? e.message : e?.message ?? String(e);
-      store.setAgentStatus("provisioner", "error");
-      store.addLog({
-        agent: "provisioner",
-        level: "error",
-        message: `Required resource providers could not be registered on ${input.subscriptionId}: ${msg}. Ask a subscription Owner to run \`az provider register --namespace Microsoft.Batch\` (and Microsoft.Storage / Microsoft.Network / Microsoft.Compute).`,
-      });
-      return {
-        status: "failed",
-        summary: {
-          total: input.regions.length,
-          created: 0,
-          failed: input.regions.length,
-          failures: [
-            {
-              region: "*",
-              error: `Provider registration failed: ${msg}`,
-            },
-          ],
-        },
-      };
     }
 
     let created = 0;
     let failed = 0;
     const failures: Array<{ region: string; error: string }> = [];
     let lastWriteTime = 0;
+
+    // Resource-group sourcing strategy (per-subscription, chosen on the
+    // account-provisioning page). When the operator picked an existing
+    // RG they own, every region in this run lands in that single RG and
+    // we skip RG creation entirely — RG-scoped Owner is enough to create
+    // a Batch account inside it, but may NOT be enough to create the RG
+    // itself. Omitted selection falls back to legacy generate-per-region.
+    const rgSelection = input.resourceGroup ?? { mode: "generate" as const };
+    const existingRgName =
+      rgSelection.mode === "existing" && rgSelection.name
+        ? rgSelection.name
+        : null;
+    const useExistingRg = existingRgName !== null;
 
     // Sticky-task progress wiring. The orchestrator forwards the active
     // sticky task id via the payload so the provisioner can tick the
@@ -283,7 +319,7 @@ export class ProvisionerAgent implements Agent {
       }
 
       const accountName = generateAccountName(region);
-      const resourceGroup = generateResourceGroup(region);
+      const resourceGroup = existingRgName ?? generateResourceGroup(region);
       const accountId = `/subscriptions/${input.subscriptionId}/resourceGroups/${resourceGroup}/providers/Microsoft.Batch/batchAccounts/${accountName}`;
 
       const account: ManagedAccount = {
@@ -311,7 +347,9 @@ export class ProvisionerAgent implements Agent {
           store.addLog({
             agent: "provisioner",
             level: "info",
-            message: `[dry-run] would create resource group ${resourceGroup} in ${region}`,
+            message: useExistingRg
+              ? `[dry-run] would use existing resource group ${resourceGroup} in ${region} (no creation)`
+              : `[dry-run] would create resource group ${resourceGroup} in ${region}`,
           });
           store.addLog({
             agent: "provisioner",
@@ -319,22 +357,35 @@ export class ProvisionerAgent implements Agent {
             message: `[dry-run] would create Batch account ${accountName} in ${region}`,
           });
         } else {
-          // Step 1: Create resource group
-          await scheduler.run(input.subscriptionId, async () => {
-            if (this._cancelled || signal.aborted) throw new Error("cancelled");
-            const token = await getAccessToken();
-            await createResourceGroup(
-              input.subscriptionId,
-              resourceGroup,
-              region,
-              token,
-            );
-          });
-          store.addLog({
-            agent: "provisioner",
-            level: "info",
-            message: `Resource group ${resourceGroup} created in ${region}`,
-          });
+          // Step 1: Create resource group — generate mode only. When the
+          // operator picked an existing RG they own, skip creation: the
+          // RG already exists, and they may hold only RG-scoped Owner
+          // (insufficient to create resource groups at subscription
+          // scope, but sufficient to create a Batch account inside one).
+          if (useExistingRg) {
+            store.addLog({
+              agent: "provisioner",
+              level: "info",
+              message: `Using existing resource group ${resourceGroup} in ${region} (skipping creation)`,
+            });
+          } else {
+            await scheduler.run(input.subscriptionId, async () => {
+              if (this._cancelled || signal.aborted)
+                throw new Error("cancelled");
+              const token = await getAccessToken();
+              await createResourceGroup(
+                input.subscriptionId,
+                resourceGroup,
+                region,
+                token,
+              );
+            });
+            store.addLog({
+              agent: "provisioner",
+              level: "info",
+              message: `Resource group ${resourceGroup} created in ${region}`,
+            });
+          }
 
           // Step 2: Create Batch account
           let result: unknown;

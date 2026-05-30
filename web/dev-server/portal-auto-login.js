@@ -48,6 +48,72 @@ const PORTAL_CLIENT_ID = "c44b4083-3bb0-49c1-b47d-974e53cbdf3c";
 const WEBUI_CLIENT_ID = "04b07795-8ddb-461a-bbee-02f9e1bf7b46";
 const DEFAULT_WEBUI_URL = "http://localhost:9000/";
 
+// --- Tuning constants -----------------------------------------------------
+// Bounded ceiling (ms) for an AAD email/password field to appear. The common
+// case is served instantly by the already-present fast scan in findInAnyFrame;
+// this ceiling only applies on the slow path (slow tenants / fields still
+// rendering), replacing the previous guaranteed 30s sequential waits.
+const FIELD_WAIT_MS = 12_000;
+// Ceiling (ms) for the forced change-password form to render after the Sign in
+// click. Kept generous because AAD navigates between distinct pages here.
+const CHANGE_PW_WAIT_MS = 15_000;
+// Poll cadence (ms) while re-scanning frames for a not-yet-rendered field.
+// Lowered from 150 → 40: the field-finder already does an instant first
+// sweep, so this only governs the slow path; a tighter cadence shaves
+// perceived latency when AAD renders the field a beat after navigation.
+const FRAME_POLL_MS = 40;
+// Submit-button readiness polling. AAD enables the Sign-in / Submit button via
+// client-side validation a few tens of ms after the field is filled. We poll
+// at this cadence and click the instant it's ready, replacing the old blind
+// ~400ms settle delay before every submit click. The ceiling is a safety net:
+// on timeout the caller still proceeds to a best-effort click (old behaviour),
+// so a slow tenant degrades to "click anyway" rather than stalling.
+const SUBMIT_READY_POLL_MS = 35;
+const SUBMIT_READY_CEILING_MS = 2500;
+
+/**
+ * Resolve as soon as a clickable submit-style button exists in `frame`, or
+ * when `ceilingMs` elapses — whichever comes first. This is an OPTIMIZATION,
+ * not a gate: every caller proceeds to its existing click afterwards, so a
+ * timeout simply falls through to a best-effort click (the previous
+ * behaviour) instead of stalling. Returns true if an enabled button was seen.
+ *
+ * Replaces the fixed `page.waitForTimeout(400)` settle delays that previously
+ * ran before each submit click — those paid 400ms unconditionally even when
+ * the button was already enabled, which is the bulk of the "slow to submit the
+ * password" latency.
+ */
+async function waitForEnabledSubmit(
+    page,
+    frame,
+    ceilingMs = SUBMIT_READY_CEILING_MS,
+) {
+    const start = Date.now();
+    for (;;) {
+        const ready = await frame
+            .evaluate(() => {
+                const isClickable = (el) =>
+                    el &&
+                    !el.disabled &&
+                    !el.hasAttribute("aria-disabled") &&
+                    el.offsetParent !== null;
+                const sels = [
+                    "input#idSIButton9",
+                    "button#idSIButton9",
+                    'input[type="submit"]',
+                    'button[type="submit"]',
+                ];
+                return sels.some((s) =>
+                    Array.from(document.querySelectorAll(s)).some(isClickable),
+                );
+            })
+            .catch(() => false);
+        if (ready) return true;
+        if (Date.now() - start >= ceilingMs) return false;
+        await page.waitForTimeout(SUBMIT_READY_POLL_MS);
+    }
+}
+
 function maskPassword(s) {
     if (typeof s !== "string" || s.length === 0) return "***";
     if (s.length <= 4) return "***";
@@ -141,9 +207,10 @@ async function fillAadLoginForm(
     // Frame-aware finder: walks every frame on the page and returns the
     // first visible element matching `selector`. Handles main + iframes
     // (signup.live.com, tenant-branded shells, etc.).
-    const findInAnyFrame = async (selector, timeoutMs = 30_000) => {
-        const start = Date.now();
-        while (Date.now() - start < timeoutMs) {
+    const findInAnyFrame = async (selector, timeoutMs = FIELD_WAIT_MS) => {
+        // Single immediate sweep across every frame BEFORE entering the timed
+        // poll loop, so an already-rendered field resolves with zero wait.
+        const sweep = async () => {
             for (const frame of page.frames()) {
                 let handles = [];
                 try {
@@ -161,7 +228,15 @@ async function fillAadLoginForm(
                     if (visible) return { frame, handle: h };
                 }
             }
-            await page.waitForTimeout(250);
+            return null;
+        };
+        const fast = await sweep();
+        if (fast) return fast;
+        const start = Date.now();
+        while (Date.now() - start < timeoutMs) {
+            await page.waitForTimeout(FRAME_POLL_MS);
+            const found = await sweep();
+            if (found) return found;
         }
         return null;
     };
@@ -249,7 +324,7 @@ async function fillAadLoginForm(
     // ---- Email ------------------------------------------------------------
     const emailSel =
         'input[type="email"], input[name="loginfmt"], input#i0116, input[autocomplete="username"]';
-    const emailFound = await findInAnyFrame(emailSel, 30_000);
+    const emailFound = await findInAnyFrame(emailSel, FIELD_WAIT_MS);
     if (!emailFound) {
         throw new Error(
             "email input not found within 30s (no visible email field in any frame)",
@@ -271,14 +346,17 @@ async function fillAadLoginForm(
     // ---- Password ---------------------------------------------------------
     const pwdSel =
         'input[type="password"], input[name="passwd"], input#i0118, input[autocomplete="current-password"]';
-    const pwdFound = await findInAnyFrame(pwdSel, 30_000);
+    const pwdFound = await findInAnyFrame(pwdSel, FIELD_WAIT_MS);
     if (!pwdFound) {
         throw new Error(
             "password input not found within 30s (no visible password field in any frame)",
         );
     }
     await fillField(pwdFound.handle, password);
-    await page.waitForTimeout(400);
+    // Click the instant AAD enables the Sign-in button (typically <50ms)
+    // instead of a blind 400ms wait. Falls through to a best-effort click on
+    // the rare slow-tenant timeout.
+    await waitForEnabledSubmit(page, pwdFound.frame);
     const pwdNext = await clickPrimary(pwdFound.frame, [
         "sign in",
         "submit",
@@ -318,7 +396,7 @@ async function fillAadLoginForm(
 
             const findInputsAcrossFrames = async () => {
                 const start = Date.now();
-                while (Date.now() - start < 30_000) {
+                while (Date.now() - start < CHANGE_PW_WAIT_MS) {
                     for (const frame of page.frames()) {
                         let handles = [];
                         try {
@@ -357,7 +435,7 @@ async function fillAadLoginForm(
                             return { frame, inputs: visible.slice(0, 3) };
                         }
                     }
-                    await page.waitForTimeout(500);
+                    await page.waitForTimeout(FRAME_POLL_MS);
                 }
                 return null;
             };
@@ -380,7 +458,7 @@ async function fillAadLoginForm(
                 console.log(
                     `[portal-auto-login] filled all 3 password fields by position`,
                 );
-                await page.waitForTimeout(400);
+                await waitForEnabledSubmit(page, found.frame);
 
                 const submitInfo = await found.frame.evaluate(() => {
                     const sels = [
@@ -893,9 +971,10 @@ async function autoLogin({
         // string). Returns null on timeout. Used for email + password
         // screens where AAD's flow can be in the main frame OR in a
         // signup.live.com / tenant-branded iframe.
-        const findInAnyFrame = async (selector, timeoutMs = 30_000) => {
-            const start = Date.now();
-            while (Date.now() - start < timeoutMs) {
+        const findInAnyFrame = async (selector, timeoutMs = FIELD_WAIT_MS) => {
+            // Single immediate sweep across every frame BEFORE entering the timed
+            // poll loop, so an already-rendered field resolves with zero wait.
+            const sweep = async () => {
                 for (const frame of page.frames()) {
                     let handles = [];
                     try {
@@ -913,7 +992,15 @@ async function autoLogin({
                         if (visible) return { frame, handle: h };
                     }
                 }
-                await page.waitForTimeout(250);
+                return null;
+            };
+            const fast = await sweep();
+            if (fast) return fast;
+            const start = Date.now();
+            while (Date.now() - start < timeoutMs) {
+                await page.waitForTimeout(FRAME_POLL_MS);
+                const found = await sweep();
+                if (found) return found;
             }
             return null;
         };
@@ -1016,7 +1103,7 @@ async function autoLogin({
         // ---- Email screen -------------------------------------------------
         const emailSel =
             'input[type="email"], input[name="loginfmt"], input#i0116, input[autocomplete="username"]';
-        const emailFound = await findInAnyFrame(emailSel, 30_000);
+        const emailFound = await findInAnyFrame(emailSel, FIELD_WAIT_MS);
         if (!emailFound) {
             throw new Error(
                 "email input not found within 30s (no visible email field in any frame)",
@@ -1039,17 +1126,17 @@ async function autoLogin({
         // ---- Password screen ----------------------------------------------
         const pwdSel =
             'input[type="password"], input[name="passwd"], input#i0118, input[autocomplete="current-password"]';
-        const pwdFound = await findInAnyFrame(pwdSel, 30_000);
+        const pwdFound = await findInAnyFrame(pwdSel, FIELD_WAIT_MS);
         if (!pwdFound) {
             throw new Error(
                 "password input not found within 30s (no visible password field in any frame)",
             );
         }
         await fillField(pwdFound.handle, password);
-        // Brief beat for AAD's client-side validation to enable the submit
-        // button. 400ms is empirically enough; the worst case is a one-tick
-        // delay before the click — far better than a tight poll loop.
-        await page.waitForTimeout(400);
+        // Click the moment AAD enables the Sign-in button (typically <50ms)
+        // rather than a blind 400ms settle — this is the main "slow to submit
+        // the password" delay. Degrades to a best-effort click on timeout.
+        await waitForEnabledSubmit(page, pwdFound.frame);
         const pwdNext = await clickPrimary(pwdFound.frame, [
             "sign in",
             "submit",
@@ -1112,7 +1199,7 @@ async function autoLogin({
                         'input[name="Pwd2"]',
                     ].join(", ");
                     const start = Date.now();
-                    while (Date.now() - start < 30_000) {
+                    while (Date.now() - start < CHANGE_PW_WAIT_MS) {
                         for (const frame of page.frames()) {
                             let handles = [];
                             try {
@@ -1160,7 +1247,7 @@ async function autoLogin({
                                 return { frame, inputs: visible.slice(0, 3) };
                             }
                         }
-                        await page.waitForTimeout(500);
+                        await page.waitForTimeout(FRAME_POLL_MS);
                     }
                     return null;
                 };
@@ -1219,11 +1306,9 @@ async function autoLogin({
                         `[portal-auto-login] filled all 3 password fields by position`,
                     );
 
-                    // Give AAD's client-side validation a beat to enable
-                    // the submit button. Polling for the button to be
-                    // enabled would be cleaner, but a short fixed wait
-                    // works in practice and avoids a tight loop.
-                    await page.waitForTimeout(400);
+                    // Click submit the instant AAD enables it (smart-wait),
+                    // instead of a blind fixed delay.
+                    await waitForEnabledSubmit(page, found.frame);
 
                     // Click submit — search the same frame as the inputs,
                     // try multiple candidates including text-based.
@@ -1379,6 +1464,43 @@ async function dismissKmsiIfPresent(page) {
     }
 }
 
+/**
+ * Fire-and-forget pre-warm of the shared persistent Chromium context so the
+ * FIRST operator webui auto-login does not pay the ~1-2s browser cold-start.
+ * (The portal flow launches a throwaway browser per call, so there is nothing
+ * durable to warm there.)
+ *
+ * Strictly best-effort and NEVER throws:
+ *   - If playwright-core is not installed, loadPlaywright() rejects and we
+ *     swallow it so the dev-server still boots.
+ *   - If no browser channel can launch, getOrLaunchPersistentContext()
+ *     rejects and is swallowed; a real login surfaces the genuine error.
+ *
+ * @returns {void}
+ */
+function prewarmPersistentContext() {
+    Promise.resolve()
+        .then(async () => {
+            const playwright = await loadPlaywright();
+            const profileDir = path.join(
+                __dirname,
+                ".playwright-profile-webui",
+            );
+            await getOrLaunchPersistentContext(playwright, profileDir);
+            console.log(
+                "[portal-auto-login] pre-warmed persistent Chromium context",
+            );
+        })
+        .catch((err) => {
+            // Best-effort only: missing playwright-core or no launchable
+            // browser must not crash the dev-server. A real login retries.
+            console.log(
+                "[portal-auto-login] pre-warm skipped:",
+                (err && err.message) || err,
+            );
+        });
+}
+
 function registerPortalAutoLogin(devServer) {
     // One-shot startup banner so the operator can confirm a freshly-restarted
     // dev-server is actually running this code. If the banner is missing
@@ -1386,6 +1508,9 @@ function registerPortalAutoLogin(devServer) {
     console.log(
         "[portal-auto-login] endpoint registered — auto-fill v4 (email + password + change-password all frame-aware, evaluate-dispatched)"
     );
+    // Warm the shared persistent Chromium so the first login skips cold-start.
+    // Guarded + swallowed so a box without playwright-core still boots.
+    prewarmPersistentContext();
     devServer.app.post("/api/portal/auto-login", async (req, res) => {
         let body;
         try {
@@ -1419,6 +1544,14 @@ function registerPortalAutoLogin(devServer) {
             });
         }
         const targetNormalized = target === "webui" ? "webui" : "portal";
+        // Whether a rotation was ASKED for (independent of whether AAD's
+        // change-password form actually appeared). Surfaced on every response
+        // so the client resolves its none/confirmed/unknown vault outcome.
+        const rotationRequested = !!(
+            mustChangePassword &&
+            typeof newPassword === "string" &&
+            newPassword.length >= 8
+        );
         console.log(
             `[portal-auto-login] launching for upn=${upn} tenant=${
                 tenantId || "common"
@@ -1477,6 +1610,7 @@ function registerPortalAutoLogin(devServer) {
                     phase: result.phase,
                     target: targetNormalized,
                     passwordRotated: !!result.passwordRotated,
+                    rotationRequested,
                 });
             }
             // Even when the overall flow didn't complete, the
@@ -1490,6 +1624,7 @@ function registerPortalAutoLogin(devServer) {
                 phase: result.phase,
                 target: targetNormalized,
                 passwordRotated: !!result.passwordRotated,
+                rotationRequested,
                 message:
                     result.error ||
                     "Form-fill did not complete. Browser left open for manual recovery.",
@@ -1505,11 +1640,13 @@ function registerPortalAutoLogin(devServer) {
                     status: "error",
                     code,
                     message: err.message,
+                    rotationRequested,
                 });
             }
             return res.status(500).json({
                 status: "error",
                 message: err.message || "Unknown error",
+                rotationRequested,
             });
         }
     });

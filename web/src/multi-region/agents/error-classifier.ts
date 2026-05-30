@@ -89,6 +89,16 @@ const SUBSCRIPTION_BLOCKED_CODES = new Set<string>([
   "SubscriptionPolicyDisabled",
 ]);
 
+// Resource-provider-not-registered. The 409 ARM returns when the
+// subscription hasn't registered the namespace (e.g. Microsoft.Batch).
+// Registration is subscription-scoped, so it fails identically for every
+// region — there's no point burning through the remaining regions once one
+// reports this. Hence `shouldAbortRun: true` below.
+const PROVIDER_UNREGISTERED_CODES = new Set<string>([
+  "MissingSubscriptionRegistration",
+  "MissingRegistrationForResourceProvider",
+]);
+
 function lowerMessage(msg: string | undefined): string {
   return (msg ?? "").toLowerCase();
 }
@@ -212,6 +222,14 @@ export function classifyAzureError(error: unknown): ClassifiedError {
       shouldAbortRun: true,
     };
   }
+  if (PROVIDER_UNREGISTERED_CODES.has(code)) {
+    return {
+      kind: "provider-unregistered",
+      reason: `${code}: ${message}`,
+      shouldFallbackVm: false,
+      shouldAbortRun: true,
+    };
+  }
 
   // Substring-driven fallback — handy when Azure returns a generic code
   // ("OperationNotAllowed", "BadRequest") wrapping a specific cause.
@@ -225,7 +243,9 @@ export function classifyAzureError(error: unknown): ClassifiedError {
         fp === "quota" ||
         fp === "capacity",
       shouldAbortRun:
-        fp === "permission" || fp === "subscription-blocked",
+        fp === "permission" ||
+        fp === "subscription-blocked" ||
+        fp === "provider-unregistered",
     };
   }
 

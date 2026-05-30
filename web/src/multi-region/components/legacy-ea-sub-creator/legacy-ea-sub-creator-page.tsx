@@ -77,6 +77,7 @@ import {
 import {
   getActiveTenant,
   getArmTokenForAccount,
+  getGraphTokenForAccount,
 } from "../../auth/msal-auth";
 import { resolveActiveTenantId } from "../../auth/perform-tenant-switch";
 import { useArmToken } from "../../auth/use-arm-token";
@@ -87,11 +88,13 @@ import { useUrlState } from "../../hooks/use-url-state";
 import { auditLog } from "../../services/audit-log";
 import {
   createLegacyEaSubscription,
+  getPrincipalsByIds,
   listLegacyEnrollmentAccounts,
 } from "../../services";
 import type {
   LegacyEaSubscriptionResult,
   LegacyEnrollmentAccount,
+  ResolvedPrincipal,
 } from "../../services";
 import {
   useMultiRegionState,
@@ -819,6 +822,151 @@ export const LegacyEaSubCreatorPage: React.FC = () => {
     setOwners([]);
   }, [setOwners]);
 
+  /* ----- Owner principal pre-validation (Microsoft Graph) -------- */
+  // The legacy createSubscription endpoint rejects the whole request with a
+  // 400 "Owners are not valid, please make sure request has correct tenant
+  // Id and object Id" when ANY owner objectId is a well-formed GUID that
+  // doesn't resolve to a real principal (user / group / servicePrincipal) in
+  // the enrollment account's tenant — e.g. an id pasted from another tenant,
+  // a subscription id, or a deleted user. The page already gates owner INPUT
+  // to GUID format, so format isn't the gap; principal EXISTENCE is. We probe
+  // Microsoft Graph in the active account's tenant (where the enrollment
+  // account lives) and surface a precise, blocking verdict BEFORE submit.
+  //
+  // The probe is reactive (debounced + abortable + deduped), and degrades
+  // gracefully: a definite "resolved-and-missing" verdict blocks submit; any
+  // probe FAILURE (throttle, missing Directory.Read.All consent, token error)
+  // is treated as INCONCLUSIVE and never blocks — the server stays the source
+  // of truth in that case. Object ids are compared case-insensitively because
+  // Graph may echo a different casing than the operator pasted.
+  type OwnerProbe =
+    | { kind: "idle" }
+    | { kind: "checking" }
+    | {
+        kind: "done";
+        /** Owner object ids (lowercased) that resolved to a real principal. */
+        resolved: Record<string, ResolvedPrincipal>;
+        /** Owner object ids (lowercased) that did NOT resolve. */
+        invalid: string[];
+        /** Tenant the probe ran against. */
+        tenantId: string;
+      }
+    | { kind: "inconclusive"; error: string };
+  const [ownerProbe, setOwnerProbe] = React.useState<OwnerProbe>({
+    kind: "idle",
+  });
+
+  // Stable, sorted, lowercased owner key so the effect only re-runs when the
+  // actual SET of owners changes (not on unrelated re-renders or reordering).
+  const ownersKey = React.useMemo(
+    () => [...owners].map((o) => o.toLowerCase()).sort().join(","),
+    [owners],
+  );
+
+  useAbortableEffect(
+    async (signal) => {
+      // No owners ⇒ nothing to validate; the server makes the caller the
+      // owner. Reset to idle so a stale verdict can't linger.
+      if (owners.length === 0 || !account) {
+        setOwnerProbe({ kind: "idle" });
+        return;
+      }
+      const requested = owners.map((o) => o.toLowerCase());
+      const probeTenantId = account.tenantId;
+      // Debounce: the operator may add several owners in quick succession;
+      // wait for the list to settle before spending a Graph round-trip.
+      await new Promise<void>((resolve) => {
+        const t = window.setTimeout(resolve, 400);
+        signal.addEventListener("abort", () => {
+          window.clearTimeout(t);
+          resolve();
+        });
+      });
+      if (signal.aborted) return;
+      setOwnerProbe({ kind: "checking" });
+      try {
+        const graphToken = await getGraphTokenForAccount(
+          account.homeAccountId,
+          probeTenantId,
+        );
+        if (signal.aborted) return;
+        const resolvedList = await getPrincipalsByIds(
+          probeTenantId,
+          requested,
+          graphToken,
+        );
+        if (signal.aborted) return;
+        // getPrincipalsByIds backfills unresolved ids as
+        // { type: "Unknown", displayName: id }. Treat anything that did NOT
+        // come back as a concrete user/group/servicePrincipal as missing —
+        // an "Unknown"-typed row means Graph's getByIds didn't return it.
+        const resolvedMap: Record<string, ResolvedPrincipal> = {};
+        for (const p of resolvedList) {
+          if (p.type && p.type !== "Unknown") {
+            resolvedMap[p.id.toLowerCase()] = p;
+          }
+        }
+        const resolvedSet = new Set(Object.keys(resolvedMap));
+        const invalid = requested.filter((o) => !resolvedSet.has(o));
+        setOwnerProbe({
+          kind: "done",
+          resolved: resolvedMap,
+          invalid,
+          tenantId: probeTenantId,
+        });
+      } catch (err) {
+        if (signal.aborted) return;
+        // Graceful degradation: a probe failure is INCONCLUSIVE, never a
+        // block. The server remains the source of truth for owner validity.
+        const msg = err instanceof Error ? err.message : String(err);
+        setOwnerProbe({ kind: "inconclusive", error: msg });
+      }
+    },
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [ownersKey, account?.homeAccountId, account?.tenantId],
+  );
+
+  /** Set of owner object ids (lowercased) the Graph probe positively
+   *  determined do NOT resolve to a principal in the tenant. Empty unless the
+   *  probe finished with a definite verdict — checking / idle / inconclusive
+   *  all yield an empty set so they never block submit. */
+  const invalidOwnerSet = React.useMemo(() => {
+    if (ownerProbe.kind !== "done") return new Set<string>();
+    return new Set(ownerProbe.invalid);
+  }, [ownerProbe]);
+
+  /** True only when the probe finished AND at least one current owner is a
+   *  confirmed non-principal. This is the single condition that blocks
+   *  submit on owner grounds. */
+  const hasInvalidOwners = invalidOwnerSet.size > 0;
+
+  /** Tenant the owner probe ran against — surfaces in the blocking message
+   *  so the operator knows WHERE the id needs to exist. */
+  const ownerProbeTenantId =
+    ownerProbe.kind === "done" ? ownerProbe.tenantId : account?.tenantId ?? "";
+
+  /** Human-readable, comma-separated list of the invalid owner ids in the
+   *  order the operator entered them (lowercased to match the chips). */
+  const invalidOwnerList = React.useMemo(
+    () => owners.filter((o) => invalidOwnerSet.has(o.toLowerCase())),
+    [owners, invalidOwnerSet],
+  );
+
+  /** The full actionable message reused by the inline alert AND the
+   *  submit-time guard so both read identically. The leading "owner" wording
+   *  also matches `classifyLegacyError("...owner...")` so the existing
+   *  owners-invalid help panel maps correctly when this is thrown. */
+  const invalidOwnerMessage = React.useMemo(() => {
+    if (!hasInvalidOwners) return "";
+    return (
+      `These owner object IDs don't resolve to a user, group, or service ` +
+      `principal in tenant ${ownerProbeTenantId}: ${invalidOwnerList.join(", ")}. ` +
+      `Paste the Object ID from Microsoft Entra ID ` +
+      `(Users / Groups / Enterprise applications → Object ID), or leave ` +
+      `owners empty to make yourself the owner.`
+    );
+  }, [hasInvalidOwners, ownerProbeTenantId, invalidOwnerList]);
+
   const displayNameTrimmed = displayName.trim();
   const displayNameTooLong = displayNameTrimmed.length > DISPLAY_NAME_MAX;
   const displayNameEmpty = displayNameTrimmed.length === 0;
@@ -888,6 +1036,9 @@ export const LegacyEaSubCreatorPage: React.FC = () => {
     !!offerType &&
     !displayNameEmpty &&
     !displayNameTooLong &&
+    // A definite "resolved-and-missing" Graph verdict blocks submit; a
+    // checking / inconclusive / idle probe never does (graceful degradation).
+    !hasInvalidOwners &&
     deprecationAck;
 
   /** Aggregate list of reasons a draft would fail to submit right now.
@@ -947,6 +1098,32 @@ export const LegacyEaSubCreatorPage: React.FC = () => {
         text: "Pending owner input isn't a valid AAD object id — fix or clear it before submitting.",
       });
     }
+    // Graph pre-validation verdict: a definite "resolved-and-missing" result
+    // is a hard error (the create would 400 with "Owners are not valid"); a
+    // checking / inconclusive probe surfaces only as informational text so it
+    // never blocks (graceful degradation — see the owner-probe effect).
+    if (hasInvalidOwners) {
+      issues.push({
+        id: "owner-invalid",
+        severity: "error",
+        text:
+          invalidOwnerList.length === 1
+            ? `Owner ${invalidOwnerList[0]} doesn't resolve to a user, group, or service principal in tenant ${ownerProbeTenantId}. Remove it or paste a valid Object ID.`
+            : `${invalidOwnerList.length} owners don't resolve to a principal in tenant ${ownerProbeTenantId}: ${invalidOwnerList.join(", ")}. Remove them or paste valid Object IDs.`,
+      });
+    } else if (ownerProbe.kind === "checking") {
+      issues.push({
+        id: "owner-checking",
+        severity: "warn",
+        text: "Verifying owner object IDs against Microsoft Entra ID…",
+      });
+    } else if (ownerProbe.kind === "inconclusive" && owners.length > 0) {
+      issues.push({
+        id: "owner-inconclusive",
+        severity: "warn",
+        text: "Couldn't verify owner object IDs against Microsoft Entra ID (the server will validate them on submit).",
+      });
+    }
     return issues;
   }, [
     account,
@@ -958,6 +1135,11 @@ export const LegacyEaSubCreatorPage: React.FC = () => {
     displayNameTrimmed.length,
     deprecationAck,
     ownerInput,
+    hasInvalidOwners,
+    invalidOwnerList,
+    ownerProbeTenantId,
+    ownerProbe.kind,
+    owners.length,
   ]);
 
   /** Why submit is disabled — surfaces inline so the disabled state
@@ -969,6 +1151,10 @@ export const LegacyEaSubCreatorPage: React.FC = () => {
     if (displayNameEmpty) return "Display name is required.";
     if (displayNameTooLong)
       return `Display name must be ${DISPLAY_NAME_MAX} characters or fewer.`;
+    if (hasInvalidOwners)
+      return invalidOwnerList.length === 1
+        ? `Owner ${invalidOwnerList[0]} doesn't resolve to a principal in tenant ${ownerProbeTenantId}.`
+        : `${invalidOwnerList.length} owners don't resolve to a principal in tenant ${ownerProbeTenantId}.`;
     if (!deprecationAck)
       return "Acknowledge the deprecation banner above first.";
     return "";
@@ -1010,6 +1196,28 @@ export const LegacyEaSubCreatorPage: React.FC = () => {
         typeof window !== "undefined" ? window.location?.host ?? "" : "",
     };
     try {
+      // Hard pre-submit guard mirroring the reactive verdict. Re-derives the
+      // invalid set from the snapshot's owners against the last completed
+      // probe so a race (operator clicks submit the instant the probe lands)
+      // can't slip a known-bad owner through. Only a DEFINITE verdict throws;
+      // a checking / inconclusive / idle probe leaves the server as the
+      // source of truth (graceful degradation). The message leads with the
+      // owners + tenant and contains "owner" so the existing catch →
+      // classifyError("...owner...") maps it to the owners-invalid panel.
+      if (ownerProbe.kind === "done" && snapshot.owners.length > 0) {
+        const stillInvalid = snapshot.owners.filter((o) =>
+          ownerProbe.invalid.includes(o.toLowerCase()),
+        );
+        if (stillInvalid.length > 0) {
+          throw new Error(
+            `These owner object IDs don't resolve to a user, group, or ` +
+              `service principal in tenant ${ownerProbe.tenantId}: ` +
+              `${stillInvalid.join(", ")}. Paste the Object ID from ` +
+              `Microsoft Entra ID (Users / Groups / Enterprise applications → ` +
+              `Object ID), or leave owners empty to make yourself the owner.`,
+          );
+        }
+      }
       const r = await createLegacyEaSubscription(
         snapshot.enrollmentAccountId,
         {
@@ -1111,6 +1319,7 @@ export const LegacyEaSubCreatorPage: React.FC = () => {
     displayNameTrimmed,
     offerType,
     owners,
+    ownerProbe,
     account?.username,
     store,
   ]);
@@ -2159,30 +2368,114 @@ export const LegacyEaSubCreatorPage: React.FC = () => {
                 {owners.length > 0 && (
                   <>
                     <ul className="mt-1 flex flex-wrap gap-1">
-                      {owners.map((o) => (
-                        <li
-                          key={o}
-                          className="group/copy inline-flex items-center gap-1 rounded-md border border-border bg-muted/50 px-2 py-0.5 font-mono text-2xs"
-                        >
-                          <User className="h-3 w-3 text-muted-foreground" />
-                          <span title={o}>{o.slice(0, 8)}…</span>
-                          <CopyButton
-                            value={o}
-                            ariaLabel={`Copy owner ${o}`}
-                          />
-                          <Button
-                            type="button"
-                            variant="ghost"
-                            size="icon-xs"
-                            className="ml-1 h-4 w-4"
-                            onClick={() => removeOwner(o)}
-                            aria-label={`Remove owner ${o}`}
+                      {owners.map((o) => {
+                        const lower = o.toLowerCase();
+                        const isInvalid = invalidOwnerSet.has(lower);
+                        const resolved =
+                          ownerProbe.kind === "done"
+                            ? ownerProbe.resolved[lower]
+                            : undefined;
+                        const isChecking = ownerProbe.kind === "checking";
+                        // Tooltip: confirmed-bad > resolved name > raw id.
+                        const chipTitle = isInvalid
+                          ? `${o} — not found in tenant ${ownerProbeTenantId}`
+                          : resolved
+                            ? `${resolved.displayName}${
+                                resolved.signInName
+                                  ? ` (${resolved.signInName})`
+                                  : ""
+                              } · ${resolved.type} · ${o}`
+                            : o;
+                        return (
+                          <li
+                            key={o}
+                            className={
+                              "group/copy inline-flex items-center gap-1 rounded-md border px-2 py-0.5 font-mono text-2xs " +
+                              (isInvalid
+                                ? "border-destructive/50 bg-destructive/10 text-destructive"
+                                : resolved
+                                  ? "border-success/40 bg-success/10"
+                                  : "border-border bg-muted/50")
+                            }
+                            title={chipTitle}
+                            aria-invalid={isInvalid ? true : undefined}
                           >
-                            <Trash2 className="h-3 w-3" />
-                          </Button>
-                        </li>
-                      ))}
+                            {isInvalid ? (
+                              <XCircle
+                                className="h-3 w-3 text-destructive"
+                                aria-label="Not found in tenant"
+                              />
+                            ) : resolved ? (
+                              <Check
+                                className="h-3 w-3 text-success"
+                                aria-label="Resolved in tenant"
+                              />
+                            ) : isChecking ? (
+                              <Loader2
+                                className="h-3 w-3 animate-spin text-muted-foreground motion-reduce:animate-none"
+                                aria-label="Verifying"
+                              />
+                            ) : (
+                              <User className="h-3 w-3 text-muted-foreground" />
+                            )}
+                            <span>{o.slice(0, 8)}…</span>
+                            {isInvalid && (
+                              <span className="not-italic font-sans opacity-90">
+                                not found
+                              </span>
+                            )}
+                            <CopyButton
+                              value={o}
+                              ariaLabel={`Copy owner ${o}`}
+                            />
+                            <Button
+                              type="button"
+                              variant="ghost"
+                              size="icon-xs"
+                              className="ml-1 h-4 w-4"
+                              onClick={() => removeOwner(o)}
+                              aria-label={`Remove owner ${o}`}
+                            >
+                              <Trash2 className="h-3 w-3" />
+                            </Button>
+                          </li>
+                        );
+                      })}
                     </ul>
+                    {/* Blocking, actionable verdict when the Graph probe
+                        positively determined one or more owners don't resolve
+                        to a principal in the enrollment account's tenant. This
+                        catches the 400 "Owners are not valid" BEFORE submit and
+                        names the exact bad id(s) + tenant. role="alert" so it's
+                        announced — it appears only on a definite bad verdict. */}
+                    {hasInvalidOwners && (
+                      <Alert variant="destructive" role="alert">
+                        <XCircle className="h-3.5 w-3.5" />
+                        <AlertDescription className="flex flex-col gap-1 text-2xs">
+                          <span>{invalidOwnerMessage}</span>
+                          <div>
+                            <Button
+                              type="button"
+                              size="sm"
+                              variant="outline"
+                              className="h-7 text-2xs"
+                              onClick={() =>
+                                setOwners((prev) =>
+                                  prev.filter(
+                                    (p) =>
+                                      !invalidOwnerSet.has(p.toLowerCase()),
+                                  ),
+                                )
+                              }
+                              aria-label="Remove the owner object IDs that don't resolve"
+                            >
+                              <Trash2 className="h-3 w-3" /> Remove invalid
+                              owner{invalidOwnerList.length === 1 ? "" : "s"}
+                            </Button>
+                          </div>
+                        </AlertDescription>
+                      </Alert>
+                    )}
                     <div>
                       <Button
                         type="button"

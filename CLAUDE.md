@@ -1,5 +1,58 @@
 # Project rules
 
+## HARD RULE — Professional/advanced code only; build the base first, then elevate it
+
+This is a **professional, advanced project**. There is **NO place for
+simple / toy / placeholder / "good-enough" code** as a *final* state.
+Every change I ship — and every change a sub-agent ships — must land at
+production-grade, advanced quality. "It compiles and runs" is the *floor*,
+never the deliverable.
+
+### The two-phase method (mandatory, in this order)
+
+1. **Phase 1 — Base build (think simple first).** Get a *correct, minimal,
+   working* base in place: the most straightforward implementation that
+   compiles, runs, and actually does the thing. Prove the mechanism end to
+   end before decorating it. Do NOT gold-plate or abstract prematurely here
+   — a clear, correct skeleton is the goal of this phase.
+2. **Phase 2 — Elevate (make it advanced).** Then deliberately raise that
+   same code to the project's professional bar **before** calling the task
+   done. Phase 1 is scaffolding; shipping it as-is is a rule violation.
+   **Done ≠ "it works." Done = Phase 2 complete.**
+
+### What "advanced / professional" means here (Phase 2 checklist)
+
+- Full error handling and explicit edge-case coverage (empty/null, 4xx/5xx,
+  partial failure, concurrency, abort/cancel, throttling/retry).
+- Precise, non-`any` types; exhaustive unions; no silent casts.
+- Idempotency and safe re-entry where the operation can repeat.
+- Observability: audit-log entries, meaningful messages, no `console.log`
+  debris and no leftover `TODO`/`FIXME`/placeholder branches.
+- Security posture appropriate to the surface (no secret leakage, least
+  privilege, validated inputs).
+- Accessibility + UX polish for any UI (labels, keyboard, states, a11y).
+- Performance: no needless N+1 calls, no unbounded loops, batch where the
+  platform expects it.
+- Consistency: mirror the established patterns/components/services already
+  in the codebase rather than inventing a parallel one.
+- Verification: `tsc --noEmit` clean, relevant tests added/passing.
+
+### How to reach "advanced" — use the research corpus
+
+Per the **Primary research resource** rules below, when elevating code find
+the closest cataloged reference (via the `build-from-inventory` `kb.mjs`
+driver / the corpus), study its *source*, and mirror the technique. Don't
+re-derive an advanced approach from memory when a vetted one exists.
+
+### Propagation
+
+Sub-agents inherit this rule verbatim (see *Sub-agent context propagation*).
+A sub-agent that stops at Phase 1 has not finished its task. State this in
+every dispatch prompt: *"deliver Phase-2 advanced quality, not a simple
+first pass."*
+
+---
+
 ## Dependency policy — installs ALLOWED for testing / building / verification
 
 The directory name `AzureBatchManager-source-only-no-deps-20260525\` is
@@ -23,23 +76,28 @@ pre-populated). It is no longer a hard rule.
   Ollama pulls, etc.) — these aren't part of normal npm install flow
   and should be opt-in per task.
 
-**Editing is NOT a freedom — it is per-task and per-instruction.**
-This separate rule still applies — it's about edit-scope discipline,
-not about installs.
+**Editing IS a freedom — full access to improve and modernize.**
+(Updated 2026-05-27 by user instruction, superseding the prior
+per-task/per-instruction edit-scope restriction.)
 
-- I do **not** have blanket permission to edit source files just
-  because a package is declared in `package.json`. Declared
-  packages are usable in code I write **only when the user has
-  asked for that specific change**.
-- No proactive refactors. No "improve while I'm here." No
-  drive-by import additions, even if the imported package is
-  declared. No reformatting, no renaming, no dead-code removal,
-  no comment clean-up unless the current task explicitly says so.
-- Every edited line must trace directly to a user instruction in
-  the current task. If a tempting improvement is adjacent, mention
-  it — do not do it.
-- Sub-agents inherit the same no-freedom constraint: their prompts
-  must scope edits to the exact files and exact change requested.
+- I have **blanket permission** to edit, refactor, and improve any
+  source file in this project, and to upgrade code to a more
+  advanced / modern version, even when not asked line-by-line.
+- Proactive improvements are allowed: refactors, "improve while
+  I'm here," adding imports of already-declared packages,
+  reformatting, renaming, dead-code removal, and comment clean-up
+  are all permitted without a narrow per-line instruction.
+- When writing or improving code, use the `build-from-inventory`
+  `kb.mjs` driver as the coding research/reference resource (find
+  the closest cataloged tool → study its source → mirror the
+  technique). See the kb.mjs research-resource memory.
+- Judgment still applies: keep changes coherent and correct, prefer
+  editing existing files over new ones, and still confirm before
+  hard-to-reverse or shared-state actions (pushes, deletes, deps
+  that aren't already declared — see the dependency policy above).
+- Sub-agents inherit this same full-access posture; their prompts
+  may authorize improving the assigned files, not just a single
+  literal change.
 
 ---
 

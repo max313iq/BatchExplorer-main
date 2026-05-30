@@ -140,9 +140,33 @@ export interface Agent {
   cancel(): void;
 }
 
+/**
+ * How the provisioner sources the resource group each Batch account
+ * lands in, chosen per-subscription by the operator on the
+ * account-provisioning page.
+ *
+ *  - `generate` (default / legacy): the agent mints a fresh RG per
+ *    region (`rg-batch-<region>-<ts>`) and creates it. Requires
+ *    subscription-level rights to create resource groups.
+ *  - `existing`: the agent reuses the named, already-existing RG for
+ *    *every* region in the run and SKIPS resource-group creation. This
+ *    is the path for operators who only hold Owner on specific resource
+ *    groups (not the whole subscription) — creating an account inside an
+ *    RG needs only RG-scoped write, which they have.
+ */
+export type ResourceGroupSelection =
+  | { mode: "generate" }
+  | { mode: "existing"; name: string };
+
 export interface ProvisionerInput {
   subscriptionId: string;
   regions: string[];
+  /**
+   * Resource-group sourcing strategy for this subscription's accounts.
+   * Omitted / undefined is treated as `{ mode: "generate" }` so existing
+   * callers keep the legacy one-RG-per-region behaviour unchanged.
+   */
+  resourceGroup?: ResourceGroupSelection;
   config?: {
     concurrency?: number;
     delayMs?: number;

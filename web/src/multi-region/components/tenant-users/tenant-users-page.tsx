@@ -122,7 +122,11 @@ import {
 } from "@/lib/utils";
 
 import { OrchestratorAgent } from "../../agents/orchestrator-agent";
-import { getActiveTenant, getGraphTokenForAccount } from "../../auth/msal-auth";
+import {
+  getActiveTenant,
+  getArmTokenForAccount,
+  getGraphTokenForAccount,
+} from "../../auth/msal-auth";
 import { credentialVault } from "../../auth/credential-vault";
 import {
   attemptInteractiveLogin,
@@ -134,12 +138,48 @@ import { useUrlState } from "../../hooks/use-url-state";
 import { usePersistedState } from "../../hooks/use-persisted-state";
 import { auditLog } from "../../services/audit-log";
 import {
+  canManageMfa,
   canResetPasswords,
   getMyDirectoryRoles,
   listOrgSubscriptions,
+  listUserAuthMethods,
+  resetUserMfa,
   resetUserPassword,
+  type MfaResetResult,
+  type UserAuthMethod,
 } from "../../services/graph-service";
-import { GraphUser } from "../../services/types";
+import { AzureRequestError, GraphUser } from "../../services/types";
+
+/**
+ * Turn a failure from `listUserAuthMethods` into an operator-actionable
+ * message. The 401/403 case is the common one: reading a user's registered
+ * authentication methods is an admin-console operation (the same call the
+ * Entra portal's "Authentication methods" blade makes), so it needs both a
+ * Graph permission AND a directory role — a Contributor/Owner Azure RBAC
+ * role is NOT sufficient. We spell out exactly what's missing instead of
+ * surfacing the bare "Request Authorization failed" string.
+ */
+function describeAuthMethodsError(err: unknown, userId: string): string {
+  const status =
+    err instanceof AzureRequestError ? err.status : undefined;
+  const raw = err instanceof Error ? err.message : String(err);
+  if (status === 403 || status === 401) {
+    return (
+      `Not authorized to read authentication methods for ${userId.slice(0, 8)}…. ` +
+      `This needs the Graph permission UserAuthenticationMethod.Read.All ` +
+      `(or .ReadWrite.All to reset) AND an Entra directory role that can ` +
+      `manage auth methods — Authentication Administrator or Privileged ` +
+      `Authentication Administrator (the latter is required for admin-role ` +
+      `targets). Azure subscription roles (Owner/Contributor) do not grant ` +
+      `this. Ask a Global Administrator to assign the role and consent the ` +
+      `permission, then retry. (${raw})`
+    );
+  }
+  if (status === 404) {
+    return `User ${userId.slice(0, 8)}… was not found in this tenant (it may have been deleted). (${raw})`;
+  }
+  return raw;
+}
 import {
   useMultiRegionState,
   useMultiRegionStore,
@@ -629,6 +669,375 @@ const QuickFilterChips: React.FC<QuickFilterChipsProps> = ({
         })}
       </div>
     </TooltipProvider>
+  );
+};
+
+// =============================================================================
+// Reset-MFA dialog (single user)
+// =============================================================================
+
+interface MfaResetDialogProps {
+  user: UserRow | null;
+  account: PrivilegedAccount | null;
+  /** Whether the signed-in account holds an MFA-management role. */
+  mfaCapable: boolean;
+  onClose: () => void;
+}
+
+const MfaResetDialog: React.FC<MfaResetDialogProps> = ({
+  user,
+  account,
+  mfaCapable,
+  onClose,
+}) => {
+  const store = useMultiRegionStore();
+  const descId = React.useId();
+  const open = !!user;
+
+  const [methods, setMethods] = React.useState<UserAuthMethod[] | null>(null);
+  const [loading, setLoading] = React.useState(false);
+  const [loadError, setLoadError] = React.useState<string | null>(null);
+  const [selectedIds, setSelectedIds] = React.useState<Set<string>>(new Set());
+  const [revokeSessions, setRevokeSessions] = React.useState(true);
+  const [submitting, setSubmitting] = React.useState(false);
+  const [submitError, setSubmitError] = React.useState<string | null>(null);
+  const [result, setResult] = React.useState<MfaResetResult | null>(null);
+
+  // Fetch the user's registered methods whenever the dialog opens for a
+  // new user. Aborted on close / target change so a slow Graph call can't
+  // land its result into the next target's dialog.
+  React.useEffect(() => {
+    if (!user || !account) return;
+    let cancelled = false;
+    const ac = new AbortController();
+    setMethods(null);
+    setLoadError(null);
+    setResult(null);
+    setSubmitError(null);
+    setLoading(true);
+    void (async () => {
+      try {
+        const token = await getGraphTokenForAccount(
+          account.homeAccountId,
+          account.tenantId,
+        );
+        if (cancelled) return;
+        const list = await listUserAuthMethods(
+          account.tenantId,
+          user.id,
+          token,
+          { signal: ac.signal },
+        );
+        if (cancelled) return;
+        setMethods(list);
+        // Default to a full reset: every removable method pre-selected.
+        setSelectedIds(
+          new Set(list.filter((m) => m.removable).map((m) => m.id)),
+        );
+      } catch (err) {
+        if (cancelled) return;
+        setLoadError(describeAuthMethodsError(err, user.id));
+      } finally {
+        if (!cancelled) setLoading(false);
+      }
+    })();
+    return () => {
+      cancelled = true;
+      ac.abort();
+    };
+  }, [user, account]);
+
+  const removable = React.useMemo(
+    () => (methods ?? []).filter((m) => m.removable),
+    [methods],
+  );
+  const nonRemovable = React.useMemo(
+    () => (methods ?? []).filter((m) => !m.removable),
+    [methods],
+  );
+  const selectedRemovable = React.useMemo(
+    () => removable.filter((m) => selectedIds.has(m.id)),
+    [removable, selectedIds],
+  );
+
+  const toggle = React.useCallback((id: string) => {
+    setSelectedIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  }, []);
+
+  const canExecute =
+    !submitting &&
+    !loading &&
+    !loadError &&
+    (selectedRemovable.length > 0 || revokeSessions);
+
+  const handleClose = React.useCallback(() => {
+    if (submitting) return;
+    onClose();
+  }, [submitting, onClose]);
+
+  const handleExecute = React.useCallback(async () => {
+    if (!user || !account) return;
+    setSubmitting(true);
+    setSubmitError(null);
+    const actor = account.username || account.name || account.homeAccountId;
+    const upn = user.userPrincipalName || user.id;
+    try {
+      const token = await getGraphTokenForAccount(
+        account.homeAccountId,
+        account.tenantId,
+      );
+      const res = await resetUserMfa(account.tenantId, user.id, token, {
+        methods: selectedRemovable,
+        revokeSessions,
+      });
+      setResult(res);
+      const ok = res.failed.length === 0;
+      store.addNotification({
+        type: ok ? "success" : res.deleted.length > 0 ? "info" : "error",
+        message: ok
+          ? `Reset MFA for ${upn}: ${res.deleted.length} method${
+              res.deleted.length === 1 ? "" : "s"
+            } removed${res.sessionsRevoked ? ", sessions revoked" : ""}.`
+          : `MFA reset for ${upn} finished with ${res.failed.length} failure${
+              res.failed.length === 1 ? "" : "s"
+            }.`,
+      });
+      auditLog.record({
+        actor,
+        action: "reset_mfa",
+        target: upn,
+        status: ok ? "success" : "failure",
+        error: ok
+          ? undefined
+          : res.failed
+              .map((f) => `${f.method.kind}: ${f.error}`)
+              .join(" · "),
+        details: {
+          tenantId: account.tenantId,
+          userId: user.id,
+          deleted: res.deleted.map((m) => m.kind),
+          failed: res.failed.map((f) => ({
+            kind: f.method.kind,
+            error: f.error,
+          })),
+          skipped: res.skipped.map((m) => m.kind),
+          revokeSessions,
+          sessionsRevoked: res.sessionsRevoked,
+          isGuest: user.isGuest,
+          accountEnabled: user.accountEnabled,
+        },
+      });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      setSubmitError(msg);
+      auditLog.record({
+        actor,
+        action: "reset_mfa",
+        target: upn,
+        status: "failure",
+        error: msg,
+        details: {
+          tenantId: account.tenantId,
+          userId: user.id,
+          revokeSessions,
+        },
+      });
+    } finally {
+      setSubmitting(false);
+    }
+  }, [user, account, selectedRemovable, revokeSessions, store]);
+
+  return (
+    <Dialog
+      open={open}
+      onOpenChange={(o) => {
+        if (!o) handleClose();
+      }}
+    >
+      <DialogContent
+        aria-describedby={descId}
+        onEscapeKeyDown={(e) => submitting && e.preventDefault()}
+        onInteractOutside={(e) => submitting && e.preventDefault()}
+      >
+        <DialogHeader>
+          <DialogTitle>
+            Reset MFA for {user?.displayName || user?.userPrincipalName}
+          </DialogTitle>
+          <DialogDescription id={descId}>
+            Remove the selected authentication methods so the user must
+            re-register MFA at next sign-in. The password is never affected.
+          </DialogDescription>
+        </DialogHeader>
+
+        {user && (
+          <div className="flex flex-wrap items-center gap-x-3 gap-y-1 rounded-md border border-border bg-muted/40 px-3 py-2 text-2xs text-muted-foreground">
+            <span className="font-mono text-foreground">
+              {user.userPrincipalName || "(no UPN)"}
+            </span>
+            <span className={cn(user.accountEnabled ? "text-success" : "text-warning")}>
+              {user.accountEnabled ? "Enabled" : "Disabled"}
+            </span>
+            {user.isGuest && (
+              <Badge variant="warning" className="gap-1">
+                <UserCog className="h-3 w-3" aria-hidden /> Guest
+              </Badge>
+            )}
+          </div>
+        )}
+
+        {!mfaCapable && !result && (
+          <Alert variant="destructive" className="py-2">
+            <AlertTriangle className="h-4 w-4" />
+            <AlertDescription className="text-2xs">
+              The signed-in account doesn&apos;t appear to hold Authentication
+              Administrator or Privileged Authentication Administrator in this
+              tenant — Graph will reject method deletes with 403 unless it does.
+            </AlertDescription>
+          </Alert>
+        )}
+
+        {user?.isGuest && !result && (
+          <Alert variant="destructive" className="py-2">
+            <AlertTriangle className="h-4 w-4" />
+            <AlertDescription className="text-2xs">
+              This is a guest user — their MFA is managed in their home tenant,
+              so a reset here typically has no effect.
+            </AlertDescription>
+          </Alert>
+        )}
+
+        {result ? (
+          <div className="flex flex-col gap-2 text-xs">
+            <div className="flex items-center gap-2 text-success">
+              <CheckCircle2 className="h-4 w-4 shrink-0" />
+              {result.deleted.length} method
+              {result.deleted.length === 1 ? "" : "s"} removed
+              {result.sessionsRevoked ? "; sign-in sessions revoked" : ""}.
+            </div>
+            {result.failed.length > 0 && (
+              <div className="flex flex-col gap-1">
+                {result.failed.map((f, i) => (
+                  <div
+                    key={i}
+                    className="flex items-start gap-2 text-destructive"
+                  >
+                    <XCircle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+                    <span>
+                      <strong>{f.method.kind}</strong>: {f.error}
+                    </span>
+                  </div>
+                ))}
+              </div>
+            )}
+            {result.skipped.length > 0 && (
+              <div className="text-muted-foreground">
+                Skipped (not removable):{" "}
+                {result.skipped.map((m) => m.kind).join(", ")}.
+              </div>
+            )}
+          </div>
+        ) : loading ? (
+          <div className="flex items-center gap-2 py-4 text-xs text-muted-foreground">
+            <Loader2 className="h-4 w-4 animate-spin" />
+            Loading authentication methods…
+          </div>
+        ) : loadError ? (
+          <Alert variant="destructive" className="py-2">
+            <AlertTriangle className="h-4 w-4" />
+            <AlertDescription className="whitespace-pre-wrap text-2xs">
+              {loadError}
+            </AlertDescription>
+          </Alert>
+        ) : methods ? (
+          <div className="flex flex-col gap-2">
+            {removable.length === 0 && nonRemovable.length === 0 && (
+              <div className="text-xs text-muted-foreground">
+                No authentication methods registered for this user.
+              </div>
+            )}
+            {removable.map((m) => (
+              <label
+                key={m.id}
+                className="flex cursor-pointer items-center gap-2 rounded-md border border-border bg-surface-sunken/40 px-2.5 py-1.5 text-xs"
+              >
+                <Checkbox
+                  checked={selectedIds.has(m.id)}
+                  onCheckedChange={() => toggle(m.id)}
+                />
+                <span className="font-medium text-foreground">{m.kind}</span>
+                {m.detail && (
+                  <span className="font-mono text-muted-foreground">
+                    {m.detail}
+                  </span>
+                )}
+              </label>
+            ))}
+            {nonRemovable.map((m) => (
+              <div
+                key={m.id}
+                className="flex items-center gap-2 rounded-md border border-dashed border-border px-2.5 py-1.5 text-xs text-muted-foreground"
+              >
+                <span className="font-medium">{m.kind}</span>
+                {m.detail && <span className="font-mono">{m.detail}</span>}
+                <span className="ml-auto text-2xs">not removable</span>
+              </div>
+            ))}
+            <label className="mt-1 flex cursor-pointer items-center gap-2 text-xs text-foreground">
+              <Checkbox
+                checked={revokeSessions}
+                onCheckedChange={(c) => setRevokeSessions(!!c)}
+              />
+              Also revoke active sign-in sessions (force immediate re-auth)
+            </label>
+          </div>
+        ) : null}
+
+        {submitError && (
+          <Alert variant="destructive" className="py-2">
+            <AlertTriangle className="h-4 w-4" />
+            <AlertDescription className="whitespace-pre-wrap text-2xs">
+              {submitError}
+            </AlertDescription>
+          </Alert>
+        )}
+
+        <DialogFooter>
+          <Button
+            type="button"
+            variant="ghost"
+            onClick={handleClose}
+            disabled={submitting}
+          >
+            {result ? "Close" : "Cancel"}
+          </Button>
+          {!result && (
+            <Button
+              type="button"
+              variant="destructive"
+              onClick={() => void handleExecute()}
+              disabled={!canExecute}
+            >
+              {submitting ? (
+                <>
+                  <Loader2 className="mr-2 h-3.5 w-3.5 animate-spin" />
+                  Resetting…
+                </>
+              ) : (
+                <>
+                  <ShieldCheck className="mr-2 h-3.5 w-3.5" />
+                  Reset MFA
+                </>
+              )}
+            </Button>
+          )}
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
   );
 };
 
@@ -1952,6 +2361,10 @@ const TenantUsersPageInner: React.FC<TenantUsersPageProps> = ({
   const azureAccounts = state.azureAccounts ?? [];
 
   const [privilegedMap, setPrivilegedMap] = React.useState<Record<string, boolean>>({});
+  // Stricter capability than password reset: which signed-in accounts can
+  // manage ANOTHER user's auth methods (Auth Admin / Privileged Auth Admin /
+  // Global Admin). Gates the MFA-reset capability hint in the dialog.
+  const [mfaCapableMap, setMfaCapableMap] = React.useState<Record<string, boolean>>({});
   const [discoveringPrivileges, setDiscoveringPrivileges] = React.useState(true);
 
   const accountKey = React.useMemo(
@@ -1974,12 +2387,14 @@ const TenantUsersPageInner: React.FC<TenantUsersPageProps> = ({
     async (signal) => {
       setDiscoveringPrivileges(true);
       const next: Record<string, boolean> = {};
+      const nextMfa: Record<string, boolean> = {};
       await Promise.allSettled(
         azureAccounts.map(async (a) => {
           if (!a.homeAccountId) return;
           const tenantId = getActiveTenant(a.homeAccountId) ?? a.tenantId;
           if (!tenantId) {
             next[a.homeAccountId] = false;
+            nextMfa[a.homeAccountId] = false;
             return;
           }
           try {
@@ -1992,16 +2407,19 @@ const TenantUsersPageInner: React.FC<TenantUsersPageProps> = ({
             if (signal.aborted) return;
             const ok = canResetPasswords(roles);
             next[a.homeAccountId] = ok;
+            nextMfa[a.homeAccountId] = canManageMfa(roles);
             store.setPasswordResetCapability(a.homeAccountId, ok);
           } catch {
             if (signal.aborted) return;
             next[a.homeAccountId] = false;
+            nextMfa[a.homeAccountId] = false;
             store.setPasswordResetCapability(a.homeAccountId, false);
           }
         }),
       );
       if (signal.aborted) return;
       setPrivilegedMap(next);
+      setMfaCapableMap(nextMfa);
       setDiscoveringPrivileges(false);
     },
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -2172,13 +2590,16 @@ const TenantUsersPageInner: React.FC<TenantUsersPageProps> = ({
         setUsersError(typeof err === "string" ? err : "Failed to load users.");
       }
       try {
-        const token = await getGraphTokenForAccount(
+        // listOrgSubscriptions reads ARM role assignments tenant-wide, so it
+        // needs an ARM-audience token (NOT the Graph token used for the user
+        // list). Best-effort: a failure here just leaves sub-counts at 0.
+        const armToken = await getArmTokenForAccount(
           activeAccount.homeAccountId,
           activeAccount.tenantId,
         );
         const subRows = await listOrgSubscriptions(
           activeAccount.tenantId,
-          token,
+          armToken,
         );
         if (seq !== refreshUsersSeqRef.current) return;
         const map: Record<string, number> = {};
@@ -2462,6 +2883,7 @@ const TenantUsersPageInner: React.FC<TenantUsersPageProps> = ({
 
   // ---- Single-user reset --------------------------------------------------
   const [resetTarget, setResetTarget] = React.useState<UserRow | null>(null);
+  const [mfaTarget, setMfaTarget] = React.useState<UserRow | null>(null);
   const [detailsTarget, setDetailsTarget] = React.useState<UserRow | null>(null);
 
   // Wire the keydown ref so the `r` hotkey opens the reset dialog. We do
@@ -3133,6 +3555,10 @@ const TenantUsersPageInner: React.FC<TenantUsersPageProps> = ({
                   <KeyRound className="mr-2 h-3.5 w-3.5" />
                   Reset password
                 </DropdownMenuItem>
+                <DropdownMenuItem onSelect={() => setMfaTarget(u)}>
+                  <ShieldCheck className="mr-2 h-3.5 w-3.5" />
+                  Reset MFA
+                </DropdownMenuItem>
                 {activeAccount && (
                   <DropdownMenuItem asChild>
                     <a
@@ -3165,6 +3591,34 @@ const TenantUsersPageInner: React.FC<TenantUsersPageProps> = ({
     if (activeKey === candidate) return;
     setUrlFilters({ tenant: candidate });
   });
+
+  // RULES OF HOOKS: every hook MUST sit above the early-return branches
+  // below. Previously `announcement` sat after the empty-state return —
+  // going from zero to non-zero privileged accounts added one hook to the
+  // call sequence and React crashed with "Rendered more hooks than during
+  // the previous render". Same fix pattern as sticky-tasks-panel.tsx.
+  const selectedCount = selectedIds.size;
+  const announcement = React.useMemo(() => {
+    if (bulkRunning) {
+      const total = bulkRows.length;
+      const done = bulkRows.filter(
+        (r) =>
+          r.status === "success" ||
+          r.status === "failure" ||
+          r.status === "cancelled",
+      ).length;
+      if (cancelRequested) return `Cancelling bulk reset at ${done} of ${total}.`;
+      if (paused) return `Bulk reset paused at ${done} of ${total}.`;
+      return `Bulk reset running, ${done} of ${total} complete.`;
+    }
+    if (bulkRows.length > 0) {
+      const success = bulkRows.filter((r) => r.status === "success").length;
+      const failure = bulkRows.filter((r) => r.status === "failure").length;
+      return `Bulk reset finished. ${success} succeeded, ${failure} failed.`;
+    }
+    if (selectedCount === 0) return "";
+    return `${selectedCount} ${selectedCount === 1 ? "user" : "users"} selected.`;
+  }, [bulkRunning, bulkRows, cancelRequested, paused, selectedCount]);
 
   // ---- Render branches -----------------------------------------------------
   if (discoveringPrivileges && privilegedAccounts.length === 0) {
@@ -3208,36 +3662,6 @@ const TenantUsersPageInner: React.FC<TenantUsersPageProps> = ({
       </div>
     );
   }
-
-  const selectedCount = selectedIds.size;
-
-  // ARIA-live announcer — narrates selection-count + bulk-run state
-  // transitions for screen-reader users. We deliberately use a
-  // `aria-live="polite"` region (not `assertive`) so it doesn't
-  // preempt other announcements; debounced via the dependency-array
-  // shape so the message only updates when the upstream count or
-  // phase actually changes.
-  const announcement = React.useMemo(() => {
-    if (bulkRunning) {
-      const total = bulkRows.length;
-      const done = bulkRows.filter(
-        (r) =>
-          r.status === "success" ||
-          r.status === "failure" ||
-          r.status === "cancelled",
-      ).length;
-      if (cancelRequested) return `Cancelling bulk reset at ${done} of ${total}.`;
-      if (paused) return `Bulk reset paused at ${done} of ${total}.`;
-      return `Bulk reset running, ${done} of ${total} complete.`;
-    }
-    if (bulkRows.length > 0) {
-      const success = bulkRows.filter((r) => r.status === "success").length;
-      const failure = bulkRows.filter((r) => r.status === "failure").length;
-      return `Bulk reset finished. ${success} succeeded, ${failure} failed.`;
-    }
-    if (selectedCount === 0) return "";
-    return `${selectedCount} ${selectedCount === 1 ? "user" : "users"} selected.`;
-  }, [bulkRunning, bulkRows, cancelRequested, paused, selectedCount]);
 
   return (
     <div className="flex flex-col gap-4 py-4">
@@ -3658,6 +4082,15 @@ const TenantUsersPageInner: React.FC<TenantUsersPageProps> = ({
         account={activeAccount}
         onClose={() => setResetTarget(null)}
         onSuccess={handleResetSuccess}
+      />
+
+      <MfaResetDialog
+        user={mfaTarget}
+        account={activeAccount}
+        mfaCapable={
+          !!activeAccount && mfaCapableMap[activeAccount.homeAccountId] === true
+        }
+        onClose={() => setMfaTarget(null)}
       />
 
       <UserDetailsSheet

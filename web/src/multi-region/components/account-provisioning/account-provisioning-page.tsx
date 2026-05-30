@@ -96,6 +96,7 @@ import {
   AlertCircle,
   AlertTriangle,
   CheckCircle2,
+  ChevronDown,
   CloudDownload,
   ExternalLink,
   Info,
@@ -174,6 +175,14 @@ import { PageHeader } from "../shared/page-header";
 import { StatusBadge } from "../shared/status-badge";
 import { TokenExpiryBadge } from "../shared/token-expiry-badge";
 import { useArmToken } from "../../auth/use-arm-token";
+import { getArmTokenForAccount } from "../../auth/msal-auth";
+import {
+  listResourceGroups,
+  ArmResourceGroup,
+  canCreateBatchAccountInResourceGroup,
+  getProviderRegistration,
+} from "../../services";
+import { ResourceGroupSelection } from "../../agents/agent-types";
 
 interface AccountProvisioningPageProps {
   orchestrator: OrchestratorAgent;
@@ -190,7 +199,448 @@ interface WizardDraft {
   selectedRegions: string[];
   perSubDelaySec: number;
   skipExisting: boolean;
+  /**
+   * Per-subscription resource-group choice (keyed by subscriptionId).
+   * Absent entry ⇒ `{ mode: "generate" }`. Persisted so the operator's
+   * RG picks survive a reload mid-configuration like every other draft
+   * field.
+   */
+  resourceGroupBySub: Record<string, ResourceGroupSelection>;
 }
+
+/**
+ * Defensive parse of a persisted `resourceGroupBySub` map — drops any
+ * entry that doesn't look like a `ResourceGroupSelection` rather than
+ * letting a malformed draft leak a bad shape into the create payload.
+ */
+function sanitizeResourceGroupMap(
+  raw: unknown,
+): Record<string, ResourceGroupSelection> {
+  const out: Record<string, ResourceGroupSelection> = {};
+  if (!raw || typeof raw !== "object") return out;
+  for (const [k, v] of Object.entries(raw as Record<string, unknown>)) {
+    if (!v || typeof v !== "object") continue;
+    const mode = (v as { mode?: unknown }).mode;
+    if (mode === "generate") {
+      out[k] = { mode: "generate" };
+    } else if (mode === "existing") {
+      const name = (v as { name?: unknown }).name;
+      out[k] = { mode: "existing", name: typeof name === "string" ? name : "" };
+    }
+  }
+  return out;
+}
+
+/** Async fetch state for one subscription's resource-group list. */
+type RgFetchStatus = "idle" | "loading" | "loaded" | "error";
+interface RgFetchState {
+  status: RgFetchStatus;
+  groups: ArmResourceGroup[];
+  error?: string;
+}
+
+/**
+ * Per-RG verdict on whether the signed-in account can create a Batch account
+ * inside it (i.e. holds `Microsoft.Batch/batchAccounts/write` at that RG
+ * scope). Probed lazily for the RGs the operator is actually looking at.
+ *   - "unknown"  — not probed yet
+ *   - "loading"  — probe in flight
+ *   - "allowed"  — caller can create a Batch account here
+ *   - "denied"   — caller lacks write here (would 403 like the generate path)
+ *   - "error"    — probe itself failed (e.g. can't even read permissions);
+ *                  treated as inconclusive, never as a hard block
+ */
+type RgPermStatus = "unknown" | "loading" | "allowed" | "denied" | "error";
+
+/**
+ * Subscription-level `Microsoft.Batch` provider-registration verdict. Orthogonal
+ * to the per-RG RBAC badge: even with write access on an RG, a create 409s with
+ * MissingSubscriptionRegistration when the provider isn't registered on the sub.
+ *   - "registered"   — Batch provider is registered; creation can proceed.
+ *   - "unregistered" — not registered; every create will 409 until an Owner
+ *                      registers it (RG-scoped access can't).
+ *   - "registering"  — registration in progress; will resolve shortly.
+ *   - "loading"      — probe in flight. "error" — probe inconclusive.
+ */
+type BatchProviderState =
+  | "loading"
+  | "registered"
+  | "unregistered"
+  | "registering"
+  | "error";
+
+/** Visual badge for a resource group's create-Batch permission verdict. */
+const RgPermBadge: React.FC<{ status: RgPermStatus }> = ({ status }) => {
+  if (status === "loading") {
+    return (
+      <span
+        className="inline-flex items-center gap-1 text-2xs text-muted-foreground"
+        title="Checking your permissions on this resource group…"
+      >
+        <Loader2 className="h-2.5 w-2.5 animate-spin" aria-hidden />
+        checking
+      </span>
+    );
+  }
+  if (status === "allowed") {
+    return (
+      <span
+        className="inline-flex items-center gap-1 rounded-full border border-success/40 bg-success/10 px-1.5 py-0.5 text-2xs font-medium text-success"
+        title="You can create a Batch account in this resource group"
+      >
+        <CheckCircle2 className="h-2.5 w-2.5" aria-hidden />
+        can create
+      </span>
+    );
+  }
+  if (status === "denied") {
+    return (
+      <span
+        className="inline-flex items-center gap-1 rounded-full border border-destructive/40 bg-destructive/10 px-1.5 py-0.5 text-2xs font-medium text-destructive"
+        title="You lack Microsoft.Batch/batchAccounts/write on this resource group — creation would 403"
+      >
+        <XCircle className="h-2.5 w-2.5" aria-hidden />
+        no access
+      </span>
+    );
+  }
+  if (status === "error") {
+    return (
+      <span
+        className="inline-flex items-center gap-1 text-2xs text-muted-foreground"
+        title="Could not determine your permissions on this resource group"
+      >
+        <AlertCircle className="h-2.5 w-2.5" aria-hidden />
+        unknown
+      </span>
+    );
+  }
+  return null;
+};
+
+/**
+ * Run `worker` over `items` with at most `limit` in flight at once. Used to
+ * fan out per-RG permission probes without flooding ARM (guardedFetch paces
+ * the underlying calls too, but bounding here keeps the burst small). Never
+ * rejects — each worker is expected to swallow its own errors.
+ */
+async function runBounded<T>(
+  items: T[],
+  limit: number,
+  worker: (item: T) => Promise<void>,
+): Promise<void> {
+  let cursor = 0;
+  const runners = Array.from(
+    { length: Math.min(Math.max(1, limit), items.length) },
+    async () => {
+      while (cursor < items.length) {
+        const idx = cursor++;
+        await worker(items[idx]);
+      }
+    },
+  );
+  await Promise.all(runners);
+}
+
+/**
+ * Per-subscription resource-group picker. Lets the operator either keep
+ * the legacy "generate a new RG per region" behaviour or reuse one
+ * existing RG they own across every region in the run. The existing-RG
+ * list is fetched lazily (on first switch / dropdown-open) via the
+ * owning account's ARM token. `plannedAccountCount` is the number of
+ * accounts this run will drop into the chosen RG; we warn past ~10 per
+ * the operator's "one RG for 10 batch" guideline (a soft cap — never a
+ * hard block).
+ */
+const ResourceGroupPicker: React.FC<{
+  sub: { subscriptionId: string; displayName: string; homeAccountId?: string };
+  selection: ResourceGroupSelection;
+  onChange: (sel: ResourceGroupSelection) => void;
+  fetchState: RgFetchState | undefined;
+  onRequestGroups: () => void;
+  plannedAccountCount: number;
+  /** Per-RG create-Batch permission verdicts (keyed by RG name). */
+  permState?: Record<string, RgPermStatus>;
+  /** Ask the parent to probe permissions for these RG names (deduped there). */
+  onProbePermissions?: (subId: string, rgNames: string[]) => void;
+}> = ({
+  sub,
+  selection,
+  onChange,
+  fetchState,
+  onRequestGroups,
+  plannedAccountCount,
+  permState,
+  onProbePermissions,
+}) => {
+  const [filter, setFilter] = React.useState("");
+  // When on, hide RGs the caller can't create a Batch account in. Off by
+  // default because verdicts arrive asynchronously — flipping it on too
+  // early would hide rows that simply haven't been probed yet.
+  const [onlyUsable, setOnlyUsable] = React.useState(false);
+  // Whether the RG dropdown is open. Permission probing is gated on this so
+  // we only spend ARM calls checking access when the operator is actually
+  // looking at the list — not the instant they switch to "Pick existing".
+  const [menuOpen, setMenuOpen] = React.useState(false);
+  const mode = selection.mode;
+  const existingName = mode === "existing" ? selection.name : "";
+  const canListRgs = Boolean(sub.homeAccountId);
+  const status = fetchState?.status ?? "idle";
+  const groups = fetchState?.groups ?? [];
+
+  const filtered = React.useMemo(() => {
+    const q = filter.trim().toLowerCase();
+    const byText = !q
+      ? groups
+      : groups.filter(
+          (g) =>
+            g.name.toLowerCase().includes(q) ||
+            g.location.toLowerCase().includes(q),
+        );
+    if (!onlyUsable) return byText;
+    return byText.filter((g) => permState?.[g.name] === "allowed");
+  }, [groups, filter, onlyUsable, permState]);
+
+  // Probe permissions for the RGs currently on screen (the text-filtered
+  // set, before the usable-only filter) so the operator sees a verdict for
+  // exactly what they're looking at. The parent dedupes already-probed RGs,
+  // so re-running as the filter narrows is cheap.
+  const textFilteredNames = React.useMemo(() => {
+    const q = filter.trim().toLowerCase();
+    const list = !q
+      ? groups
+      : groups.filter(
+          (g) =>
+            g.name.toLowerCase().includes(q) ||
+            g.location.toLowerCase().includes(q),
+        );
+    return list.map((g) => g.name);
+  }, [groups, filter]);
+
+  React.useEffect(() => {
+    if (!menuOpen || mode !== "existing" || status !== "loaded") return;
+    if (!onProbePermissions || textFilteredNames.length === 0) return;
+    onProbePermissions(sub.subscriptionId, textFilteredNames);
+  }, [
+    menuOpen,
+    mode,
+    status,
+    textFilteredNames,
+    onProbePermissions,
+    sub.subscriptionId,
+  ]);
+
+  const selectedPerm: RgPermStatus =
+    mode === "existing" && existingName
+      ? permState?.[existingName] ?? "unknown"
+      : "unknown";
+
+  const overTen =
+    mode === "existing" && Boolean(existingName) && plannedAccountCount > 10;
+
+  return (
+    <div className="flex flex-col gap-1.5 rounded-md border border-border bg-surface-sunken/40 p-2.5">
+      <div className="flex items-center justify-between gap-2">
+        <span
+          className="truncate text-2xs font-medium text-foreground"
+          title={sub.subscriptionId}
+        >
+          {sub.displayName}
+        </span>
+        <div
+          className="inline-flex shrink-0 overflow-hidden rounded-md border border-border"
+          role="group"
+          aria-label={`Resource group mode for ${sub.displayName}`}
+        >
+          <button
+            type="button"
+            onClick={() => onChange({ mode: "generate" })}
+            aria-pressed={mode === "generate"}
+            className={cn(
+              "px-2 py-0.5 text-2xs transition-colors",
+              mode === "generate"
+                ? "bg-primary text-primary-foreground"
+                : "bg-muted/40 text-muted-foreground hover:bg-muted",
+            )}
+          >
+            <Plus className="mr-1 inline h-2.5 w-2.5" aria-hidden />
+            Generate
+          </button>
+          <button
+            type="button"
+            disabled={!canListRgs}
+            onClick={() => {
+              onChange({ mode: "existing", name: existingName });
+              if (canListRgs && status === "idle") onRequestGroups();
+            }}
+            aria-pressed={mode === "existing"}
+            title={
+              canListRgs
+                ? undefined
+                : "Sign in with this subscription's account to list resource groups"
+            }
+            className={cn(
+              "border-l border-border px-2 py-0.5 text-2xs transition-colors disabled:cursor-not-allowed disabled:opacity-50",
+              mode === "existing"
+                ? "bg-primary text-primary-foreground"
+                : "bg-muted/40 text-muted-foreground hover:bg-muted",
+            )}
+          >
+            Pick existing
+          </button>
+        </div>
+      </div>
+
+      {mode === "generate" ? (
+        <span className="text-2xs text-muted-foreground">
+          A new resource group is generated per region. Needs
+          subscription-level rights to create resource groups.
+        </span>
+      ) : !canListRgs ? (
+        <span className="text-2xs text-warning">
+          Sign in with this subscription&apos;s account on the Azure Accounts
+          page to list resource groups you own.
+        </span>
+      ) : (
+        <>
+          <DropdownMenu
+            onOpenChange={(open) => {
+              setMenuOpen(open);
+              if (open && status === "idle") onRequestGroups();
+            }}
+          >
+            <DropdownMenuTrigger asChild>
+              <Button
+                type="button"
+                variant="outline"
+                size="xs"
+                className="justify-between"
+                aria-label={`Choose resource group for ${sub.displayName}`}
+              >
+                <span className="truncate">
+                  {existingName || "Choose a resource group"}
+                </span>
+                <ChevronDown className="ml-2 h-3 w-3 shrink-0" aria-hidden />
+              </Button>
+            </DropdownMenuTrigger>
+            <DropdownMenuContent
+              align="start"
+              className="max-h-72 w-[--radix-dropdown-menu-trigger-width] overflow-y-auto"
+              onCloseAutoFocus={(e) => e.preventDefault()}
+            >
+              <div className="sticky top-0 z-10 -mx-1 mb-1 bg-popover px-2 py-1.5">
+                <div className="relative">
+                  <Search
+                    className="pointer-events-none absolute left-2 top-1/2 h-3 w-3 -translate-y-1/2 text-muted-foreground"
+                    aria-hidden
+                  />
+                  <Input
+                    value={filter}
+                    onChange={(e) => setFilter(e.target.value)}
+                    placeholder="Filter resource groups…"
+                    aria-label="Filter resource groups"
+                    className="h-7 pl-7 text-xs"
+                    onKeyDown={(e) => e.stopPropagation()}
+                    autoFocus
+                  />
+                </div>
+                <div className="mt-1.5 flex items-center justify-between gap-2">
+                  <button
+                    type="button"
+                    onClick={onRequestGroups}
+                    className="rounded-sm border border-border bg-muted/50 px-1.5 py-0.5 text-2xs text-foreground transition-colors hover:bg-muted"
+                    aria-label="Reload resource groups"
+                  >
+                    <RotateCw className="mr-1 inline h-2.5 w-2.5" aria-hidden />
+                    Reload
+                  </button>
+                  <label className="inline-flex cursor-pointer items-center gap-1 text-2xs text-muted-foreground">
+                    <input
+                      type="checkbox"
+                      checked={onlyUsable}
+                      onChange={(e) => setOnlyUsable(e.target.checked)}
+                      className="h-3 w-3 accent-primary"
+                      aria-label="Only show resource groups I can create a Batch account in"
+                    />
+                    Only ones I can use
+                  </label>
+                  <span className="text-2xs tabular-nums text-muted-foreground">
+                    {groups.length} found
+                  </span>
+                </div>
+              </div>
+              {status === "loading" ? (
+                <div className="flex items-center gap-2 px-2 py-3 text-2xs text-muted-foreground">
+                  <Loader2 className="h-3 w-3 animate-spin" aria-hidden />
+                  Loading resource groups…
+                </div>
+              ) : status === "error" ? (
+                <div className="px-2 py-3 text-2xs text-destructive">
+                  {fetchState?.error ?? "Failed to load resource groups."}
+                </div>
+              ) : filtered.length === 0 ? (
+                <div className="px-2 py-3 text-center text-2xs text-muted-foreground">
+                  {groups.length === 0
+                    ? "No resource groups in this subscription."
+                    : onlyUsable
+                      ? "None of the matching groups are ones you can create a Batch account in (or they’re still being checked)."
+                      : `No groups match “${filter}”.`}
+                </div>
+              ) : (
+                filtered.map((g) => {
+                  const perm = permState?.[g.name] ?? "unknown";
+                  return (
+                    <button
+                      key={g.id}
+                      type="button"
+                      onClick={() =>
+                        onChange({ mode: "existing", name: g.name })
+                      }
+                      className={cn(
+                        "flex w-full items-center justify-between gap-2 px-2 py-1.5 text-left text-xs transition-colors hover:bg-muted/60",
+                        g.name === existingName && "bg-primary/10",
+                      )}
+                    >
+                      <span className="truncate font-medium text-foreground">
+                        {g.name}
+                      </span>
+                      <span className="ml-2 flex shrink-0 items-center gap-1.5">
+                        <RgPermBadge status={perm} />
+                        <span className="font-mono text-2xs text-muted-foreground">
+                          {g.location}
+                        </span>
+                      </span>
+                    </button>
+                  );
+                })
+              )}
+            </DropdownMenuContent>
+          </DropdownMenu>
+          {mode === "existing" && !existingName && (
+            <span className="text-2xs text-warning">
+              Choose a resource group, or switch back to Generate.
+            </span>
+          )}
+          {selectedPerm === "denied" && (
+            <span className="inline-flex items-start gap-1 text-2xs text-destructive">
+              <XCircle className="mt-px h-3 w-3 shrink-0" aria-hidden />
+              You don&apos;t appear to have create access on this resource
+              group — provisioning here would 403. Pick one marked “can
+              create”, or ask an Owner for access.
+            </span>
+          )}
+          {overTen && (
+            <span className="inline-flex items-center gap-1 text-2xs text-warning">
+              <AlertTriangle className="h-3 w-3 shrink-0" aria-hidden />
+              {plannedAccountCount} accounts will land in one RG (over the ~10
+              recommended).
+            </span>
+          )}
+        </>
+      )}
+    </div>
+  );
+};
 
 type StepId = "configure" | "preflight" | "review" | "submit" | "result";
 type FlowTab = "create" | "import";
@@ -775,6 +1225,7 @@ const AccountProvisioningPageInner: React.FC<AccountProvisioningPageProps> = ({
       selectedRegions: [],
       perSubDelaySec: 30,
       skipExisting: true,
+      resourceGroupBySub: {},
     },
     {
       version: 1,
@@ -800,6 +1251,7 @@ const AccountProvisioningPageInner: React.FC<AccountProvisioningPageProps> = ({
               : 30,
           skipExisting:
             typeof d.skipExisting === "boolean" ? d.skipExisting : true,
+          resourceGroupBySub: sanitizeResourceGroupMap(d.resourceGroupBySub),
         };
       },
     },
@@ -938,6 +1390,213 @@ const AccountProvisioningPageInner: React.FC<AccountProvisioningPageProps> = ({
     (next: boolean) => setWizardDraft((d) => ({ ...d, skipExisting: next })),
     [setWizardDraft],
   );
+
+  // ---- Per-subscription resource-group selection ---------------------------
+  // `resourceGroupBySub` (persisted in the draft) maps subscriptionId →
+  // generate-new vs. reuse-an-existing-RG. `rgCacheBySub` holds the
+  // lazily-fetched RG list per sub (NOT persisted — re-enumerated each
+  // session via the owning account's ARM token, since RG membership
+  // changes server-side).
+  // Default to {} — `usePersistedState` only runs `migrate` on a version
+  // MISMATCH, so a wizard draft persisted at v1 BEFORE this field existed
+  // hydrates without `resourceGroupBySub`. Without this guard,
+  // `resourceGroupBySub[subId]` below becomes `undefined[guid]` and throws
+  // during render (crashing the page via the error boundary).
+  const resourceGroupBySub = wizardDraft.resourceGroupBySub ?? {};
+  const setResourceGroupForSub = React.useCallback(
+    (subId: string, sel: ResourceGroupSelection) => {
+      setWizardDraft((d) => ({
+        ...d,
+        resourceGroupBySub: { ...(d.resourceGroupBySub ?? {}), [subId]: sel },
+      }));
+    },
+    [setWizardDraft],
+  );
+  const [rgCacheBySub, setRgCacheBySub] = React.useState<
+    Record<string, RgFetchState>
+  >({});
+  const loadResourceGroupsForSub = React.useCallback(
+    async (subId: string) => {
+      const sub = state.subscriptions.find(
+        (s) => s.subscriptionId === subId,
+      );
+      if (!sub?.homeAccountId) {
+        setRgCacheBySub((m) => ({
+          ...m,
+          [subId]: {
+            status: "error",
+            groups: [],
+            error:
+              "No signed-in account owns this subscription — can't list resource groups.",
+          },
+        }));
+        return;
+      }
+      setRgCacheBySub((m) => ({
+        ...m,
+        [subId]: { status: "loading", groups: m[subId]?.groups ?? [] },
+      }));
+      try {
+        const token = await getArmTokenForAccount(
+          sub.homeAccountId,
+          sub.tenantId,
+        );
+        const groups = await listResourceGroups(subId, token);
+        groups.sort((a, b) => a.name.localeCompare(b.name));
+        setRgCacheBySub((m) => ({
+          ...m,
+          [subId]: { status: "loaded", groups },
+        }));
+      } catch (err: unknown) {
+        const message = err instanceof Error ? err.message : String(err);
+        setRgCacheBySub((m) => ({
+          ...m,
+          [subId]: { status: "error", groups: [], error: message },
+        }));
+      }
+    },
+    [state.subscriptions],
+  );
+
+  // ---- Per-RG "can I create a Batch account here?" probe -------------------
+  // `rgPermsBySub[subId][rgName]` is the verdict the picker badges each RG
+  // with. Not persisted — effective permissions can change server-side, so
+  // we re-probe each session via the owning account's ARM token (the same
+  // `Microsoft.Authorization/permissions` call the Azure Portal uses to
+  // grey out buttons; it only ever reports the *caller's* own access).
+  // `rgProbedRef` dedupes in-flight / already-probed RGs so the picker's
+  // per-render effect can call freely without re-issuing probes.
+  const [rgPermsBySub, setRgPermsBySub] = React.useState<
+    Record<string, Record<string, RgPermStatus>>
+  >({});
+  const rgProbedRef = React.useRef<Record<string, Set<string>>>({});
+  const probeRgPermissions = React.useCallback(
+    async (subId: string, rgNames: string[]) => {
+      const sub = state.subscriptions.find((s) => s.subscriptionId === subId);
+      if (!sub?.homeAccountId) return;
+      const seen =
+        rgProbedRef.current[subId] ??
+        (rgProbedRef.current[subId] = new Set<string>());
+      const todo = rgNames.filter((n) => !seen.has(n));
+      if (todo.length === 0) return;
+      for (const n of todo) seen.add(n);
+      setRgPermsBySub((m) => {
+        const cur = { ...(m[subId] ?? {}) };
+        for (const n of todo) cur[n] = "loading";
+        return { ...m, [subId]: cur };
+      });
+
+      let token: string;
+      try {
+        token = await getArmTokenForAccount(sub.homeAccountId, sub.tenantId);
+      } catch {
+        // Token acquisition failed — mark probed RGs inconclusive and forget
+        // them so reopening the picker retries.
+        setRgPermsBySub((m) => {
+          const cur = { ...(m[subId] ?? {}) };
+          for (const n of todo) cur[n] = "error";
+          return { ...m, [subId]: cur };
+        });
+        for (const n of todo) seen.delete(n);
+        return;
+      }
+
+      await runBounded(todo, 6, async (rgName) => {
+        try {
+          const ok = await canCreateBatchAccountInResourceGroup(
+            subId,
+            rgName,
+            token,
+          );
+          setRgPermsBySub((m) => ({
+            ...m,
+            [subId]: {
+              ...(m[subId] ?? {}),
+              [rgName]: ok ? "allowed" : "denied",
+            },
+          }));
+        } catch {
+          // Probe failed (e.g. can't read permissions at this scope) —
+          // inconclusive, never a hard block. Forget it so a reopen retries.
+          setRgPermsBySub((m) => ({
+            ...m,
+            [subId]: { ...(m[subId] ?? {}), [rgName]: "error" },
+          }));
+          seen.delete(rgName);
+        }
+      });
+    },
+    [state.subscriptions],
+  );
+
+  // ---- Microsoft.Batch provider-registration probe (early warning) ---------
+  // Independent of the RG choice: a Batch account can't be created in a
+  // subscription where the `Microsoft.Batch` resource provider isn't
+  // registered, and registering it needs subscription-scoped
+  // `Microsoft.Batch/register/action` (Contributor/Owner at sub scope) — RG-
+  // scoped access is NOT enough. We GET the registration state (read-only)
+  // when a sub is selected so the operator sees this BEFORE running, instead
+  // of hitting a per-region 409 MissingSubscriptionRegistration at submit.
+  const [batchProviderBySub, setBatchProviderBySub] = React.useState<
+    Record<string, BatchProviderState>
+  >({});
+  const batchProbedRef = React.useRef<Set<string>>(new Set());
+  const probeBatchProvider = React.useCallback(
+    async (subId: string) => {
+      if (batchProbedRef.current.has(subId)) return;
+      const sub = state.subscriptions.find((s) => s.subscriptionId === subId);
+      // No signed-in account owns this sub (typed-id fallback) — can't probe.
+      if (!sub?.homeAccountId) return;
+      batchProbedRef.current.add(subId);
+      setBatchProviderBySub((m) => ({ ...m, [subId]: "loading" }));
+      try {
+        const token = await getArmTokenForAccount(
+          sub.homeAccountId,
+          sub.tenantId,
+        );
+        const reg = await getProviderRegistration(
+          subId,
+          "Microsoft.Batch",
+          token,
+        );
+        const next: BatchProviderState =
+          reg.registrationState === "Registered"
+            ? "registered"
+            : reg.registrationState === "Registering"
+              ? "registering"
+              : "unregistered";
+        setBatchProviderBySub((m) => ({ ...m, [subId]: next }));
+      } catch {
+        // Read failed (e.g. can't read provider state) — inconclusive, never
+        // a hard block. Forget it so a later re-selection retries.
+        setBatchProviderBySub((m) => ({ ...m, [subId]: "error" }));
+        batchProbedRef.current.delete(subId);
+      }
+    },
+    [state.subscriptions],
+  );
+
+  // Probe each selected sub's Batch-provider state (deduped in the callback).
+  React.useEffect(() => {
+    for (const id of selectedSubIds) void probeBatchProvider(id);
+  }, [selectedSubIds, probeBatchProvider]);
+
+  // Selected subs confirmed to NOT have Microsoft.Batch registered — drives
+  // the early-warning banner. Only "unregistered" (a definite verdict) is
+  // surfaced; "loading"/"registering"/"error" are inconclusive and stay quiet.
+  const unregisteredBatchSubs = React.useMemo(
+    () =>
+      selectedSubIds
+        .filter((id) => batchProviderBySub[id] === "unregistered")
+        .map((id) => ({
+          id,
+          name:
+            state.subscriptions.find((s) => s.subscriptionId === id)
+              ?.displayName ?? id,
+        })),
+    [selectedSubIds, batchProviderBySub, state.subscriptions],
+  );
+
   // Region picker inline filter — typed into the search box at the top
   // of the dropdown so the operator can jump straight to a region by
   // typing part of its name. Empty string means "show all".
@@ -1204,6 +1863,19 @@ const AccountProvisioningPageInner: React.FC<AccountProvisioningPageProps> = ({
     return trimmed ? [trimmed] : [];
   }, [selectedSubIds, subscriptionId]);
 
+  // A sub set to "Pick existing" but with no RG chosen yet can't be
+  // dispatched — block submit until the operator picks one or switches
+  // back to Generate. (The >10-accounts-per-RG case is only a warning,
+  // never a block.)
+  const rgSelectionIncomplete = React.useMemo(
+    () =>
+      effectiveSubscriptionIds.some((id) => {
+        const sel = resourceGroupBySub[id];
+        return sel?.mode === "existing" && !sel.name;
+      }),
+    [effectiveSubscriptionIds, resourceGroupBySub],
+  );
+
   const configureValid = React.useMemo(() => {
     if (effectiveSubscriptionIds.length === 0) return false;
     // For the typed-input fallback, validate the GUID shape. Multi-
@@ -1217,6 +1889,7 @@ const AccountProvisioningPageInner: React.FC<AccountProvisioningPageProps> = ({
       return false;
     }
     if (selectedRegions.length === 0) return false;
+    if (rgSelectionIncomplete) return false;
     return true;
   }, [
     effectiveSubscriptionIds.length,
@@ -1224,6 +1897,7 @@ const AccountProvisioningPageInner: React.FC<AccountProvisioningPageProps> = ({
     subscriptionId,
     selectedRegions,
     state.subscriptions.length,
+    rgSelectionIncomplete,
   ]);
 
   const isStepDisabled = React.useCallback(
@@ -1593,6 +2267,10 @@ const AccountProvisioningPageInner: React.FC<AccountProvisioningPageProps> = ({
           payload: {
             subscriptionId: sub,
             regions: regionsForSub,
+            // Per-sub RG choice — generate-new (legacy) or reuse an
+            // existing RG the operator owns. Defaults to generate when
+            // the operator never touched the picker for this sub.
+            resourceGroup: resourceGroupBySub[sub] ?? { mode: "generate" },
           },
           signal: ac.signal,
         });
@@ -1704,6 +2382,7 @@ const AccountProvisioningPageInner: React.FC<AccountProvisioningPageProps> = ({
     state.subscriptions,
     armTokenTracker.secondsUntilExpiry,
     setResumeHint,
+    resourceGroupBySub,
   ]);
 
   // Stop = abort the inter-sub timer + tell the orchestrator to bail
@@ -2786,6 +3465,73 @@ const AccountProvisioningPageInner: React.FC<AccountProvisioningPageProps> = ({
           )}
 
           {subscriptionSelector}
+
+          {state.subscriptions.length > 0 && selectedSubIds.length > 0 && (
+            <div className="flex flex-col gap-1.5 max-w-[28rem]">
+              <Label>Resource groups</Label>
+              <span className="text-2xs text-muted-foreground">
+                Per subscription, generate a fresh RG per region, or reuse one
+                existing RG you own across every region (about 10 accounts per
+                RG).
+              </span>
+              {unregisteredBatchSubs.length > 0 && (
+                <Alert
+                  variant="destructive"
+                  className="px-3 py-2 text-xs [&>svg]:left-3 [&>svg]:top-2.5 [&>svg~*]:pl-6"
+                >
+                  <AlertCircle className="h-4 w-4" aria-hidden />
+                  <AlertDescription className="text-xs leading-relaxed">
+                    <span className="font-semibold">
+                      Microsoft.Batch is not registered
+                    </span>{" "}
+                    on{" "}
+                    {unregisteredBatchSubs.map((s) => s.name).join(", ")}.
+                    Account creation will fail with{" "}
+                    <code className="font-mono">
+                      MissingSubscriptionRegistration
+                    </code>{" "}
+                    no matter which resource group you pick. Registering a
+                    provider is a subscription-scoped action — resource-group
+                    access can&apos;t do it. Ask a subscription Owner to run{" "}
+                    <code className="font-mono">
+                      az provider register --namespace Microsoft.Batch
+                    </code>{" "}
+                    (or Subscription → Resource providers → Microsoft.Batch →
+                    Register), then retry.
+                  </AlertDescription>
+                </Alert>
+              )}
+              <div className="flex flex-col gap-2">
+                {selectedSubIds.map((id) => {
+                  const sub = state.subscriptions.find(
+                    (s) => s.subscriptionId === id,
+                  );
+                  if (!sub) return null;
+                  return (
+                    <ResourceGroupPicker
+                      key={id}
+                      sub={{
+                        subscriptionId: id,
+                        displayName: sub.displayName,
+                        homeAccountId: sub.homeAccountId,
+                      }}
+                      selection={
+                        resourceGroupBySub[id] ?? { mode: "generate" }
+                      }
+                      onChange={(sel) => setResourceGroupForSub(id, sel)}
+                      fetchState={rgCacheBySub[id]}
+                      onRequestGroups={() => void loadResourceGroupsForSub(id)}
+                      permState={rgPermsBySub[id]}
+                      onProbePermissions={probeRgPermissions}
+                      plannedAccountCount={
+                        dispatchPerSub.get(id)?.length ?? selectedRegions.length
+                      }
+                    />
+                  );
+                })}
+              </div>
+            </div>
+          )}
 
           <div className="flex flex-col gap-1.5 max-w-[28rem]">
             <Label htmlFor={regionFieldId}>

@@ -94,6 +94,12 @@ class AuditLog {
     // Mirror store changes to local listeners so existing onChange consumers
     // keep firing without coupling to react-context.
     this.storeUnsub = store.subscribeAuditLog(() => this.notify());
+    // Notify on bind so subscribers that registered BEFORE the store was
+    // attached (the common case: child useEffect runs before parent's, so
+    // AuditLogPage subscribes before MultiRegionDashboard calls bind) pick
+    // up the store-backed entries — including any rows hydrated from
+    // localStorage by the store constructor.
+    this.notify();
   }
 
   /** Unbind the current store. Safe to call multiple times. */

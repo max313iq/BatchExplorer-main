@@ -93,16 +93,17 @@ module.exports = (env) => {
             host: "0.0.0.0",
             allowedHosts: "all",
             hot: true,
-            // liveReload disabled so a webpack-dev-server failed-HMR fallback
-            // doesn't full-reload the page mid-task. Long-running orchestrator
-            // workflows (create_pools_smart across 50+ accounts) lose their
-            // in-flight fetch() when the runtime is torn down, so the page
-            // would show "Interrupted by reload" even though the user wasn't
-            // the one who reloaded — HMR was. With this off, edits to React
-            // components hot-swap (state preserved); edits that can't be
-            // hot-swapped require an EXPLICIT user reload, which is the right
-            // trade-off for in-progress dispatches.
-            liveReload: false,
+            // liveReload ON so a rejected HMR update falls back to a clean
+            // full reload instead of running stale code. No file in src/
+            // calls module.hot.accept(...), so most edits rejection-propagate
+            // up to index.tsx; with liveReload off, the bundle in the browser
+            // would drift from disk silently. Long-running orchestrator
+            // workflows already model interruption via TaskRecord status
+            // "interrupted", so a reload during a long batch is recoverable
+            // from the Task Manager panel. ErrorBoundary also auto-reloads
+            // on React hook-count-mismatch errors as a last line of defense
+            // (see shared/error-boundary.tsx).
+            liveReload: true,
             client: {
                 overlay: {
                     errors: true,

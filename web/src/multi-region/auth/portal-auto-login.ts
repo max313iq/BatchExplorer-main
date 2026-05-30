@@ -67,30 +67,38 @@ export interface PortalAutoLoginResult {
   status?: number;
   error?: string;
   /**
-   * Set by the dev-server when AAD's change-password form was successfully
-   * submitted, regardless of whether the rest of the flow (MSAL session
-   * add, popup close, etc.) completed. Callers MUST update the credential
-   * vault with `args.newPassword` when this is true and `args.newPassword`
-   * was provided — even if `ok` is false. AAD-side rotation is irreversible
-   * once submitted; if the vault still holds the old temp password, the
-   * next sign-in for that account will fail with "wrong password".
+   * The dev-server's raw `passwordRotated` boolean, surfaced verbatim for
+   * diagnostics. It is `true` only when AAD's change-password form was found,
+   * filled, and submitted server-side. This field does NOT account for
+   * transport failures or non-2xx responses, so it must NEVER be used on its
+   * own to gate a credential-vault write — use {@link passwordRotationStatus}
+   * for every decision. May be omitted entirely on a mid-flight transport
+   * failure, where the dev-server's answer never reached us.
    */
   passwordRotated?: boolean;
   /**
-   * Three-state outcome describing what we know about AAD-side password
-   * rotation:
-   *   - "confirmed" — dev-server replied with `passwordRotated: true`
-   *     and the response itself reached us cleanly. Caller MUST update
-   *     its vault with `args.newPassword`.
-   *   - "unknown"   — the fetch failed mid-flight (network drop,
-   *     dev-server crash) AFTER the dev-server may have already
-   *     submitted the change-password form. The vault could be stale
-   *     OR up-to-date — we cannot tell. Caller MUST prompt the
-   *     operator to verify (e.g. attempt a sign-in with the new
-   *     password and a "use old password instead" escape hatch).
-   *   - "none"      — the flow did NOT include a password rotation
-   *     (either `mustChangePassword: false` or no `newPassword`
-   *     supplied), so there is nothing to verify.
+   * Precise three-state outcome and the ONLY field a caller may consult to
+   * decide whether to persist a rotated credential. The mapping is
+   * deliberately conservative: a credential is overwritten only on an
+   * affirmative, transport-clean confirmation.
+   *
+   *   - "confirmed" — a rotation was requested (`mustChangePassword` AND
+   *     `newPassword`), the dev-server answered with a clean HTTP-ok (2xx)
+   *     response, AND the body reported `passwordRotated === true`. Caller
+   *     MUST persist `args.newPassword` into the vault.
+   *   - "none"      — no rotation took effect. Either no rotation was
+   *     requested, OR a definitive HTTP response was received (including any
+   *     non-2xx response) but it did not affirmatively confirm a rotation
+   *     (`passwordRotated !== true`), so AAD still holds the ORIGINAL
+   *     password. Caller MUST keep the ORIGINAL password in the vault and
+   *     MUST NOT write `args.newPassword`.
+   *   - "unknown"   — a rotation was requested but the fetch threw
+   *     mid-flight (network drop, dev-server crash, CORS, abort) BEFORE any
+   *     HTTP response was observed. The dev-server MAY have already submitted
+   *     the change-password form, so the vault could be stale OR up-to-date —
+   *     we cannot tell. Caller MUST NOT silently overwrite; it MUST prompt
+   *     the operator to verify (e.g. attempt a sign-in with the new password
+   *     and a "use old password instead" escape hatch).
    *
    * Always set on every code path so callers can match exhaustively.
    */
@@ -119,10 +127,12 @@ export interface PortalAutoLoginResult {
  *
  * Implementation note: when the rotation could not have happened
  * (`mustChangePassword: false` or no `newPassword`), we always set
- * `passwordRotationStatus: "none"`, regardless of HTTP outcome. When
- * a rotation COULD have happened, the status maps to the actual
- * `passwordRotated` body field on HTTP success, or to "unknown" on
- * mid-flight transport failure.
+ * `passwordRotationStatus: "none"`, regardless of HTTP outcome. When a
+ * rotation COULD have happened, the status is "confirmed" ONLY on a clean
+ * HTTP-ok (2xx) response whose body reports `passwordRotated === true`; a
+ * non-2xx response — even one carrying `passwordRotated: true` — collapses to
+ * "none" (the vault keeps the ORIGINAL password); and a mid-flight transport
+ * failure (the fetch throwing before any response) maps to "unknown".
  */
 export async function launchPortalAutoLogin(
   args: PortalAutoLoginArgs,
@@ -155,18 +165,31 @@ export async function launchPortalAutoLogin(
       /* fallback to text below */
     }
     const rotated = !!body?.passwordRotated;
-    const rotationStatus: PortalAutoLoginResult["passwordRotationStatus"] =
-      !rotationAttempted ? "none" : rotated ? "confirmed" : "none";
     if (!response.ok) {
+      // A definitive HTTP response was received (the request reached the
+      // dev-server and came back), so the outcome is knowable — never
+      // "unknown". The contract reserves "confirmed" strictly for a clean
+      // HTTP-ok response, so a non-2xx can never be "confirmed": it always
+      // collapses to "none" and consumers keep the ORIGINAL password. The
+      // server's raw `passwordRotated` flag is still surfaced verbatim for
+      // diagnostics.
       const text = body?.message ?? (await response.text().catch(() => ""));
       return {
         ok: false,
         status: response.status,
         error: text || `HTTP ${response.status}`,
         passwordRotated: rotated,
-        passwordRotationStatus: rotationStatus,
+        passwordRotationStatus: "none",
       };
     }
+    // "confirmed" requires ALL of: rotation was requested, the response was
+    // HTTP-ok (guaranteed here), and the body affirmatively reported
+    // `passwordRotated === true`. Any other combination — including a server
+    // that returns `passwordRotated:true` without a rotation having been
+    // requested — collapses to "none", so the vault keeps the ORIGINAL
+    // password.
+    const rotationStatus: PortalAutoLoginResult["passwordRotationStatus"] =
+      rotationAttempted && rotated ? "confirmed" : "none";
     return {
       ok: true,
       status: response.status,

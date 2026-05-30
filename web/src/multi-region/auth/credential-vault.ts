@@ -5,17 +5,38 @@
  * and stores it AES-GCM-encrypted in localStorage so the user can re-launch
  * an Azure portal sign-in for any provisioned account on demand.
  *
+ * Storage model — PER-ACCOUNT envelopes (v1):
+ *   key   = `azbm:credential-vault:v1:<homeAccountId>`
+ *   value = { version, saltB64, ivB64, ciphertextB64 }  (one VaultEnvelope)
+ *
+ *   Each signed-in MSAL account gets its OWN encrypted envelope, keyed by
+ *   homeAccountId and encrypted under a key derived from that same
+ *   homeAccountId. This is a deliberate change from the original
+ *   single-envelope design (`azbm:credential-vault:v1`, no suffix), where a
+ *   write by account B re-encrypted the whole blob under B's key and so
+ *   CLOBBERED account A's entries — only the last writer's credentials ever
+ *   survived. Per-account envelopes let multiple accounts' credentials
+ *   coexist, which is what the "Created by me" page needs to surface every
+ *   saved password regardless of which account minted it.
+ *
+ * Migration:
+ *   The legacy single-envelope key is read-only now. `loadPayloadForAccount`
+ *   migrates on read: if an account has no per-account envelope yet but the
+ *   legacy envelope decrypts under that account's key, its entries are copied
+ *   into the per-account key. The legacy key is left in place so a different
+ *   account can still migrate its own slice out of it; stale legacy data is
+ *   harmless once every account has migrated.
+ *
  * Encryption key: derived per-MSAL-account via PBKDF2 from
  *   `${homeAccountId}|${window.location.origin}`. The signed-in user is
  *   already authenticated; we treat the homeAccountId as a per-user salt so
- *   one signed-in account can't read another's vault entries (matches the
- *   multi-account model in msal-auth.ts).
+ *   one signed-in account can't decrypt another's vault entries.
  *
- * Storage shape (after decrypt):
- *   { version: 1, entries: CredentialEntry[] }
- *
- * On `clearAll()` (called from msal-auth.logout) we wipe the localStorage
- * key entirely — no decrypt round-trip needed.
+ * Lifecycle: the vault deliberately SURVIVES logout. Sign-out clears the
+ * MSAL token cache (see msal-auth.logout / logoutAccount, which explicitly
+ * skip `azbm:credential-vault:` keys) but leaves saved passwords intact so
+ * an operator who signs back in still sees what they created. `clearAll()`
+ * remains available for an explicit, user-initiated wipe.
  */
 
 // AUDIT-LOG BINDING. Vault put / remove events surface through the
@@ -23,7 +44,10 @@
 // without us pulling that module in here. See `auth/audit-binding.ts`.
 import { recordAuditEvent } from "./audit-binding";
 
+/** Legacy single-envelope key (read-only; migrate-on-read source). */
 const STORAGE_KEY = "azbm:credential-vault:v1";
+/** Per-account envelope key prefix; full key = PREFIX + homeAccountId. */
+const STORAGE_KEY_PREFIX = "azbm:credential-vault:v1:";
 const PBKDF2_ITERATIONS = 250_000;
 const PBKDF2_SALT_BYTES = 16;
 const AES_IV_BYTES = 12;
@@ -115,9 +139,14 @@ function passphraseFor(homeAccountId: string): string {
 // Storage
 // ---------------------------------------------------------------------------
 
-function readEnvelope(): VaultEnvelope | null {
+/** Full localStorage key for an account's per-account envelope. */
+function envelopeKeyFor(homeAccountId: string): string {
+  return `${STORAGE_KEY_PREFIX}${homeAccountId}`;
+}
+
+function readEnvelopeAt(storageKey: string): VaultEnvelope | null {
   if (typeof localStorage === "undefined") return null;
-  const raw = localStorage.getItem(STORAGE_KEY);
+  const raw = localStorage.getItem(storageKey);
   if (!raw) return null;
   try {
     const parsed = JSON.parse(raw) as VaultEnvelope;
@@ -135,9 +164,18 @@ function readEnvelope(): VaultEnvelope | null {
   }
 }
 
-function writeEnvelope(env: VaultEnvelope): void {
+function writeEnvelopeAt(storageKey: string, env: VaultEnvelope): void {
   if (typeof localStorage === "undefined") return;
-  localStorage.setItem(STORAGE_KEY, JSON.stringify(env));
+  localStorage.setItem(storageKey, JSON.stringify(env));
+}
+
+/** Legacy single-envelope reader, retained for migration + tests. */
+function readEnvelope(): VaultEnvelope | null {
+  return readEnvelopeAt(STORAGE_KEY);
+}
+
+function writeEnvelope(env: VaultEnvelope): void {
+  writeEnvelopeAt(STORAGE_KEY, env);
 }
 
 async function decryptVault(
@@ -190,6 +228,41 @@ async function encryptVault(
   };
 }
 
+/**
+ * Decrypt an account's full credential payload, preferring the per-account
+ * envelope and migrating on read from the legacy single envelope when the
+ * per-account one is absent. Returns null when the account has no readable
+ * entries (no envelope, wrong key, or crypto unavailable).
+ */
+async function loadPayloadForAccount(
+  homeAccountId: string,
+): Promise<VaultPayload | null> {
+  // Preferred: the account's own envelope.
+  const perAccount = readEnvelopeAt(envelopeKeyFor(homeAccountId));
+  if (perAccount) {
+    const decoded = await decryptVault(homeAccountId, perAccount);
+    if (decoded) return decoded;
+  }
+  // Migrate-on-read: the legacy single envelope held one account's entries
+  // (encrypted under the last writer's key). If it decrypts under THIS
+  // account, copy those entries into the per-account key so future writes
+  // by other accounts can't clobber them.
+  const legacy = readEnvelopeAt(STORAGE_KEY);
+  if (legacy) {
+    const decoded = await decryptVault(homeAccountId, legacy);
+    if (decoded) {
+      try {
+        const sealed = await encryptVault(homeAccountId, decoded);
+        writeEnvelopeAt(envelopeKeyFor(homeAccountId), sealed);
+      } catch {
+        /* best-effort migration — fall through with the decoded payload */
+      }
+      return decoded;
+    }
+  }
+  return null;
+}
+
 // ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
@@ -207,6 +280,16 @@ export interface CredentialVault {
     homeAccountId: string,
   ): Promise<CredentialEntry | null>;
   list(filter?: CredentialVaultListFilter): Promise<CredentialEntry[]>;
+  /**
+   * List credentials across MANY signed-in accounts at once, merged into a
+   * single array. Used by the "Created by me" page so the operator sees every
+   * saved password regardless of which account created it. Order follows
+   * `homeAccountIds`; duplicate ids are de-duplicated.
+   */
+  listAllForAccounts(
+    homeAccountIds: string[],
+    tenantId?: string,
+  ): Promise<CredentialEntry[]>;
   remove(
     upn: string,
     tenantId: string,
@@ -222,20 +305,16 @@ export interface CredentialVault {
 
 class LocalCredentialVault implements CredentialVault {
   /**
-   * The vault is keyed by the writing-user's homeAccountId. Reads scope to
-   * the same key, so vault entries written by one MSAL account are invisible
-   * to a different signed-in account on the same browser.
+   * Each entry lives in the writing account's own per-account envelope, so a
+   * write by one signed-in account never disturbs another's saved credentials.
    */
   async put(entry: CredentialEntry): Promise<void> {
     if (!entry?.homeAccountId || !entry.upn || !entry.tenantId) return;
-    const env = readEnvelope();
-    const existing = env
-      ? (await decryptVault(entry.homeAccountId, env)) ?? {
-          version: VAULT_VERSION as 1,
-          entries: [],
-        }
-      : { version: VAULT_VERSION as 1, entries: [] as CredentialEntry[] };
-    // Replace prior entry for the same upn+tenant.
+    const existing = (await loadPayloadForAccount(entry.homeAccountId)) ?? {
+      version: VAULT_VERSION as 1,
+      entries: [] as CredentialEntry[],
+    };
+    // Replace any prior entry for the same upn+tenant within this account.
     const next: VaultPayload = {
       version: VAULT_VERSION,
       entries: [
@@ -251,7 +330,7 @@ class LocalCredentialVault implements CredentialVault {
       ],
     };
     const sealed = await encryptVault(entry.homeAccountId, next);
-    writeEnvelope(sealed);
+    writeEnvelopeAt(envelopeKeyFor(entry.homeAccountId), sealed);
     // NEVER include the password / decrypted body — only enough
     // identifying metadata for the operator to correlate the audit
     // entry with the action that produced it.
@@ -279,13 +358,12 @@ class LocalCredentialVault implements CredentialVault {
   }
 
   async list(filter?: CredentialVaultListFilter): Promise<CredentialEntry[]> {
-    const env = readEnvelope();
-    if (!env) return [];
-    // We need a homeAccountId to decrypt. Caller must pass one in filter, or
-    // we return [] (we can't enumerate every signed-in account here without
-    // a circular import; pages always know their active account).
+    // We need a homeAccountId to decrypt. Callers that want every account's
+    // entries use `listAllForAccounts`; a bare list() with no account returns
+    // [] (we can't enumerate accounts here without a circular import — pages
+    // always know their signed-in accounts).
     if (!filter?.homeAccountId) return [];
-    const payload = await decryptVault(filter.homeAccountId, env);
+    const payload = await loadPayloadForAccount(filter.homeAccountId);
     if (!payload) return [];
     return payload.entries.filter((e) => {
       if (filter.tenantId && e.tenantId !== filter.tenantId) return false;
@@ -295,14 +373,33 @@ class LocalCredentialVault implements CredentialVault {
     });
   }
 
+  async listAllForAccounts(
+    homeAccountIds: string[],
+    tenantId?: string,
+  ): Promise<CredentialEntry[]> {
+    const seen = new Set<string>();
+    const out: CredentialEntry[] = [];
+    for (const id of homeAccountIds) {
+      if (!id || seen.has(id)) continue;
+      seen.add(id);
+      const payload = await loadPayloadForAccount(id);
+      if (!payload) continue;
+      for (const e of payload.entries) {
+        if (tenantId && e.tenantId !== tenantId) continue;
+        // Guard against a corrupted envelope leaking another account's id.
+        if (e.homeAccountId !== id) continue;
+        out.push(e);
+      }
+    }
+    return out;
+  }
+
   async remove(
     upn: string,
     tenantId: string,
     homeAccountId: string,
   ): Promise<void> {
-    const env = readEnvelope();
-    if (!env) return;
-    const payload = await decryptVault(homeAccountId, env);
+    const payload = await loadPayloadForAccount(homeAccountId);
     if (!payload) return;
     const next: VaultPayload = {
       version: VAULT_VERSION,
@@ -316,7 +413,7 @@ class LocalCredentialVault implements CredentialVault {
       ),
     };
     const sealed = await encryptVault(homeAccountId, next);
-    writeEnvelope(sealed);
+    writeEnvelopeAt(envelopeKeyFor(homeAccountId), sealed);
     recordAuditEvent({
       actor: upn,
       action: "credentialVault.remove",
@@ -336,10 +433,22 @@ class LocalCredentialVault implements CredentialVault {
     await this.put({ ...entry, lastUsedAt: new Date().toISOString() });
   }
 
+  /**
+   * Explicit, user-initiated wipe of EVERY saved credential (legacy + all
+   * per-account envelopes). NOT called on logout — sign-out keeps the vault
+   * so a returning operator still sees what they created.
+   */
   clearAll(): void {
     if (typeof localStorage === "undefined") return;
     try {
-      localStorage.removeItem(STORAGE_KEY);
+      const toRemove: string[] = [];
+      for (let i = 0; i < localStorage.length; i++) {
+        const k = localStorage.key(i);
+        if (k && (k === STORAGE_KEY || k.startsWith(STORAGE_KEY_PREFIX))) {
+          toRemove.push(k);
+        }
+      }
+      for (const k of toRemove) localStorage.removeItem(k);
     } catch {
       /* ignore */
     }
@@ -348,9 +457,16 @@ class LocalCredentialVault implements CredentialVault {
 
 export const credentialVault: CredentialVault = new LocalCredentialVault();
 
-/** Internal helper — exposed for tests only. */
+/** Internal helpers — exposed for tests only. */
 export const __testing__ = {
   STORAGE_KEY,
+  STORAGE_KEY_PREFIX,
+  envelopeKeyFor,
   readEnvelope,
+  readEnvelopeAt,
   writeEnvelope,
+  writeEnvelopeAt,
+  /** Seal a payload under an account's key — lets tests author a legacy envelope. */
+  encryptForTest: (homeAccountId: string, payload: VaultPayload) =>
+    encryptVault(homeAccountId, payload),
 };

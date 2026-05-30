@@ -72,6 +72,7 @@ export {
   assignSubscriptionRole,
   AZURE_ROLE_OWNER,
   listSubscriptionRoleAssignments,
+  listSubscriptionAccessByPrincipal,
   deleteRoleAssignment,
   listSubscriptionRoleDefinitions,
   // EA Billing Manager
@@ -105,6 +106,10 @@ export {
   queryCostManagement,
   // Resource Manager
   listResourceGroups,
+  listResourceGroupPermissions,
+  isActionAllowed,
+  canCreateBatchAccountInResourceGroup,
+  getProviderRegistration,
   validateMoveResources,
   moveResources,
   // Subscription Mover
@@ -150,6 +155,9 @@ export type {
   CostQueryBody,
   CostQueryResult,
   ResourceMoveOutcome,
+  EffectivePermission,
+  PrincipalSubscriptionAccess,
+  SubscriptionAccessResult,
 } from "./arm-service";
 
 // Batch data plane

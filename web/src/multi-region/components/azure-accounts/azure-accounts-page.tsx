@@ -111,6 +111,7 @@ import {
   loginAccount,
   logoutAccount,
 } from "../../auth/msal-auth";
+import { getImportedPseudoAccounts } from "../../auth/imported-tokens";
 // Canonical tenant-switch util — the page used to re-implement this
 // inline (~165 LOC) which drifted from the header switcher's copy.
 // Now everyone calls the SAME implementation.
@@ -1421,27 +1422,68 @@ const AzureAccountsPageInner: React.FC = () => {
       try {
         const msalAccounts = await getAllLoggedInAccounts();
         if (isCancelled()) return;
-        if (!msalAccounts || msalAccounts.length === 0) {
+
+        // Imported tokens (pasted via the Import Token page) live in
+        // localStorage and survive reloads — they MUST appear alongside
+        // MSAL accounts. The previous code replaced the slice with MSAL
+        // only and silently wiped imported principals on every refresh.
+        const importedAccounts = getImportedPseudoAccounts();
+
+        if (
+          (!msalAccounts || msalAccounts.length === 0) &&
+          importedAccounts.length === 0
+        ) {
           store.setAzureAccounts([]);
           return;
         }
 
-        const initial: AzureLoginAccount[] = msalAccounts.map((acct) => ({
-          homeAccountId: acct.homeAccountId,
-          localAccountId: acct.localAccountId,
-          username: acct.username,
-          name: acct.name ?? "",
-          tenantId: acct.tenantId,
-          environment: acct.environment,
-          subscriptions: [],
-          subscriptionCount: 0,
-          status: "loading" as const,
-          error: null,
-          addedAt: new Date().toISOString(),
-        }));
+        // MSAL wins on homeAccountId conflict — it carries the live refresh
+        // token; the imported entry would otherwise overwrite display
+        // fields with stale JWT claims.
+        const msalIds = new Set(
+          (msalAccounts ?? []).map((a) => a.homeAccountId),
+        );
+        const initial: AzureLoginAccount[] = [
+          ...(msalAccounts ?? []).map((acct) => ({
+            homeAccountId: acct.homeAccountId,
+            localAccountId: acct.localAccountId,
+            username: acct.username,
+            name: acct.name ?? "",
+            tenantId: acct.tenantId,
+            environment: acct.environment,
+            subscriptions: [],
+            subscriptionCount: 0,
+            status: "loading" as const,
+            error: null,
+            addedAt: new Date().toISOString(),
+          })),
+          // `ImportedPseudoAccount.subscriptions` is `unknown[]` to keep the
+          // auth module dependency-free; coerce to AzureLoginSubscription[]
+          // (always [] for a fresh pseudo-account — the real subs are
+          // loaded by the Promise.allSettled pass below).
+          ...importedAccounts
+            .filter((a) => !msalIds.has(a.homeAccountId))
+            .map<AzureLoginAccount>((a) => ({
+              homeAccountId: a.homeAccountId,
+              localAccountId: a.localAccountId,
+              username: a.username,
+              name: a.name,
+              tenantId: a.tenantId,
+              environment: a.environment,
+              subscriptions: [],
+              subscriptionCount: a.subscriptionCount,
+              status: "loading" as const,
+              error: null,
+              addedAt: a.addedAt,
+            })),
+        ];
 
         store.setAzureAccounts(initial);
 
+        // Imported accounts go through the same `listSubscriptionsForAccount`
+        // path — msal-auth already routes ARM token acquisition through the
+        // imported-token redemption lane when no MSAL account exists for the
+        // homeAccountId.
         await Promise.allSettled(
           initial.map(async (acct) => {
             try {

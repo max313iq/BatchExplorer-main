@@ -33,7 +33,10 @@ import {
   WorkflowState,
 } from "./store-types";
 import type { EndpointFamily } from "../services/types";
-import { setActiveTenant as msalSetActiveTenant } from "../auth/msal-auth";
+import {
+  getActiveTenant as msalGetActiveTenant,
+  setActiveTenant as msalSetActiveTenant,
+} from "../auth/msal-auth";
 import {
   PoolDefaults,
   loadPoolDefaults,
@@ -47,6 +50,14 @@ const ACTIVITIES_STORAGE_KEY = "multi-region:activities";
 const ACTIVITY_PERSIST_DEBOUNCE_MS = 500;
 const ACTIVITY_TERMINAL_TTL_MS = 30 * 60 * 1000;
 const ACTIVITY_FAILED_TTL_MS = 2 * 60 * 1000;
+// Audit entries persist to localStorage so failure events ("Failed to add
+// account: fetch failed", create-pool errors, role-grant rejections, etc.)
+// survive page reloads — without this, every refresh wipes the only
+// forensic record of intermittent backend / network issues. Cap matches
+// the in-memory cap in addAuditEntry.
+const AUDIT_STORAGE_KEY = "multi-region:audit-entries";
+const AUDIT_PERSIST_DEBOUNCE_MS = 500;
+const AUDIT_MAX_PERSISTED = 500;
 
 type Listener = () => void;
 
@@ -56,6 +67,7 @@ export class MultiRegionStore {
   private _auditListeners = new Set<Listener>();
   private _pausedActivities = new Set<string>();
   private _persistTimer: ReturnType<typeof setTimeout> | null = null;
+  private _auditPersistTimer: ReturnType<typeof setTimeout> | null = null;
   private authMode: "msal" | "cli" = "msal";
 
   constructor(initialState?: Partial<MultiRegionState>) {
@@ -64,6 +76,9 @@ export class MultiRegionStore {
     this._state.poolDefaults = loadPoolDefaults();
     // Hydrate activities from sessionStorage so cross-page nav doesn't lose state
     this.hydrateActivities();
+    // Hydrate audit entries so prior failure events stay readable on the
+    // Audit Log page after reloads.
+    this.hydrateAuditEntries();
   }
 
   getState(): Readonly<MultiRegionState> {
@@ -246,15 +261,16 @@ export class MultiRegionStore {
   // --- Audit Entries ---
 
   /**
-   * Prepend an audit entry (newest first), capped at 500 entries. The
-   * entry is expected to already carry `id` and `timestamp` from the
-   * audit-log facade, so we just append.
+   * Prepend an audit entry (newest first), capped at 500. The entry is
+   * expected to already carry `id` and `timestamp` from the audit-log
+   * facade. Debounce-persists to localStorage so the trail survives reloads.
    */
   addAuditEntry(entry: AuditEntry): void {
     const auditEntries = [entry, ...this._state.auditEntries].slice(0, 500);
     this._state = { ...this._state, auditEntries };
     this._notify();
     this._notifyAudit();
+    this._schedulePersistAuditEntries();
   }
 
   /** Defensive copy of the current audit entries. */
@@ -267,6 +283,9 @@ export class MultiRegionStore {
     this._state = { ...this._state, auditEntries: [] };
     this._notify();
     this._notifyAudit();
+    // Persist immediately (skip the debounce) so a clear followed by a
+    // reload doesn't resurrect the cleared entries from disk.
+    this.persistAuditEntries();
   }
 
   /**
@@ -456,6 +475,45 @@ export class MultiRegionStore {
     }, ACTIVITY_PERSIST_DEBOUNCE_MS);
   }
 
+  /** Debounce-write audit entries to localStorage. Dampens the EA pre-grant
+   *  flow's parallel per-principal grant-result fan-out. */
+  private _schedulePersistAuditEntries(): void {
+    if (typeof localStorage === "undefined") return;
+    if (this._auditPersistTimer) clearTimeout(this._auditPersistTimer);
+    this._auditPersistTimer = setTimeout(() => {
+      this._auditPersistTimer = null;
+      this.persistAuditEntries();
+    }, AUDIT_PERSIST_DEBOUNCE_MS);
+  }
+
+  /** Persist the current audit-entries slice to localStorage. */
+  persistAuditEntries(): void {
+    try {
+      if (typeof localStorage === "undefined") return;
+      const slice = this._state.auditEntries.slice(0, AUDIT_MAX_PERSISTED);
+      localStorage.setItem(AUDIT_STORAGE_KEY, JSON.stringify(slice));
+    } catch {
+      // localStorage may be full/disabled — best-effort.
+    }
+  }
+
+  /** Hydrate audit entries from localStorage on store construction. */
+  hydrateAuditEntries(): void {
+    try {
+      if (typeof localStorage === "undefined") return;
+      const raw = localStorage.getItem(AUDIT_STORAGE_KEY);
+      if (!raw) return;
+      const parsed = JSON.parse(raw) as AuditEntry[];
+      if (!Array.isArray(parsed)) return;
+      this._state = {
+        ...this._state,
+        auditEntries: parsed.slice(0, AUDIT_MAX_PERSISTED),
+      };
+    } catch {
+      // best-effort hydrate
+    }
+  }
+
   /**
    * Persist activities to localStorage so the task manager state survives
    * full page reloads + browser-tab restarts. Hydrate on construct restores
@@ -627,11 +685,43 @@ export class MultiRegionStore {
 
   // --- Azure Accounts (multi-account auth) ---
 
-  /** Set / replace all AzureLoginAccounts */
+  /**
+   * Set / replace all AzureLoginAccounts.
+   *
+   * Seeds each account's `activeTenantId` (and the `activeTenants` map) from
+   * the persisted localStorage pointer when the caller didn't already supply
+   * one. Account lists are rebuilt from the MSAL cache on every load and
+   * carry only the HOME tenantId, so without this seed `resolveActiveTenantId`
+   * would revert the whole app to the home tenant after a reload/new tab —
+   * re-introducing the cross-tenant "wrong issuer" token error. Honoring the
+   * durable pointer here makes the operator's tenant choice consistent across
+   * the entire web app immediately on load, no tenant-change event required.
+   */
   setAzureAccounts(accounts: AzureLoginAccount[]): void {
+    const activeTenants: Record<string, string> = {
+      ...this._state.activeTenants,
+    };
+    const seeded = accounts.map((a) => {
+      if (!a.homeAccountId) return a;
+      const persisted = (() => {
+        try {
+          return msalGetActiveTenant(a.homeAccountId);
+        } catch {
+          return null;
+        }
+      })();
+      const active = a.activeTenantId ?? persisted ?? undefined;
+      if (active) {
+        activeTenants[a.homeAccountId] = active;
+      }
+      // Only fill activeTenantId when missing — never override an explicit
+      // value the caller passed in.
+      return a.activeTenantId || !active ? a : { ...a, activeTenantId: active };
+    });
     this._state = {
       ...this._state,
-      azureAccounts: [...accounts],
+      azureAccounts: [...seeded],
+      activeTenants,
     };
     this._notify();
   }
